@@ -1,0 +1,78 @@
+{
+  "lesson": "13-api-design-for-money",
+  "title": "API Design for Money: Versioning, Pagination, and Error Semantics",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A client sends POST /v1/payments and receives 502 Bad Gateway from the load balancer. What can the client conclude about the charge?",
+      "options": [
+        "The charge did not happen, because 5xx means the server failed the request",
+        "The charge happened, because a gateway only returns 502 after the origin replied",
+        "Nothing; the outcome is unknown and must be resolved by retry or lookup",
+        "The charge is still pending and will be confirmed by a webhook within a minute"
+      ],
+      "correct": 2,
+      "explanation": "A 502 means the intermediary did not get a valid answer from the origin, which may have committed the charge before failing. The outcome is unknown, so the client retries with the same idempotency key or looks the payment up by client reference. Treating 5xx as 'did not happen' is exactly the assumption that produced the double charges in the lesson's problem."
+    },
+    {
+      "stage": "check",
+      "question": "A client crashed after sending a payment request and before saving its idempotency key. On restart, what is the safe recovery?",
+      "options": [
+        "Look up the payment by client_reference, and create it only if none exists",
+        "Send the request again with a new idempotency key and the same request body",
+        "Wait 24 hours for the old key to expire, then resend with the original key",
+        "Page through the full list of today's payments and match on the amount field"
+      ],
+      "correct": 0,
+      "explanation": "The client reference is client-chosen, server-enforced unique, and readable, so it identifies the order's payment without the lost key; if none exists, a create is safe, and the uniqueness constraint stops two concurrent recoveries. A new key with the same body is a new request to the server and charges again if the first one was applied."
+    },
+    {
+      "stage": "check",
+      "question": "Why must a payments list endpoint sort its cursor on (created, id) rather than on updated?",
+      "options": [
+        "Sorting on updated would require a second database index on the payments table",
+        "The sort key must be immutable and unique, or rows move between pages",
+        "Clients expect the newest payments to appear first in any list endpoint",
+        "Cursor values encoding updated timestamps would be too long for a URL"
+      ],
+      "correct": 1,
+      "explanation": "A cursor names a position by the sort key of the last row seen. If that key can change (a refund bumps updated) or tie (two rows share a timestamp), rows cross the cursor between requests and are skipped or duplicated, just as with offsets. The id tie-breaker supplies uniqueness; created supplies immutability."
+    },
+    {
+      "stage": "check",
+      "question": "A provider adds a new value, requires_capture, to the payment status enum. Why does the lesson treat that as a breaking change?",
+      "options": [
+        "New enum values make every response larger and slow down older clients",
+        "Enum values are part of the URL path, so adding one changes existing routes",
+        "Adding any value to an enum invalidates the signatures on previously sent webhooks",
+        "An old client's exhaustive switch sends the unknown value to a default branch"
+      ],
+      "correct": 3,
+      "explanation": "Clients write switch statements over status, and for a payment the default branch is often 'failed' or 'succeeded', either of which is wrong for an authorized-but-uncaptured payment. Date-pinned versions let the server render requires_capture as processing for old pins. Webhook signatures cover the bytes sent, not the enum's definition, so they are unaffected."
+    },
+    {
+      "stage": "post",
+      "question": "The server returns 429 for a payment request partway through processing, after the card was already authorized. What has the server done wrong?",
+      "options": [
+        "Nothing; 429 is a client error, so the client is responsible for the retry",
+        "It should have returned 503 so that the client would know to back off longer",
+        "It reported not-applied for an applied side effect; 429 must precede side effects",
+        "It should have omitted Retry-After so that the client would retry immediately"
+      ],
+      "correct": 2,
+      "explanation": "Clients are told 429 means nothing happened and the same request can be retried after Retry-After. Returning it after an authorization moves an applied outcome into the not-applied class; with an idempotency key the retry is merely confusing, and without one it double-authorizes. Swapping in 503 changes the status code but repeats the same misclassification."
+    },
+    {
+      "stage": "post",
+      "question": "A team relies only on webhooks to update order status. Their endpoint is down for 30 hours and the provider stops retrying after 24. What design closes the gap?",
+      "options": [
+        "Treat webhooks as hints and reconcile from the events endpoint with a stored cursor",
+        "Ask the provider to extend its retry window for webhook deliveries to 72 hours",
+        "Poll every order's payment every minute instead of receiving webhooks",
+        "Store each webhook body as the authoritative state of the payment it names"
+      ],
+      "correct": 0,
+      "explanation": "The events endpoint is ordered and complete per account, so a consumer that persists its cursor can always catch up, however long it was down. A longer retry window only moves the cliff edge. Per-order polling works but costs a request per order per minute and runs into rate limits, which is why the events feed exists."
+    }
+  ]
+}

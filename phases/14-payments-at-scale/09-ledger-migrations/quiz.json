@@ -1,0 +1,78 @@
+{
+  "lesson": "09-ledger-migrations",
+  "title": "Migrating a Live Ledger",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A team exports every balance at 02:00 and imports them as opening entries while an interest batch is still committing. What goes wrong?",
+      "options": [
+        "Nothing: the import runs after the export, so it sees every balance",
+        "The interest is credited twice, once in the export and once in the import",
+        "Credits committed after an account was exported are never in the new ledger",
+        "The export fails because the interest batch holds locks on the table"
+      ],
+      "correct": 2,
+      "explanation": "Each account's exported balance reflects the moment it was read; credits committed to the old table after that moment exist only in the old table, so those customers are short in the new ledger. Defining the snapshot and the change stream by one log position closes the gap. Double crediting would need the change to be both in the snapshot and replayed, which this export does not do."
+    },
+    {
+      "stage": "check",
+      "question": "Why does this lesson feed the new ledger from the database's change log rather than adding a second write in application code?",
+      "options": [
+        "The change log is faster, so the new ledger lags the old one less",
+        "It sees every committed change from every source, atomically with the commit",
+        "Application code cannot write to two databases in the same request",
+        "The change log already contains the journal entries in double-entry form"
+      ],
+      "correct": 1,
+      "explanation": "The log records every committed change, including direct updates by scripts and other services, in commit order, and it exists if and only if the commit did, so there is no crash window between two writes. Application dual-write can be made to work for a single write path, but it misses bypassing writers and can diverge on partial failure. The log contains row changes, not journals; translation is still needed."
+    },
+    {
+      "stage": "check",
+      "question": "An ops script reduced account B by 0.50 years ago with no reason row anywhere. During dual-write, how should the consumer post that kind of change?",
+      "options": [
+        "Skip it, since only changes with a reason row belong in the new ledger",
+        "Post it as a fee against fee_revenue, the most likely explanation",
+        "Adjust B's opening balance so the two systems agree without a journal",
+        "Post it against migration:unexplained so it balances and can be explained"
+      ],
+      "correct": 3,
+      "explanation": "The suspense account keeps the new ledger balanced and B's balance correct while making every unexplained change visible and countable; finance must reclassify or accept it before cutover. Guessing a fee hides the problem in a real account; skipping it leaves B wrong; editing the opening balance hides it entirely."
+    },
+    {
+      "stage": "check",
+      "question": "Shadow-read on day one reports 1,840 mismatches, most of which vanish when re-checked a second later. What is the most likely cause?",
+      "options": [
+        "The old and new values were compared at different log positions",
+        "The CDC consumer is dropping one change in every few thousand",
+        "The translation rules are wrong for the most common transfer type",
+        "The new ledger rounds balances differently from the old table"
+      ],
+      "correct": 0,
+      "explanation": "Transient mismatches that disappear on re-check are the signature of comparing the old balance now with the new ledger before the consumer has applied the same changes; each comparison must carry the LSN the old read saw. Dropped changes or wrong rules produce persistent mismatches that do not heal on their own."
+    },
+    {
+      "stage": "post",
+      "question": "Every customer account matches between the old and new systems. Which error can still be present, and which proof catches it?",
+      "options": [
+        "Two customers with offsetting errors; caught by the range checksum alone",
+        "A missing customer account; caught by comparing the number of rows",
+        "A journal that hit the wrong internal account; caught by the trial balance",
+        "A rounding residue on one account; caught by the per-account comparison"
+      ],
+      "correct": 2,
+      "explanation": "Per-account equality only checks customer wallets; a fee credited to interest_expense instead of fee_revenue leaves every wallet right and the books wrong, and only the aggregate checks over internal accounts find it. Offsetting customer errors and rounding residues would already fail the per-account comparison, so those options describe errors that cannot be present here."
+    },
+    {
+      "stage": "post",
+      "question": "After 100% cutover the reverse sync is still running. Which event crosses the point of no return?",
+      "options": [
+        "The nightly per-account proof passes for the seventh night in a row",
+        "A customer uses holds, a feature the old balance table cannot represent",
+        "The last cohort of accounts is switched over to the new ledger",
+        "The CDC consumer from the old table to the new ledger is stopped"
+      ],
+      "correct": 1,
+      "explanation": "Once the new ledger records state the old model cannot hold, flipping back would lose it, so rollback is no longer possible without data loss. The last cohort's switch is reversible while the reverse sync runs, and stopping the forward consumer is expected after full cutover; neither removes the old table's ability to take back the accounts."
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "lesson": "10-fees-and-splits",
+  "title": "Fees, Splits, and Platform Payments",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "0.10 EUR is split three ways by rounding each third to the cent. What goes wrong?",
+      "options": ["Nothing, because each part rounds to 0.03", "The parts sum to 0.09 and a cent is lost", "The parts sum to 0.11 and a cent appears", "The rounding mode makes the result undefined"],
+      "correct": 1,
+      "explanation": "Each third is 0.0333..., which rounds to 0.03, and three of them sum to 0.09. Largest-remainder allocation gives [0.04, 0.03, 0.03] instead. Gaining a cent happens with ceilings, not with rounding a third."
+    },
+    {
+      "stage": "check",
+      "question": "The schedule is 12% + 0.30 with a 0.50 minimum and 25.00 maximum, capped at the base. What is the fee on a 0.40 sale?",
+      "options": ["0.35, the percent plus fixed amount", "0.50, because the minimum applies", "0.40, because a fee never exceeds its base", "0.00, because the sale is below the minimum"],
+      "correct": 2,
+      "explanation": "12% of 0.40 is 0.05, plus 0.30 is 0.35; the minimum raises it to 0.50; the final cap at the base lowers it to 0.40 so the seller net is zero rather than negative. Stopping at the minimum would create an unintended debt owed by the seller."
+    },
+    {
+      "stage": "check",
+      "question": "A 56.73 EUR line includes 19% VAT. How does the splitter separate net and VAT?",
+      "options": ["allocate(10000, 1900) so net + VAT is exactly 56.73", "VAT = 56.73 x 19%, then net = 56.73 - VAT", "net = 56.73 / 1.19 rounded, and VAT rounded separately", "VAT is left in the seller net and remitted later on"],
+      "correct": 0,
+      "explanation": "A tax-inclusive price is net x 1.19, so net : VAT = 100 : 19, and allocating by those ratios guarantees the two sum to the line. Multiplying the gross by 19% overstates VAT (10.78 instead of 9.06), and rounding net and VAT independently can lose a cent."
+    },
+    {
+      "stage": "check",
+      "question": "Which part of each line's split is computed as a remainder rather than by allocation?",
+      "options": ["The VAT owed to the tax authority", "The referral partner's share", "The platform's commission revenue", "The seller's net amount"],
+      "correct": 3,
+      "explanation": "Seller net = net of tax - commission, so it absorbs whatever the other parts leave and the line sums exactly. VAT and the referral share come from allocate, and the commission comes from the fee schedule. Having two remainders in one split is not possible; having none is the original bug."
+    },
+    {
+      "stage": "post",
+      "question": "Why does posting the whole split as one journal entry make a good production check on the splitter?",
+      "options": ["Journal entries round every posting to the nearest cent", "The entry is rejected if any split lost or invented a cent", "It lets the processor recompute the fees from the entry", "One entry is faster to post than one entry per party"],
+      "correct": 1,
+      "explanation": "The receivable debit must equal the sum of all credits, so a split that does not conserve produces an unbalanced entry that the ledger refuses, on every order, in production. Entries never round anything, and speed is not the point."
+    },
+    {
+      "stage": "post",
+      "question": "Seller-A has 44.84 available, with a 10% reserve, a 0.25 payout fee, and a 20.00 minimum. Why is the reserve 4.49 and not 4.48?",
+      "options": ["The reserve rounds UP, in the platform's favour", "HALF_EVEN rounds 4.484 to the even neighbour", "The payout fee is added into the reserve", "The minimum payout forces the reserve up"],
+      "correct": 0,
+      "explanation": "10% of 44.84 is 4.484. The reserve protects the platform against refunds and chargebacks, so it is rounded UP to 4.49. HALF_EVEN would give 4.48 because 0.4 is below the halfway point, not a tie."
+    }
+  ]
+}

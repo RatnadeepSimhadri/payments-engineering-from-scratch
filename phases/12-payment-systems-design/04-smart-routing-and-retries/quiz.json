@@ -1,0 +1,78 @@
+{
+  "lesson": "04-smart-routing-and-retries",
+  "title": "Smart Routing, Cascading, and Retry Policies",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Acquirer A charges 2.20% + 0.20 USD and approves 86% of Visa payments; acquirer B charges 2.90% + 0.30 USD and approves 93%. For a 100.00 USD Visa payment, which should get the first attempt?",
+      "options": [
+        "A, because a lower fee always yields a higher margin per payment",
+        "Either one, because a decline on the first can be cascaded anyway",
+        "B, because 0.93 x 96.80 USD is larger than 0.86 x 97.60 USD",
+        "A, because its auth rate is within ten points of B's auth rate"
+      ],
+      "correct": 2,
+      "explanation": "Expected margin is P(approve) x (amount - fee): 0.93 x 9680 = 9002.4 minor units for B against 0.86 x 9760 = 8393.6 for A. Seven points of approval rate are worth far more than 0.80 USD of fee at this ticket size. 'Cascade anyway' is wrong because most declines may not be cascaded, and every cascade costs latency and a budget token."
+    },
+    {
+      "stage": "check",
+      "question": "Acquirer B returns response code 51 (insufficient funds). What should the router do?",
+      "options": [
+        "Stop and report a decline the merchant may retry later on the same card",
+        "Cascade to acquirer A, since 51 is a soft decline and A may approve",
+        "Mark acquirer B unhealthy and open its circuit breaker for cool-down",
+        "Return PENDING_UNKNOWN and send a reversal to acquirer B right away"
+      ],
+      "correct": 0,
+      "explanation": "51 is the issuer's decision about the cardholder's balance. Acquirer A would reach the same issuer, which would see the same balance. It is soft only in time: it may approve later. Cascading it is the most common mistake because 'soft' is read as 'retry anywhere'. An issuer decline is a health success for B, not a failure."
+    },
+    {
+      "stage": "check",
+      "question": "Acquirer B times out after 30 seconds on a 1,200 USD authorization. Why must the router not cascade the payment to acquirer A?",
+      "options": [
+        "A timeout always means the issuer declined and A would be declined as well",
+        "The retry budget forbids cascades on any payment above 1,000 USD",
+        "Visa rules forbid sending the same card to two acquirers in one day",
+        "B may have obtained an approval whose response was lost, so A would add a second hold"
+      ],
+      "correct": 3,
+      "explanation": "A read timeout means the request was sent and the outcome is unknown; the issuer may have approved and placed a hold. A cascade can create a second hold on the cardholder's credit. The router returns PENDING_UNKNOWN so the orchestrator can query or reverse at B first. A timeout says nothing about the issuer's decision, which is why the first distractor is wrong."
+    },
+    {
+      "stage": "check",
+      "question": "A connection to acquirer A is refused five times in a row. Which component should change, and which should not?",
+      "options": [
+        "The auth-rate estimate for A should fall, and the circuit breaker should stay put",
+        "A's circuit breaker should trip; A's auth-rate estimate should not change",
+        "Both should change, since each refused call is a failed payment attempt",
+        "Neither should change, since a refused connection is cascaded at no cost"
+      ],
+      "correct": 1,
+      "explanation": "Technical failures are health signals; issuer decisions are auth-rate signals. If refused connections lowered the estimate, a short network blip would push traffic away for hours after recovery because the estimate decays slowly by design. Counting them in both places double-penalises the processor and mixes two failure modes that need different responses."
+    },
+    {
+      "stage": "post",
+      "question": "A retry budget deposits 0.1 token per first attempt and costs 1 token per cascade, with 3 tokens banked. During a total outage, 20 payments arrive and every attempt is a 91. How many processor calls are made?",
+      "options": [
+        "40, because each payment cascades once to the second acquirer",
+        "20, because the budget refuses all cascades during an outage",
+        "23, because only the 3 banked tokens can pay for cascades",
+        "25: 20 first attempts plus the 5 cascades the tokens can pay for"
+      ],
+      "correct": 3,
+      "explanation": "The budget holds 3 banked tokens plus 20 x 0.1 = 2 earned by the first attempts, so 5 cascades are paid for: 25 calls in total. The deposits made during the outage count, which is why 23 is wrong. Without a budget every payment would cascade, doubling the load to 40 calls on a network that is already failing."
+    },
+    {
+      "stage": "post",
+      "question": "A greedy router always sends the first attempt to the processor with the highest expected margin. Why does the lesson add a small exploration rate?",
+      "options": [
+        "Other processors otherwise get only cascades, a biased sample, so their estimates go stale",
+        "Exploration lowers the average processing fee across all of the merchant's payments",
+        "Card networks require merchants to spread volume across at least two acquirers",
+        "Exploration keeps every circuit breaker in the HALF_OPEN state for probing"
+      ],
+      "correct": 0,
+      "explanation": "An estimate only learns where traffic goes. Without exploration a processor whose approval rate improves is never noticed, because it sees only payments that already failed elsewhere. This is the explore-exploit trade-off of a multi-armed bandit. Exploration usually costs margin rather than saving fees, and breakers move to HALF_OPEN on cool-down, not because of exploration."
+    }
+  ]
+}

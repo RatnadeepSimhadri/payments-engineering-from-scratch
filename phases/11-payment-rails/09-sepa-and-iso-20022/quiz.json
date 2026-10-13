@@ -1,0 +1,48 @@
+{
+  "lesson": "09-sepa-and-iso-20022",
+  "title": "SEPA, Wires, and ISO 20022 (pain.001, pacs.008)",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A Nacha Batch Control record repeats the entry count and total amounts already implied by the entries. What is that redundancy for?",
+      "options": ["It lets the bank skip reading the entry records", "It lets the receiver detect a missing or altered entry", "It encrypts the batch against tampering in transit", "It tells the bank how many files to expect that day"],
+      "correct": 1,
+      "explanation": "The receiver recomputes the totals and rejects a batch whose declared values disagree with its contents, which catches dropped, duplicated, or altered entries. It is not a security control: anyone who can alter an entry can recompute the totals. pain.001's NbOfTxs and CtrlSum play the same role."
+    },
+    {
+      "stage": "check",
+      "question": "Which identifier must travel unchanged from the debtor's pain.001 through pacs.008 to the creditor?",
+      "options": ["MsgId from the group header", "PmtInfId of the payment block", "TxId assigned for the interbank leg", "EndToEndId of the transaction"],
+      "correct": 3,
+      "explanation": "EndToEndId is set by the debtor and passed through every hop so both companies can match the payment. MsgId and PmtInfId belong to the pain.001 sender and are not carried; TxId is created by the debtor bank for the interbank leg and is the banks' reference, not the customers'."
+    },
+    {
+      "stage": "check",
+      "question": "A pain.001 is valid against the ISO 20022 XSD but has a creditor named \"Zürich Präzision AG\". What does a SEPA bank do?",
+      "options": ["Accept it, since the schema allows any Unicode", "Reject it unless bilaterally agreed, since ü is outside the basic Latin set", "Accept it, since names are only displayed and never processed", "Reject it, since SEPA names may contain only uppercase letters"],
+      "correct": 1,
+      "explanation": "The EPC guidelines narrow the schema: the only character set every SEPA bank must accept is basic Latin (EPC217-08), so ü must be transliterated unless the bank agrees to a wider set. Schema validity is necessary, not sufficient; uppercase-only is not a SEPA rule."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the parser disallow any DOCTYPE declaration instead of merely disabling external entity expansion?",
+      "options": ["DOCTYPE parsing is slow on files larger than a few megabytes", "ISO 20022 namespaces are incompatible with any DTD declaration", "Blocking DOCTYPE stops XXE, entity bombs, and DTD tricks at once", "The XSD validator rejects any document that has an internal DTD"],
+      "correct": 2,
+      "explanation": "ISO 20022 messages never need a DTD, so refusing DOCTYPE outright closes external entities, billion-laughs expansion, and other DTD-based attacks with one setting. Disabling only entity expansion leaves gaps that vary by parser; speed and namespace compatibility are not the reason."
+    },
+    {
+      "stage": "post",
+      "question": "A customer sends a pain.001 with only the creditor's IBAN and no BIC. What must the debtor bank do before sending pacs.008?",
+      "options": ["Derive the creditor agent BIC from the IBAN's bank code via a directory", "Reject the transaction because pacs.008 cannot route without a BIC", "Send the pacs.008 without CdtrAgt and let the CSM derive it from the IBAN", "Ask the customer to resend the file with the BIC filled in for each creditor"],
+      "correct": 0,
+      "explanation": "Under SEPA's IBAN-only rule the customer need not supply the BIC, but pacs.008 requires CdtrAgt for routing, so the debtor bank looks it up from the national bank code inside the IBAN. Rejecting or pushing it back to the customer violates IBAN-only; the CSM does not fill it in."
+    },
+    {
+      "stage": "post",
+      "question": "An ERP computes CtrlSum by adding amounts as doubles and formatting to two decimals. What failure does that cause, and when?",
+      "options": ["The XML serializer rejects doubles, so it fails on every file", "It fails only for amounts in currencies with three decimal places", "Its total drifts by a cent on large files and the bank rejects them", "It overflows past 2^53 cents and wraps the total to a negative number"],
+      "correct": 2,
+      "explanation": "Binary floating-point addition accumulates representation error; on large files it can cross a rounding boundary so CtrlSum is 0.01 off and the bank rejects the file. Small files usually pass, which is why it ships. The fix is integer minor units; the serializer never sees the double, and SEPA is EUR only."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "10-payment-method-abstraction",
+  "title": "Payment Method Abstraction and Processor Adapters",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A checkout service calls a card processor's SDK directly and its retry worker branches on response_code == \"51\". The business adds ACH debits. What is the underlying design problem?",
+      "options": [
+        "ACH settles too slowly to share a retry worker with card payments at all",
+        "The retry worker should simply retry every decline after a fixed 24 hours",
+        "A vendor's vocabulary leaked into product code, so each new rail changes every caller",
+        "Response codes should be stored as integers rather than strings so they compare safely"
+      ],
+      "correct": 2,
+      "explanation": "The retry worker knows the card processor's words. ACH answers with R-codes, days later, so every caller that branches on card codes must change and each grows its own translation. A port with a normalized DeclineReason fixes that. Retrying every decline after 24 hours is the opposite of safe: R10 and fraud declines must not be retried at all."
+    },
+    {
+      "stage": "check",
+      "question": "The card adapter receives response code \"N7\", which is not in its mapping table. What should the result say, and why?",
+      "options": [
+        "DECLINED with UNKNOWN, whose advice is DO_NOT_RETRY, and raise an alert to add the mapping",
+        "DECLINED with DO_NOT_HONOR, because that is the most common generic decline reason",
+        "SUCCEEDED, since only mapped codes are known to be declines by the adapter",
+        "Throw an exception so the caller can decide how to interpret the raw code"
+      ],
+      "correct": 0,
+      "explanation": "Unknown codes fail safe: UNKNOWN advises DO_NOT_RETRY, so nothing is re-attempted against a code that might mean fraud or a closed account, and the alert gets the mapping added. Mapping to DO_NOT_HONOR looks reasonable but carries RETRY_LATER, which is how unmapped codes end up retried against network and NACHA re-presentment rules."
+    },
+    {
+      "stage": "check",
+      "question": "A caller sends charge(capture=false) to the bank debit adapter, which does not declare SEPARATE_CAPTURE. What does the contract require?",
+      "options": [
+        "Submit the debit anyway and mark the result AUTHORIZED until a capture call arrives",
+        "Submit the debit and let the ACH network reject the unsupported authorization",
+        "Return DECLINED with INVALID_AMOUNT so the caller retries with capture set to true",
+        "Throw UnsupportedCapabilityException before the vendor is called, with zero vendor calls"
+      ],
+      "correct": 3,
+      "explanation": "Capabilities are checked before I/O. ACH has no authorize-only concept, so submitting would move money the caller only meant to reserve; the rail will not reject it. Marking it AUTHORIZED is the dangerous option because it reports a reservation while the customer is actually being debited."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the bank adapter keep its own reference-to-result map while the card adapter does not?",
+      "options": [
+        "Bank debits are larger, so they need a stronger dedupe than card charges",
+        "The ACH rail has no idempotency key, so the adapter must supply the port's one-charge rule",
+        "The card adapter's map is held in the PaymentService instead of the adapter",
+        "ACH trace numbers are reused by banks, so the adapter must remap them locally"
+      ],
+      "correct": 1,
+      "explanation": "The port promises that one reference is one charge. The card acquirer honours an idempotency key natively; ACH does not, and submitting the same debit twice debits twice. The adapter fills the gap. The PaymentService holds results by processor reference for event application, which is not dedupe of submissions."
+    },
+    {
+      "stage": "post",
+      "question": "A teammate writes a new adapter, unit-tests its happy path, and it compiles against PaymentProcessor. What does running ProcessorConformance add?",
+      "options": [
+        "Nothing new, because the compiler already checked every method in the interface signature",
+        "A load test that measures the adapter's latency and error rate against the vendor's sandbox",
+        "Checks of contracts the types cannot express, like PENDING iff async and one charge per reference",
+        "A verification that the adapter's raw codes are identical to the raw codes of the other adapters"
+      ],
+      "correct": 2,
+      "explanation": "An interface fixes signatures, not meaning. The suite drives every adapter through the same scenarios and checks behaviour: status rules, the decline mapping, dedupe, capability honesty, event tolerance. The lesson shows it failing a lossy mapping and a missing dedupe. Raw codes are expected to differ across adapters; only the normalized vocabulary must agree."
+    },
+    {
+      "stage": "post",
+      "question": "An ACH debit settled (SUCCEEDED) and 40 days later a return line with R10 arrives. Why does this lesson's PaymentService ignore it, and what should production do?",
+      "options": [
+        "The payment is final, so a late return is a new reversal object with its own lifecycle, not a status flip",
+        "R10 is unmapped, so the adapter translates it to an empty Optional and nothing happens",
+        "Returns after settlement are invalid under NACHA rules, so ignoring the line is correct",
+        "The service should flip the payment back to PENDING and wait for a second settlement line"
+      ],
+      "correct": 0,
+      "explanation": "The isFinal guard is right for redelivered duplicates and wrong for genuine late reversals; an unauthorized-debit return can arrive up to 60 days after settlement and must be handled like a dispute, with ledger reversal. R10 is mapped (to UNAUTHORIZED_DEBIT), and late returns are explicitly allowed by NACHA for consumer unauthorized debits."
+    }
+  ]
+}

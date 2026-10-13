@@ -1,0 +1,48 @@
+{
+  "lesson": "12-wallets-and-stored-value",
+  "title": "Wallets, Stored Value, and E-Money Regulation",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "In a double-entry ledger, a company receives 100.00 that it owes back to a customer on demand. Which accounts change?",
+      "options": ["Cash asset up, revenue up", "Cash asset up, a liability up", "A liability up, equity down", "Revenue up, an expense up"],
+      "correct": 1,
+      "explanation": "Money received that must be repaid increases an asset (cash) and a liability (the amount owed) equally; equity does not change. Recording it as revenue is the core mistake this lesson guards against: customer money is not income."
+    },
+    {
+      "stage": "check",
+      "question": "Which product holds no stored value on the provider's books?",
+      "options": ["A PayPal balance funded from a bank account", "A Starbucks card loaded with 25.00 USD", "An Apple Pay token for an existing debit card", "A Venmo balance received from a friend"],
+      "correct": 2,
+      "explanation": "Apple Pay is a pass-through wallet: it stores a token for the customer's card, and the card issuer holds the funds. PayPal and Venmo balances are stored value owed by the provider; a Starbucks card balance is a closed-loop liability of the merchant."
+    },
+    {
+      "stage": "check",
+      "question": "An acquirer settles a 100.00 EUR wallet top-up net of a 1.65 EUR fee, and the wallet credited the customer 100.00. What must the provider do?",
+      "options": ["Reduce the customer's balance to 98.35 EUR", "Move 1.65 EUR of its own money into safeguarding", "Record the 1.65 EUR shortfall as a customer receivable", "Nothing, since the fee is a normal processing cost"],
+      "correct": 1,
+      "explanation": "E-money is issued at par, so the provider owes 100.00 while safeguarding holds 98.35; it must cover the 1.65 from its own funds. Reducing the balance breaks issuance at par unless the fee was disclosed and charged as a fee, and the customer does not owe it."
+    },
+    {
+      "stage": "check",
+      "question": "Why did many Synapse end users lack FDIC protection even though their money sat in FDIC-insured banks?",
+      "options": ["FDIC insurance never covers money held in custodial FBO accounts", "The partner banks had failed and exhausted the deposit insurance fund", "Pass-through cover protects against bank failure and needs owner records", "Fintech wallet balances are excluded from FDIC insurance by statute"],
+      "correct": 2,
+      "explanation": "Pass-through insurance protects beneficial owners against the failure of the bank, and only if records identify each owner and amount. No bank failed; the middleware failed and its ledger did not reconcile. Custodial accounts can be covered, which is why the distractors that say never are wrong."
+    },
+    {
+      "stage": "post",
+      "question": "A customer's wallet goes to -40.00 after a top-up chargeback while other customers hold +500.00 in total. How much must be safeguarded?",
+      "options": ["460.00, the net of all customer balances", "500.00, the sum of positive balances only", "540.00, positive balances plus the negative one", "0.00 until the negative balance is recovered"],
+      "correct": 1,
+      "explanation": "Safeguarding covers what is owed to customers: the positive balances, 500.00. The -40.00 is a receivable from one customer and must not reduce other customers' protection, so netting to 460.00 under-safeguards. The provider absorbs the 40.00 from its own funds."
+    },
+    {
+      "stage": "post",
+      "question": "Alice sends Bob 40.00 inside the same wallet. What happens at the safeguarding bank?",
+      "options": ["Nothing; two ledger postings move the liability", "A 40.00 internal transfer between sub-accounts", "A payout of 40.00 followed by a top-up of 40.00", "A hold of 40.00 until the end-of-day settlement"],
+      "correct": 0,
+      "explanation": "An internal P2P transfer debits Alice's liability account and credits Bob's; total customer liabilities and safeguarded assets are unchanged, so no money moves at any bank. That is why the wallet's ledger, not the bank, is the record of who owns what."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "07-payment-incident-management",
+  "title": "Incident Management for Payments",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A processor times out a third of authorizations and customers retry with a new idempotency key per click. What is the first thing the on-call engineer should do?",
+      "options": [
+        "Read the logs to find which code path is producing the timeouts",
+        "Open a ticket with the processor and wait for their status update",
+        "Route away from the processor and treat timeouts as unknown outcomes",
+        "Refund every customer who was charged during the incident window"
+      ],
+      "correct": 2,
+      "explanation": "Money is moving wrongly (orphaned holds and duplicate authorizations accumulate with every retry), so containment comes before diagnosis: route away and stop the retry path from creating new payments. Reading logs first is what the team in The Problem did, and it let the duplicate set grow for forty minutes."
+    },
+    {
+      "stage": "check",
+      "question": "Two bugs: one double-charged 200 customers and has been fixed; the other double-charges every retry and is still running but has hit only 20 customers. How should their severities compare?",
+      "options": [
+        "The running bug is higher: unbounded and growing beats a larger fixed count",
+        "The fixed bug is higher because it has affected ten times more customers",
+        "Both are the same severity because both of them are duplicate charges",
+        "Neither is an incident until reconciliation confirms the duplicate set"
+      ],
+      "correct": 0,
+      "explanation": "Severity in payments weighs money at risk and whether it is still growing; a running duplication bug needs containment now, while a stopped one is a bounded clean-up. Ranking by customers affected so far is the intuitive distractor, but it prioritizes the incident where nothing urgent remains to be done."
+    },
+    {
+      "stage": "check",
+      "question": "An orphaned authorization is a hold approved at the processor for an order the platform recorded as failed. What is the preferred remediation?",
+      "options": [
+        "Capture it, then refund it, so the customer sees a matching credit",
+        "Void it, which releases the hold without a settled charge or fee",
+        "Leave it alone, since the authorization will expire in a few days",
+        "Refund it immediately so the customer is not out of pocket"
+      ],
+      "correct": 1,
+      "explanation": "A void releases the authorization before capture, leaves no settled charge on the statement, and usually costs nothing. A refund requires a capture first, adds two statement lines and fees. Letting it expire is tempting and costs nothing, but the customer's funds stay held for days and the network rules expect unused authorizations to be reversed."
+    },
+    {
+      "stage": "check",
+      "question": "After a nightly run, reconciliation breaks jump from 30 to 4,200. What is the right first step?",
+      "options": [
+        "Auto-resolve the breaks so the queue is clear before the payout batch",
+        "Release the payout batch and investigate the breaks during the day",
+        "Open a dispute with the processor for every break over the threshold",
+        "Check the input files' control totals and format for a reconciler fault"
+      ],
+      "correct": 3,
+      "explanation": "Most break storms are caused by the reconciliation inputs or the reconciler (a format change, a late or duplicated file, a cutoff shift), and a re-run after fixing the input collapses them. Auto-resolving writes the discrepancy into the books and destroys the evidence; releasing payouts risks paying merchants from wrong balances."
+    },
+    {
+      "stage": "post",
+      "question": "Support agents and the finance team both refunded the same 300 'duplicate' charges. Which practice prevents this?",
+      "options": [
+        "Restricting refunds to the finance team for the length of the incident",
+        "A single remediation batch with an idempotency key per affected payment",
+        "Requiring two approvals on every refund larger than a fixed threshold",
+        "Asking customers to confirm that they were charged twice before acting"
+      ],
+      "correct": 1,
+      "explanation": "One owner (the reconciliation lead), one authoritative affected set, and one batch keyed by remediation:<incident>:<payment_id> means a payment can be remediated exactly once however many times the job runs. Restricting refunds to finance removes one actor but finance can still run its fix twice; the idempotency key is what makes a rerun safe."
+    },
+    {
+      "stage": "post",
+      "question": "Why must the incident timeline record when the firm became aware of the incident and when it was classified?",
+      "options": [
+        "Regulatory notification deadlines are computed from those timestamps",
+        "The card networks charge their incident fees per hour from awareness",
+        "Blameless reviews need to identify which engineer noticed it first",
+        "The SLO burn-rate calculation needs the incident's start and end times"
+      ],
+      "correct": 0,
+      "explanation": "Regimes such as DORA count from classification as major and from awareness, and the US bank rule and CERT-In count hours from determination or noticing; without recorded timestamps the deadline is computed from whatever earliest evidence a regulator finds. The SLO option sounds plausible, but burn rate comes from event counts, not from incident timestamps."
+    }
+  ]
+}

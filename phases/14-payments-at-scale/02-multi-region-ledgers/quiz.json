@@ -1,0 +1,78 @@
+{
+  "lesson": "02-multi-region-ledgers",
+  "title": "Multi-Region Ledgers and Home-Region Routing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Two regions each accept writes for any account and replicate asynchronously. An account holds 600.00; each region debits 500.00 within the replication lag. What is the root cause of the -400.00 balance?",
+      "options": [
+        "The replication lag was too long, and a faster network would prevent it",
+        "Each region checked a valid balance, but the non-negative rule needs one decider",
+        "The clocks in the two regions disagreed about which debit came first",
+        "The second debit should have been merged with the first as a CRDT"
+      ],
+      "correct": 1,
+      "explanation": "Both debits were valid against the state each region saw; merging two valid divergent states produced an invalid one. A non-negative balance is not invariant-confluent, so it needs coordination, most cheaply a single owning region. A faster network only shrinks the window; any non-zero lag still permits the double spend."
+    },
+    {
+      "stage": "check",
+      "question": "A router has a cached directory entry saying acct_7 is homed in us-east at epoch 3, but the account was migrated to eu-central at epoch 4. What stops the stale write?",
+      "options": [
+        "The router's cache expires after a fixed TTL and refetches the entry",
+        "us-east replicates the write to eu-central, which then rejects it",
+        "The client's idempotency key is unknown in us-east and is refused",
+        "us-east no longer owns acct_7 at epoch 3 and fences the write"
+      ],
+      "correct": 3,
+      "explanation": "Every write carries the epoch the router saw, and a home accepts writes only for accounts it owns at the current epoch, so the old home rejects it and the router refreshes and retries. A TTL bounds how long the stale entry lives but does not stop writes inside that window, which is exactly when the damage happens."
+    },
+    {
+      "stage": "check",
+      "question": "A 250.00 transfer from A (home eu-central) to B (home us-east) has posted in EU but the message has not yet reached US. Which statement is true?",
+      "options": [
+        "EU's ledger is unbalanced by 250.00 until the US side posts",
+        "B's balance already includes the 250.00 via the async replica",
+        "EU balances alone; due_to plus due_from plus in-flight equals zero",
+        "Both regions hold a lock on the transfer until the commit completes"
+      ],
+      "correct": 2,
+      "explanation": "tx1 debits A and credits EU's due_to:us-east in one balanced local transaction, and the outbox row records the 250.00 in flight, so -250 + 0 + 250 = 0. No region ever holds half a transaction. The lock option describes two-phase commit, which this design avoids precisely so that no locks are held across an ocean."
+    },
+    {
+      "stage": "check",
+      "question": "us-east is lost with 300 ms of acknowledged transactions not yet replicated to its standby. After promoting the standby, where does the team find those transactions?",
+      "options": [
+        "In external records: delivered outbox messages, processor and bank reports",
+        "In the standby's write-ahead log, which received them synchronously",
+        "Nowhere; they are lost and the customers must be asked to repeat them",
+        "In the read replicas in eu-central, which are always ahead of the standby"
+      ],
+      "correct": 0,
+      "explanation": "The unreplicated tail is gone from the region's own copies, but its effects are recorded outside it: messages already delivered to other regions, payments the processor and bank saw, and client idempotency keys that will be retried. Those are replayed idempotently, and the old journal is diffed when the region returns. The standby was asynchronous, so it does not have them."
+    },
+    {
+      "stage": "post",
+      "question": "Why is a customer in India homed in an Indian region even if a Singapore region would give lower latency for most of them?",
+      "options": [
+        "Indian card networks only accept authorizations from Indian IP ranges",
+        "The RBI requires payment system data for India to be stored only in India",
+        "Cross-border clearing accounts cannot be denominated in Indian rupees",
+        "Singapore regions cannot replicate synchronously to Indian standbys"
+      ],
+      "correct": 1,
+      "explanation": "The Reserve Bank of India's 2018 storage directive requires end-to-end payment data for Indian payment systems to be stored in India, so residency fixes the home region and latency is optimized only within that constraint. The other options are not real constraints; the clearing-account and replication options describe engineering choices, not rules."
+    },
+    {
+      "stage": "post",
+      "question": "Which account is the poorest fit for home-region ownership and may justify a global consensus store instead?",
+      "options": [
+        "A consumer wallet whose owner lives and spends mostly in one country",
+        "A merchant's payable account credited by captures from many regions",
+        "A treasury account that must be debited from every continent",
+        "A per-region fee-revenue account that only its own region credits"
+      ],
+      "correct": 2,
+      "explanation": "An account debited from everywhere has no natural home, so every remote debit would forward across regions, and its balance check needs a single decider; consensus pays one cross-region round trip per write but gives every region equal access. A merchant payable that is only credited from many regions is fine with a home, since credits cannot violate the balance invariant."
+    }
+  ]
+}

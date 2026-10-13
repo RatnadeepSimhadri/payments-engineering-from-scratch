@@ -1,0 +1,48 @@
+{
+  "lesson": "11-ledger-concurrency",
+  "title": "Ledger Concurrency: Hot Accounts and Balance Checks",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Two threads each run 'read balance, add 10, write balance' on the same account with no synchronization. What can happen?",
+      "options": ["The balance always increases by exactly 20", "One increment overwrites the other: a lost update", "The JVM throws a ConcurrentModificationException", "The second write blocks until the first commits"],
+      "correct": 1,
+      "explanation": "Both threads can read the same value, add 10, and write it back, so the account rises by 10 instead of 20. Nothing in plain field access detects this or blocks; ConcurrentModificationException is about iterating collections, not field updates."
+    },
+    {
+      "stage": "check",
+      "question": "The checker explores 90 schedules for three naive two-step operations. Why does the LOCKED model have only 6?",
+      "options": ["The checker skips locked schedules to save time", "Locks make each step twice as long, halving choices", "Holding the lock blocks other threads, leaving only serial orders", "Six is the number of steps per locked operation"],
+      "correct": 2,
+      "explanation": "Once a thread takes the lock, no other thread can take a step until it unlocks, so the only freedom is the order of the three whole operations: 3! = 6 serial executions. The checker skips nothing; blocked threads simply have no enabled transition."
+    },
+    {
+      "stage": "check",
+      "question": "A hot account's row lock is held for 4 ms per transaction. Roughly what is the maximum update rate on that account?",
+      "options": ["About 250 updates per second, whatever the core count", "About 4,000 updates per second on a four-core machine", "Unlimited, because the database queues waiting writers", "About 250 updates per second per application server"],
+      "correct": 0,
+      "explanation": "Updates to one account are serialized, so throughput is one over the exclusive hold time: 1 / 0.004 s = 250 per second. More cores or servers add waiters, not throughput; queuing only turns the excess into latency and timeouts."
+    },
+    {
+      "stage": "check",
+      "question": "In the optimistic ledger, why is an insufficient-funds rejection thrown only after the version check passes?",
+      "options": ["Exceptions cannot be thrown while holding a lock", "Rejecting on a stale read could refuse a valid payout", "The version check is what computes the new balance", "Optimistic ledgers never reject, they only retry forever"],
+      "correct": 1,
+      "explanation": "The balance read in the unlocked phase may be stale; a concurrent credit might have raised it. Acting on the decision only when validation confirms nothing changed means every rejection is based on the current balance. Exceptions under a lock are fine with finally blocks."
+    },
+    {
+      "stage": "post",
+      "question": "What does sharding a hot merchant account into K sub-accounts give up in exchange for K times the credit throughput?",
+      "options": ["Conservation of money across the K shards", "The ability to credit the account at all during roll-up", "Deadlock freedom between payouts and credits", "An exact debit check: payouts may be refused while funds are in flight"],
+      "correct": 3,
+      "explanation": "No single shard knows the total, so a payout drains shards greedily and rejects if it comes up short, even if credits arriving elsewhere would have covered it. The check is conservative, never permissive. Conservation holds at every step through the in-flight account, and lock ordering prevents deadlock."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the stress test run an auditor thread calling totalMinor() during the run instead of only checking totals at the end?",
+      "options": ["To catch money that is briefly missing mid-transfer", "To slow the workers down so races become more likely", "Because end-of-run totals are not deterministic", "To measure contention for the --stats output"],
+      "correct": 0,
+      "explanation": "A design can end with correct balances yet lose money transiently, for example by debiting a shard before crediting any account. totalMinor() takes a consistent cut under all locks, so each mid-run total must equal the initial total. End totals are deterministic here by construction."
+    }
+  ]
+}

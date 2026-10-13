@@ -377,28 +377,28 @@ flowchart TB
 ### Track C: Payments Engineering
 
 <details id="phase-10">
-<summary><b>Phase 10 — Money & Ledgers</b> &nbsp;<code>12 lessons · 5 complete</code>&nbsp; <em>A ledger is a data structure with a legal obligation.</em></summary>
+<summary><b>Phase 10 — Money & Ledgers</b> &nbsp;<code>12 lessons · 12 complete</code>&nbsp; <em>A ledger is a data structure with a legal obligation.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
 | 01 | [Representing Money: Minor Units, Currencies, and Rounding](phases/10-money-and-ledgers/01-representing-money/) | Build | Java, Python, Go | ✅ |
-| 02 | [Currencies, Exchange Rates, and FX Conversion](phases/10-money-and-ledgers/02-currency-and-fx/) | Build | — | ⬚ |
+| 02 | [Currencies, Exchange Rates, and FX Conversion](phases/10-money-and-ledgers/02-currency-and-fx/) | Build | Java | ✅ |
 | 03 | [The Double-Entry Ledger from Scratch](phases/10-money-and-ledgers/03-double-entry-ledger/) | Build | Java, Python, Go | ✅ |
 | 04 | [Chart of Accounts and Account Types](phases/10-money-and-ledgers/04-chart-of-accounts/) | Learn | — | ✅ |
-| 05 | [Balances, Running Totals, and Snapshots](phases/10-money-and-ledgers/05-balances-and-snapshots/) | Build | — | ⬚ |
-| 06 | [Immutability, Reversals, and Corrections](phases/10-money-and-ledgers/06-immutability-and-reversals/) | Build | — | ⬚ |
+| 05 | [Balances, Running Totals, and Snapshots](phases/10-money-and-ledgers/05-balances-and-snapshots/) | Build | Java | ✅ |
+| 06 | [Immutability, Reversals, and Corrections](phases/10-money-and-ledgers/06-immutability-and-reversals/) | Build | Java | ✅ |
 | 07 | [Holds, Pending Transactions, and Available Balance](phases/10-money-and-ledgers/07-holds-and-available-balance/) | Build | Java, Python, Go | ✅ |
 | 08 | [Reconciliation: Matching Your Ledger Against Theirs](phases/10-money-and-ledgers/08-reconciliation/) | Build | Java | ✅ |
-| 09 | [Multi-Currency Ledgers and Revaluation](phases/10-money-and-ledgers/09-multi-currency-ledgers/) | Build | — | ⬚ |
-| 10 | [Fees, Splits, and Platform Payments](phases/10-money-and-ledgers/10-fees-and-splits/) | Build | — | ⬚ |
-| 11 | [Ledger Concurrency: Hot Accounts and Balance Checks](phases/10-money-and-ledgers/11-ledger-concurrency/) | Build | — | ⬚ |
-| 12 | [Audit Trails, Trial Balance, and Financial Close](phases/10-money-and-ledgers/12-audit-trails-and-financial-close/) | Learn | — | ⬚ |
+| 09 | [Multi-Currency Ledgers and Revaluation](phases/10-money-and-ledgers/09-multi-currency-ledgers/) | Build | Java | ✅ |
+| 10 | [Fees, Splits, and Platform Payments](phases/10-money-and-ledgers/10-fees-and-splits/) | Build | Java | ✅ |
+| 11 | [Ledger Concurrency: Hot Accounts and Balance Checks](phases/10-money-and-ledgers/11-ledger-concurrency/) | Build | Java | ✅ |
+| 12 | [Audit Trails, Trial Balance, and Financial Close](phases/10-money-and-ledgers/12-audit-trails-and-financial-close/) | Learn | — | ✅ |
 
 </details>
 
 <details id="phase-11">
-<summary><b>Phase 11 — Payment Rails & Card Networks</b> &nbsp;<code>15 lessons · 8 complete</code>&nbsp; <em>Every rail is a protocol, a rulebook, and a settlement cycle.</em></summary>
+<summary><b>Phase 11 — Payment Rails & Card Networks</b> &nbsp;<code>15 lessons · 15 complete</code>&nbsp; <em>Every rail is a protocol, a rulebook, and a settlement cycle.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
@@ -407,78 +407,78 @@ flowchart TB
 | 02 | [Authorization, Capture, Void, Refund: The Card Lifecycle State Machine](phases/11-payment-rails/02-card-authorization-lifecycle/) | Build | Java, Python, Go | ✅ |
 | 03 | [ISO 8583: Parsing the Card Network Message](phases/11-payment-rails/03-iso-8583/) | Build | Java, Python, Go | ✅ |
 | 04 | [PANs, Luhn, and BIN Range Routing](phases/11-payment-rails/04-pan-luhn-and-bin-ranges/) | Build | Java | ✅ |
-| 05 | [Tokenization and PCI DSS Scope Reduction](phases/11-payment-rails/05-tokenization-and-pci-scope/) | Build | — | ⬚ |
-| 06 | [3-D Secure and Strong Customer Authentication](phases/11-payment-rails/06-3ds-and-strong-customer-authentication/) | Learn | — | ⬚ |
-| 07 | [Interchange, Scheme Fees, and Merchant Pricing](phases/11-payment-rails/07-interchange-and-scheme-fees/) | Build | — | ⬚ |
+| 05 | [Tokenization and PCI DSS Scope Reduction](phases/11-payment-rails/05-tokenization-and-pci-scope/) | Build | Java | ✅ |
+| 06 | [3-D Secure and Strong Customer Authentication](phases/11-payment-rails/06-3ds-and-strong-customer-authentication/) | Learn | — | ✅ |
+| 07 | [Interchange, Scheme Fees, and Merchant Pricing](phases/11-payment-rails/07-interchange-and-scheme-fees/) | Build | Java | ✅ |
 | 08 | [ACH and the NACHA File Format](phases/11-payment-rails/08-ach-and-nacha/) | Build | Java, Python, Go | ✅ |
-| 09 | [SEPA, Wires, and ISO 20022 (pain.001, pacs.008)](phases/11-payment-rails/09-sepa-and-iso-20022/) | Build | — | ⬚ |
-| 10 | [Real-Time Payments: RTP, FedNow, UPI, Faster Payments](phases/11-payment-rails/10-real-time-payments/) | Learn | — | ⬚ |
+| 09 | [SEPA, Wires, and ISO 20022 (pain.001, pacs.008)](phases/11-payment-rails/09-sepa-and-iso-20022/) | Build | Java | ✅ |
+| 10 | [Real-Time Payments: RTP, FedNow, UPI, Faster Payments](phases/11-payment-rails/10-real-time-payments/) | Learn | — | ✅ |
 | 11 | [IBAN, BIC, and Account Number Validation](phases/11-payment-rails/11-iban-bic-and-account-validation/) | Build | Java, Python, Go | ✅ |
-| 12 | [Wallets, Stored Value, and E-Money Regulation](phases/11-payment-rails/12-wallets-and-stored-value/) | Learn | — | ⬚ |
+| 12 | [Wallets, Stored Value, and E-Money Regulation](phases/11-payment-rails/12-wallets-and-stored-value/) | Learn | — | ✅ |
 | 13 | [Open Banking: OAuth Consent, Account Aggregation, and Data Access](phases/11-payment-rails/13-open-banking-and-account-aggregation/) | Build | Java | ✅ |
-| 14 | [Bank Statement Formats: MT940, CAMT.053, BAI2, OFX](phases/11-payment-rails/14-bank-statements-and-formats/) | Build | — | ⬚ |
+| 14 | [Bank Statement Formats: MT940, CAMT.053, BAI2, OFX](phases/11-payment-rails/14-bank-statements-and-formats/) | Build | Java | ✅ |
 | 15 | [Settlement and Clearing: Gross, Net, and Deferred](phases/11-payment-rails/15-settlement-and-clearing/) | Learn | — | ✅ |
 
 </details>
 
 <details id="phase-12">
-<summary><b>Phase 12 — Payment Systems Design</b> &nbsp;<code>14 lessons · 4 complete</code>&nbsp; <em>Correctness first, then availability, then everything else.</em></summary>
+<summary><b>Phase 12 — Payment Systems Design</b> &nbsp;<code>14 lessons · 14 complete</code>&nbsp; <em>Correctness first, then availability, then everything else.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
 | 01 | [Designing an Idempotent Payment API](phases/12-payment-systems-design/01-idempotent-payment-api/) | Build | Java, Python, Go | ✅ |
 | 02 | [The Payment State Machine](phases/12-payment-systems-design/02-payment-state-machine/) | Build | Java, Python, Go | ✅ |
-| 03 | [Payment Orchestration Across Processors](phases/12-payment-systems-design/03-payment-orchestration/) | Build | — | ⬚ |
-| 04 | [Smart Routing, Cascading, and Retry Policies](phases/12-payment-systems-design/04-smart-routing-and-retries/) | Build | — | ⬚ |
+| 03 | [Payment Orchestration Across Processors](phases/12-payment-systems-design/03-payment-orchestration/) | Build | Java | ✅ |
+| 04 | [Smart Routing, Cascading, and Retry Policies](phases/12-payment-systems-design/04-smart-routing-and-retries/) | Build | Java | ✅ |
 | 05 | [Webhooks: Signing, Delivery, Ordering, and Replay](phases/12-payment-systems-design/05-webhooks-and-callbacks/) | Build | Java | ✅ |
-| 06 | [Refunds, Partial Refunds, and Refund Windows](phases/12-payment-systems-design/06-refunds-and-partial-refunds/) | Build | — | ⬚ |
-| 07 | [Disputes and Chargebacks: The Lifecycle and the Evidence](phases/12-payment-systems-design/07-disputes-and-chargebacks/) | Build | — | ⬚ |
-| 08 | [Payouts, Balances, and Negative Balance Handling](phases/12-payment-systems-design/08-payouts-and-balance-management/) | Build | — | ⬚ |
-| 09 | [Limits, Velocity Controls, and Exposure](phases/12-payment-systems-design/09-limits-and-velocity-controls/) | Build | — | ⬚ |
-| 10 | [Payment Method Abstraction and Processor Adapters](phases/12-payment-systems-design/10-payment-method-abstraction/) | Build | — | ⬚ |
-| 11 | [Recurring Payments, Subscriptions, and Dunning](phases/12-payment-systems-design/11-recurring-and-subscriptions/) | Build | — | ⬚ |
-| 12 | [Currency Conversion at Checkout and DCC](phases/12-payment-systems-design/12-currency-conversion-at-checkout/) | Build | — | ⬚ |
-| 13 | [API Design for Money: Versioning, Pagination, and Error Semantics](phases/12-payment-systems-design/13-api-design-for-money/) | Learn | — | ⬚ |
+| 06 | [Refunds, Partial Refunds, and Refund Windows](phases/12-payment-systems-design/06-refunds-and-partial-refunds/) | Build | Java | ✅ |
+| 07 | [Disputes and Chargebacks: The Lifecycle and the Evidence](phases/12-payment-systems-design/07-disputes-and-chargebacks/) | Build | Java | ✅ |
+| 08 | [Payouts, Balances, and Negative Balance Handling](phases/12-payment-systems-design/08-payouts-and-balance-management/) | Build | Java | ✅ |
+| 09 | [Limits, Velocity Controls, and Exposure](phases/12-payment-systems-design/09-limits-and-velocity-controls/) | Build | Java | ✅ |
+| 10 | [Payment Method Abstraction and Processor Adapters](phases/12-payment-systems-design/10-payment-method-abstraction/) | Build | Java | ✅ |
+| 11 | [Recurring Payments, Subscriptions, and Dunning](phases/12-payment-systems-design/11-recurring-and-subscriptions/) | Build | Java | ✅ |
+| 12 | [Currency Conversion at Checkout and DCC](phases/12-payment-systems-design/12-currency-conversion-at-checkout/) | Build | Java | ✅ |
+| 13 | [API Design for Money: Versioning, Pagination, and Error Semantics](phases/12-payment-systems-design/13-api-design-for-money/) | Learn | — | ✅ |
 | 14 | [Testing Payment Systems: Simulators, Property Tests, and Invariants](phases/12-payment-systems-design/14-testing-payment-systems/) | Build | Java | ✅ |
 
 </details>
 
 <details id="phase-13">
-<summary><b>Phase 13 — Risk, Fraud & Compliance</b> &nbsp;<code>11 lessons · 4 complete</code>&nbsp; <em>Every control is a trade between fraud losses and good customers lost.</em></summary>
+<summary><b>Phase 13 — Risk, Fraud & Compliance</b> &nbsp;<code>11 lessons · 11 complete</code>&nbsp; <em>Every control is a trade between fraud losses and good customers lost.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
-| 01 | [Fraud Patterns: Card Testing, Account Takeover, Friendly Fraud](phases/13-risk-fraud-and-compliance/01-fraud-patterns/) | Learn | — | ⬚ |
+| 01 | [Fraud Patterns: Card Testing, Account Takeover, Friendly Fraud](phases/13-risk-fraud-and-compliance/01-fraud-patterns/) | Learn | — | ✅ |
 | 02 | [A Rules Engine with Velocity Checks](phases/13-risk-fraud-and-compliance/02-rules-engine-and-velocity-checks/) | Build | Java, Python, Go | ✅ |
-| 03 | [Risk Scoring, Thresholds, and Precision-Recall Trade-offs](phases/13-risk-fraud-and-compliance/03-risk-scoring-and-thresholds/) | Build | — | ⬚ |
+| 03 | [Risk Scoring, Thresholds, and Precision-Recall Trade-offs](phases/13-risk-fraud-and-compliance/03-risk-scoring-and-thresholds/) | Build | Java | ✅ |
 | 04 | [Sanctions Screening: Name Matching Under Uncertainty](phases/13-risk-fraud-and-compliance/04-sanctions-screening/) | Build | Java, Python, Go | ✅ |
-| 05 | [KYC, CIP, and Identity Verification Flows](phases/13-risk-fraud-and-compliance/05-kyc-and-identity-verification/) | Learn | — | ⬚ |
+| 05 | [KYC, CIP, and Identity Verification Flows](phases/13-risk-fraud-and-compliance/05-kyc-and-identity-verification/) | Learn | — | ✅ |
 | 06 | [AML Transaction Monitoring and Structuring Detection](phases/13-risk-fraud-and-compliance/06-aml-transaction-monitoring/) | Build | Java | ✅ |
-| 07 | [Device Fingerprinting and Behavioral Signals](phases/13-risk-fraud-and-compliance/07-device-fingerprinting-and-signals/) | Learn | — | ⬚ |
+| 07 | [Device Fingerprinting and Behavioral Signals](phases/13-risk-fraud-and-compliance/07-device-fingerprinting-and-signals/) | Learn | — | ✅ |
 | 08 | [PCI DSS for Engineers](phases/13-risk-fraud-and-compliance/08-pci-dss-for-engineers/) | Learn | — | ✅ |
-| 09 | [PSD2, SCA, and Regional Regulation](phases/13-risk-fraud-and-compliance/09-psd2-sca-and-regional-regulation/) | Learn | — | ⬚ |
-| 10 | [Data Privacy, Retention, and Right to Erasure in Financial Systems](phases/13-risk-fraud-and-compliance/10-data-privacy-and-retention/) | Learn | — | ⬚ |
-| 11 | [Auditability: Immutable Logs and Evidence Bundles](phases/13-risk-fraud-and-compliance/11-auditability-and-evidence/) | Build | — | ⬚ |
+| 09 | [PSD2, SCA, and Regional Regulation](phases/13-risk-fraud-and-compliance/09-psd2-sca-and-regional-regulation/) | Learn | — | ✅ |
+| 10 | [Data Privacy, Retention, and Right to Erasure in Financial Systems](phases/13-risk-fraud-and-compliance/10-data-privacy-and-retention/) | Learn | — | ✅ |
+| 11 | [Auditability: Immutable Logs and Evidence Bundles](phases/13-risk-fraud-and-compliance/11-auditability-and-evidence/) | Build | Java | ✅ |
 
 </details>
 
 <details id="phase-14">
-<summary><b>Phase 14 — Payments at Scale</b> &nbsp;<code>11 lessons · 4 complete</code>&nbsp; <em>At scale, every rare bug is a daily event.</em></summary>
+<summary><b>Phase 14 — Payments at Scale</b> &nbsp;<code>11 lessons · 11 complete</code>&nbsp; <em>At scale, every rare bug is a daily event.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
 | 01 | [Architecture of a High-Availability Payment Gateway](phases/14-payments-at-scale/01-high-availability-payment-gateway/) | Learn | — | ✅ |
-| 02 | [Multi-Region Ledgers and Home-Region Routing](phases/14-payments-at-scale/02-multi-region-ledgers/) | Learn | — | ⬚ |
+| 02 | [Multi-Region Ledgers and Home-Region Routing](phases/14-payments-at-scale/02-multi-region-ledgers/) | Learn | — | ✅ |
 | 03 | [Exactly-Once Money Movement End to End](phases/14-payments-at-scale/03-exactly-once-money-movement/) | Build | Java, Python, Go | ✅ |
-| 04 | [Reconciliation at Scale: Streams, Buckets, and Breaks](phases/14-payments-at-scale/04-reconciliation-at-scale/) | Build | — | ⬚ |
-| 05 | [Batch vs Real-Time Settlement Pipelines](phases/14-payments-at-scale/05-batch-vs-real-time-settlement/) | Build | — | ⬚ |
-| 06 | [Observability for Money Movement](phases/14-payments-at-scale/06-observability-for-money-movement/) | Build | — | ⬚ |
-| 07 | [Incident Management for Payments](phases/14-payments-at-scale/07-payment-incident-management/) | Learn | — | ⬚ |
-| 08 | [Cost and Authorization-Rate Optimization](phases/14-payments-at-scale/08-cost-and-authorization-optimization/) | Build | — | ⬚ |
-| 09 | [Migrating a Live Ledger](phases/14-payments-at-scale/09-ledger-migrations/) | Learn | — | ⬚ |
+| 04 | [Reconciliation at Scale: Streams, Buckets, and Breaks](phases/14-payments-at-scale/04-reconciliation-at-scale/) | Build | Java | ✅ |
+| 05 | [Batch vs Real-Time Settlement Pipelines](phases/14-payments-at-scale/05-batch-vs-real-time-settlement/) | Build | Java | ✅ |
+| 06 | [Observability for Money Movement](phases/14-payments-at-scale/06-observability-for-money-movement/) | Build | Java | ✅ |
+| 07 | [Incident Management for Payments](phases/14-payments-at-scale/07-payment-incident-management/) | Learn | — | ✅ |
+| 08 | [Cost and Authorization-Rate Optimization](phases/14-payments-at-scale/08-cost-and-authorization-optimization/) | Build | Java | ✅ |
+| 09 | [Migrating a Live Ledger](phases/14-payments-at-scale/09-ledger-migrations/) | Learn | — | ✅ |
 | 10 | [Deterministic Simulation Testing of Payment Systems](phases/14-payments-at-scale/10-simulation-testing-of-payment-systems/) | Build | Java | ✅ |
 | 11 | [Payments System Design: Interview Patterns](phases/14-payments-at-scale/11-payments-system-design-interviews/) | Learn | — | ✅ |
 

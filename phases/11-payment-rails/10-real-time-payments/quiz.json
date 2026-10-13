@@ -1,0 +1,48 @@
+{
+  "lesson": "10-real-time-payments",
+  "title": "Real-Time Payments: RTP, FedNow, UPI, Faster Payments",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A customer disputes an ACH debit taken from their account without authorization. Roughly how long does their bank have to return it?",
+      "options": ["Two banking days, the same as every other return reason", "Sixty calendar days after the settlement date", "One hundred twenty days, the same window as card chargebacks", "No time at all, because ACH settlement is final"],
+      "correct": 1,
+      "explanation": "Unauthorized consumer ACH debits can be returned for sixty calendar days (Lesson 08); most other reasons have two banking days. That revocability is what real-time credit push rails lack: once accepted and settled, the sender cannot take the payment back."
+    },
+    {
+      "stage": "check",
+      "question": "A sending bank sends a pacs.008 on RTP and gets no pacs.002 before its timeout. What should it do?",
+      "options": ["Resend the payment with a new TxId so the network processes it again", "Mark it failed and tell the customer to try again later", "Mark it failed and reverse the hold on the payer's account", "Keep it in an unknown state and send a status inquiry for that TxId"],
+      "correct": 3,
+      "explanation": "The payment may have settled; a resend with a new id could pay twice, irrevocably, and telling the customer it failed may be false. The correct move is a status inquiry (pacs.028) using the same identifiers, with the payment held in UNKNOWN until the answer arrives."
+    },
+    {
+      "stage": "check",
+      "question": "Which settlement model credits the payee before the banks have settled with each other?",
+      "options": ["Prefunded settlement in a joint account", "Real-time gross settlement in central bank money", "Deferred net settlement in cycles during the day", "Correspondent settlement through nostro accounts"],
+      "correct": 2,
+      "explanation": "In deferred net settlement (Faster Payments, UPI) the payee is credited immediately and banks settle net positions later, so there is interbank credit risk between cycles, covered by collateral or a guarantee fund. Prefunded and RTGS models settle each payment before or as it is credited."
+    },
+    {
+      "stage": "check",
+      "question": "Why did NPCI discontinue person-to-person collect requests on UPI from October 2025?",
+      "options": ["Victims were approving requests disguised as refunds and paying fraudsters", "Collect requests could not be settled within NPCI's net settlement cycles", "Merchants used collect requests to avoid the zero merchant discount rate", "The UPI PIN could not be verified on collect requests sent between people"],
+      "correct": 0,
+      "explanation": "A collect request puts an approve button in the payer's app; fraudsters sent requests framed as refunds or prizes and victims approved payments to them. Merchant collect continues. Settlement and PIN verification work the same for collect and push payments."
+    },
+    {
+      "stage": "post",
+      "question": "Under the UK reimbursement rules, a non-vulnerable customer loses 12,000 GBP to APP fraud and the maximum excess applies. What does the receiving PSP pay?",
+      "options": ["Nothing, since the sending PSP alone reimburses", "6,000.00 GBP, half of the full loss", "5,950.00 GBP, half of the reimbursed amount", "11,900.00 GBP, the whole reimbursed amount"],
+      "correct": 2,
+      "explanation": "The sending PSP reimburses 12,000 minus the 100 GBP excess, 11,900, and the cost is split 50:50 with the receiving PSP, so each pays 5,950. The split applies to the reimbursed amount, not the gross loss, and the receiving PSP is not exempt."
+    },
+    {
+      "stage": "post",
+      "question": "A bank's fraud system scores outgoing payments in a nightly batch and relies on returns. What must change before it offers real-time payments?",
+      "options": ["Nothing, since requests for return of funds replace ACH returns", "Scoring must run before the payment is sent, within the timeout", "Scoring can stay nightly if per-payment limits are lowered for all", "Scoring must move to the receiving bank, which now owns the loss"],
+      "correct": 1,
+      "explanation": "On an irrevocable rail, detection after the fact cannot recover funds; controls must be preventive, synchronous, and fit the scheme's timeout. Return requests are voluntary and rarely recover moved funds. Receiving banks should add inbound monitoring, but that does not replace the sender's controls."
+    }
+  ]
+}

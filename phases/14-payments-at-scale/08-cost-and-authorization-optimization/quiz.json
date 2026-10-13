@@ -1,0 +1,78 @@
+{
+  "lesson": "08-cost-and-authorization-optimization",
+  "title": "Cost and Authorization-Rate Optimization",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A retry job re-sends every declined recurring charge once a day for a week. Which declines should it never re-send unchanged?",
+      "options": [
+        "Insufficient funds (51), because the customer may never top up",
+        "Issuer unavailable (91), because the issuer's system may stay down",
+        "Lost or stolen (43) and expired card (54) declines",
+        "Do not honor (05), because the issuer gave no reason for it"
+      ],
+      "correct": 2,
+      "explanation": "A lost or stolen card will never be approved and re-sending it incurs network reattempt fees; an expired card number no longer exists, so only new credential data (token or updater) can recover it. Insufficient funds is the strongest distractor, but it is precisely the 'retry later' class: it often succeeds after payday."
+    },
+    {
+      "stage": "check",
+      "question": "Why does this lesson give each transaction fixed random draws instead of drawing fresh random numbers when each lever runs?",
+      "options": [
+        "Fixed draws make the simulation run faster than fresh calls to Random",
+        "So every arm sees the same luck and differences come only from levers",
+        "Because java.util.Random is not thread-safe across experiment arms",
+        "So that the approval rates match the real processor's published rates"
+      ],
+      "correct": 1,
+      "explanation": "Common random numbers mean that turning a lever on changes exactly the transactions it acts on, so uplifts are exact integers that tests can assert. With fresh draws, turning on one lever would shift the random stream every later decision sees, adding noise to every comparison. Speed and thread safety are incidental."
+    },
+    {
+      "stage": "check",
+      "question": "Network tokens alone recover 3,501 approvals, the account updater alone 3,208, but both together far fewer than 6,709 extra. Why?",
+      "options": [
+        "Both target stale stored credentials, so they recover the same cards",
+        "The token fee makes the updater uneconomic, so it is switched off",
+        "Issuers decline more transactions when two levers are used together",
+        "The updater only works on cards that are not eligible for a token"
+      ],
+      "correct": 0,
+      "explanation": "Most of both levers' uplift is expired cards on file. A token-eligible expired card is fixed by the token's lifecycle management, so the updater has nothing left to do for it; only ineligible cards gain from the updater. The last option is close but wrong: the updater works on any stored card, it just runs after the token in this design."
+    },
+    {
+      "stage": "check",
+      "question": "A request times out at the primary processor. With both routing and soft-decline retry on, what does the code do?",
+      "options": [
+        "Retries at the primary first, then fails over if the retry also times out",
+        "Fails over and then retries once more, for three attempts in total",
+        "Treats the timeout as a hard decline and stops after one attempt",
+        "Fails over once to the secondary and does not also retry it"
+      ],
+      "correct": 3,
+      "explanation": "A timeout means the issuer probably never saw the request, so the secondary processor is the best second attempt, and the code caps every transaction at two attempts. Retrying at the primary first is plausible, but it re-sends into the component that just failed and spends the second attempt there."
+    },
+    {
+      "stage": "post",
+      "question": "Sending level 3 data on commercial cards shows zero extra approvals but the largest single cost reduction. What is it changing?",
+      "options": [
+        "The issuer's fraud score, so fewer chargebacks arrive afterwards",
+        "The interchange rate, which is lower for transactions with line items",
+        "The processor's per-attempt fee, which is waived for enriched requests",
+        "The network routing, which moves commercial cards to a cheaper network"
+      ],
+      "correct": 1,
+      "explanation": "Networks publish lower commercial-card interchange for transactions carrying tax, reference, and line-item data, because the issuer's corporate customer uses it. In the worked example 1,000.00 drops from 26.60 to 18.60. Routing to a cheaper network is a different lever, and in this lesson it only applies to regulated debit."
+    },
+    {
+      "stage": "post",
+      "question": "The retry lever adds 2,785 approvals and 26,039.88 USD of cost. Most of that cost is not retry fees. What is it?",
+      "options": [
+        "Network penalties for retrying hard declines too many times",
+        "Token fees charged on every retried attempt, tokenized or not",
+        "Interchange and network fees on the newly approved sales volume",
+        "Account-updater lookups triggered by the retried transactions"
+      ],
+      "correct": 2,
+      "explanation": "About 10,085 extra attempts at 0.05 cost about 504 USD; the rest is interchange and network fees on roughly 1.04 million USD of recovered volume, which is a cost worth paying. That is why the lesson decides on net value at a margin rather than on cost. Penalties are zero because the code never re-sends hard declines."
+    }
+  ]
+}

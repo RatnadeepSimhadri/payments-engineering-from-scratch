@@ -1,0 +1,78 @@
+{
+  "lesson": "08-payouts-and-balance-management",
+  "title": "Payouts, Balances, and Negative Balance Handling",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A merchant's card captures from Monday are usually paid to the platform on Wednesday. Can the platform pay the merchant on Wednesday morning, before the settlement report has arrived?",
+      "options": [
+        "Yes, because settlement on T+2 is guaranteed by the card networks",
+        "No: until a report says the scheme has paid, the funds are still pending",
+        "Yes, as long as the platform holds back a reserve on each payout",
+        "No, because merchants may only be paid on a weekly schedule"
+      ],
+      "correct": 1,
+      "explanation": "Settlement timing is usual, not guaranteed: holidays, file delays and exceptions move it. Paying out of expected funds is how a platform overdraws its own bank account. Funds become available when a settlement report that reconciles against the captures says they were paid. A reserve protects against later debits, not against paying money that has not arrived."
+    },
+    {
+      "stage": "check",
+      "question": "A settlement report lists captures summing to 400.00 USD but states a total of 399.99 USD. What should the balance service do?",
+      "options": [
+        "Accept it and post the 0.01 USD difference to fee revenue",
+        "Accept it, since the captures it names are all known to us",
+        "Refuse it with nothing changed, as the report does not reconcile",
+        "Settle only the captures whose amounts add up to 399.99 USD"
+      ],
+      "correct": 2,
+      "explanation": "A report that does not reconcile is not believed: some capture or amount is wrong, and moving funds to available on a wrong report pays merchants for money that may not have arrived. All checks run before the first posting, so a refused report leaves pending, available and cash untouched. Posting the difference to fee revenue hides the discrepancy reconciliation exists to find."
+    },
+    {
+      "stage": "check",
+      "question": "A merchant has reserve tranches of 5.00 USD (release June 1) and 8.00 USD (release June 15), and available is -6.00 USD. What does applying the reserve leave?",
+      "options": [
+        "Available 0.00 and one tranche of 7.00 USD releasing on June 15",
+        "Available 0.00 and one tranche of 7.00 USD releasing on June 1",
+        "Available -6.00, because a reserve may only be released on its date",
+        "Available 7.00, since every tranche is released at the same time"
+      ],
+      "correct": 0,
+      "explanation": "Earliest-releasing tranches are used first: all 5.00 of the June 1 tranche, then 1.00 of the June 15 tranche, which keeps its own release date for the 7.00 left. Covering a deficit is what the reserve is for, so waiting for release dates defeats it. Releasing everything over-releases funds held against future chargebacks."
+    },
+    {
+      "stage": "check",
+      "question": "A payout is returned by the bank with code R03 (no account / unable to locate account). What should happen next?",
+      "options": [
+        "Retry the same payout on the next business day automatically",
+        "Return the funds to available and pause until bank details are verified",
+        "Treat the return as a chargeback and debit the merchant's balance",
+        "Move the funds into the merchant's reserve for the next 90 days"
+      ],
+      "correct": 1,
+      "explanation": "R03 means the destination is wrong, so a retry to the same account fails the same way and costs another return fee. The funds come back from in transit to available, still owed to the merchant, and payouts pause until the details are fixed. A return is not a debit: the merchant has lost nothing, and there is no reason to reserve the funds."
+    },
+    {
+      "stage": "post",
+      "question": "In what order should a platform recover a merchant's negative available balance?",
+      "options": [
+        "Debit the merchant's bank at once, then apply the reserve to any part of the debit that is returned",
+        "Write the balance off, then pursue the merchant through a collections agency for recovery",
+        "Pause all of the merchant's captures until future card sales cover the deficit in full",
+        "Net against new settlements and apply the reserve, then debit the bank after a grace period"
+      ],
+      "correct": 3,
+      "explanation": "The order runs from cheapest to most expensive. Netting and the reserve use money the platform already holds; a bank debit is costly, may be returned, and damages the relationship, so it waits until the balance has been negative for a set period. Debiting at once punishes merchants whose deficit would have cleared with Tuesday's sales."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the payout file end with a trailer carrying the line count and the total credits and debits?",
+      "options": [
+        "The bank checks the totals before accepting, and reconciliation checks them after",
+        "The trailer tells the bank which payouts to process first when funds are short",
+        "The totals let the bank work out the platform's fees for the payout file",
+        "A trailer is required so that the file can be encrypted for transmission"
+      ],
+      "correct": 0,
+      "explanation": "Control totals detect a truncated, duplicated or corrupted file: the bank recomputes the count and sums and rejects a file that disagrees, as NACHA batch and file control records do. Afterwards the platform reconciles the bank's acknowledgement against the same totals. The trailer does not set priority, compute fees or relate to encryption."
+    }
+  ]
+}

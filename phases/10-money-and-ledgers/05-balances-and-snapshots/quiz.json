@@ -1,0 +1,48 @@
+{
+  "lesson": "05-balances-and-snapshots",
+  "title": "Balances, Running Totals, and Snapshots",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "In the double-entry ledger from Lesson 03, what is the source of truth for an account's balance?",
+      "options": ["The balance column stored on the account row", "The postings in the append-only journal", "The most recent snapshot that was taken", "The processor's settlement statement"],
+      "correct": 1,
+      "explanation": "A balance is derived: it is a fold over the account's postings in the journal. A stored balance column and snapshots are caches that must be reproducible from the journal; the processor statement is an external view used for reconciliation, not the definition."
+    },
+    {
+      "stage": "check",
+      "question": "A snapshot was taken at seq 30,000 and you need an account's balance as of seq 34,500. What does the snapshot read path do?",
+      "options": ["Fold every posting from seq 1 up to seq 34,500", "Return the seq 30,000 value unchanged as an approximation", "Take the seq 30,000 value and replay entries 30,001 to 34,500", "Replay from seq 34,500 back down to seq 30,000 in reverse"],
+      "correct": 2,
+      "explanation": "Because a balance is a sum, it splits: fold(s) = snapshot(k) + replay(k+1..s). Replaying forward from the nearest snapshot at or before the target bounds the work by the snapshot interval. Folding from seq 1 gives the same answer but defeats the purpose; returning the stale value is simply wrong."
+    },
+    {
+      "stage": "check",
+      "question": "Why does this ledger reject an entry whose effective timestamp is earlier than the last posted entry?",
+      "options": ["Time queries binary-search the journal and need timestamps sorted", "Java records cannot hold timestamps that run out of order", "Double-entry rules forbid any two entries with equal times", "Rejecting it is faster than validating the posting's currency"],
+      "correct": 0,
+      "explanation": "seqAsOf turns a time into a journal position by binary search, which is only valid if timestamps never decrease along the journal; inserting the entry earlier instead would shift seqs and invalidate every later snapshot. Equal timestamps are allowed, so the double-entry distractor is false."
+    },
+    {
+      "stage": "check",
+      "question": "What does the per-account running-balance column store, and what does an as-of read cost?",
+      "options": ["One balance per account per day; a hash lookup on the date", "The balance after each posting; a binary search over that account", "Every account's balance every N entries; a replay of the delta", "Only the current balance; a full scan of the journal for history"],
+      "correct": 1,
+      "explanation": "The column records (seq, balanceAfter) for each posting to the account, sorted by seq because seqs only grow, so an as-of read is a binary search: O(log P_a). Storing all balances every N entries describes snapshots, which cost a replay rather than a search."
+    },
+    {
+      "stage": "post",
+      "question": "A ledger has 500,000 two-leg entries and snapshots every 10,000 entries. What is the worst case for a snapshot-plus-replay read?",
+      "options": ["About 1,000,000 postings scanned, the whole journal", "Exactly one posting, the account's latest posting", "About 2,000 postings, one per account in the ledger", "About 20,000 postings, one interval of two-leg entries"],
+      "correct": 3,
+      "explanation": "Replay covers at most N - 1 = 9,999 entries after the nearest snapshot, each with two postings, so just under 20,000 postings. That is 2% of the journal regardless of the account's activity. The full journal is the no-snapshot case."
+    },
+    {
+      "stage": "post",
+      "question": "Nightly verification finds that the stored snapshot at seq 430,000 disagrees with the full fold for one merchant. What should happen?",
+      "options": ["Quarantine the snapshot and recompute it from the journal", "Edit the journal so it matches the stored snapshot value", "Average the two values and post the difference as revenue", "Keep the snapshot because snapshots are faster to read"],
+      "correct": 0,
+      "explanation": "The journal is the source of truth and the snapshot is a cache, so a mismatch means the cache is wrong: stop reading from it and rebuild it from the journal (or the previous verified snapshot plus replay). Editing the journal to match a cache destroys the evidence the ledger exists to keep."
+    }
+  ]
+}

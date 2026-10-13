@@ -1,0 +1,78 @@
+{
+  "lesson": "06-observability-for-money-movement",
+  "title": "Observability for Money Movement",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A capture webhook is lost and a payment sits in CAPTURE_PENDING forever. Which existing signal is most likely to notice?",
+      "options": [
+        "The API's p99 latency, because the capture call took too long",
+        "The 5xx error rate, because the capture endpoint returned an error",
+        "None of them: a stuck payment generates no requests to measure",
+        "The consumer lag on the payment events topic, because it backs up"
+      ],
+      "correct": 2,
+      "explanation": "The capture request already succeeded and nothing further is sent, so request-level metrics see silence, which looks healthy. Only a per-payment signal (age in current state) notices. Latency is the tempting answer, but the capture call itself completed quickly; the missing piece is a callback that never arrives."
+    },
+    {
+      "stage": "check",
+      "question": "A payment was created at 11:00, entered CAPTURE_PENDING at 12:00, and it is now 12:16. The CAPTURE_PENDING limit is 15 minutes. What does the detector report?",
+      "options": [
+        "Not stuck, because its age is measured from creation and the limit only applies after one hour",
+        "Stuck for 16 minutes, because age is measured from entering the current state",
+        "Stuck for 76 minutes, because age is measured from the payment's creation time",
+        "Not stuck, because the strict comparison treats 16 minutes as on the boundary"
+      ],
+      "correct": 1,
+      "explanation": "The detector stores when the payment entered its current state, so its age is 16 minutes, which exceeds 15. Measuring from creation (76 minutes) would flag every slow-but-healthy payment that spent time in earlier states, and would make the age meaningless for comparing with a per-state limit."
+    },
+    {
+      "stage": "check",
+      "question": "On a bank holiday issuer declines rise from 8% to 16% of attempts while processor errors stay at 0.05%. What happens to the 99.9% availability burn rate?",
+      "options": [
+        "It rises eightfold because declines count against the error budget",
+        "It doubles because declines double, and the page rule then fires",
+        "It falls to zero because declines are removed from the denominator",
+        "It stays about the same, because declines are good events in this SLI"
+      ],
+      "correct": 3,
+      "explanation": "The SLI's bad events are processor errors only; declines are definitive answers and count as good, so the ratio of errors to attempts is unchanged. Counting declines as bad is the strongest distractor: it is the mistake that makes a success-rate SLO page on holidays and hide genuine processor outages in the noise."
+    },
+    {
+      "stage": "check",
+      "question": "A 10-minute error spike ended 10 minutes ago. The 1-hour burn rate is 16.66 and the 5-minute burn rate is 0. With the 1h/5m rule at 14.4, what happens?",
+      "options": [
+        "No page: both windows must exceed the threshold, and the short one has recovered",
+        "A page: the long window is above 14.4, which is enough on its own to fire",
+        "A ticket: one window above threshold downgrades the page to a ticket",
+        "A page that clears only once the 1-hour window falls back below 14.4"
+      ],
+      "correct": 0,
+      "explanation": "The multiwindow rule requires both windows above the threshold. The short window exists so that alerts reset quickly when the incident is over, instead of paging for up to an hour after recovery. The 'clears only when the long window drops' option describes a single-window rule, which is exactly what the short window was added to fix."
+    },
+    {
+      "stage": "post",
+      "question": "Why does this lesson compare each processor's 15-minute auth rate with the fleet's, instead of alerting below a fixed 85%?",
+      "options": [
+        "Fleet comparison needs fewer attempts to be statistically meaningful",
+        "Approval rates swing with traffic mix and issuers; the fleet is a control",
+        "A fixed threshold would require floating-point math to be evaluated",
+        "Processors contractually guarantee the same approval rate as each other"
+      ],
+      "correct": 1,
+      "explanation": "Approval rates move with time of day, merchant and card mix, and issuer behaviour, so any fixed threshold either pages constantly or never. Other processors carrying similar traffic in the same window are a natural control, so a gap isolates a processor-specific fault. The minimum-sample rule handles statistical noise; it is not why the fleet is used."
+    },
+    {
+      "stage": "post",
+      "question": "The monitor restarts mid-outage. Why does this lesson disarm the 6h/30m rule until six hours of data exist?",
+      "options": [
+        "With less data the long window is effectively short and fires too early",
+        "The 6-hour window would overflow the long counters if it were evaluated",
+        "Alertmanager rejects alert rules whose window is longer than the uptime",
+        "The 30-minute short window cannot be computed in the first six hours"
+      ],
+      "correct": 0,
+      "explanation": "Burn rate is a ratio over the events in the window. With 90 minutes of data, the '6-hour' burn rate is the 90-minute burn rate, so a slow-burn rule fires as if it were a fast one, before the rule designed for fast burns. The short window is computable after 30 minutes, which is why that distractor is wrong."
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "lesson": "06-immutability-and-reversals",
+  "title": "Immutability, Reversals, and Corrections",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "In Lesson 05, every snapshot and as-of balance is defined as a fold over a journal prefix. What does editing an entry at position k do to them?",
+      "options": ["Nothing, because snapshots copy balances", "Invalidates every value at or after k", "Only affects the account that was edited", "Only affects balances read after the edit"],
+      "correct": 1,
+      "explanation": "fold(s) for every s >= k includes the edited entry, so every snapshot, running-balance value, statement, and closed period from k onward silently becomes wrong. Snapshots copying balances is exactly why they become stale rather than immune."
+    },
+    {
+      "stage": "check",
+      "question": "pay-100 was 120.00 with legs Dr 1200 120.00, Cr 2100 116.52, Cr 4100 3.48, and 50.00 has already been refunded. What does reverse() post for a chargeback?",
+      "options": ["Cr 1200 120.00, Dr 2100 116.52, Dr 4100 3.48", "Cr 1200 50.00, Dr 2100 48.55, Dr 4100 1.45", "Cr 1200 70.00, Dr 2100 67.97, Dr 4100 2.03", "Nothing, since a refunded entry cannot be reversed"],
+      "correct": 2,
+      "explanation": "reverse flips what remains on each leg: 120.00 - 50.00, 116.52 - 48.55, and 3.48 - 1.45. Reversing the full original would over-reverse every leg and drive the payable 50.00 negative, the exact bug in the Problem section."
+    },
+    {
+      "stage": "check",
+      "question": "A fee was booked at 3.9% instead of 2.9%. Why does the lesson prefer reverse-plus-replace over a single 0.80 delta entry?",
+      "options": ["The delta entry would be unbalanced", "Delta entries are slower for the ledger to post", "The original stays live with the wrong fee", "Reversals cannot be posted for fee accounts"],
+      "correct": 2,
+      "explanation": "Both approaches give the same balances and both are balanced. With a delta, pay-200 still reads as an 80.00 sale at 3.9% and an unexplained 0.80 movement sits elsewhere; reverse-plus-replace makes the original visibly dead and the replacement self-contained."
+    },
+    {
+      "stage": "check",
+      "question": "Why does reverse() check whether reversalId already exists before checking whether the original is fully reversed?",
+      "options": ["So a retry of the final reversal returns its result", "Because the hash chain must be computed first", "Because reading the id index is cheaper than math", "So that the reason text can be updated on retry"],
+      "correct": 0,
+      "explanation": "The reversal that fully reverses an entry, if retried, must return the same entry it returned the first time. Checking full reversal first would make that retry throw AlreadyReversedException, so a retry would see a different outcome than the original call."
+    },
+    {
+      "stage": "post",
+      "question": "Each journal record stores SHA-256(prevHash | seq | entry). What attack does this chain not detect on its own?",
+      "options": ["An edit to the amount of a single record", "Deleting one record from the middle", "Swapping the order of two adjacent records", "Rewriting a record and every later hash"],
+      "correct": 3,
+      "explanation": "Editing, deleting, or reordering one record breaks the recomputed chain at that point. An attacker who recomputes every later hash produces a consistent chain; detecting that requires a head hash published somewhere they cannot write."
+    },
+    {
+      "stage": "post",
+      "question": "A partial reversal allocates its amount across the credit legs in proportion to what remains on each leg rather than the original ratios. What does that guarantee?",
+      "options": ["No leg is ever reversed beyond what it posted", "The platform always refunds its full fee first", "Every partial reversal has exactly three legs", "Rounding residue always goes to fee revenue"],
+      "correct": 0,
+      "explanation": "With amount <= total remaining, each exact share is at most that leg's remainder, and the largest-remainder step only adds a unit to a share with a fractional part, so it stays within bounds. Fee-first refunds and residue-to-revenue are policies the mechanism does not impose."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "03-risk-scoring-and-thresholds",
+  "title": "Risk Scoring, Thresholds, and Precision-Recall Trade-offs",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A fraud model outputs a probability for each payment and 2% of traffic is fraud. An engineer declines when p >= 0.5 because it is the midpoint. What is the most likely result?",
+      "options": [
+        "Recall is low: most fraud scores below 0.5 at this base rate, so many frauds are approved",
+        "Precision is low: most declined payments turn out to be legitimate customers",
+        "The insult rate is high because half of all payments end up being declined",
+        "Results are near-optimal because 0.5 minimises total errors whatever the costs"
+      ],
+      "correct": 0,
+      "explanation": "With a 2% base rate a well-ranked model is rarely more than 50% confident, so p >= 0.5 flags very few transactions: in the lesson it catches 25 of 136 frauds with perfect precision. Low precision is the failure of a low threshold, not a high one. 0.5 minimises errors only when both mistakes cost the same, which they never do."
+    },
+    {
+      "stage": "check",
+      "question": "A missed fraud costs 105.00 USD and declining a good customer costs 12.00 USD. For a calibrated model, above which probability should you decline?",
+      "options": [
+        "0.50, because a decline is only justified when fraud is more likely than not",
+        "About 0.103, because declining wins once p * 105 exceeds (1 - p) * 12",
+        "About 0.114, the ratio of the insult cost to the fraud loss, 12 / 105",
+        "About 0.897, because a decline needs to be right roughly nine times in ten"
+      ],
+      "correct": 1,
+      "explanation": "Declining costs (1 - p) * 12 and approving costs p * 105, so decline when p > 12 / (12 + 105) = 0.1026. 12/105 is the tempting distractor: it is the odds ratio, not the probability threshold, and forgets that the denominator must include both costs."
+    },
+    {
+      "stage": "check",
+      "question": "Your model has AUC 0.975. A colleague says this proves the threshold of 0.10 is good. What is wrong with the argument?",
+      "options": [
+        "AUC above 0.95 signals overfitting, so no threshold chosen on it can be trusted",
+        "AUC is only defined at the 0.5 threshold, so it says nothing about 0.10",
+        "AUC averages over every threshold and ignores both costs and the base rate",
+        "AUC depends on calibration, so it is meaningless until the model is recalibrated"
+      ],
+      "correct": 2,
+      "explanation": "AUC is the probability that a random fraud outscores a random legitimate transaction: a ranking measure integrated over all thresholds, unchanged by any monotone rescaling and blind to costs and base rate. It cannot single out 0.10. It does not depend on calibration (a monotone transform leaves it unchanged), and it is not defined at a single threshold."
+    },
+    {
+      "stage": "check",
+      "question": "The reliability table shows that transactions scored around p = 0.24 are fraud 75% of the time, while the overall expected calibration error is only 0.024. What should you conclude?",
+      "options": [
+        "The model is well calibrated, since an ECE under 0.05 is the accepted standard",
+        "The table is noisy at small counts, so the ECE is the number to trust here",
+        "The model is overconfident in the tail and its probabilities should be shrunk",
+        "The model is underconfident where decisions happen; analytic thresholds will be wrong"
+      ],
+      "correct": 3,
+      "explanation": "ECE is count-weighted, so the 97% of traffic in the bottom bin dominates it. In the decision region the model predicts 0.24 when the true rate is 0.75: underconfident, not overconfident. Small counts do add noise, but a gap of 0.5 across adjacent bins is a real pattern, and it is exactly where the threshold sits."
+    },
+    {
+      "stage": "post",
+      "question": "Manual review costs 4.00 USD and catches 90% of the fraud it sees. Under what condition can adding a review band lower the total cost compared with the best single threshold?",
+      "options": [
+        "When reviewing a borderline case costs less than the expected loss of either automatic outcome",
+        "When the model's AUC is below 0.9, because only weak models leave uncertain cases to review",
+        "When the review queue holds at least 5% of traffic, so that analysts stay fully utilised",
+        "When reviewers are perfect, because any review miss rate makes the band cost more overall"
+      ],
+      "correct": 0,
+      "explanation": "Review wins on the probability interval where its cost (fee plus imperfect outcomes) is below both p * C_fn and (1 - p) * C_fp; with 4.00 USD that interval is about [0.048, 0.338) for a calibrated model. AUC does not decide it, imperfect reviewers still help as long as the inequality holds, and queue utilisation is a capacity concern, not the cost condition."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the scorecard emit an integer 0..999 score and the top three contributions with every decision, instead of just the probability as a double?",
+      "options": [
+        "Integers compress better in logs, and explanations are needed only for credit decisions",
+        "Rules and logs compare a stable integer, and reason codes let analysts and auditors replay why",
+        "The probability is secret model output and must never leave the service that computed it",
+        "Doubles cannot represent probabilities below 0.001, so they lose the low-risk end of the range"
+      ],
+      "correct": 1,
+      "explanation": "An integer score avoids floating-point equality traps in rules (score >= 130) and is what the decision log records; deterministic reason codes drive analyst queues, decline messages, and audit replay. Explanations matter well beyond credit, and doubles represent tiny probabilities fine; the issue is cross-service comparison, not range."
+    }
+  ]
+}

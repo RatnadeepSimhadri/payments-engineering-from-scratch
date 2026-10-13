@@ -1,0 +1,48 @@
+{
+  "lesson": "12-audit-trails-and-financial-close",
+  "title": "Audit Trails, Trial Balance, and Financial Close",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "The trial balance's debit and credit columns are equal. What does that prove about the ledger?",
+      "options": ["Every entry is in the correct account", "No real-world event is missing", "Every entry that was posted balanced", "Every balance is stated at fair value"],
+      "correct": 2,
+      "explanation": "Equal columns follow from every entry having equal debits and credits, and that is all they show. A misclassified entry, a missing event, or a stale valuation all leave the trial balance balanced, which is why the close continues with reconciliations and adjustments."
+    },
+    {
+      "stage": "check",
+      "question": "A chargeback that occurred on January 30 is reported by the processor on February 2, before January is locked. Where is it recorded?",
+      "options": ["In January, because cutoff follows when the event occurred", "In February, because that is when the ledger learned of it", "Nowhere until the merchant agrees to bear the loss", "In a suspense account until the year-end audit"],
+      "correct": 0,
+      "explanation": "Cutoff assigns events to the period in which they occurred, so it is a January adjustment found by the reconciliation. Had January already been locked, it would be posted in February with a reference to January rather than reopening the period."
+    },
+    {
+      "stage": "check",
+      "question": "Which audit assertion is best supported by reconciling the ledger against the processor's settlement file?",
+      "options": ["Presentation: accounts map to statement lines", "Completeness: every real event is recorded", "Valuation: balances use the closing rate", "Rights: assets belong to the company"],
+      "correct": 1,
+      "explanation": "Completeness is tested by tracing from an independent source into the ledger, and the processor file lists events whether or not your application recorded them. Tracing ledger entries outward tests existence; valuation and presentation depend on rates and account mapping."
+    },
+    {
+      "stage": "check",
+      "question": "Why do auditors care about IT general controls such as code review and production access before relying on an application control like 'entries must balance'?",
+      "options": ["ITGCs are required by the double-entry rule itself", "ITGCs replace the need to test application controls", "Application controls only run during the close", "Without them the control's code could change unnoticed"],
+      "correct": 3,
+      "explanation": "An automated control is tested once on the assumption that the code and data it runs on cannot be altered without review. Weak change management or shared database credentials break that assumption. ITGCs do not replace testing the control; they make one test meaningful for the whole year."
+    },
+    {
+      "stage": "post",
+      "question": "After January is locked, an engineer finds a January fee that was booked 0.80 too high. What is the right fix?",
+      "options": ["Post a correction in February that references the January entry", "Unlock January, edit the entry, and lock the period again", "Delete the January entry and repost it with the right fee", "Leave it, because amounts below a dollar are immaterial"],
+      "correct": 0,
+      "explanation": "A locked period stays fixed so reported numbers remain reproducible; the correction is a new entry in the open period linking back to the original (Lesson 06). Reopening or deleting breaks the close snapshot and the hash chain. Materiality affects disclosure decisions, not whether a known error is corrected."
+    },
+    {
+      "stage": "post",
+      "question": "A support tool lets one engineer create and post manual payouts. Which control addresses the audit finding?",
+      "options": ["Log every manual payout to the application log file", "Maker-checker: a second, different user must approve", "Run the reconciliation job twice a day instead of once", "Require manual payouts to be below a fixed amount"],
+      "correct": 1,
+      "explanation": "The finding is a segregation-of-duties failure: one person can initiate and complete a money movement. Maker-checker enforced in the ledger API requires a distinct approver before posting. Logging records the problem without preventing it, and a limit only caps the size of an unapproved payout."
+    }
+  ]
+}

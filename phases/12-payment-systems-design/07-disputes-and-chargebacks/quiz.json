@@ -1,0 +1,78 @@
+{
+  "lesson": "07-disputes-and-chargebacks",
+  "title": "Disputes and Chargebacks: The Lifecycle and the Evidence",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "How does a chargeback differ from a refund?",
+      "options": [
+        "A chargeback is a refund the merchant issues after the refund window closes",
+        "The issuer initiates it through the network, and funds are taken back without the merchant's consent",
+        "A chargeback releases an authorization hold, while a refund moves money that was captured",
+        "Chargebacks only apply to fraud, while refunds cover every other kind of complaint"
+      ],
+      "correct": 1,
+      "explanation": "A refund is a credit the merchant chooses to send. A chargeback is started by the cardholder's issuer, and the network moves the funds back from the acquirer first, leaving the merchant to respond. Releasing a hold is a void. Chargebacks cover fraud, authorization, processing errors and consumer disputes, which is why reason codes exist."
+    },
+    {
+      "stage": "check",
+      "question": "A merchant's representment succeeds and the network re-credits the 249.00 USD. Where should the PSP's ledger put those funds?",
+      "options": [
+        "Into the merchant's payable balance, since the merchant has won",
+        "Back to the cardholder's account, since the outcome is still open",
+        "Into fee revenue, to offset the cost of the pre-arbitration fee",
+        "Into a dispute hold the merchant cannot be paid out of until the outcome is final"
+      ],
+      "correct": 3,
+      "explanation": "A representment is not the end: the issuer may file pre-arbitration and then arbitration. Funds re-credited mid-dispute are provisional, so they sit in a liability the payout process cannot touch until a final WON releases them or a LOST returns them. Releasing them at once is the incident in the lesson: the merchant is paid out and the money is needed again weeks later."
+    },
+    {
+      "stage": "check",
+      "question": "A Visa 13.1 (not received) chargeback arrives. The merchant has a receipt and a 3-D Secure authentication result. Should the representment be filed?",
+      "options": [
+        "No: 13.1 needs proof of delivery, and 3-D Secure only answers fraud claims",
+        "Yes: 3-D Secure shifts liability to the issuer for any reason code",
+        "Yes: a receipt alone is enough to answer every consumer dispute code",
+        "No: 13.1 disputes can only be accepted and can never be represented"
+      ],
+      "correct": 0,
+      "explanation": "Evidence must answer the claim. 3-D Secure proves who the cardholder was, which answers 'I did not make this purchase', not 'it never arrived'. The 13.1 requirement is (proof of delivery or signed delivery) and receipt. Filing anyway risks pre-arbitration and arbitration fees on a dispute that cannot be won. The liability shift is scoped to fraud reasons only."
+    },
+    {
+      "stage": "check",
+      "question": "A chargeback's response deadline is 2026-02-22. The daily sweep runs on 02-22 and again on 02-23 with no merchant response. What happens?",
+      "options": [
+        "The dispute is lost on 02-22, because the deadline day itself counts as late",
+        "Nothing happens on either day, since only the issuer can close a chargeback",
+        "Nothing on 02-22; on 02-23 DEADLINE_PASSED moves it from CHARGEBACK to LOST",
+        "On 02-23 it moves to WON, because the issuer did not pursue the dispute in time"
+      ],
+      "correct": 2,
+      "explanation": "The deadline day is still inside the window; the guard fires only when today is after the deadline. In CHARGEBACK the merchant owes the response, so silence is acceptance and the outcome is LOST. WON on silence applies when the issuer owes the next move, as in REPRESENTED and PRE_ARB_RESPONDED."
+    },
+    {
+      "stage": "post",
+      "question": "With a 15.00 USD chargeback fee and a 500.00 USD arbitration fee, what does a 249.00 USD dispute cost the merchant if it is lost in arbitration?",
+      "options": [
+        "249.00 USD, since fees are refunded when the dispute is resolved",
+        "264.00 USD: the amount and the chargeback fee, as with acceptance",
+        "500.00 USD, since the arbitration fee replaces every other charge",
+        "764.00 USD: the amount, the chargeback fee and the arbitration fee"
+      ],
+      "correct": 3,
+      "explanation": "The first chargeback debits 249.00 + 15.00. The representment re-credit sat in the hold; losing returns it to the network, so the 249.00 stays lost, and losing in arbitration adds the 500.00 filing fee: 764.00 in total. Accepting on day 0 would have cost 264.00, which is why a representment that cannot win should not be filed."
+    },
+    {
+      "stage": "post",
+      "question": "Why is the deadline stored as part of the dispute's state and applied by a sweep, rather than scheduled as a timer when the state is entered?",
+      "options": [
+        "A stored date survives restarts and lets any day's sweep be re-run safely",
+        "Timers cannot represent deadlines longer than thirty days in the JVM",
+        "Networks forbid automated processing of deadlines by the acquirer",
+        "A sweep is faster than a timer for a small number of open disputes"
+      ],
+      "correct": 0,
+      "explanation": "A timer lives in memory and is lost when the process restarts; a stored date is data. The sweep is an ordinary caller of apply, its event id names the state and date so a second run is a DUPLICATE, and an operator can re-run a missed day. Speed is not the reason: at scale production indexes disputes by deadline and scans only those due."
+    }
+  ]
+}

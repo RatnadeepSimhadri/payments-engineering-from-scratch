@@ -1,0 +1,78 @@
+{
+  "lesson": "05-batch-vs-real-time-settlement",
+  "title": "Batch vs Real-Time Settlement Pipelines",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A checkout shows 'payment succeeded' one second after the customer pays by card. What has happened to the merchant's money at that moment?",
+      "options": [
+        "Nothing has moved yet; the issuer has only approved and placed a hold",
+        "The funds have moved from the issuer to the acquirer's settlement account",
+        "The merchant's bank has been credited and the funds are available",
+        "The funds sit in the platform's bank account waiting for the payout"
+      ],
+      "correct": 0,
+      "explanation": "Authorization approves and places a hold; no money moves. Clearing establishes the obligation and settlement moves funds between banks a day or more later, after which the platform pays the merchant. The tempting distractor, funds already at the acquirer, confuses authorization with network settlement, which happens in a later cycle."
+    },
+    {
+      "stage": "check",
+      "question": "A batch selects events with 'created_at between last_cutoff and this_cutoff'. A capture timestamped 23:59:58 commits at 00:00:03, after the query ran. What happens and what is the fix?",
+      "options": [
+        "It lands in the next batch automatically because its timestamp is later",
+        "It falls in no batch; select by unsettled status plus at < cutoff instead",
+        "It is paid twice, once in each batch; add a unique index on event id",
+        "It is rejected by the ledger because it arrived after the cutoff time"
+      ],
+      "correct": 1,
+      "explanation": "Its timestamp belongs to the old range, which has already been queried, and the next run starts after the old cutoff, so it is in neither. Selecting by 'not yet settled and at < cutoff' picks it up in the next batch. The 'next batch automatically' option is what people assume, but a time-range query never revisits a range it has closed."
+    },
+    {
+      "stage": "check",
+      "question": "Merchant m_bolt has one 45.50 capture (fee 1.62) and one 60.00 chargeback with a 15.00 dispute fee in the batch. What does the batch do?",
+      "options": [
+        "Pays 43.88 now and invoices the merchant 75.00 separately next week",
+        "Pays nothing and writes off the chargeback against the fee revenue",
+        "Pays nothing and carries -31.12 to be netted against future captures",
+        "Pays 43.88 and posts the chargeback to tomorrow's batch instead"
+      ],
+      "correct": 2,
+      "explanation": "Netting gives 45.50 - 1.62 - 60.00 - 15.00 = -31.12, a deficit that is carried forward and paid down by the merchant's next captures before any money leaves. Paying 43.88 now would leave the platform funding the chargeback out of its own cash, which is exactly the failure the netting step exists to prevent."
+    },
+    {
+      "stage": "check",
+      "question": "The payout job crashes after posting half the payout journals and is restarted for the same business date. What makes the restart safe in this lesson's design?",
+      "options": [
+        "The batch id comes from the business date and each payout journal id includes it",
+        "The restart deletes the posted journals first and then reposts every one",
+        "The bank deduplicates any payout file it receives twice on the same day",
+        "The job checks the merchant bank balances before it sends each payout"
+      ],
+      "correct": 0,
+      "explanation": "The batch id BATCH-<date> is the idempotency key and every payout journal is 'payout:<batchId>:<merchant>', so the ledger refuses journals already posted and the rerun converges on one payout per merchant. Relying on bank deduplication is the strongest distractor, but banks deduplicate on file identifiers you control, and a regenerated file with new identifiers would be paid."
+    },
+    {
+      "stage": "post",
+      "question": "Over the same day, batch payout needs zero prefunding while real-time sweep needs 1,450.63 USD. Why?",
+      "options": [
+        "Instant rails charge a per-transfer fee that the platform has to prepay",
+        "Real-time payouts are gross, while batch payouts are net of the fees",
+        "Batch payouts are delayed by the ACH return window of two banking days",
+        "The acquirer still pays T+1, so instant payouts leave before funds arrive"
+      ],
+      "correct": 3,
+      "explanation": "The acquirer's funding timeline does not change when the payout rail does. Paying merchants instantly means paying out of the platform's own cash until the T+1 wire, and the peak negative cash position is the prefunding requirement. Both pipelines pay net of fees, so the 'gross versus net' option misidentifies the cause."
+    },
+    {
+      "stage": "post",
+      "question": "Which check proves that no payout was lost or paid twice after a batch run?",
+      "options": [
+        "Each merchant's payable equals carried balance plus unsettled event effects",
+        "The settlement file's trailer total equals the sum of its detail lines",
+        "The number of payout instructions equals the number of active merchants",
+        "The acquirer's funding wire equals the batch's total payout amount"
+      ],
+      "correct": 0,
+      "explanation": "The tie-out derives each merchant's expected balance from events and carries and compares it with the ledger, so a duplicated payout or an event settled without being netted shows up as a mismatch. The trailer check only proves the file is internally consistent; a file that pays a merchant twice in two batches still has a correct trailer."
+    }
+  ]
+}

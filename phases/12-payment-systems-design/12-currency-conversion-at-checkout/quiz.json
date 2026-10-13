@@ -1,0 +1,78 @@
+{
+  "lesson": "12-currency-conversion-at-checkout",
+  "title": "Currency Conversion at Checkout and DCC",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A US merchant shows EUR prices and lets its processor convert the EUR to USD at settlement, two days after the sale, with no rate lock. Who bears the exchange-rate movement?",
+      "options": [
+        "The shopper, whose card statement shows a different EUR amount from checkout",
+        "The merchant, whose USD revenue depends on the rate on the settlement day",
+        "The card issuer, which converts every cross-border transaction at clearing",
+        "Nobody, because the EUR price displayed to the shopper never changes afterwards"
+      ],
+      "correct": 1,
+      "explanation": "The shopper paid a fixed EUR amount, so the movement lands on whoever converts it later without a lock: the merchant receives whatever the EUR is worth at settlement. The issuer converts only when the card currency differs from the charge currency; here the shopper was charged in EUR, so the issuer's conversion is not part of this flow."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the lesson keep USD/EUR as the fraction 200/217 instead of the decimal 0.9217?",
+      "options": [
+        "Fractions are faster to multiply than BigDecimal values in Java",
+        "Decimal rates cannot be stored in a database column for later audit",
+        "The inverse of 1.0850 does not terminate, so any decimal is already rounded",
+        "Rational rates let the converter skip the explicit rounding mode"
+      ],
+      "correct": 2,
+      "explanation": "1/1.0850 is a repeating decimal; storing it as 0.9217 rounds money inside a rate, and that error multiplies through every conversion (0.39 EUR on 50,000 USD with a four-decimal rate). The rational form still needs exactly one explicit rounding on the final amount, so it does not remove the rounding mode."
+    },
+    {
+      "stage": "check",
+      "question": "A quote is issued at t0 with a 15-minute lock. The shopper confirms at exactly t0 + 15 minutes. What should happen?",
+      "options": [
+        "Confirm at the locked rate, since the window includes its final millisecond",
+        "Confirm at the current market rate and show the new price on the receipt",
+        "Confirm at the locked rate and charge the PSP's spread a second time",
+        "Reject with QuoteExpired; checkout must re-quote and show the new price"
+      ],
+      "correct": 3,
+      "explanation": "The window is half-open, [t0, t0 + 15m), so the end instant is outside it and there is no moment where a quote is both valid and expired. Silently charging at the current rate is the failure from the lesson's problem: the shopper is charged a price they were never shown."
+    },
+    {
+      "stage": "check",
+      "question": "The PSP locked 120.00 USD for 112.82 EUR. At settlement EUR/USD is 1.0600 and the EUR sells for 119.59 USD. What does the merchant receive?",
+      "options": [
+        "120.00 USD; the PSP absorbs the 0.41 USD loss because it owns the lock",
+        "119.59 USD; the merchant always receives the settlement-day conversion",
+        "119.80 USD; the 0.41 USD loss is split evenly between merchant and PSP",
+        "112.82 EUR; the merchant is paid in presentment currency once a loss occurs"
+      ],
+      "correct": 0,
+      "explanation": "The lock promised the merchant exactly 120.00 USD, and settle copies that amount rather than computing it. The PSP's P&L is proceeds minus promise, here -0.41 USD. Receiving the settlement-day conversion is the unlocked model, which is precisely what the merchant paid the spread to avoid."
+    },
+    {
+      "stage": "post",
+      "question": "A DCC offer converts 100.00 EUR at ECB 0.8550 plus 350 bps, giving 88.49 GBP. Which markup figure belongs in the regulated disclosure, and why?",
+      "options": [
+        "3.4971%, because it reflects the amount the cardholder actually pays",
+        "3.50%, the DCC rate over the ECB reference rate, computed exactly",
+        "2.99%, because that is the gross margin in pounds on this transaction",
+        "0.10%, the gap between the ECB rate and the network's conversion rate"
+      ],
+      "correct": 1,
+      "explanation": "The regulation defines the disclosure as the markup of the conversion rate over the latest ECB reference rate, so it is computed rate over rate, exactly 7/2 percent. The 3.4971% figure is amount over amount and drifts with rounding of the card amount, so it changes per transaction even though the markup policy has not."
+    },
+    {
+      "stage": "post",
+      "question": "A teammate converts by first rounding the rate to four decimals, then multiplying. On 50,000.00 USD that gives 47,005.00 EUR instead of 47,004.61 EUR. What is the general rule being broken?",
+      "options": [
+        "Rates must always be stored to at least eight decimal places to be safe",
+        "Use HALF_EVEN rather than HALF_UP whenever converting currency amounts",
+        "Converted amounts should be rounded to whole units of the target currency",
+        "Round once, on the final minor-unit amount; never round the rate itself"
+      ],
+      "correct": 3,
+      "explanation": "Rounding the rate rounds money at a precision nobody chose, and the error scales with the amount. Keeping the rate exact and rounding only the final amount, with a named mode, is the rule. More decimals shrink the error without removing it, so the first option treats the symptom; the rounding mode is a separate policy choice."
+    }
+  ]
+}

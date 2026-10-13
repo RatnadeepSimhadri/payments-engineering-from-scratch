@@ -1,0 +1,78 @@
+{
+  "lesson": "09-psd2-sca-and-regional-regulation",
+  "title": "PSD2, SCA, and Regional Regulation",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A checkout collects card number, expiry, and CVV, then a password for the merchant account. Under the EBA's reading of PSD2, how many SCA factors is that?",
+      "options": [
+        "Three: the card details are possession, the CVV and password are both knowledge",
+        "Two: the card details count as possession and the password counts as knowledge",
+        "One at most: card details are not a factor, and the merchant password is not the issuer's",
+        "Two: the CVV counts as knowledge and the card number entered counts as possession"
+      ],
+      "correct": 2,
+      "explanation": "The EBA's opinion says card number, expiry, and CVV are neither knowledge nor possession, because they are printed on the card and widely leaked. SCA is applied by the payer's PSP, so a merchant login does not authenticate the payment either. That is why remote card payments go through 3-D Secure to the issuer."
+    },
+    {
+      "stage": "check",
+      "question": "A subscription renewal is charged with no customer present, and the original sign-up was authenticated with 3-D Secure. How should the renewal be submitted in the EEA?",
+      "options": [
+        "As a merchant-initiated transaction that references the authenticated CIT's network ID",
+        "With a low-value exemption request, so the issuer does not require a fresh challenge",
+        "Through 3-D Secure with a challenge, since every EEA card payment needs fresh SCA",
+        "With a TRA exemption request, since the subscriber's history makes it a low-risk payment"
+      ],
+      "correct": 0,
+      "explanation": "A payment the merchant initiates under a prior agreement is not initiated by the payer, so it is out of scope of SCA, provided it references the authenticated CIT. Challenging is impossible with no customer present, and requesting an exemption treats an out-of-scope payment as in-scope, inviting soft declines and moving liability."
+    },
+    {
+      "stage": "check",
+      "question": "An acquirer's 90-day remote card fraud rate is 0.075%. Can it apply the TRA exemption to a low-risk 180 EUR payment?",
+      "options": [
+        "Yes, because 0.075% is below the 0.13% reference rate that applies to card payments",
+        "Yes, because any payment scored low risk by real-time analysis is eligible for TRA",
+        "No, because TRA can only be applied by the issuer and never by the acquirer itself",
+        "No, because 180 EUR is in the 250 EUR band, which requires a rate of 0.06% or less"
+      ],
+      "correct": 3,
+      "explanation": "TRA ceilings depend on the PSP's fraud rate: up to 0.13% unlocks 100 EUR, up to 0.06% unlocks 250 EUR, up to 0.01% unlocks 500 EUR. At 0.075% the ceiling is 100 EUR, so a 180 EUR payment needs SCA or another exemption. Acquirers may apply TRA; a low score alone is necessary but not sufficient."
+    },
+    {
+      "stage": "check",
+      "question": "A 9 EUR payment is sent with a low-value exemption request and comes back with Visa response 1A. What happened, and what should the integration do?",
+      "options": [
+        "The card was declined for insufficient funds; show an error and do not retry the payment",
+        "The issuer's cumulative low-value counter was reached; authenticate with 3DS, resubmit once",
+        "The merchant miscalculated the 30 EUR limit; resubmit it with a TRA exemption request",
+        "The acquirer does not support exemptions; resubmit the same request without the flag"
+      ],
+      "correct": 1,
+      "explanation": "1A is a soft decline: additional authentication required. Low-value counters (100 EUR cumulative or 5 consecutive) are kept by the issuer across all merchants, so a small payment can still trigger SCA. The correct handling is one authenticated retry. Retrying without authentication, or switching exemptions, repeats the request the issuer just refused."
+    },
+    {
+      "stage": "post",
+      "question": "How does the US approach to unauthorised card and account payments differ from PSD2's?",
+      "options": [
+        "The US mandates two-factor authentication for card payments, but with higher limits",
+        "The US leaves both authentication and consumer liability entirely to network rules",
+        "The US caps consumer liability (Reg E, Reg Z) and leaves authentication to institutions",
+        "The US requires 3-D Secure on all e-commerce payments above 100 USD in value"
+      ],
+      "correct": 2,
+      "explanation": "Regulation E limits consumer losses on unauthorised electronic fund transfers (50 USD if reported within 2 business days, more later) and Regulation Z caps credit card liability at 50 USD, putting the remaining loss on institutions, which then choose controls; networks add 3-D Secure liability shifts. There is no US authentication mandate, but liability is set by law, not only by network rules."
+    },
+    {
+      "stage": "post",
+      "question": "Why should SCA and exemption rules live in a versioned rule table with effective dates and legal references, rather than as constants in checkout code?",
+      "options": [
+        "Rule tables run faster than conditionals, which matters when authorisation latency is tight",
+        "Payment networks require merchants to submit their rule tables for approval each quarter",
+        "Constants cannot represent amounts in minor units, so the limits would need to be floats",
+        "Rules change; replay needs the rule in force then, and each decision must cite its basis"
+      ],
+      "correct": 3,
+      "explanation": "Limits and interpretations change (and PSD3 will change them again); a dispute or examination months later must evaluate the rule in force on that date and see which rule and article justified the decision, logged immutably. Speed and network approval are not the reason, and constants can hold integer minor units perfectly well."
+    }
+  ]
+}

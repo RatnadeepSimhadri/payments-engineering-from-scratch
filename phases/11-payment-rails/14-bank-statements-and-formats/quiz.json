@@ -1,0 +1,48 @@
+{
+  "lesson": "14-bank-statements-and-formats",
+  "title": "Bank Statement Formats: MT940, CAMT.053, BAI2, OFX",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A statement opens at 12,500.00, lists lines of -1,500.00, +3,250.75, and -12.50, and closes at 14,283.25. What does that tell you?",
+      "options": ["The statement is consistent and can be loaded", "A line of 45.00 is missing or a balance is wrong", "The bank charged 45.00 of unreported interest", "The closing balance includes pending entries only"],
+      "correct": 1,
+      "explanation": "12,500.00 + 1,738.25 = 14,238.25, not 14,283.25, so either a line is missing or a balance is wrong; a difference divisible by 9 also hints at transposed digits. Guessing a cause such as interest is exactly what the continuity check exists to prevent."
+    },
+    {
+      "stage": "check",
+      "question": "An MT940 :61: line has the mark RC and amount 3250,75. How is it normalized?",
+      "options": ["As +3250.75, because C means credit", "As -3250.75, because a reversed credit is a debit", "As a zero amount, because it cancels the original", "As +3250.75, flagged for manual review instead"],
+      "correct": 1,
+      "explanation": "RC is a reversal of a credit, which takes the money back out, so its effect on the balance is a debit. Reading only the C would mis-sign it and break continuity by twice the amount. camt.053 expresses the same thing with RvslInd."
+    },
+    {
+      "stage": "check",
+      "question": "A camt.053 contains a CRDT entry of 999.00 with status PDNG. What should the parser do with it?",
+      "options": ["Include it, since the bank reported it in the statement", "Include it only if its value date is before the closing date", "Reject the whole statement, since pending entries are invalid", "Exclude it from the lines that move the booked balance"],
+      "correct": 3,
+      "explanation": "Only BOOK entries move the booked balance that OPBD and CLBD report. Counting the pending entry would make opening plus movements differ from closing by 999.00. Pending entries are valid information, so the statement should not be rejected."
+    },
+    {
+      "stage": "check",
+      "question": "A BAI2 parser ignores 88 records. Which failure follows first in production?",
+      "options": ["Amounts are read with the wrong sign for type codes over 399", "Descriptions lose their continuation, and record counts fail", "The control totals no longer match because amounts are dropped", "The as-of date is lost because it is carried on 88 records"],
+      "correct": 1,
+      "explanation": "88 records continue the previous record; for a 16 detail they carry the rest of the text, often the invoice number reconciliation needs. The trailer record counts include 88 lines, so a parser that checks them also fails. 88s on 16 records carry text, not amounts or dates."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the model mark an OFX statement with openingReported = false?",
+      "options": ["OFX reports only a closing balance, so a derived opening makes the check a tautology", "OFX opening balances use a different sign convention from the other three formats", "OFX statements cover only one day, so there is no meaningful opening to report", "OFX amounts are decimals, so the opening balance cannot be represented exactly"],
+      "correct": 0,
+      "explanation": "OFX gives LEDGERBAL and no opening; computing opening as closing minus movements guarantees the within-statement check passes, so it proves nothing. Marking it lets code and people rely on cross-download checks instead. OFX decimals convert exactly to minor units."
+    },
+    {
+      "stage": "post",
+      "question": "Day 1 closes at 14,238.25 and day 2 opens at 14,250.75; each statement is internally continuous. What failed?",
+      "options": ["Nothing, since each statement passed its own continuity check", "Day 2's parser mis-signed a 12.50 debit as a credit line", "Day 1 is missing a 12.50 line that the bank booked late", "Something changed the balance between statements without a line"],
+      "correct": 3,
+      "explanation": "The chain invariant says each closing must equal the next opening. A 12.50 gap with both statements internally consistent means the balance moved between them with no line, such as a reversed fee or a missing statement. A mis-signed line or a missing day-1 line would break that statement's own continuity."
+    }
+  ]
+}

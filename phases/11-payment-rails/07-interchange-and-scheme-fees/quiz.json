@@ -1,0 +1,48 @@
+{
+  "lesson": "07-interchange-and-scheme-fees",
+  "title": "Interchange, Scheme Fees, and Merchant Pricing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "On a card purchase, which party receives the interchange fee?",
+      "options": ["The card network that sets the rate", "The acquirer that sponsors the merchant", "The issuer of the cardholder's card", "The payment gateway that formats the request"],
+      "correct": 2,
+      "explanation": "Interchange is paid by the acquirer to the issuer: the issuer settles the purchase amount minus interchange. The network sets the rate and runs settlement but does not keep interchange; its own revenue is the separate scheme fees."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the fee engine store 1.80% as the integer 18000 rather than the double 0.018?",
+      "options": ["Parts per million keep every published rate exact, so the only rounding is the one HALF_EVEN step", "Integer multiplication is much faster than double multiplication on every modern 64-bit CPU", "The networks transmit interchange rates in ISO 8583 messages as parts-per-million fields", "A double cannot represent percentages above one hundred, which some premium card rates exceed"],
+      "correct": 0,
+      "explanation": "0.018 has no exact binary representation, so a double rate is already wrong before any arithmetic. Parts per million make 1.80%, 0.05%, and even 0.0013% exact integers, leaving one deliberate rounding per component. Speed is not the reason, and rates are not carried in ISO 8583 messages."
+    },
+    {
+      "stage": "check",
+      "question": "A merchant on blended 2.9% + 0.30 sees its customers switch from consumer debit to commercial credit cards. What changes?",
+      "options": ["The merchant's net per transaction drops because interchange is now higher", "The issuer's interchange revenue falls because commercial cards are capped", "The acquirer's margin shrinks while the merchant's net stays the same", "The scheme fees rise because commercial cards pay a higher assessment"],
+      "correct": 2,
+      "explanation": "Under blended pricing the merchant pays the contract rate whatever the card, so the merchant's net does not move; the acquirer absorbs the higher commercial interchange and its margin shrinks or goes negative. Under IC++ it would be the merchant's net that dropped."
+    },
+    {
+      "stage": "check",
+      "question": "The table loader rejects an EEA consumer debit rate of 0.10% + 0.01 EUR. Why, when 0.10% is below the 0.2% cap?",
+      "options": ["The IFR forbids charging interchange on debit cards issued inside the EEA", "The IFR caps a percentage of value, so a fixed part exceeds it on small tickets", "EEA rates must be quoted with exactly two decimal places of a percent", "The fixed part must be stated in USD so that schemes can compare across regions"],
+      "correct": 1,
+      "explanation": "The IFR caps consumer debit at 0.2% of the transaction value. A fixed 0.01 EUR is more than 0.2% of any ticket under 5.00 EUR, so a rate with a fixed part breaks the cap for small amounts. Debit interchange is capped, not forbidden."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the engine compute merchant net by subtraction instead of rounding it from its own percentage?",
+      "options": ["Subtraction is cheaper than another multiplication and avoids an overflow check", "The acquirer's contract defines the merchant net as the residual amount by law", "Rounding the net separately would require the merchant's currency exponent as well", "Independent rounding of all four parts can sum to one cent more or less than gross"],
+      "correct": 3,
+      "explanation": "Each rounded component can be off by up to half a minor unit; rounding four parts independently lets the total drift from the gross by a cent, which a double-entry ledger cannot absorb. Deriving the last part by subtraction makes the invariant hold by construction. Performance is not the concern."
+    },
+    {
+      "stage": "post",
+      "question": "A 25.00 USD monthly fee is attributed to transactions of 100.00, 37.77, and 2.00 USD. What guarantees the three shares sum to exactly 25.00?",
+      "options": ["Largest-remainder allocation hands leftover cents to the biggest remainders", "HALF_EVEN rounding on each share cancels the rounding errors on average", "Computing every share in parts per million before converting back to cents", "Sorting the transactions by amount so the largest one absorbs any rounding"],
+      "correct": 0,
+      "explanation": "allocate floors each share, then distributes the leftover minor units one at a time to the largest fractional remainders, so the total is exact by construction. HALF_EVEN only cancels errors on average over many values; for three shares it can still sum to 24.99 or 25.01."
+    }
+  ]
+}

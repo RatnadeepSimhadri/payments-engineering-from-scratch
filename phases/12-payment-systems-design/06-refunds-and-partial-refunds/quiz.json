@@ -1,0 +1,78 @@
+{
+  "lesson": "06-refunds-and-partial-refunds",
+  "title": "Refunds, Partial Refunds, and Refund Windows",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A card payment was authorized an hour ago and has not been captured. The customer cancels the order. What should the merchant do?",
+      "options": [
+        "Issue a full refund against the payment as soon as possible",
+        "Void the authorization, since no money has moved yet",
+        "Wait for capture to happen and then issue a refund",
+        "Ask the customer to dispute the charge with the issuer"
+      ],
+      "correct": 1,
+      "explanation": "Before capture there is only a hold on the cardholder's open-to-buy; voiding releases it and nothing ever moves. A refund is a new credit transaction that presumes a capture to refund against, so refunding an uncaptured authorization either fails or, worse, sends money that was never received. A dispute costs the merchant a chargeback fee for no reason."
+    },
+    {
+      "stage": "check",
+      "question": "A 100.00 USD capture has 30.00 USD refunded and a 30.00 USD refund pending at the processor. A request for 50.00 USD arrives. What should happen?",
+      "options": [
+        "Accept it, because 30.00 + 50.00 is less than the 100.00 captured",
+        "Accept it now and reject the pending refund if both succeed",
+        "Queue it until the pending refund either succeeds or fails",
+        "Refuse it, because only 40.00 USD remains once pending is counted"
+      ],
+      "correct": 3,
+      "explanation": "Remaining refundable is captured - succeeded - pending = 100 - 30 - 30 = 40.00. A pending refund may succeed, so it must already consume balance; otherwise both could succeed and 110.00 would leave for a 100.00 capture. Ignoring pending is the most common version of this bug. Queueing changes nothing, since 50.00 exceeds 40.00 whichever way the pending refund resolves."
+    },
+    {
+      "stage": "check",
+      "question": "Two support agents click 'refund remaining 60.00' on the same 100.00 capture in the same second, after 40.00 was already refunded. Which design guarantees only one refund is accepted?",
+      "options": [
+        "One conditional UPDATE that reserves the amount only if the balance still covers it",
+        "Reading the refunded total, checking it, then writing the new total back",
+        "Checking the balance again after the processor confirms the refund",
+        "Comparing each request with the original captured amount of 100.00"
+      ],
+      "correct": 0,
+      "explanation": "The check and the reservation must be one atomic step. A conditional UPDATE does both under one row lock, so the second request's WHERE clause sees the first one's reservation and updates zero rows. Read-check-write is exactly the race in the lesson: both readers see 40.00 refunded and both write. Checking after confirmation is too late: the money has already left."
+    },
+    {
+      "stage": "check",
+      "question": "A 10.00 USD capture has a 0.59 USD fee returned pro rata on refunds. It is refunded as 3.33, 3.33 and 3.34. With the cumulative method, what fee shares are returned?",
+      "options": [
+        "0.19, 0.19 and 0.19, totalling 0.57",
+        "0.20, 0.20 and 0.19, totalling 0.59",
+        "0.19, 0.20 and 0.20, totalling 0.59",
+        "0.20, 0.20 and 0.20, totalling 0.60"
+      ],
+      "correct": 2,
+      "explanation": "Each share is target(refunded after) - target(refunded before) with target(x) = floor(59 x x / 1000): targets 19, 39, 59, so shares 19, 20, 20. They telescope to exactly the fee. Flooring each refund separately gives 0.19 three times and loses two cents, which is the drift the cumulative method exists to prevent."
+    },
+    {
+      "stage": "post",
+      "question": "A refund that was accepted and reserved fails at the processor because the card account is closed. How should the ledger record the failure?",
+      "options": [
+        "Delete the reservation entry, since that refund never happened",
+        "Post a reversal of the reservation entry, leaving both in the journal",
+        "Edit the reservation entry's amount down to zero in place",
+        "Leave the reservation and pay the cardholder by bank transfer"
+      ],
+      "correct": 1,
+      "explanation": "Ledgers are append-only: a mistake or a withdrawn promise is corrected by a new entry that flips the original, so the journal shows what was promised, that it was withdrawn, and why. Deleting or editing destroys the audit trail and breaks any balance snapshot already computed. Paying by bank transfer is a payout with its own compliance obligations, not a fix for the ledger."
+    },
+    {
+      "stage": "post",
+      "question": "The refund window is 180 days. A capture was made on 2026-01-15. A refund requested on day 180 is still pending on day 181. What happens?",
+      "options": [
+        "The pending refund is failed automatically when the window closes",
+        "The refund settles only if the merchant extends the window",
+        "The refund is converted into an unreferenced credit on day 181",
+        "It may still settle: the window governs requests, not confirmations"
+      ],
+      "correct": 3,
+      "explanation": "The window decides when a refund may be promised. A refund promised on day 180 was valid when made, and the processor's later confirmation completes it. Failing it automatically would break a promise already made to the cardholder. Unreferenced credits are a separate, restricted mechanism and never an automatic conversion."
+    }
+  ]
+}

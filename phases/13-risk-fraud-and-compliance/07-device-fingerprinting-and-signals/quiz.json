@@ -1,0 +1,78 @@
+{
+  "lesson": "07-device-fingerprinting-and-signals",
+  "title": "Device Fingerprinting and Behavioral Signals",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A wallet declines every payout from a device not previously seen on the account. Which outcome is most likely?",
+      "options": [
+        "Few false positives, because device identifiers stay stable for years on most phones",
+        "Many legitimate customers declined after new phones, reinstalls, or cleared storage",
+        "Attackers are stopped for good, because a device fingerprint cannot be forged",
+        "No measurable effect, because account takeovers mostly happen on the victim's device"
+      ],
+      "correct": 1,
+      "explanation": "Stored identifiers disappear on reinstall, browser storage limits, and cleared data, and fingerprints drift with updates, so 'new device' fires on many good customers. Attackers adapt with antidetect browsers that present fresh fingerprints. Device novelty is a useful feature and step-up trigger, not a decline rule."
+    },
+    {
+      "stage": "check",
+      "question": "Per-component surprisal for a browser sums to 30 bits, but measured on your traffic the full combination occurs once in 40,000 sessions. Why the difference?",
+      "options": [
+        "The components are correlated (GPU, OS, and canvas move together), so bits overlap",
+        "Surprisal must be measured in natural log units, so the 30-bit figure is mis-scaled",
+        "Your traffic sample is too small; with more data the joint figure will approach 30 bits",
+        "Surprisal only adds for numeric attributes, and the canvas hash is a string value"
+      ],
+      "correct": 0,
+      "explanation": "Summing surprisal assumes independence. The canvas hash is largely determined by GPU, driver, and OS, which the renderer and user agent already reveal, so the true joint surprisal (log2 40,000 = 15.3 bits) is about half the naive sum. More data improves the estimate of the joint frequency; it does not make correlated components independent."
+    },
+    {
+      "stage": "check",
+      "question": "Which signal is hardest for an attacker running an antidetect browser to fake convincingly?",
+      "options": [
+        "The WebGL renderer string that the browser reports to your fingerprint script",
+        "The timezone and language settings that the browser exposes to page scripts",
+        "Agreement between the claimed user agent and the TLS handshake your server sees",
+        "The canvas hash, since it depends on the exact pixels the graphics stack renders"
+      ],
+      "correct": 2,
+      "explanation": "The TLS ClientHello is observed by your server, not reported by client JavaScript, so a tool must replicate a real browser's network stack to make it consistent with the claimed user agent. The renderer string, timezone, and canvas output are all produced or intercepted by client code; antidetect tools routinely rewrite or add noise to canvas output."
+    },
+    {
+      "stage": "check",
+      "question": "A mobile IP address is linked to 3,000 distinct accounts this month. What is the most likely explanation, and what should you do?",
+      "options": [
+        "A card-testing farm on one connection; block that IP address at the edge right away",
+        "A residential proxy exit node used by attackers; add it to the IP deny list for good",
+        "A corrupted geolocation database record; ignore the IP address signal for the account",
+        "Carrier-grade NAT sharing one address among many users; tune velocity per connection type"
+      ],
+      "correct": 3,
+      "explanation": "Mobile carriers place thousands of subscribers behind one IPv4 address with carrier-grade NAT, so raw per-IP counts look like abuse. Thresholds must depend on connection type (and use /64 for IPv6). Blocking would deny service to every customer on that carrier gateway; the farm and proxy explanations need corroborating signals."
+    },
+    {
+      "stage": "post",
+      "question": "A login from a new but attested genuine phone, in the customer's city, shows a typing rhythm far from the account's baseline, then requests to add a payout card. What response fits?",
+      "options": [
+        "Decline and lock the account, since an unfamiliar typing rhythm indicates a takeover",
+        "Allow it, since the attestation proves that the customer is holding the phone",
+        "Step up with strong authentication tied to an existing factor before adding the card",
+        "Allow the login but delay the card addition by 24 hours with no other verification"
+      ],
+      "correct": 2,
+      "explanation": "The evidence is mixed: attestation proves a genuine app and device, not who holds it, and a new keyboard changes typing rhythm. Step-up authentication lets the real customer through in seconds and stops an impostor. Declining on one soft behavioral signal insults customers; allowing treats attestation as identity, which it is not."
+    },
+    {
+      "stage": "post",
+      "question": "Marketing asks to reuse the fraud team's device fingerprints to measure ad conversions across sites. In the EU, what is the main problem?",
+      "options": [
+        "Fingerprints are stored as hashes, so they cannot be linked to any individual user",
+        "Fraud prevention is a lawful purpose, but ad measurement needs consent and new grounds",
+        "The data is not personal data, so the only concern is the platform's terms of service",
+        "Reuse is fine as long as the fingerprints are deleted after 13 months of retention"
+      ],
+      "correct": 1,
+      "explanation": "Fingerprinting falls within ePrivacy Article 5(3); strict necessity may cover fraud prevention for a payment the user started, and GDPR Recital 47 recognises fraud prevention as a legitimate interest, but neither extends to advertising. Purpose limitation forbids the silent reuse. Hashing does not anonymise a stable identifier, and a retention limit does not cure a missing legal basis."
+    }
+  ]
+}

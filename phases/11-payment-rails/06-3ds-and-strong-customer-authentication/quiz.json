@@ -1,0 +1,48 @@
+{
+  "lesson": "06-3ds-and-strong-customer-authentication",
+  "title": "3-D Secure and Strong Customer Authentication",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "By default, who loses the money when a stolen card number is used for an online purchase and the cardholder disputes it?",
+      "options": ["The merchant, through a fraud chargeback", "The card network, from its fraud reserve", "The issuer, because it approved the payment", "The cardholder, unless they report it within 24 hours"],
+      "correct": 0,
+      "explanation": "Card-not-present fraud liability sits with the merchant by default: the issuer raises a fraud chargeback and the merchant loses the sale. Issuer approval does not shift it, because the issuer could not authenticate the cardholder; 3-D Secure exists to let it do so and take the liability."
+    },
+    {
+      "stage": "check",
+      "question": "After a challenge, how does the merchant's 3DS Server learn the final authentication result?",
+      "options": ["From the CRes that the browser posts back to the merchant", "From an RReq the ACS sends through the Directory Server", "From the authorization response the issuer returns later", "From polling the ACS status endpoint with the transaction id"],
+      "correct": 1,
+      "explanation": "The ACS sends the result in an RReq via the Directory Server to the 3DS Server, a server-to-server path the cardholder cannot tamper with. The CRes goes to the browser or SDK and only signals that the challenge finished; trusting it would let a manipulated browser forge success."
+    },
+    {
+      "stage": "check",
+      "question": "An acquirer applies the TRA exemption in the authorization and the issuer approves without 3DS. The cardholder later claims fraud. Who pays?",
+      "options": ["The issuer, because it approved the transaction", "The card scheme, because the exemption is a scheme rule", "The merchant, because no authentication shifted liability", "Nobody, because exempted transactions cannot be disputed"],
+      "correct": 2,
+      "explanation": "An exemption applied by the acquirer keeps fraud liability with the acquirer and so the merchant: no authentication took place, so there is no shift. Issuer approval is authorization, not authentication; liability would move to the issuer only if the issuer applied its own exemption or authenticated."
+    },
+    {
+      "stage": "check",
+      "question": "Which property makes an SCA code satisfy PSD2 dynamic linking for a remote payment?",
+      "options": ["It expires within five minutes of being sent to the user", "It combines a knowledge factor with a possession factor", "It is delivered over a separate channel such as SMS", "It is specific to the amount and payee shown to the payer"],
+      "correct": 3,
+      "explanation": "Article 97(2) and RTS Article 5 require the authentication code to be bound to the specific amount and payee, which the payer must see. Two factors are a separate requirement; expiry and a separate channel are good practice but do not create the link to the transaction."
+    },
+    {
+      "stage": "post",
+      "question": "An issuer returns decline code 1A on a 25 EUR payment that the merchant flagged as low value. What should the checkout do?",
+      "options": ["Retry the authorization with the TRA exemption instead", "Run full 3DS with a challenge allowed, then retry", "Treat it as a hard decline and ask for another card", "Retry the same request after a short backoff delay"],
+      "correct": 1,
+      "explanation": "1A is a soft decline: the issuer wants SCA, perhaps because the low-value counters are exhausted. The fix is to authenticate with 3DS and retry. Claiming a different exemption loops into another soft decline, and treating it as a hard decline loses a payment that would succeed."
+    },
+    {
+      "stage": "post",
+      "question": "A merchant authenticates 180.00 EUR with 3DS, then adds shipping and authorizes 195.00 EUR. What is the main risk?",
+      "options": ["The issuer will authenticate the cardholder a second time", "The scheme converts it into a merchant-initiated transaction", "The authentication value no longer covers the amount authorized", "The acquirer must reapply the TRA exemption on the difference"],
+      "correct": 2,
+      "explanation": "The CAVV/AAV is bound to the authenticated amount (dynamic linking), so a materially different authorization amount can be declined or lose the liability shift. Nothing reauthenticates automatically, and it does not become an MIT; authenticate the final amount instead."
+    }
+  ]
+}

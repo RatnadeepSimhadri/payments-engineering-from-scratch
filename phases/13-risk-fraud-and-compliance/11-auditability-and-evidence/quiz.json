@@ -1,0 +1,78 @@
+{
+  "lesson": "11-auditability-and-evidence",
+  "title": "Auditability: Immutable Logs and Evidence Bundles",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Risk decisions are stored in a database table that the application can UPDATE, with an updated_at column. An examiner asks you to prove a row was not changed after a backfill. What can the table alone show?",
+      "options": [
+        "That the row was not changed, as long as updated_at is older than the backfill date",
+        "That the row was not changed, provided the nightly backup contains the identical row",
+        "Nothing conclusive: anyone who could edit the row could also edit updated_at and backups",
+        "That the row was not changed, because the database transaction log records every write"
+      ],
+      "correct": 2,
+      "explanation": "A mutable record is a claim whose credibility equals that of everyone who can edit it; the backfill itself set updated_at, and backups are equally mutable and unverifiable by the examiner. The database's write-ahead log is the strongest distractor, but it is retained briefly, controlled by the same operator, and not designed to be shown to a third party as proof."
+    },
+    {
+      "stage": "check",
+      "question": "An operator edits entry #3 of a hash-chained log, recomputes its hash, then rewrites #4 through #8 with new prev pointers and hashes. With no checkpoints, what does a chain verifier report?",
+      "options": [
+        "A hash mismatch at entry #3, because its content no longer matches the original",
+        "A broken link between #3 and #4, because #4 still points to the old hash of #3",
+        "A sequence gap, because rewritten entries receive new sequence numbers from the log",
+        "Nothing: every hash matches its content and every link matches its predecessor"
+      ],
+      "correct": 3,
+      "explanation": "A hash chain proves internal consistency, not that this is the chain that existed yesterday. After a full suffix rewrite every check passes. The broken-link distractor is what happens if the operator stops after rehashing #3; rewriting the suffix removes it. Detecting this needs an anchor held by someone else, such as a signed checkpoint of the Merkle root."
+    },
+    {
+      "stage": "check",
+      "question": "Why does RFC 6962 hash leaves as SHA-256(0x00 || data) and interior nodes as SHA-256(0x01 || left || right)?",
+      "options": [
+        "So an interior node's two child hashes can never be passed off as a leaf in a proof",
+        "So that leaf hashes and node hashes sort apart, making the tree faster to search",
+        "So the tree stays balanced when the number of leaves is not a power of two",
+        "So that a SHA-256 collision in one leaf cannot propagate to the root of the tree"
+      ],
+      "correct": 0,
+      "explanation": "Without domain separation, the 64 bytes of two child hashes could be presented as leaf data, letting an attacker prove inclusion of a fake leaf (a second-preimage attack on the tree). Balancing comes from splitting at the largest power of two below n, not from the prefix, and a real SHA-256 collision would break the scheme regardless."
+    },
+    {
+      "stage": "check",
+      "question": "Checkpoint 1 covering entries 0..4 was signed by the time-stamp authority at 10:01. Checkpoint 2 covering 0..8 was signed at 10:08. Entry #6 says 10:02. What is actually proven about when #6 was written?",
+      "options": [
+        "It was written at exactly 10:02, because its timestamp is covered by the signed root",
+        "It was written after 10:01 and no later than 10:08, the window between the two seals",
+        "It was written no later than 10:01, because it follows entries sealed in checkpoint 1",
+        "Nothing about its time is proven, because its timestamp came from the operator's clock"
+      ],
+      "correct": 1,
+      "explanation": "The TSA's signatures bound existence: #6 was not in the 5-entry log sealed at 10:01 and was in the 9-entry log sealed at 10:08. Its own 10:02 timestamp is only the operator's claim within that window. 'Nothing is proven' is the strongest distractor: the entry's own clock proves nothing, but the seals do, which is why the seal interval is the backdating window."
+    },
+    {
+      "stage": "post",
+      "question": "A regulator investigating one complaint needs to verify that customer's two decisions without seeing anyone else's. What should the evidence bundle contain?",
+      "options": [
+        "A database dump of the full log, plus the TSA-signed checkpoint covering every entry",
+        "The two entries as JSON, with each entry's own hash and the log operator's signature",
+        "The two entries, plus the hash of every other entry so the root can be recomputed",
+        "The two entries as canonical bytes, their audit paths, and the TSA-signed checkpoint"
+      ],
+      "correct": 3,
+      "explanation": "Canonical bytes let the verifier recompute exactly what was hashed; O(log n) audit paths prove inclusion in the signed root without revealing other entries; the TSA signature makes the root trustworthy independent of the operator. A full dump or every other hash discloses far more than needed or scales linearly, and an operator's own signature proves nothing about rewrites by that operator."
+    },
+    {
+      "stage": "post",
+      "question": "Your verifier passes on every bundle. A customer says a decline was never logged at all. What does the verifier prove about that claim?",
+      "options": [
+        "Nothing: logs prove what was written, so omission needs log-before-act plus reconciliation",
+        "That the claim is false, because a missing decision would break the hash chain at that point",
+        "That the claim is false, because the Merkle root commits to every decision the engine made",
+        "That the claim is true, because the bundle has no entry for that payment's identifier"
+      ],
+      "correct": 0,
+      "explanation": "A tamper-evident log proves the integrity of what was appended; a decision that was never appended leaves no gap in the chain or the tree. The control is process: append the decision before returning it, and reconcile every authorization in the ledger against a log entry. The chain-gap distractor confuses deleting an appended entry, which is detected, with never appending one."
+    }
+  ]
+}

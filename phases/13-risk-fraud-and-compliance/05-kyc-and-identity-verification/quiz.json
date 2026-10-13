@@ -1,0 +1,78 @@
+{
+  "lesson": "05-kyc-and-identity-verification",
+  "title": "KYC, CIP, and Identity Verification Flows",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A payouts platform verifies each seller's bank account with a micro-deposit and stores is_verified = true. Why is that not enough to meet a customer identification requirement?",
+      "options": [
+        "Micro-deposits are too slow; regulators require identity to be verified in real time",
+        "It proves control of an account, not who the person is, and records no method or evidence",
+        "Bank accounts can be closed later, so verification must be repeated before every payout",
+        "Micro-deposit amounts are floats, so the stored verification result is not reliable"
+      ],
+      "correct": 1,
+      "explanation": "CIP requires collecting identifying information (name, DOB, address, ID number in the US) and verifying the person, with records of the method and result. A micro-deposit proves control of a bank account only, and a bare boolean records nothing an examiner can rely on. Real-time verification is not required; the rule allows a reasonable time."
+    },
+    {
+      "stage": "check",
+      "question": "Which statement correctly separates CIP from CDD?",
+      "options": [
+        "CIP establishes and verifies identity; CDD adds purpose, risk profile, owners, and monitoring",
+        "CIP applies to individual customers; CDD applies only to legal-entity business customers",
+        "CIP is the US term and CDD the EU term for the same identity verification requirement",
+        "CIP happens at account opening; CDD happens only after a suspicious activity report"
+      ],
+      "correct": 0,
+      "explanation": "CIP answers 'is this a real person and is it this person'; CDD builds on it with the nature and purpose of the relationship, a risk profile, beneficial owners for entities, and ongoing monitoring. The entity-only distractor confuses CDD with its beneficial-ownership element; CDD applies to every customer."
+    },
+    {
+      "stage": "check",
+      "question": "Company A is owned 60% by Holding B and 20% directly by Zara. Zara also owns 20% of Holding B. Under a 25% ownership prong, is Zara a beneficial owner of A?",
+      "options": [
+        "No, because neither her direct 20% nor her indirect stake reaches 25% on its own",
+        "No, because indirect stakes held through an entity are not counted for ownership",
+        "Yes, because she holds shares at two levels, which always triggers identification",
+        "Yes, because her direct 20% plus 0.60 x 20% indirect gives 32% effective ownership"
+      ],
+      "correct": 3,
+      "explanation": "Effective ownership multiplies along each path and sums across paths: 20% + 0.60 x 20% = 32%, above the threshold. Evaluating each edge separately is the classic implementation bug that misses her. Indirect ownership is explicitly counted under both US and EU rules."
+    },
+    {
+      "stage": "check",
+      "question": "The document-verification vendor is down for two hours. What should the onboarding state machine do with new applicants?",
+      "options": [
+        "Approve them at full limits and re-verify them later, so that conversion is protected",
+        "Reject them with a request to try again, since verification cannot be completed now",
+        "Hold them in Verifying, or a restricted tier with low limits, and resume when it recovers",
+        "Skip the document step and rely on email and phone checks for applicants in that window"
+      ],
+      "correct": 2,
+      "explanation": "The state machine fails closed: applicants wait in a pending state or get restricted access whose limits match the assurance actually achieved. Approving at full limits fails open and creates exactly the unverified accounts the rules prohibit; rejecting outright loses good customers for an internal outage."
+    },
+    {
+      "stage": "post",
+      "question": "An engineer proposes storing full Aadhaar numbers and passport scans in the main customer table so support agents can see them. What is the right design?",
+      "options": [
+        "Keep them in the main table but encrypt that column, so that support agents can still see them",
+        "Hold raw identifiers and documents in a vault, give other services tokens and masked values",
+        "Delete them right after verification, because privacy law forbids keeping identity documents",
+        "Store only a SHA-256 hash of each identifier, which satisfies record-keeping and privacy rules"
+      ],
+      "correct": 1,
+      "explanation": "An identity vault isolates raw identifiers (UIDAI requires a vault with reference keys and masked display for Aadhaar) while other systems hold tokens, last-4 values, and verification outcomes. Deleting immediately breaks CIP record-keeping, which requires a description of the document for five years after closure; a bare hash of a low-entropy ID number is reversible by brute force and does not preserve the required description."
+    },
+    {
+      "stage": "post",
+      "question": "An approved customer's name appears on a sanctions list update published today. Which onboarding design handles this correctly?",
+      "options": [
+        "Nothing happens until the customer's scheduled periodic review, as screening is at onboarding",
+        "The customer is deleted from the system, along with balances, to remove the prohibited party",
+        "An alert is emailed to compliance, and the account stays fully active until someone replies",
+        "A rescreen raises an event that moves the account to Restricted, freezes funds, logs evidence"
+      ],
+      "correct": 3,
+      "explanation": "Sanctions screening is continuous: every list update rescreens the base, and a confirmed match is a prohibition that must take effect immediately through the state machine, with funds blocked and the evidence logged. Waiting for periodic review leaves a prohibited party transacting; deletion destroys required records and the blocked funds must be held and reported, not removed."
+    }
+  ]
+}

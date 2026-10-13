@@ -1,0 +1,78 @@
+{
+  "lesson": "11-recurring-and-subscriptions",
+  "title": "Recurring Payments, Subscriptions, and Dunning",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A billing job sets next_bill_date = next_bill_date + 1 month after each charge. A customer signed up on January 31. On which day of the month are they billed in May?",
+      "options": [
+        "The 31st, because plusMonths always clamps back to the anchor day",
+        "The 30th, because May follows April and April only has 30 days",
+        "The 28th, because the February clamp is fed back into every later date",
+        "The 1st, because an invalid date rolls over into the following month"
+      ],
+      "correct": 2,
+      "explanation": "Chaining feeds the clamped February 28 into March, April, and May, so the customer is billed on the 28th forever. Computing each date from the anchor (anchor.plusMonths(n)) gives May 31. The first option describes anchored computation, not the chained job in the question."
+    },
+    {
+      "stage": "check",
+      "question": "A 30.00 USD plan is changed on day 11 of a 31-day period. Why does the lesson compute the credit as price.allocate(10, 21)[1] instead of rounding 30.00 * 21 / 31?",
+      "options": [
+        "Allocation guarantees the used share plus the credit equals the price to the cent",
+        "Allocation is faster than division because it avoids computing a remainder",
+        "Rounding 30.00 * 21 / 31 would give a negative credit when used exceeds remaining",
+        "Allocation lets the proration skip the actual number of days in the period"
+      ],
+      "correct": 0,
+      "explanation": "Largest-remainder allocation distributes the leftover minor units so the shares sum exactly to the price; independent rounding can over- or under-bill (9.99 split in half rounds to 5.00 + 5.00). Allocation still uses the real period length, 31 days here; it does not skip it."
+    },
+    {
+      "stage": "check",
+      "question": "An invoice first fails on Feb 14 with INSUFFICIENT_FUNDS under offsets [1, 3, 7, 14]. The engine is down Feb 16 to Feb 20 and runs again on Feb 21. What happens on Feb 21?",
+      "options": [
+        "Two attempts run, for the missed Feb 17 retry and for the Feb 21 retry",
+        "The invoice is exhausted because the Feb 17 retry was missed entirely",
+        "Nothing runs, because the schedule restarts from the date the engine recovered",
+        "One attempt runs, and the next is scheduled for Feb 28 from the first failure"
+      ],
+      "correct": 3,
+      "explanation": "The schedule is positional from the first failure: on Feb 21 the +1, +3, and +7 offsets are all in the past, so one attempt runs and the next is +14, Feb 28. Bursting the missed attempts back to back would hammer the issuer within minutes for no gain, which is why the first option is wrong."
+    },
+    {
+      "stage": "check",
+      "question": "A renewal is declined as EXPIRED_CARD and the card updater returns a new token. What does the engine do?",
+      "options": [
+        "Schedules the new card for the next dunning offset, one day after the decline",
+        "Charges the new token immediately, as a new attempt with a new reference",
+        "Replays the original reference against the new token so the gateway dedupes",
+        "Moves the subscription to UNPAID until the customer confirms the new card"
+      ],
+      "correct": 1,
+      "explanation": "A reissued credential is the fix for an expired card, so the engine charges it at once as a distinct attempt with its own reference. Replaying the original reference would return the stored EXPIRED_CARD outcome from the gateway's dedupe, since a reference identifies one charge request, not a card."
+    },
+    {
+      "stage": "post",
+      "question": "Operations reruns the billing job for a day that already completed. Which property guarantees no customer is charged twice?",
+      "options": [
+        "The gateway dedupes by card token, so a second charge on one card is ignored",
+        "The engine holds a lock that prevents runDay from executing twice on one day",
+        "Deterministic invoice ids and per-attempt references, with attempts gated by nextAttempt",
+        "Each subscription records the date of its last run and skips the day if it matches"
+      ],
+      "correct": 2,
+      "explanation": "Opening an invoice whose id (subscription:periodStart) exists returns it; an attempt only runs when today >= nextAttempt, and every attempt moves nextAttempt or closes the invoice; the gateway dedupes on invoiceId#attempt. Deduping by card token would be wrong: it would block a legitimate second subscription or a retry on the same card."
+    },
+    {
+      "stage": "post",
+      "question": "Why is CANCELED terminal in the transition table, rather than allowing CANCELED -> ACTIVE when a late retry succeeds?",
+      "options": [
+        "A customer who canceled must never be charged by a stale retry; reactivation is a new subscription",
+        "Canceled subscriptions lose their anchor date, so no next billing date can be computed",
+        "The card networks forbid any merchant-initiated charge after a cancellation date",
+        "The engine deletes canceled subscriptions, so there is no record left to reactivate"
+      ],
+      "correct": 0,
+      "explanation": "Terminal CANCELED means no code path can revive a subscription the customer ended, and runDay skips invoices of canceled subscriptions. The anchor is still stored, so the second option is false; UNPAID exists precisely for the case where the business wants to keep the anchor and allow reactivation."
+    }
+  ]
+}

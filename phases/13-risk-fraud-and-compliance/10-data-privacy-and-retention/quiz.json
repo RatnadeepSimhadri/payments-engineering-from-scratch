@@ -1,0 +1,78 @@
+{
+  "lesson": "10-data-privacy-and-retention",
+  "title": "Data Privacy, Retention, and Right to Erasure in Financial Systems",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A former customer requests erasure under GDPR. Their transactions are in the ledger and the law requires AML records to be kept for five years after the relationship ends. What should happen to the transaction records?",
+      "options": [
+        "Delete them at once, because the right to erasure overrides other obligations",
+        "Keep them unchanged and usable for every purpose, because a legal duty applies",
+        "Keep them restricted under the retention duty, then erase them when it expires",
+        "Ask the customer to choose between deleting the records and keeping them on file"
+      ],
+      "correct": 2,
+      "explanation": "Article 17(3)(b) exempts data that must be kept to comply with a legal obligation, so the records stay, but only for that purpose: access is restricted, other uses stop, and erasure is scheduled for when the obligation ends. Keeping them fully usable ignores purpose limitation; deleting them breaks AML law."
+    },
+    {
+      "stage": "check",
+      "question": "The analytics team replaces phone numbers with SHA-256(phone) and calls the warehouse pseudonymized. Why is this weak?",
+      "options": [
+        "SHA-256 has known collisions, so two phone numbers can end up with the same value",
+        "The input space is small enough to enumerate, so every hash maps back to its number",
+        "Hashed values are larger than the originals, which breaks GDPR's minimisation rule",
+        "SHA-256 is a reversible encoding, so anyone can decode the hashes with no key needed"
+      ],
+      "correct": 1,
+      "explanation": "Ten-digit mobile numbers give a few billion candidates, which a GPU hashes in seconds, recovering every number. The fix is a random token from a vault or a keyed HMAC with the key held in a KMS. SHA-256 is not reversible as such and has no practical collisions; the weakness is the low-entropy input."
+    },
+    {
+      "stage": "check",
+      "question": "Personal data sits in Kafka topics, immutable warehouse partitions, backups, and a hash-chained audit log. Which approach erases one customer from all of them most reliably?",
+      "options": [
+        "Encrypt each customer's fields under a per-customer key, then delete that key to erase",
+        "Run a deletion job in each store that rewrites every record containing the customer",
+        "Replace the customer's name with a hash everywhere so the records are anonymized",
+        "Delete the customer row from the primary database and let downstream stores expire"
+      ],
+      "correct": 0,
+      "explanation": "Crypto-shredding makes every copy unreadable at once, including immutable stores that cannot be rewritten; and if audit-log hashes cover the ciphertext, the chain still verifies. Rewriting jobs cannot touch immutable backups or hash-chained logs without breaking them, and waiting for expiry leaves the data readable for years."
+    },
+    {
+      "stage": "check",
+      "question": "Why must foreign keys from ledger postings to the customer table never use ON DELETE CASCADE?",
+      "options": [
+        "Cascading deletes run too slowly on large tables and can lock the ledger for hours",
+        "Cascades are not permitted by GDPR, which requires every deletion to be done by hand",
+        "Cascades only delete one level of rows, so customer data in child tables would remain",
+        "Erasing a person then deletes financial facts, unbalancing the ledger and AML records"
+      ],
+      "correct": 3,
+      "explanation": "Postings are financial facts under retention duties and are paired with counter-postings on other accounts; deleting one side breaks double-entry balance and destroys records the law requires. Erasure belongs in the identity vault. Performance and cascade depth are real concerns but not the reason; GDPR says nothing about how deletion is implemented."
+    },
+    {
+      "stage": "post",
+      "question": "An access request arrives by email from an address not on file, giving the account holder's name and date of birth. What should the pipeline do first?",
+      "options": [
+        "Send the data export to the requesting address, since it is due within one month",
+        "Verify the requester as strongly as a login to that account, before any data is sent",
+        "Ask for a passport scan, then fulfil the request once any identity document arrives",
+        "Reject the request, since access requests must be sent from the email address on file"
+      ],
+      "correct": 1,
+      "explanation": "A DSAR is an account-takeover vector: an impostor who knows a name and date of birth would receive the full history. Verify through the account's existing authentication, without collecting more identity data than you already hold. Blanket rejection of a different email address fails the right of access; a passport scan collects more data and still may not prove control of the account."
+    },
+    {
+      "stage": "post",
+      "question": "A backup from three weeks ago is restored after an outage. Two customers were crypto-shredded and one erased by deletion in the vault since then. What prevents their data from returning?",
+      "options": [
+        "Nothing more is needed, because the restore brings back only what the law allows",
+        "Backups must never be restored once any erasure has happened since they were made",
+        "Shredded keys keep ciphertext unreadable; an erasure journal replays the vault delete",
+        "The data map marks the restored rows as erased, so applications skip them on read"
+      ],
+      "correct": 2,
+      "explanation": "Ciphertext for the two shredded customers stays unreadable as long as their keys stay deleted (and the key store backup does not resurrect them). The vault deletion is undone by the restore, so an erasure journal of subject IDs must be replayed after any restore. Forbidding restores is not viable, and the data map routes requests; it does not filter reads."
+    }
+  ]
+}

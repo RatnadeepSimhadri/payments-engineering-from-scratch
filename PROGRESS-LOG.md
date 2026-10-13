@@ -2,6 +2,14 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-10-13 — Batch 3: Phases 10–14 complete — Java pass DONE
+
+- Authored the final 38 Track C lessons: 161 → 199 complete. **Every lesson in the curriculum is complete in Java.**
+- Verification: audit 199/199 lessons, 0 issues; all 143 Java Build lessons run and pass; 3/3 projects pass 4/4 stages; skills in sync.
+- Incident: one agent's cleanup deleted the Python/Go ports of four Phase 11 lessons; restored from git and re-verified.
+- To review before publishing: some Further Reading URLs and recent regulatory figures (FedNow limits, FCA safeguarding 2026, RBI e-mandate circular, EBA SCA opinion) were written without network access.
+- Next: Python and Go ports (40 of 143 Build lessons already have them).
+
 ## 2026-10-13 — Batch 2: Phases 5–9 complete (Java)
 
 - Authored the 24 remaining Track B lessons: 137 → 161 complete. Track B (Phases 5–9) is now 63/63.

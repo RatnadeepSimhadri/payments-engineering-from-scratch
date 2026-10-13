@@ -1,0 +1,48 @@
+{
+  "lesson": "09-multi-currency-ledgers",
+  "title": "Multi-Currency Ledgers and Revaluation",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "An entry debits 110.00 USD and credits 100.00 EUR. Why can't a double-entry validator accept it without outside help?",
+      "options": ["Debits must always be in the functional currency", "It balances only after applying an exchange rate", "Entries are limited to two postings in total", "Credits cannot be posted to liability accounts"],
+      "correct": 1,
+      "explanation": "Debits equal credits is a statement about one unit of account. 110 USD and 100 EUR are different units, so they balance only if the validator embeds a rate, which makes ledger correctness depend on a rate service. The functional-currency distractor describes no real rule."
+    },
+    {
+      "stage": "check",
+      "question": "How does this lesson post the 110.00 USD payment that creates a 100.00 EUR obligation?",
+      "options": ["One entry with four postings across two currencies", "One USD entry, with the EUR amount kept in a memo", "Two entries, each balanced via a clearing account", "One EUR entry, with USD converted at posting time"],
+      "correct": 2,
+      "explanation": "The USD entry debits the receivable and credits 1900-USD; the EUR entry debits 1900-EUR and credits the payable. Each balances in its own currency with no rate, and the transaction groups them with the rate as data. A four-posting mixed entry is exactly what the single-currency rule forbids."
+    },
+    {
+      "stage": "check",
+      "question": "The platform owes 100.00 EUR booked at 1.1000 (basis -110.00 USD). At month end the closing rate is 1.1200. What does revalue book?",
+      "options": ["A 2.00 USD gain, credited to 4900", "Nothing, because the EUR balance is unchanged", "A 2.00 EUR adjustment in the EUR sub-ledger", "A 2.00 USD loss, debited to 4900"],
+      "correct": 3,
+      "explanation": "Fair value is -100.00 EUR x 1.12 = -112.00 USD; carrying is -110.00; the difference -2.00 is a loss on a short EUR position when EUR strengthens. It is posted in USD only (Dr 4900, Cr 1950-EUR). The EUR balance is unchanged, which is why the adjustment cannot live in the EUR sub-ledger."
+    },
+    {
+      "stage": "check",
+      "question": "Which invariant ties the functional clearing account to the foreign positions?",
+      "options": ["netDebit(1900-USD) equals the sum of open bases", "netDebit(1900-USD) is zero after every transaction", "netDebit(1900-USD) equals the sum of revaluations", "netDebit(1900-USD) equals the EUR clearing balance"],
+      "correct": 0,
+      "explanation": "Every exchange moves the functional clearing account by its functional leg and the foreign basis by the same signed amount, so the two always agree. Functional clearing is non-zero whenever a position is open, and revaluations never touch clearing; comparing it to EUR clearing mixes currencies."
+    },
+    {
+      "stage": "post",
+      "question": "After a 2.00 USD unrealized loss was booked, the position is closed at a total cost of 1.50 USD. What does realize leave in 4900 and 4910?",
+      "options": ["4900 at -2.00 and 4910 at -1.50", "4900 at 0.00 and 4910 at -3.50", "4900 at 0.00 and 4910 at -1.50", "4900 at -2.00 and 4910 at +0.50"],
+      "correct": 2,
+      "explanation": "realize books the remaining basis (+1.50, a cost) as a realized loss and unwinds the earlier unrealized loss, because realization replaces the estimate. Keeping 4900 at -2.00 would count the same currency movement twice, for a total of 3.50 USD when only 1.50 was actually lost."
+    },
+    {
+      "stage": "post",
+      "question": "Why does exchange() require one side of every conversion to be the functional currency?",
+      "options": ["Clearing accounts can exist only in the functional currency", "So the position's basis is known exactly without a second rate", "Because ISO 4217 does not define rates between EUR and GBP", "Because converting EUR to GBP would need a mixed-currency entry"],
+      "correct": 1,
+      "explanation": "The basis is measured in functional currency; when one leg is USD, that leg is the basis change exactly. A EUR-GBP trade would need a USD rate per leg to update both bases. Every currency has its own clearing account, and a cross could still be two single-currency entries."
+    }
+  ]
+}
