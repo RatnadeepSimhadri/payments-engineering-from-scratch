@@ -1,0 +1,78 @@
+{
+  "lesson": "02-failure-models",
+  "title": "Failure Models: Crash-Stop, Omission, Byzantine",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A replica stops responding to heartbeats. From the point of view of the other replicas in an asynchronous network, which statement is true?",
+      "options": [
+        "It has crashed, because a correct process always answers a heartbeat within the timeout",
+        "It has either crashed or is slow, and no amount of waiting can tell the two apart with certainty",
+        "It is slow, because crashes are detected by the operating system and reported out of band",
+        "It has been partitioned, because heartbeat loss is always a network fault rather than a process fault"
+      ],
+      "correct": 1,
+      "explanation": "Without a bound on delay, silence is consistent with both a crash and an arbitrarily long pause. This indistinguishability is the core of the FLP result and the reason timeouts can drive liveness but never safety. The first option assumes a synchronous network, which real networks are not."
+    },
+    {
+      "stage": "check",
+      "question": "A ledger primary enters a 38-second GC pause, its 10-second lease expires, a standby takes over, and the primary later resumes and writes its buffered postings. Which failure model did the protocol tolerate, and which one actually occurred?",
+      "options": [
+        "Tolerated omission; a Byzantine failure occurred",
+        "Tolerated crash-recovery; an omission failure occurred",
+        "Tolerated crash-stop; a timing failure occurred",
+        "Tolerated timing; a crash-stop failure occurred"
+      ],
+      "correct": 2,
+      "explanation": "The lease design assumes a node that stops renewing has halted for good (crash-stop). A node that is silent past the timeout and then resumes with correct but stale behaviour is a timing failure. The fix is a fencing token so the resumed node's writes are rejected, making safety independent of the timeout."
+    },
+    {
+      "stage": "check",
+      "question": "Why does consensus under crash failures need n >= 2f + 1 replicas while consensus under Byzantine failures needs n >= 3f + 1?",
+      "options": [
+        "Byzantine protocols need an extra replica per fault to hold the signatures and keys for verification",
+        "Two crash quorums need one shared correct process; two Byzantine quorums need f + 1 shared so at least one is honest",
+        "Crash failures are detected synchronously so fewer replicas are needed, while Byzantine ones are never detected",
+        "Byzantine replicas consume twice the bandwidth, so the cluster needs more nodes to carry the message load"
+      ],
+      "correct": 1,
+      "explanation": "Under crash failures a process is correct or silent, never wrong, so a single shared process carries a decision between quorums. A Byzantine shared process might lie, so the intersection must contain f + 1 processes to guarantee one honest one, which forces quorums of 2f + 1 out of 3f + 1. Signatures reduce message complexity but do not change this counting argument."
+    },
+    {
+      "stage": "check",
+      "question": "The partially synchronous model (Dwork, Lynch, Stockmeyer) says delay bounds hold only after an unknown global stabilisation time. What does this require of a correct consensus protocol?",
+      "options": [
+        "It must remain safe at all times and make progress once the bounds hold",
+        "It must make progress at all times and become safe once the bounds hold",
+        "It must halt entirely until it can measure the bound and then resume with that timeout",
+        "It must switch to a Byzantine-tolerant mode during the unstable period and back afterwards"
+      ],
+      "correct": 0,
+      "explanation": "Before stabilisation anything can happen, so the protocol may not decide incorrectly; after it, the bounds let a leader be elected and decisions made. This is exactly Raft's behaviour: never two values at one index, progress only when the network settles. Sacrificing safety for progress during instability is what the lease protocol in The Problem did, and it is wrong."
+    },
+    {
+      "stage": "post",
+      "question": "A card network's daily settlement file arrives correctly signed but with 1,400 amounts off by a factor of 100 due to an upstream bug. Which model does this fall under, and which mechanism addresses it?",
+      "options": [
+        "Omission; retransmit the file until a consistent copy arrives",
+        "Crash-recovery; replay the network's write-ahead log to rebuild the file",
+        "Timing; wait for the next settlement window and compare the two files",
+        "Authenticated Byzantine; validate the schema and reconcile against independent evidence"
+      ],
+      "correct": 3,
+      "explanation": "The counterparty is outside the trust boundary and produced protocol-violating output without forging a signature, which is the authenticated Byzantine sub-model. Consensus does not apply; the defences are field validation, trailer totals, and reconciliation against the ledger's own record. Retransmission would deliver the same wrong file again."
+    },
+    {
+      "stage": "post",
+      "question": "A design document for a three-replica store says only that it 'tolerates one node failure'. According to this lesson, what is the most important thing missing from that sentence?",
+      "options": [
+        "The failure model assumed, the synchrony assumption, and how timing failures are fenced",
+        "The brand of hardware and the network bandwidth available between the three replicas",
+        "The number of client connections each replica can serve during a failover event",
+        "The expected mean time between failures for each replica, derived from vendor data"
+      ],
+      "correct": 0,
+      "explanation": "A protocol is correct only relative to its model, so a claim of tolerance without the model is unverifiable. The lesson's template sentence names f and n, the process model, the synchrony assumption, the fencing mechanism for stale writers, and how external inputs are validated. MTBF figures describe frequency, which a failure model deliberately does not address."
+    }
+  ]
+}

@@ -3,7 +3,7 @@
 > An account is the sum of its events; a balance is a cache.
 
 **Type:** Build
-**Languages:** Java, Python, Go
+**Languages:** Java
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 

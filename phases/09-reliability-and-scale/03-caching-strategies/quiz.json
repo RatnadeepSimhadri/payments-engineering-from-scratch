@@ -1,0 +1,78 @@
+{
+  "lesson": "03-caching-strategies",
+  "title": "Caching Strategies: Cache-Aside, Write-Through, Write-Behind",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service puts a cache with a 30-second TTL in front of its balance query and makes no other change. What is now true?",
+      "options": [
+        "Reads can return a balance up to 30 seconds old whenever any writer changes the database",
+        "Reads are always correct because the TTL forces a reload before any stale value is served",
+        "Writes become slower because every write must now also update the cache synchronously",
+        "The cache will only ever be stale if the database itself loses a committed transaction"
+      ],
+      "correct": 0,
+      "explanation": "A TTL bounds staleness by time only. Until the entry expires the cache serves whatever it last loaded, regardless of what any writer did to the store. The TTL does not force a reload at write time; it only guarantees the wrong value is served for at most 30 seconds, and nothing about writes changed at all."
+    },
+    {
+      "stage": "check",
+      "question": "In cache-aside with invalidate-on-write, why does the strategy write the store first and delete the cache entry second rather than the other way round?",
+      "options": [
+        "Because deleting first would make the write path slower by one cache round trip",
+        "Because a reader between a delete-first and the store write could repopulate the cache with the old value",
+        "Because the store rejects writes to a key that still has a live entry in the cache",
+        "Because the cache cannot delete a key that the store has not yet acknowledged writing"
+      ],
+      "correct": 1,
+      "explanation": "If the delete happens first, a concurrent reader misses, loads the old balance from the store (the new value has not landed yet), and puts it back with a fresh TTL after the store write commits. The stale value then survives the whole TTL. Writing the store first shrinks that window to the gap between commit and delete. Ordering has no effect on latency and the store knows nothing about the cache."
+    },
+    {
+      "stage": "check",
+      "question": "The seeded workload shows cache-aside with TTL only at a 67.8% hit rate and cache-aside with invalidation at 60.8%. What accounts for the difference?",
+      "options": [
+        "The invalidating cache evicts entries early when it runs out of memory under the same load",
+        "The TTL-only cache has a longer expiry, so entries survive more of the 20,000 operations",
+        "Writes remove entries in the invalidating cache, so the read after each debit is a miss instead of a stale hit",
+        "The invalidating cache counts a hit only when the value matches the store, which lowers its ratio"
+      ],
+      "correct": 2,
+      "explanation": "Both caches have the same TTL and no size bound. The seven-point gap is exactly the reads that followed a debit: the TTL-only cache still holds the pre-debit balance and serves it as a hit (a stale one), while the invalidating cache removed it and must reload. The hit counter is the same in both; the divergence counter is what differs."
+    },
+    {
+      "stage": "check",
+      "question": "Write-behind stores dirty entries with no expiry. What goes wrong if a dirty entry were allowed to expire before flush?",
+      "options": [
+        "The flush would write the entry twice, once from the dirty queue and once from the cache",
+        "The store would receive the write early, before the batch, defeating coalescing",
+        "The cache would reject later writes to that key until the flush completed",
+        "A read would miss, reload the old balance from the store, and serve it as truth while the debit sits unflushed"
+      ],
+      "correct": 3,
+      "explanation": "In write-behind the cache is ahead of the store. If the only copy of the new value expires, the next read loads the stale pre-debit balance from the store and caches it, so the application sees money that was already spent. Expiry has no effect on the dirty queue itself, so there is no double write and no early flush."
+    },
+    {
+      "stage": "post",
+      "question": "A nightly settlement job debits accounts by writing directly to the database. The balance API uses cache-aside with invalidate-on-write. Which statement is correct?",
+      "options": [
+        "Balances read after the job are correct because invalidation covers every write to the store",
+        "Balances can be stale for up to one TTL because the job's writes bypass the invalidation path",
+        "Balances are correct because the store notifies the cache of any change to a cached key",
+        "Balances are never stale because the job's writes replace the cache entries as a side effect"
+      ],
+      "correct": 1,
+      "explanation": "Invalidation only happens inside the strategy's write method. A writer that goes straight to the database never calls it, so the cache holds the old balance until its TTL ends. A plain database does not notify a cache; making it do so is change data capture, a separate mechanism. The job's writes do not touch the cache at all."
+    },
+    {
+      "stage": "post",
+      "question": "For which piece of state in a payment system is write-behind caching an acceptable choice?",
+      "options": [
+        "The account balance that authorizations are checked against",
+        "The ledger postings that record each debit and credit",
+        "A denormalized risk score that can be recomputed from the ledger if lost",
+        "The idempotency store that decides whether a request was already processed"
+      ],
+      "correct": 2,
+      "explanation": "Write-behind acknowledges a write before the store has it, so a crash loses acknowledged writes. That is tolerable only for derived data that can be rebuilt. Balances, ledger postings, and idempotency records are all state whose loss changes what the system does next: a lost debit, a missing posting, or a duplicate charge."
+    }
+  ]
+}

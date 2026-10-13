@@ -1,0 +1,78 @@
+{
+  "lesson": "04-cache-invalidation-and-stampedes",
+  "title": "Cache Invalidation, Stampedes, and Request Coalescing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A key is read 1,000 times per second and reloading it from the database takes 100 ms. Roughly how many identical database queries run concurrently when its cache entry expires, with no protection?",
+      "options": [
+        "One, because the cache serializes misses for the same key",
+        "About ten, because only requests in the first 10 ms miss",
+        "About one hundred, one per request arriving during the reload",
+        "One thousand, one per request arriving in the next second"
+      ],
+      "correct": 2,
+      "explanation": "Every request that arrives before the first reload completes sees a miss and starts its own reload, so the concurrency is rate times reload latency: 1,000/s x 0.1 s = 100. A plain cache does not serialize misses; that is what request coalescing adds. After the first reload lands, the following requests are hits, so it does not grow to a thousand."
+    },
+    {
+      "stage": "check",
+      "question": "Lesson 03 recommended invalidating the cache on every write. What does that do to a hot key, and what does this lesson add?",
+      "options": [
+        "It avoids stampedes because invalidation refreshes the entry; this lesson adds TTL tuning",
+        "It causes a stampede on every write because the entry vanishes under load; this lesson adds coalescing on the miss path",
+        "It makes the key cold so stampedes cannot happen; this lesson adds early expiration for warm keys",
+        "It has no effect on stampedes because they only follow TTL expiry; this lesson adds longer TTLs"
+      ],
+      "correct": 1,
+      "explanation": "Invalidation deletes the entry; it does not refresh it. On a hot key every reader in the next reload latency misses, so each write schedules a stampede. The fix is not to stop invalidating (that brings back stale balances) but to coalesce the misses so one reload serves everyone. The demo shows naive at 101 concurrent loads on an invalidation and single-flight at 1."
+    },
+    {
+      "stage": "check",
+      "question": "In single-flight, the load completes and the strategy writes the cache entry before completing the waiters. Why that order?",
+      "options": [
+        "Because waiters are completed on another thread and need the entry to exist",
+        "Because the store requires the cache to acknowledge the value before returning",
+        "Because the stats counter must see the hit before the miss count is adjusted",
+        "Because a request arriving at the same instant should see a hit instead of starting a new load"
+      ],
+      "correct": 3,
+      "explanation": "Events at the same simulated instant run in order. If waiters were completed first and one of their callbacks triggered another request, or if a new request landed in the same tick, it would find no fresh entry and no in-flight load, and start one. Writing the entry first closes that gap. The simulation is single-threaded and the store knows nothing about the cache."
+    },
+    {
+      "stage": "check",
+      "question": "XFetch recomputes when now + delta * beta * (-ln rand) >= expiry. A reader arrives 50 ms before expiry, the last reload took 100 ms, beta is 1. What is the probability it recomputes?",
+      "options": [
+        "About 61%, because rand must be at most e^-0.5",
+        "About 50%, because the reader is half a reload from expiry",
+        "About 39%, because rand must be at least e^-0.5",
+        "Exactly 100%, because the gap is smaller than the reload time"
+      ],
+      "correct": 0,
+      "explanation": "The condition is 100 * (-ln rand) >= 50, so -ln rand >= 0.5, so rand <= e^-0.5 = 0.607. The probability that a uniform rand is at most 0.607 is 60.7%. It is not certain even though the gap is shorter than a reload; that is deliberate, so that not every reader in the last 100 ms volunteers at once."
+    },
+    {
+      "stage": "post",
+      "question": "Which key should NOT be served with stale-while-revalidate, and why?",
+      "options": [
+        "A merchant's fee schedule, because fee rows change daily and every fee must be computed exactly to the cent",
+        "An FX rate table, because rates move continuously and a quote made from a stale rate loses the spread",
+        "An account balance used for authorization, because serving a stale value approves spending money that has already left",
+        "A feature flag, because a flag must flip for every user at the same instant or behaviour diverges across the fleet"
+      ],
+      "correct": 2,
+      "explanation": "Stale-while-revalidate serves the old value for up to the grace period. For a balance that means authorizing against funds that a previous debit removed, which is the Lesson 03 hazard with a time bound attached. Fee schedules, rate tables, and flags are normally fine with seconds of staleness; a flag that must flip atomically everywhere is a coordination problem, not a caching one."
+    },
+    {
+      "stage": "post",
+      "question": "Early expiration (XFetch) is deployed on a hot key. Which stampede can it still not prevent?",
+      "options": [
+        "The expiry stampede when the TTL is shorter than the reload time",
+        "The stampede after an explicit invalidation or a cold start, because there is no entry to refresh early",
+        "The stampede caused by beta being set above 1, which triggers every reader at once",
+        "The stampede on a key whose reload latency varies between calls"
+      ],
+      "correct": 1,
+      "explanation": "XFetch works by having a reader refresh a value that still exists. After an invalidation or on a cold start the entry is gone, so every reader misses and nothing can volunteer early; coalescing is needed for those. Beta above 1 refreshes earlier, not simultaneously. Variable reload latency is handled by recording delta on every load, which is why the paper uses the measured value."
+    }
+  ]
+}

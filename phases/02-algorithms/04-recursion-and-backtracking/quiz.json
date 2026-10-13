@@ -1,0 +1,78 @@
+{
+  "lesson": "04-recursion-and-backtracking",
+  "title": "Recursion and Backtracking",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "How many subsets does a set of 20 elements have, and what does that imply for an exhaustive search over them?",
+      "options": [
+        "20! subsets, so exhaustive search is impossible for any realistic n",
+        "2^20, about one million, so exhaustive search is feasible here but doubles with every added element",
+        "20^2 = 400 subsets, so exhaustive search is trivially cheap at any scale",
+        "C(20, 10) = 184,756 subsets, so only the middle sizes need to be enumerated"
+      ],
+      "correct": 1,
+      "explanation": "Each element is in or out, giving 2^n subsets; 2^20 is 1,048,576, which is fine, but 2^40 is a trillion. Permutations are n! (far larger); C(20, 10) counts only the subsets of size 10."
+    },
+    {
+      "stage": "check",
+      "question": "In the permutation generator, what goes wrong if the un-choose step (current.remove and used[i] = false) is omitted?",
+      "options": [
+        "The function recurses forever because the base case is never reached",
+        "Later sibling branches see a corrupted path and the used array, so most permutations are missing or wrong",
+        "The output contains each permutation twice because nothing stops a repeat choice",
+        "Nothing changes, because the leaf copies the list before it is returned"
+      ],
+      "correct": 1,
+      "explanation": "The path and used[] are shared by the whole tree; without restoring them, the next iteration of the loop starts from the wrong state and explores a different, wrong tree. The leaf copy protects the recorded results but not the siblings. The base case is still reached because current grows."
+    },
+    {
+      "stage": "check",
+      "question": "The settlement search sorts receivables in descending order before searching. Why?",
+      "options": [
+        "Because the allocations must be reported with the largest invoice first for the operator",
+        "Because the overshoot prune fires closer to the root when large amounts are tried first, cutting bigger subtrees",
+        "Because the suffix-sum array can only be computed on a descending sequence",
+        "Because the search would otherwise find duplicate allocations in different orders"
+      ],
+      "correct": 1,
+      "explanation": "Pruning saves the most when it triggers high in the tree; putting large items first makes sum > target happen after few choices. The output order is a presentation concern, suffix sums work on any order, and the include/exclude structure never produces duplicates regardless of order."
+    },
+    {
+      "stage": "check",
+      "question": "The tests assert that the pruned and unpruned searches return identical allocations. What property of the pruning rules does this verify?",
+      "options": [
+        "That the rules are exact: they only cut branches that provably contain no solution",
+        "That the rules reduce the node count by at least a constant factor on every input",
+        "That the rules keep the search within the JVM's recursion depth limit",
+        "That the rules make the search polynomial rather than exponential in n"
+      ],
+      "correct": 0,
+      "explanation": "A pruning rule that changes the answer is a bug, and comparing against the exhaustive search on small inputs is the only way to catch it. Pruning does not change the exponent and may save nothing on some inputs; recursion depth is unaffected because depth is n either way."
+    },
+    {
+      "stage": "post",
+      "question": "When converting the recursive settlement search to an explicit stack, the code pushes the 'skip' frame before the 'take' frame. Why?",
+      "options": [
+        "Because the skip branch is cheaper to evaluate and should be explored first so that dead ends fail fast",
+        "Because a stack pops the most recent push first, so reversing the push order reproduces the recursion's visit order",
+        "Because the take frame needs the skip frame's result to compute its running sum before it can be pushed",
+        "Because pushing the take frame first would make the stack grow without bound on inputs with many receivables"
+      ],
+      "correct": 1,
+      "explanation": "The recursion explored take then skip; with LIFO popping, the frame pushed last is explored first, so skip is pushed first. The tests check that node counts and output order match exactly. Neither branch depends on the other and stack growth is bounded by the depth times the branching factor either way."
+    },
+    {
+      "stage": "post",
+      "question": "A cash-application job must match wires against customers with up to 60 open invoices and targets in the middle of the achievable range. Pruned backtracking times out. What is the right conclusion?",
+      "options": [
+        "Add more pruning rules until the node count fits; exact pruning never changes the answer so it is always the right lever",
+        "Increase the JVM stack size with -Xss, since the search is failing on recursion depth",
+        "The problem has left the backtracking regime; a bounded-target subset-sum is dynamic programming in O(n * target), not O(2^n)",
+        "Parallelise the search across cores, because 2^60 divided by 64 cores is tractable"
+      ],
+      "correct": 2,
+      "explanation": "Pruning shrinks the tree by a factor but 2^60 with loose constraints is beyond any factor; the same question over a bounded integer target is solved by the DP table in Lesson 06. Depth is only 60 frames, so -Xss is irrelevant, and 2^60 / 64 is still 2^54."
+    }
+  ]
+}

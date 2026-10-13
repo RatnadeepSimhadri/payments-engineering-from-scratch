@@ -1,0 +1,78 @@
+{
+  "lesson": "03-two-pointers-and-sliding-windows",
+  "title": "Two Pointers and Sliding Windows",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A loop over right from 0 to n contains an inner while loop that advances left. Why can the whole thing still be O(n)?",
+      "options": [
+        "Because the inner loop runs at most once per outer iteration by construction",
+        "Because left only moves forward, so across the whole run it advances at most n times in total",
+        "Because the compiler hoists the inner loop out of the outer loop when the bounds are constant",
+        "Because the inner loop only executes when the array is already sorted, which is rare"
+      ],
+      "correct": 1,
+      "explanation": "This is amortized analysis: a single outer iteration may advance left many times, but the sum over all iterations is bounded by n because left never moves backward. The inner loop can certainly run more than once per outer step; what matters is the total."
+    },
+    {
+      "stage": "check",
+      "question": "In pairWithSum on a sorted array, the sum a[i] + a[j] is less than the target. Why is i++ safe?",
+      "options": [
+        "Because a[i] is the smallest remaining element, so pairing it with anything gives a sum that is still too small",
+        "Because the array has no duplicates, so a[i] can appear in at most one valid pair anyway",
+        "Because j has already been decremented past every element that could pair with a[i]",
+        "Because the algorithm will revisit i later if j reaches it from the other side"
+      ],
+      "correct": 0,
+      "explanation": "Every element still in play is at most a[j], so a[i] + anything <= a[i] + a[j] < target; a[i] is eliminated with proof. Duplicates are allowed and handled, and the algorithm never revisits an index, which is exactly why it is linear."
+    },
+    {
+      "stage": "check",
+      "question": "Why does shortestRunWithSumAtLeast reject arrays containing negative values?",
+      "options": [
+        "Because a negative sum would underflow the long accumulator on large inputs",
+        "Because the shrink step assumes that removing an element never increases the sum, which negatives break",
+        "Because the answer is undefined when the total of the whole array is negative",
+        "Because the window length would have to be allowed to become negative"
+      ],
+      "correct": 1,
+      "explanation": "The window technique is correct only when the condition is monotone: once a window qualifies, shrinking it from the left must move it toward not qualifying. A negative element lets a shrunken window qualify again later, so the algorithm skips valid answers silently. Underflow is not a concern at these magnitudes and the length is always right - left + 1."
+    },
+    {
+      "stage": "check",
+      "question": "In the monotonic deque for sliding-window maximum, what do the two invariants say about the deque's contents?",
+      "options": [
+        "Indices are increasing and values are increasing front to back, so the back is the maximum",
+        "Indices are decreasing and values are decreasing front to back, so the back is the window's oldest",
+        "Indices are increasing and values are strictly decreasing front to back, so the front is the maximum",
+        "The deque holds exactly k indices at all times and the maximum is found by scanning them"
+      ],
+      "correct": 2,
+      "explanation": "Elements are pushed at the back in index order and anything at the back that is <= the new value is popped first, so values strictly decrease toward the back and the front is the largest still in the window. The deque holds at most k indices, usually far fewer, and never needs scanning."
+    },
+    {
+      "stage": "post",
+      "question": "A velocity rule says no more than 4 authorizations per trailing 60 seconds. An authorization arrived at t = 0 and another at t = 60,000 ms exactly. Under this lesson's checker, is the first one still in the window?",
+      "options": [
+        "Yes: the window is inclusive at both ends, so an event 60 seconds old still counts",
+        "No: eviction removes events with timestamp <= now - 60,000, so the boundary is strict and the first is gone",
+        "It depends on wall-clock jitter, because the checker reads System.currentTimeMillis() on each call",
+        "Yes: events are only evicted when the window exceeds its count limit, not by time"
+      ],
+      "correct": 1,
+      "explanation": "The trailing window is (t - w, t]; the test pins +60,000 ms as evicted and +59,999 ms as retained. Time is an input (the event's timestamp), never the wall clock, which is what makes the checker replayable. Eviction is by time on every record call, not by count."
+    },
+    {
+      "stage": "post",
+      "question": "The SQL-based velocity check scanned every authorization for a card on each attempt and timed out under attack. What property of the deque-based checker fixes this?",
+      "options": [
+        "It stores the events in a sorted set keyed by timestamp so each lookup costs O(log n) instead of a full O(n) scan",
+        "It caps the number of stored events at the configured count limit so the scan on each attempt is always short",
+        "Each event is added once and evicted at most once, so the cost per attempt is O(1) amortized regardless of window size",
+        "It samples a fixed fraction of the window rather than reading every event, trading a little accuracy for speed"
+      ],
+      "correct": 2,
+      "explanation": "Running totals plus front-only eviction mean a new event costs a constant amount of work on average, no matter how many events the window holds; the attacker's volume does not slow the rule. Capping at the count limit would lose the denied attempts that are the signal, and nothing is sampled or logarithmic here."
+    }
+  ]
+}

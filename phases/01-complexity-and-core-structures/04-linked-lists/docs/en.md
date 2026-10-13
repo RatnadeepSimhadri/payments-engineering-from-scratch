@@ -3,21 +3,426 @@
 > Pointer chasing is slow; here is when linked lists still win.
 
 **Type:** Build
-**Languages:** —
-**Prerequisites:** See the phase README
+**Languages:** Java
+**Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays)
 **Time:** ~75 minutes
-**Status:** Planned
 
 ## Learning Objectives
 
-- Explain the problem this lesson solves and where it appears in a payment or distributed system
-- Build or trace the core mechanism in Java, Python, or Go
-- Verify the invariant the mechanism must preserve with a test or a worked example
-- Connect the mechanism to the production system that depends on it
+- Implement a singly linked list with head and tail pointers and state which operations are O(1) and which are O(n)
+- Implement a doubly linked list with a sentinel node so that insert and unlink are the same code at every position
+- Explain why handing out node references makes unlink and move-to-front O(1), and why that is the basis of every LRU cache
+- Implement an intrusive list where the element carries its own links, and state the one-list-at-a-time constraint it imposes
+- Splice two lists in O(1) and explain why ownership tracking makes it O(n) again
+- Measure the cache-miss cost of pointer chasing against a contiguous array and decide from the measurement when a linked list is the right choice
 
-## Outline
+## The Problem
 
-This lesson is registered in `curriculum/curriculum.json` and waiting for an author. Follow
-`AGENTS.md` and `LESSON_TEMPLATE.md`, then run `python3 scripts/scaffold_lesson.py 1 4` to
-replace this outline with the full skeleton. The hook above states the lesson's thesis; the
-objectives state what a finished lesson must deliver.
+An authorization service keeps every pending card authorization in memory until it is captured, voided, or expires. Pending authorizations arrive in time order and mostly leave in time order, so somebody reached for `java.util.LinkedList<PendingAuthorization>`: cheap to append, cheap to remove from the front when the oldest one expires. It worked for a year.
+
+Then captures became the dominant exit path. A capture arrives for an authorization that is somewhere in the middle of two million pending ones, and the code calls `pending.remove(auth)`. `LinkedList.remove(Object)` walks from the head comparing every element until it finds the match: O(n), two million pointer dereferences, each a likely cache miss, around a hundred milliseconds. At two thousand captures per second, the service spends more CPU time walking the list than doing anything else, and the walk holds a lock. Latency climbs, the upstream acquirer times out, and retries make the queue longer. The structure that was chosen for O(1) removal is delivering O(n) removal because the caller does not hold the one thing that would make it O(1): the node.
+
+The second failure is the one everyone has seen. A report iterates a list of transactions with `for (int i = 0; i < list.size(); i++) list.get(i)`. On an `ArrayList` that is O(n). On a `LinkedList` each `get(i)` walks `i` nodes, and the loop is O(n^2): a 100,000-row report takes five billion steps. Nothing in the type signature warns you; `List<T>` promises `get(int)` and says nothing about its cost.
+
+Linked lists are not a bad structure. They are a structure with a narrow contract: O(1) insertion and removal **at a position you already hold**, O(1) splicing of whole lists, and stable element identity across modifications. Everything else they do, an array does faster. This lesson builds three variants to make the contract precise, and then measures the cost that the contract does not mention: following a pointer to memory the CPU has not seen yet.
+
+## The Concept
+
+### The node and the link
+
+A linked list is a chain of nodes, each holding a value and a reference to the next node (and, in a doubly linked list, to the previous one). The list itself holds only a reference to the first node, plus optionally the last. Nothing is contiguous; the nodes are wherever the allocator put them.
+
+```mermaid
+flowchart LR
+  subgraph singly["Singly linked, with head and tail"]
+    H["head"] --> N1["auth-0 | next"] --> N2["auth-1 | next"] --> N3["auth-3 | next"] --> NULL["null"]
+    T["tail"] --> N3
+  end
+```
+
+```mermaid
+flowchart LR
+  subgraph doubly["Doubly linked, with a sentinel (prev links omitted for space)"]
+    S["sentinel"] --> D1["key-1"] --> D2["key-3"] --> D3["key-2"] --> S
+  end
+```
+
+Three consequences fall out of the layout:
+
+1. **Position is a pointer, not an index.** The list cannot compute where element `i` lives; it has to walk `i` links. `get(i)` is O(i).
+2. **Modification at a held position is local.** Given a node, inserting after it or removing it touches only the node and its neighbours: O(1), no copying, no shifting, and every other node keeps its identity and address.
+3. **Every step is a dependent load.** To find node `k + 1` the CPU must first finish loading node `k`. The prefetcher cannot help, because the next address is data, not a pattern.
+
+### The cost table
+
+| Operation | Singly (head + tail) | Doubly (sentinel) | Dynamic array (Lesson 03) |
+|-----------|----------------------|-------------------|----------------------------|
+| `addFirst` | O(1) | O(1) | O(n) shift |
+| `addLast` | O(1) | O(1) | O(1) amortized |
+| `removeFirst` | O(1) | O(1) | O(n) shift |
+| `removeLast` | O(n): no back pointer to the new tail | O(1) | O(1) |
+| `get(i)` | O(i) | O(min(i, n - i)) | O(1) |
+| remove given the **node** | O(n): must find the predecessor | O(1) | n/a (no stable handles) |
+| remove given the **value** | O(n) | O(n) | O(n) |
+| insert before a held node | O(n) | O(1) | n/a |
+| splice list B onto A | O(1) with tails | O(1) | O(size of B) |
+| iterate n elements | O(n), one cache miss per node | O(n), one cache miss per node | O(n), one miss per 8 to 16 elements |
+| memory per element | value ref + next ref + object header: 24 bytes or more beyond the value | plus prev: 32 bytes or more | one reference, 4 to 8 bytes, plus slack |
+
+The row to internalize is "remove given the node": O(n) singly, O(1) doubly. A singly linked node does not know its predecessor, and unlinking requires updating the predecessor's `next`. That is why every structure that needs O(1) removal by handle (LRU caches, timer wheels, free lists, schedulers) is doubly linked.
+
+### The sentinel
+
+A doubly linked list without a sentinel has four cases for every operation: empty list, insert at head, insert at tail, insert in the middle, each with its own null checks. A sentinel is a permanent dummy node whose `next` is the first element and whose `prev` is the last; in an empty list it points to itself. With it there is one case: every element has a non-null `prev` and `next`, so `linkBefore(value, succ)` and `unlink(node)` are each five assignments with no branches. The sentinel costs one node per list and removes an entire class of off-by-one bugs. Java's own `LinkedList` does not use one (it has `first`/`last` fields with null checks); `LinkedHashMap` effectively does, via its `head`/`tail` entries.
+
+### Handles and ownership
+
+The doubly linked list in this lesson returns the `Node` from `addFirst` and `addLast`. That is the design decision that makes it useful: the caller stores the node (in a hash map, in the domain object) and later calls `unlink(node)` or `moveToFront(node)` without searching. An LRU cache is exactly a hash map from key to node plus this list: `get` is a map lookup plus `moveToFront`, eviction is `removeLast`, all O(1). Phase 3 builds that cache on this list.
+
+Handing out nodes creates a new failure mode: a caller can pass a node that was already unlinked, or that belongs to a different list. The `owner` field on each node records which list it is linked into, `unlink` sets it to null, and `requireOwned` rejects anything else. The check is one comparison, and it turns a silent corruption (unlinking a node from the wrong list splices two lists together) into an exception at the call site. `java.util.LinkedList` has no such check because it never exposes nodes; that safety is why its `remove(Object)` is O(n).
+
+### Splice
+
+Moving every node of list B to the end of list A is four pointer assignments: A's last points to B's first, B's first points back, B's last points to A's sentinel, A's sentinel points back to B's last. O(1) regardless of how many nodes moved. This is the operation that makes linked lists the right structure for work queues that merge (a scheduler stealing a whole run queue from another core) and for free lists that are returned in bulk.
+
+With the `owner` field, however, splice must visit every moved node to update its owner, which is O(size of B). The lesson keeps the field because safe `unlink` matters more than O(1) splice in the payment systems this course builds; the Linux kernel's `list_splice` makes the opposite choice (no owner, O(1) splice, and a corrupted list if you misuse it). Both are correct designs for their context; the trade-off is explicit here so you can choose.
+
+### Intrusive lists
+
+In the lists above, the list allocates a `Node` that points to the element. In an intrusive list, the element **is** the node: it extends `IntrusiveNode` (or embeds a `list_head` in C) and carries its own `prev` and `next`. Consequences:
+
+- **No allocation on insert.** The element was allocated when it was created; linking it is pointer assignment.
+- **Removal needs nothing but the element.** `pending.remove(auth)` is O(1) because `auth` knows its own neighbours. The authorization service in The Problem is fixed by this one change.
+- **Membership is O(1).** `owner == this` answers "is this element in this list" without a hash set.
+- **One list at a time.** An element has one pair of links, so it can be in at most one intrusive list. To be in two (pending by time **and** pending by merchant), it needs two sets of links, which is what the kernel does by embedding several `list_head`s in one struct.
+- **The type hierarchy is invaded.** `PendingAuthorization extends IntrusiveNode` couples a domain object to a data structure. In C this is idiomatic; in Java it is a deliberate trade made on hot paths (Netty's and the JDK's own `ForkJoinPool` work queues use variants of it).
+
+### Worked example by hand: an LRU over three idempotency keys
+
+Idempotency keys arrive in order 1, 2, 3; the front of the list is most recently used.
+
+| Step | Operation | List (front to back) | Pointer work |
+|------|-----------|----------------------|--------------|
+| 1 | addLast(key-1), addLast(key-2), addLast(key-3) | key-1, key-2, key-3 | three `linkBefore(value, sentinel)` calls |
+| 2 | touch key-3: moveToFront(k3) | key-3, key-1, key-2 | unlink k3 from between key-2 and sentinel (2 writes), link after sentinel (4 writes) |
+| 3 | touch key-1: moveToFront(k1) | key-1, key-3, key-2 | same six writes |
+| 4 | evict: removeLast() | key-1, key-3 | `unlink(sentinel.prev)` returns key-2 |
+| 5 | unlink(k3) directly | key-1 | O(1); k3.owner becomes null |
+
+No step walked the list. Step 5 is the one a `java.util.LinkedList` cannot do.
+
+### The measured cost of pointer chasing
+
+The demo sums one million `long` values three ways: from a `long[]`, from an intrusive list whose nodes were allocated in the same order they are linked (so a walk through the list is also a walk forward through memory), and from an intrusive list whose nodes were allocated sequentially but linked in a seeded random order (so each step jumps to an arbitrary address). On the machine that produced the reference output:
+
+```text
+long[] sequential scan        :   0.68 ms
+list, nodes in memory order   :   5.39 ms   (8.0x the array)
+list, nodes in shuffled order : 132.20 ms   (195.6x the array)
+```
+
+Same `n`, same O(n), same sum. The array streams at memory bandwidth: 8 values per 64-byte cache line and a prefetcher that stays ahead. The in-order list pays for a 32-byte object header and link per value and for the dependent load, but the hardware's adjacent-line prefetch still mostly wins. The shuffled list pays a full DRAM round trip (60 to 100 ns) per node, with nothing to overlap it with. Real heaps after a few hours of churn look like the shuffled case, not the sequential one.
+
+The ordering survives every machine; the ratios do not. Run it on yours.
+
+### What linked lists do not do
+
+- They do not give random access. If any caller needs `get(i)`, the list is the wrong type, whatever the interface promises.
+- They do not save memory. Each node costs two or three references plus an object header; an array of references costs one reference per element plus slack.
+- They do not iterate fast. For a scan over more than a few hundred elements, an array wins by one to two orders of magnitude.
+- They do not make `remove(value)` fast. Removal is O(1) only given the node. If you cannot hold the node, use a hash map to find it or use a different structure.
+
+## Build It
+
+The three lists live in `code/java/Main.java`; the tests are in `MainTest.java`.
+
+### Step 1: Singly linked, with the tail pointer that makes `addLast` O(1)
+
+```java
+final class SinglyLinkedList<T> implements Iterable<T> {
+    private static final class Node<T> {
+        T value;
+        Node<T> next;
+        Node(T value) { this.value = value; }
+    }
+    private Node<T> head, tail;
+    private int size;
+
+    void addLast(T value) {
+        Node<T> n = new Node<>(value);
+        if (tail == null) { head = tail = n; }
+        else { tail.next = n; tail = n; }
+        size++;
+    }
+
+    T removeFirst() {
+        if (head == null) throw new NoSuchElementException("empty");
+        T v = head.value;
+        head = head.next;
+        if (head == null) tail = null;
+        size--;
+        return v;
+    }
+```
+
+The two `if` statements are the empty-list special cases a sentinel would remove. Forgetting `if (head == null) tail = null;` leaves `tail` pointing at a removed node; the next `addLast` then links onto garbage and the element is unreachable. The test "singly addLast after emptying works" exists for that bug.
+
+**Predict:** what does `removeLast` cost on this list, and which pointer is missing that would make it O(1)?
+
+### Step 2: Removal by value needs the predecessor
+
+```java
+boolean removeFirstOccurrence(T value) {
+    Node<T> prev = null, cur = head;
+    while (cur != null) {
+        if (Objects.equals(cur.value, value)) {
+            if (prev == null) head = cur.next; else prev.next = cur.next;
+            if (cur == tail) tail = prev;
+            size--;
+            return true;
+        }
+        prev = cur;
+        cur = cur.next;
+    }
+    return false;
+}
+```
+
+The loop carries `prev` alongside `cur` because unlinking `cur` means writing `prev.next`. This is the whole reason singly linked lists cannot remove a node in O(1) given only that node, and the whole reason the next list has a `prev` pointer.
+
+### Step 3: Reversal in place
+
+```java
+void reverse() {
+    Node<T> prev = null, cur = head;
+    tail = head;
+    while (cur != null) {
+        Node<T> next = cur.next;
+        cur.next = prev;
+        prev = cur;
+        cur = next;
+    }
+    head = prev;
+}
+```
+
+Three pointers, one pass, no allocation. It is an interview staple because it tests whether you can hold three moving references in your head; it is in this lesson because it is the simplest operation where forgetting to update `tail` produces a list that looks right until the next `addLast`.
+
+**Predict:** after `reverse()` on `[1, 2, 3]`, what are `head.value` and `tail.value`?
+
+### Step 4: The sentinel, and one `linkBefore` for every position
+
+```java
+final class DoublyLinkedList<T> implements Iterable<T> {
+    static final class Node<T> {
+        T value;
+        Node<T> prev, next;
+        DoublyLinkedList<T> owner;
+        Node(T value) { this.value = value; }
+    }
+    private final Node<T> sentinel = new Node<>(null);
+    private int size;
+
+    DoublyLinkedList() { sentinel.prev = sentinel.next = sentinel; }
+
+    private Node<T> linkBefore(T value, Node<T> succ) {
+        Node<T> n = new Node<>(value);
+        Node<T> pred = succ.prev;
+        n.prev = pred;
+        n.next = succ;
+        pred.next = n;
+        succ.prev = n;
+        n.owner = this;
+        size++;
+        return n;
+    }
+
+    Node<T> addFirst(T value) { return linkBefore(value, sentinel.next); }
+    Node<T> addLast(T value)  { return linkBefore(value, sentinel); }
+```
+
+In an empty list `sentinel.next == sentinel`, so `addFirst` and `addLast` both link between the sentinel and itself. There is no empty-list branch anywhere in the class. The method returns the node: that return value is the handle every O(1) operation below depends on.
+
+### Step 5: O(1) unlink and move-to-front, guarded by ownership
+
+```java
+T unlink(Node<T> node) {
+    requireOwned(node);
+    node.prev.next = node.next;
+    node.next.prev = node.prev;
+    node.prev = node.next = null;
+    node.owner = null;
+    size--;
+    return node.value;
+}
+
+void moveToFront(Node<T> node) {
+    requireOwned(node);
+    if (sentinel.next == node) return;
+    node.prev.next = node.next;
+    node.next.prev = node.prev;
+    node.prev = sentinel;
+    node.next = sentinel.next;
+    sentinel.next.prev = node;
+    sentinel.next = node;
+}
+
+private void requireOwned(Node<T> node) {
+    if (node == null || node.owner != this) throw new IllegalArgumentException("node is not linked into this list");
+}
+```
+
+`unlink` nulls the node's links so a stale handle cannot be used to reach into the list, and sets `owner` to null so a second `unlink` is rejected rather than corrupting `size`. `moveToFront` relinks without allocating: the same node object, six pointer writes, no `new`. On an LRU hot path that is the difference between zero garbage and one object per cache hit.
+
+**Predict:** what happens to `size` if `unlink` is called twice on the same node without the `requireOwned` check?
+
+### Step 6: Splice
+
+```java
+void spliceAll(DoublyLinkedList<T> other) {
+    if (other == this) throw new IllegalArgumentException("cannot splice a list into itself");
+    if (other.size == 0) return;
+    Node<T> otherFirst = other.sentinel.next;
+    Node<T> otherLast = other.sentinel.prev;
+    Node<T> myLast = sentinel.prev;
+    myLast.next = otherFirst;
+    otherFirst.prev = myLast;
+    otherLast.next = sentinel;
+    sentinel.prev = otherLast;
+    for (Node<T> n = otherFirst; n != sentinel; n = n.next) n.owner = this;
+    size += other.size;
+    other.sentinel.next = other.sentinel.prev = other.sentinel;
+    other.size = 0;
+}
+```
+
+Four pointer writes do the splice. The `for` loop is the ownership update, and it is the only reason this is not O(1); delete the `owner` field and the loop goes with it, at the cost of the safety in Step 5. The test "splice transfers ownership so nodes can be unlinked from the new list" checks that a handle obtained from B still works after B's nodes moved to A.
+
+### Step 7: The intrusive list
+
+```java
+abstract class IntrusiveNode {
+    IntrusiveNode prev, next;
+    IntrusiveList<?> owner;
+    boolean isLinked() { return owner != null; }
+}
+
+final class IntrusiveList<T extends IntrusiveNode> implements Iterable<T> {
+    private static final class Sentinel extends IntrusiveNode {}
+    private final IntrusiveNode sentinel = new Sentinel();
+    private int size;
+
+    void addLast(T element) {
+        if (element.owner != null) throw new IllegalStateException("element is already in a list");
+        IntrusiveNode last = sentinel.prev;
+        element.prev = last;
+        element.next = sentinel;
+        last.next = element;
+        sentinel.prev = element;
+        element.owner = this;
+        size++;
+    }
+
+    void remove(T element) {
+        if (element.owner != this) throw new IllegalArgumentException("element is not in this list");
+        element.prev.next = element.next;
+        element.next.prev = element.prev;
+        element.prev = element.next = null;
+        element.owner = null;
+        size--;
+    }
+
+    boolean contains(T element) { return element.owner == this; }
+}
+```
+
+There is no `Node` class and no `new` in `addLast`. `PendingAuthorization extends IntrusiveNode` and the authorization service's capture path becomes `pending.remove(auth)`: O(1), no search, no lock held while walking. The `IllegalStateException` in `addLast` enforces the one-list-at-a-time rule; without it, adding an element to a second list silently corrupts the first.
+
+**Predict:** `pending.contains(auth)` is O(1). What does the equivalent check cost on a `java.util.LinkedList`, and on an `ArrayList`?
+
+### Step 8: Run it
+
+```bash
+cd phases/01-complexity-and-core-structures/04-linked-lists/code/java
+javac -d .out *.java && java -cp .out Main
+java -cp .out MainTest
+```
+
+Expected output, abbreviated:
+
+```console
+== Doubly linked with a sentinel: O(1) unlink given the node ==
+recency order (front = most recent): [idem-key-1, idem-key-2, idem-key-3]
+touch key-3 -> [idem-key-3, idem-key-1, idem-key-2]
+touch key-1 -> [idem-key-1, idem-key-3, idem-key-2]
+evict least recent (removeLast) -> idem-key-2, now [idem-key-1, idem-key-3]
+
+== Intrusive list: the element is its own node ==
+pending: auth-7f3a(1999) auth-9c21(4500) auth-0b77(250)
+capture auth-9c21: remove(a2) is O(1) with no search; linked before? true
+pending: auth-7f3a(1999) auth-0b77(250)  linked after? false
+
+== Measured: summing 1,000,000 longs, array vs linked list (sequential vs shuffled memory order) ==
+all three sums equal 499999500000: true
+long[] sequential scan :   0.68 ms
+list, nodes in memory order :   5.39 ms  (8.0x the array)
+list, nodes in shuffled order: 132.20 ms  (195.6x the array)
+```
+
+The test harness prints `46 passed, 0 failed`. The timings will differ on your machine; the sums and the ordering will not.
+
+### Porting notes
+
+A Python port uses `__slots__ = ("value", "prev", "next", "owner")` on the node classes, since without it each node carries a dictionary and the memory-per-element row in the cost table roughly doubles; exceptions map one to one (`IndexError`, `ValueError`). A Go port makes `Node[T]` a generic struct with pointer fields, returns `(T, bool)` or `error` instead of throwing, and must take care that `unlink` nils the pointers so the GC can collect the node; the intrusive variant embeds a `ListHook` struct in the element, exactly as `container/list` would not let you do. In both languages the measured gap between array and shuffled list is wider, not narrower, because their object headers are larger.
+
+## Use It
+
+### `java.util.LinkedList`, and why you almost never want it
+
+`LinkedList` is a doubly linked list without a sentinel and without exposed nodes. Because nodes are hidden, `remove(Object)` and `get(int)` are O(n); because every element is a separate 24-byte node pointing to a boxed value, iteration is a pointer chase. Its author, Joshua Bloch, has said publicly that he never uses it; `ArrayDeque` is the better choice for nearly every queue or stack. The remaining legitimate use is `ListIterator.remove()` and `ListIterator.add()` during a traversal, which are O(1) because the iterator holds the node.
+
+### `java.util.ArrayDeque`
+
+For a queue or stack, `ArrayDeque` is a ring buffer over an array (Lesson 05): O(1) at both ends, contiguous, no per-element allocation. It is what to reach for when you were about to type `LinkedList`.
+
+### `LinkedHashMap` and `LinkedHashMap(…, accessOrder = true)`
+
+The JDK's own LRU building block: a hash map whose entries are also nodes in a doubly linked list, with `removeEldestEntry` as the eviction hook. It is exactly the hash-map-plus-doubly-linked-list design from The Concept, and reading its `afterNodeAccess` method shows the same six pointer writes as this lesson's `moveToFront`.
+
+### Intrusive lists in production
+
+The Linux kernel's `struct list_head` is embedded in nearly every kernel object (tasks, inodes, timers, network buffers), and `list_del` is two pointer writes. Netty's object pools, the JDK's `ForkJoinPool` work-stealing queues, and most game engines use the same idea. In payment systems the pattern appears wherever an object must be removable from a time-ordered set in O(1) by the object itself: pending authorizations awaiting capture, in-flight requests awaiting a response for timeout tracking, and connections in a pool.
+
+### Where arrays win anyway
+
+Any list you iterate more than you mutate, any list you index, and any list you sort should be an array. The 196x measurement is the argument; the cache hierarchy that produced it is in every machine you will deploy to.
+
+## Ship It
+
+`outputs/interview-card-linked-lists.md` is a one-page card: the cost table, the three questions to ask before choosing a linked list, the reverse-in-place and LRU patterns, and the trap questions (`LinkedList.get(i)` in a loop, `remove(Object)` on a hot path). Use it to prepare for interviews and to review code that reaches for a linked list.
+
+## Exercises
+
+1. **Reinforce.** Add `removeLast()` to `SinglyLinkedList`. It must be O(n) (walk to the predecessor of `tail`). Then write a test that times `removeLast` on a 100,000-element singly linked list against the doubly linked version and assert the doubly linked version is at least ten times faster.
+2. **Apply.** Build `LruCache<K, V>` with `get`, `put`, and a capacity, using `HashMap<K, DoublyLinkedList.Node<Entry<K, V>>>` and this lesson's `DoublyLinkedList`. Every operation must be O(1); the test should insert capacity + 1 keys and assert the least recently used one was evicted, and should assert that `get` on an existing key prevents its eviction. Phase 3 revisits this with TTLs.
+3. **Extend.** Combine with Lesson 03: implement the benchmark from `main` for `DynamicArray<Long>` (an array of references to boxed values) as a fourth row. Predict where it lands between `long[]` and the in-order list, then measure. Explain in a comment why the boxed array is closer to one than the other on your machine, and what that implies for a ledger that stores `List<Money>` versus parallel primitive arrays.
+
+## Key Terms
+
+| Term | What people say | What it actually means |
+|------|-----------------|------------------------|
+| Node | "an element" | The allocated cell holding a value and one or two links; the list is the chain of nodes, the elements are what they hold |
+| Sentinel | "a dummy node" | A permanent node whose links frame the list so that every real node has non-null neighbours and no operation has an empty-list branch |
+| Handle | "a reference to the item" | The node itself, returned to the caller so it can unlink or move the element in O(1) without searching |
+| Intrusive list | "the object has next and prev in it" | A list whose links live inside the element rather than in a separate node; no allocation on insert, O(1) removal by element, at most one list per element |
+| Splice | "merge the lists" | Relinking a whole chain into another list in O(1), independent of length; O(n) only if nodes must learn a new owner |
+| Dependent load | "pointer chasing" | A memory access whose address comes from the previous access, so the CPU cannot start it early; the reason a linked-list walk is one cache miss per node |
+| Cache line | "a block of memory" | The 64-byte unit the CPU moves between RAM and cache; an array scan uses all 8 longs in each line, a list walk uses one node per line and often less |
+
+## Further Reading
+
+- Knuth, *The Art of Computer Programming*, Volume 1, Sections 2.2.3 to 2.2.5 (linked allocation, circular lists, doubly linked lists) — the original treatment, including the sentinel idea and the memory-management arguments for and against linking.
+- [Linux kernel `include/linux/list.h`](https://github.com/torvalds/linux/blob/master/include/linux/list.h) — the canonical intrusive doubly linked list: `list_add`, `list_del`, `list_splice`, each a handful of pointer writes with no ownership tracking.
+- [OpenJDK `LinkedHashMap.java`](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/LinkedHashMap.java) — read `afterNodeAccess` and `afterNodeInsertion` to see this lesson's `moveToFront` and LRU eviction inside a production class.
+- [OpenJDK `ArrayDeque.java`](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/ArrayDeque.java) — the class Javadoc states it is faster than `LinkedList` as a queue and than `Stack` as a stack, and explains why.
+- Ulrich Drepper, [*What Every Programmer Should Know About Memory*](https://people.freebsd.org/~lstewart/articles/cpumemory.pdf) (2007) — Section 3 measures sequential versus random access and dependent-load chains; the shuffled-list result in this lesson reproduces his random-walk measurements in Java.

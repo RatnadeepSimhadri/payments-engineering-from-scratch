@@ -1,0 +1,78 @@
+{
+  "lesson": "14-randomized-algorithms",
+  "title": "Randomized Algorithms and Reservoir Sampling",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "You need exactly 500 uniformly chosen transactions from a stream whose total length is unknown until it ends, using little memory. Which approach has the right shape?",
+      "options": [
+        "Keep each item with probability 500 / (yesterday's count) as it passes",
+        "Keep the first 500 items and stop reading",
+        "Keep a 500-slot reservoir; item n replaces a random slot with probability 500 / n",
+        "Buffer everything, shuffle at the end, take the first 500"
+      ],
+      "correct": 2,
+      "explanation": "Reservoir sampling gives exactly k items, uniformly, in O(k) memory without knowing n in advance. A fixed probability gives a variable count and depends on a guess; the first 500 is a time-of-day sample; buffering everything is correct but needs O(n) memory, which is the problem being avoided."
+    },
+    {
+      "stage": "check",
+      "question": "After n items, reservoir sampling with k slots guarantees each item seen so far is in the reservoir with what probability?",
+      "options": [
+        "1 / n",
+        "k / n",
+        "k / (n - k)",
+        "1 / k"
+      ],
+      "correct": 1,
+      "explanation": "The induction: item n enters with probability k/n, and each earlier item (there with probability k/(n-1)) survives unless item n enters and picks its slot, probability 1/n, giving k/(n-1) * (n-1)/n = k/n. 1/n would be the probability for a one-slot reservoir."
+    },
+    {
+      "stage": "check",
+      "question": "Shuffling [a, b, c] by swapping each position with a uniformly random position in the whole list is biased. What is the arithmetic reason?",
+      "options": [
+        "Swapping a position with itself is wasted work that skews later swaps",
+        "The 27 equally likely execution paths cannot divide evenly among 6 permutations",
+        "The random index must be drawn from a cryptographic generator to be uniform",
+        "Three elements are too few for any shuffle to be uniform"
+      ],
+      "correct": 1,
+      "explanation": "n^n = 27 paths map onto n! = 6 permutations, and 27 is not a multiple of 6, so some permutations get 5 paths and others 4. Fisher-Yates has exactly n! paths, one per permutation. Self-swaps are fine; Fisher-Yates allows them too."
+    },
+    {
+      "stage": "check",
+      "question": "Randomized quickselect is a Las Vegas algorithm. What does that mean here?",
+      "options": [
+        "It returns the exact k-th smallest every time; only the running time varies with the random pivots",
+        "It returns an approximately correct rank with probability at least 3/4",
+        "It runs in guaranteed O(n) time but may return a wrong element with small probability",
+        "It uses a random seed derived from the system clock so results differ between runs"
+      ],
+      "correct": 0,
+      "explanation": "Las Vegas: correctness is certain, time is random (expected O(n), worst O(n^2) with vanishing probability). The third option describes a Monte Carlo algorithm. The result does not differ between runs; the test asserts the same answer under twenty seeds."
+    },
+    {
+      "stage": "post",
+      "question": "Miller-Rabin with 10 random bases reports 561 as composite and 1,000,003 as probably prime. Which statement about its errors is correct?",
+      "options": [
+        "Both answers could be wrong with probability at most 4^-10",
+        "The composite verdict is certain; the prime verdict is wrong with probability at most 4^-10",
+        "The prime verdict is certain; the composite verdict is wrong with probability at most 4^-10",
+        "Neither verdict is certain, which is why 561 is called a Carmichael number"
+      ],
+      "correct": 1,
+      "explanation": "A witness is a proof of compositeness, so 'composite' is never wrong. 'Probably prime' means no witness was found in 10 tries, which a composite survives with probability at most 4^-10. 561 is a Carmichael number because it fools the plain Fermat test, not Miller-Rabin."
+    },
+    {
+      "stage": "post",
+      "question": "An auditor asks you to prove that today's 500-transaction sample was not hand-picked. What property of the sampler makes that possible, and what would make it unsafe elsewhere?",
+      "options": [
+        "A cryptographic generator, which makes the sample unpredictable to everyone but also impossible to reproduce for the auditor",
+        "A recorded seed for a deterministic generator, which makes the sample reproducible but predictable to anyone holding the seed",
+        "Sampling the first 500 items of the stream, which anyone can verify from the recorded stream order without any generator",
+        "Reducing nextLong() modulo n for each draw, which spreads the sample evenly across the whole day's stream"
+      ],
+      "correct": 1,
+      "explanation": "Given the seed and the stream, the auditor regenerates the identical sample, proving it was not chosen by hand. The same predictability is why a seeded non-cryptographic generator must never produce tokens or keys. First-500 is reproducible but not uniform; modulo reduction is biased for most n."
+    }
+  ]
+}

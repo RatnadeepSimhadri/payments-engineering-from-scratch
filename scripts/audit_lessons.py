@@ -166,7 +166,10 @@ def audit_code(audit: Audit, lesson: Path, declared: list[str], planned: bool) -
             continue
         if not test.is_file():
             audit.add("code-tests", lesson, None, f"missing code/{lang['dir']}/{lang['testEntry']}")
-        head = "\n".join(entry.read_text(encoding="utf-8").splitlines()[:12])
+        source = entry.read_text(encoding="utf-8")
+        if "TODO: replace with the lesson" in source:
+            audit.add("code-stub", lesson, entry, "scaffold stub has not been replaced with an implementation")
+        head = "\n".join(source.splitlines()[:12])
         if "docs/en.md" not in head:
             audit.add("code-header", lesson, entry, "header comment must cite docs/en.md")
         if lang["id"] == "go" and not (folder / "go.mod").is_file():

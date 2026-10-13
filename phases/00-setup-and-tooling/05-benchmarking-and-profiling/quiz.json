@@ -1,0 +1,78 @@
+{
+  "lesson": "05-benchmarking-and-profiling",
+  "title": "Benchmarking and Profiling Without Lying to Yourself",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A loop times HashMap.get and then TreeMap.get, once each, in a fresh JVM, and reports TreeMap as 9x faster. Which explanation is most likely?",
+      "options": [
+        "TreeMap.get really is faster for integer keys because comparisons are cheaper than hashing",
+        "The HashMap loop ran while the JVM was still interpreting bytecode, before the JIT compiled the lookup",
+        "HashMap.get allocates on every call and the garbage collector ran during its loop",
+        "Sequential integer keys collide in a HashMap and degrade every lookup to a linear scan"
+      ],
+      "correct": 1,
+      "explanation": "The first code to run in a JVM is interpreted; C1 and C2 compile it only after thousands of invocations, so whichever loop runs first pays the warm-up cost. HashMap.get does not allocate, Integer hashing does not collide for sequential keys, and TreeMap.get is O(log n) pointer chasing, which is slower once both are compiled."
+    },
+    {
+      "stage": "check",
+      "question": "Using nearest-rank percentiles on the ten sorted samples 10, 20, ..., 100, what are p50 and p99?",
+      "options": [
+        "55 and 99.1, interpolating between the neighbouring samples",
+        "50 and 100: ranks ceil(0.5 * 10) = 5 and ceil(0.99 * 10) = 10",
+        "60 and 100: the median rounds up and p99 is the maximum",
+        "50 and 90: p99 excludes the single largest sample as an outlier"
+      ],
+      "correct": 1,
+      "explanation": "Nearest rank picks the sample at 1-based rank ceil(p/100 * n): rank 5 is 50 and rank 10 is 100. It never interpolates, so every reported percentile is a value that occurred. Excluding the largest sample would hide exactly the tail event p99 exists to show."
+    },
+    {
+      "stage": "check",
+      "question": "A benchmark row reports per-fork medians [60, 8, 8] and a pooled p50 of 11 ns. What should you conclude?",
+      "options": [
+        "The operation costs 11 ns; the pooled median is the most robust single number",
+        "The operation costs about 25 ns, the mean of the three fork medians",
+        "The forks disagree because the first was still compiling; the row is unstable and should not be quoted",
+        "The second and third forks were cached by the CPU, so 60 ns is the honest cold figure"
+      ],
+      "correct": 2,
+      "explanation": "A 7x disagreement between forks means the runs did not measure the same thing: the first fork paid for JIT compilation of the harness loop. The harness marks it UNSTABLE for this reason. Neither the pooled median nor the mean of the medians is a measurement of the operation; the fix is more warm-up or real forks."
+    },
+    {
+      "stage": "check",
+      "question": "Why does every benchmark body hand its result to a Blackhole whose consume writes a volatile field?",
+      "options": [
+        "To warm the memory subsystem so that the first measured iteration is not a cold-cache outlier",
+        "Because a computation whose result has no observable effect may be deleted by the JIT, leaving an empty loop",
+        "To force a garbage collection between iterations so GC pauses land outside the timed region",
+        "Because System.nanoTime is only accurate when a memory barrier separates consecutive reads"
+      ],
+      "correct": 1,
+      "explanation": "Dead-code elimination removes work whose result nobody reads. A volatile write is a side effect the compiler must preserve, so the computation feeding it survives. The blackhole has nothing to do with caches, GC timing, or nanoTime accuracy."
+    },
+    {
+      "stage": "post",
+      "question": "A closed-loop generator intends one request per millisecond. It records 999 latencies of 0.2 ms and one of 2,000 ms. After the coordinated-omission correction, roughly what is p99?",
+      "options": [
+        "Still about 0.2 ms; the correction only changes the maximum",
+        "About 20 ms; the stall is spread evenly over the 999 other samples",
+        "About 1,000 ms; the correction adds one sample at half the stall duration",
+        "About 1,970 ms; 1,999 back-filled samples from 1 ms to 1,999 ms push rank 2,970 deep into the stall"
+      ],
+      "correct": 3,
+      "explanation": "During a 2 s stall the generator should have sent 1,999 more requests, waiting 1,999 ms, 1,998 ms, ..., 1 ms. With 2,999 samples, p99 is rank ceil(0.99 * 2999) = 2970, which is the 1,971st back-filled value: 1,971 ms. Raw p99 was 0.2 ms, which is the lie coordinated omission tells."
+    },
+    {
+      "stage": "post",
+      "question": "A sampling profile shows computeFees with 0% self time and 70% inclusive time, and Money.times with 60% self and 60% inclusive. What does this tell you?",
+      "options": [
+        "computeFees is idle and can be deleted outright; Money.times is the only method in the program doing any work",
+        "The profiler suffers from safepoint bias and has attributed computeFees's own loop time to the callee it inlined",
+        "Money.times is the hot leaf; computeFees is never the leaf but 70% of samples are beneath it, so calling it less is the structural fix",
+        "The two figures contradict each other, because a frame's inclusive time can never exceed the self time of its largest callee"
+      ],
+      "correct": 2,
+      "explanation": "Self time is samples where the frame was executing; inclusive is samples where it was anywhere on the stack. computeFees spends all its time in callees (Money.times at 60% and another 10%), so it is the frame to restructure, while Money.times is the one to micro-optimise. Inclusive can exceed one callee's self time because it sums over all callees."
+    }
+  ]
+}

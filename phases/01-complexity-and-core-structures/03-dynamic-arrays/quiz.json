@@ -1,0 +1,78 @@
+{
+  "lesson": "03-dynamic-arrays",
+  "title": "Dynamic Arrays from Scratch",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A list grows its backing array by a fixed 1,000 slots every time it fills. What is the amortized cost of appending n elements for large n?",
+      "options": [
+        "O(1) per append, because 1,000 is a constant",
+        "O(log n) per append, because the number of reallocations is logarithmic",
+        "O(n) per append, because the total copies are about n squared over 2,000",
+        "O(n log n) per append, because each reallocation also sorts"
+      ],
+      "correct": 2,
+      "explanation": "With increment k, the reallocations copy k, 2k, 3k, ... up to n elements, which sums to roughly n^2 / (2k): quadratic total, so O(n) per append. Only a geometric factor (any constant ratio above 1) makes the total linear and the amortized cost O(1); the constant increment feels safe but is the classic quadratic trap."
+    },
+    {
+      "stage": "check",
+      "question": "The backing array has capacity 8 and size 5. What should get(6) do?",
+      "options": [
+        "Return the value in slot 6, since the slot exists in the array",
+        "Return null, because the slot is past the live prefix and has been cleared",
+        "Throw IndexOutOfBoundsException, because bounds are checked against size, not capacity",
+        "Grow the array first and then return the default value for the element type"
+      ],
+      "correct": 2,
+      "explanation": "Only elements[0..size) are elements; slots past size may hold stale references from earlier removals. Returning a slot's contents would be a use-after-free in disguise. Checking against capacity compiles and passes casual tests, which is exactly why the lesson's test for get(size) exists."
+    },
+    {
+      "stage": "check",
+      "question": "Starting from capacity 8, appending one million elements measured about 1.05 copies per append under 2x and about 2.01 under 1.5x. What does the 1.5x policy buy in return?",
+      "options": [
+        "Fewer reallocations, since each one is smaller",
+        "Lower slack: the array is at most one third empty right after a grow instead of one half",
+        "Faster indexed access, because the array stays closer to a cache-line multiple",
+        "Guaranteed O(1) worst-case appends instead of amortized O(1)"
+      ],
+      "correct": 1,
+      "explanation": "Slack is bounded by the growth factor minus one: a 1.5x array wastes at most 33% of its capacity, a 2x array up to 50%. The 1.5x policy reallocates more often (29 times versus 17 in the demo), not fewer; indexed access cost is unaffected; and no growth factor changes the worst case, which is always a full copy."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the golden ratio appear in the argument for growth factors below 1.618?",
+      "options": [
+        "It is the growth factor at which the measured copies per append drop to exactly one",
+        "Below it, the freed blocks from earlier growths add up to more than the next allocation, so they can be reused",
+        "Above it, the number of reallocations needed to reach n elements stops being logarithmic in n",
+        "It is the factor that minimizes slack while keeping the total number of reallocations under thirty"
+      ],
+      "correct": 1,
+      "explanation": "With factor r, freed blocks total about C/(r-1) when the next request is C; that is at least C exactly when r^2 - r - 1 <= 0, i.e. r <= 1.618. With 2x the freed blocks sum to 2^k - 1, always one short of 2^k, so a doubling array can never reuse its own garbage. The number of reallocations is logarithmic for every geometric factor, not only above the golden ratio."
+    },
+    {
+      "stage": "post",
+      "question": "A queue backed by a dynamic array grows 2x when full and shrinks to half when it drops below half full. Under steady load near the boundary it spends most of its time in System.arraycopy. What is the fix?",
+      "options": [
+        "Grow by 1.5x instead of 2x, so each copy moves fewer elements and the thrash becomes cheaper",
+        "Shrink only when below one quarter full, so a shrink leaves it half full and the next copy is far away",
+        "Disable shrinking entirely in the hot path and call trimToSize from a scheduled job at a quiet hour",
+        "Replace the array with a doubly linked list, so neither growing nor shrinking ever copies anything"
+      ],
+      "correct": 1,
+      "explanation": "The thrash comes from adjacent triggers: a shrink lands exactly at full, so the next add grows. Hysteresis (shrink below 1/4, to 1/2) guarantees capacity/2 adds or capacity/4 removes between reallocations, which pays for them. Disabling shrink also stops the thrash but gives up memory reclamation entirely; a linked list trades the copies for pointer chasing on every operation."
+    },
+    {
+      "stage": "post",
+      "question": "A clearing-file parser appends 3.2 million records to a default ArrayList and the heap dump shows the backing array has 4.8 million slots. What is the cheapest change that removes both the slack and the reallocation latency spikes?",
+      "options": [
+        "Switch to a LinkedList, which has no capacity to manage and therefore never copies elements",
+        "Call trimToSize after the loop finishes so the unused slots are released back to the heap",
+        "Construct the list with the record count from the file header so it is allocated once at the right size",
+        "Lower the growth factor to 1.125x as CPython does so that the slack stays under fifteen percent"
+      ],
+      "correct": 2,
+      "explanation": "Pre-sizing eliminates every reallocation, so there are no copy spikes and no slack. trimToSize fixes the slack after the fact but keeps all the spikes during the loop. A LinkedList uses more memory per element and is far slower to iterate. A smaller growth factor reduces slack but increases the number of copy spikes."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "10-segment-trees-and-fenwick-trees",
+  "title": "Segment Trees and Fenwick Trees",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A table stores a running_balance column maintained by a trigger. A posting arrives that is effective 90 days ago. How many rows does the trigger have to rewrite?",
+      "options": [
+        "One: only the row for the effective date changes",
+        "About log2(90), because the trigger walks a tree",
+        "Every row from the effective date to today, about 90",
+        "None: running balances are recomputed on read"
+      ],
+      "correct": 2,
+      "explanation": "A running balance is a prefix sum, and changing one value shifts every later prefix, so a backdated posting rewrites every row after it. That O(n) write cost is the problem the lesson's trees solve. Recomputing on read would be the other extreme: O(1) write, O(n) read."
+    },
+    {
+      "stage": "check",
+      "question": "In a Fenwick tree, which values does tree[6] (1-indexed) cover, and why?",
+      "options": [
+        "values[5..5], because each node covers exactly one value",
+        "values[4..5], because lowbit(6) = 2 and the block ends at position 6",
+        "values[0..5], because every node stores a full prefix sum",
+        "values[6..7], because 6 is the left child of 7 in heap order"
+      ],
+      "correct": 1,
+      "explanation": "6 is 0110 in binary, its lowest set bit is 2, so tree[6] covers the two values ending at 1-indexed position 6, which are 0-indexed values 4 and 5. Only nodes at powers of two store full prefixes; a Fenwick tree is not a heap-ordered binary tree."
+    },
+    {
+      "stage": "check",
+      "question": "Why can a Fenwick tree answer range sums but not range minimums?",
+      "options": [
+        "Because the min of a block cannot be stored in a single long value",
+        "Because a Fenwick tree can only store non-negative values",
+        "Because prefixMin(hi) minus prefixMin(lo-1) is meaningless: min has no inverse",
+        "Because min queries need a power-of-two array size and Fenwick arrays are n+1"
+      ],
+      "correct": 2,
+      "explanation": "The Fenwick range query is a difference of two prefix queries, which requires an inverse operation; subtraction undoes addition but nothing undoes min. A point update that raises a value also cannot be applied to a min-block without knowing its other members. Segment trees store every node explicitly, so they handle min without an inverse."
+    },
+    {
+      "stage": "check",
+      "question": "In lazy propagation, rangeAdd reaches a node whose range is fully inside [lo, hi]. What does it do?",
+      "options": [
+        "Recurses into both children so that every leaf under the node is updated",
+        "Adds delta times the node's count to its sum, records delta as pending, and stops",
+        "Marks the node stale and rebuilds it from the leaves on the next query",
+        "Adds delta to the node's sum once and continues to the sibling"
+      ],
+      "correct": 1,
+      "explanation": "A fully covered node absorbs the update: its sum grows by delta times the number of values under it, and delta is stored as pending so children can be corrected later, lazily, when something descends through the node. Recursing to the leaves would make the operation O(range length) instead of O(log n)."
+    },
+    {
+      "stage": "post",
+      "question": "A 30-day BalanceHistory holds closing balances. A backdated posting of -75.00 effective day 5 arrives. Which tree operation implements it, and what does the average daily balance over days 0..29 do?",
+      "options": [
+        "rangeAdd(5, 29, -7500); the average falls by 25 * 75.00 / 30 = 62.50",
+        "set(5, -7500); the average falls by 75.00 / 30 = 2.50",
+        "rangeAdd(5, 5, -7500); the average falls by 75.00",
+        "rangeAdd(0, 5, -7500); the average falls by 6 * 75.00 / 30 = 15.00"
+      ],
+      "correct": 0,
+      "explanation": "A posting changes the closing balance of its effective day and every later day, so it is a range add from day 5 to the end of the period: 25 days each move by 75.00, and the 30-day average moves by 25 * 75 / 30. A point update would change only one day's balance, which is not how balances work."
+    },
+    {
+      "stage": "post",
+      "question": "You need range sums with point updates over 50 million int64 counters, memory is tight, and the operation is addition. Which structure, and why?",
+      "options": [
+        "Lazy segment tree: it is the most general and handles any future requirement",
+        "Prefix-sum array: range sums are O(1) and 50 million updates are affordable",
+        "Fenwick tree: n+1 longs, O(log n) for both operations, and addition is invertible",
+        "Segment tree with power-of-two padding: 2 * 2^26 longs and no bit tricks to get wrong"
+      ],
+      "correct": 2,
+      "explanation": "Sum is invertible and updates are to single positions, so a Fenwick tree does everything required in about n longs and fifteen lines. The segment tree would use 2.7x the memory for no additional capability here, and a lazy tree 8x; a prefix array makes each update O(n), which at 50 million entries is the failure in The Problem."
+    }
+  ]
+}

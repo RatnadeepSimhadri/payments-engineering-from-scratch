@@ -1,0 +1,78 @@
+{
+  "lesson": "15-serialization-formats",
+  "title": "Serialization: JSON, Protobuf-style Binary, and Schema Evolution",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A JSON event carries \"id\": 9007199254740993. A Node.js consumer parses it with JSON.parse. What does it see?",
+      "options": [
+        "9007199254740993, because JSON numbers have unlimited precision",
+        "9007199254740992, because the value exceeds 2^53 and is rounded to the nearest double",
+        "A parse error, because the number has too many digits for a JSON parser",
+        "A string \"9007199254740993\", because large numbers are automatically quoted"
+      ],
+      "correct": 1,
+      "explanation": "JSON.parse produces IEEE 754 doubles, which represent integers exactly only up to 2^53 = 9007199254740992; the next integer rounds back down to it. RFC 8259 permits any digit sequence but guarantees nothing about precision, which is why 64-bit ids are sent as strings by Twitter, Stripe, and this lesson."
+    },
+    {
+      "stage": "check",
+      "question": "What is the varint encoding of 300?",
+      "options": [
+        "01 2c",
+        "2c 01",
+        "ac 02",
+        "82 2c"
+      ],
+      "correct": 2,
+      "explanation": "300 is binary 1_0010_1100. Split into 7-bit groups from the low end: 0101100 (0x2c) and 0000010 (0x02). The low group goes first with its continuation bit set, 0x2c | 0x80 = 0xac, then 0x02 with the bit clear. 2c 01 is the right groups without the continuation bit; 01 2c has the groups in big-endian order."
+    },
+    {
+      "stage": "check",
+      "question": "Why does a refund of -1999 minor units cost 2 bytes as sint64 but 10 bytes as int64?",
+      "options": [
+        "sint64 stores the sign in a separate byte, so only the magnitude is varint-encoded",
+        "int64 is always 8 bytes plus a 2-byte tag, while sint64 is variable-width",
+        "ZigZag maps -1999 to 3997, a small unsigned number; without it, two's complement makes -1999 a 64-bit value with all high bits set",
+        "sint64 uses base-256 digits while int64 uses base-128, so it needs fewer bytes for the same magnitude"
+      ],
+      "correct": 2,
+      "explanation": "A varint spends bytes on magnitude, and a negative two's-complement number has its top bit set, so it is enormous as an unsigned value: ten varint bytes. ZigZag interleaves signs so -1999 becomes 3997, which fits in two bytes. Both types are varints; neither has a separate sign byte or a different base."
+    },
+    {
+      "stage": "check",
+      "question": "A v1 reader meets tag byte 0x3a (field 7, wire type 2) that it does not know. What does it do?",
+      "options": [
+        "Fails, because an unknown field number means the schemas are incompatible",
+        "Reads a varint length and skips that many bytes, then continues with the next tag",
+        "Skips exactly 8 bytes, the default size for an unknown field",
+        "Stops parsing and returns the fields decoded so far"
+      ],
+      "correct": 1,
+      "explanation": "Wire type 2 is LENGTH_DELIMITED, so the value is a varint length followed by that many bytes; the reader can skip it without knowing what it means. That is the whole mechanism of forward compatibility. Failing or stopping would make every producer upgrade a breaking change; no wire type has a default size."
+    },
+    {
+      "stage": "post",
+      "question": "A team changes `int64 amount_minor = 2` to `string amount_minor = 2` so that amounts can carry decimals. What happens when a new producer sends to an old consumer?",
+      "options": [
+        "The old consumer parses the string as a decimal number, rounds it to minor units, and continues normally",
+        "The old consumer finds LENGTH_DELIMITED where it expects VARINT on field 2 and rejects the message as malformed",
+        "The old consumer ignores field 2 entirely and falls back to the protobuf default amount of zero minor units",
+        "Nothing breaks: changing a field's type while keeping its number is a wire-compatible change in proto3"
+      ],
+      "correct": 1,
+      "explanation": "The field number is the same but the wire type changed, which violates Rule 2; the typed accessor checks the wire type and throws. A reader that did not check would misinterpret bytes instead. The correct change is a new field number for the new representation, with the old one reserved."
+    },
+    {
+      "stage": "post",
+      "question": "Why does this lesson warn against hashing or signing serialized protobuf bytes directly?",
+      "options": [
+        "Because protobuf bytes are compressed and the compression dictionary varies by machine",
+        "Because the encoding is not canonical: field order and default-omission can differ between encoders for the same message",
+        "Because varints are little-endian and hash functions require big-endian input",
+        "Because the tag bytes contain the field names, which differ between language bindings"
+      ],
+      "correct": 1,
+      "explanation": "Two correct encoders may emit the same message with fields in different orders, or with a default value present in one and omitted in the other, producing different bytes and therefore different hashes. Signing requires a defined canonical form, as Lesson 09 used for its Merkle leaves. Tags carry numbers, not names, and varints are not compressed."
+    }
+  ]
+}

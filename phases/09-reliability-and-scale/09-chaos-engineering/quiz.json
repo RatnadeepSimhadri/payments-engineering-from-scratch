@@ -1,0 +1,48 @@
+{
+  "lesson": "09-chaos-engineering",
+  "title": "Chaos Engineering and Fault Injection",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A payment gateway has 100% unit-test coverage and passes a load test at twice peak volume. Which failure is it still most likely to be unprepared for?",
+      "options": ["A code path with a logic error that the unit tests never reached", "A dependency behaving in a way nobody on the team imagined, such as a clock that is wrong", "A throughput spike more than twice as large as the load test exercised", "A memory leak that appears only after the process has run for several weeks"],
+      "correct": 1,
+      "explanation": "Tests cover the failures their authors imagined. Chaos engineering exists to find the ones they did not, such as a processor whose clock has drifted. A logic error in an unreached path is ruled out by the coverage premise, and a larger spike or a leak are plausible but are at least the kind of failure the team already knows to think about."
+    },
+    {
+      "stage": "check",
+      "question": "The experiment runner measures a 500-request baseline before arming any fault and refuses to inject if the steady state does not hold. Why?",
+      "options": ["Because the processor's dedup table must be warmed up before faults can be injected", "Because the baseline is needed to seed the random source that chooses the blast radius", "Because without a measured normal there is no way to attribute a change to the fault or to define an abort", "Because the GameDay report format requires three metric blocks for every experiment"],
+      "correct": 2,
+      "explanation": "The steady state is the control group. If normal already fails the thresholds, a failing experimental run says nothing about the fault, and the abort condition, which is a steady-state threshold with a shorter window, has no meaning. The report format is a consequence of the protocol, not the reason for it."
+    },
+    {
+      "stage": "check",
+      "question": "From the gateway's point of view, how does the Partition fault differ from a Latency fault whose added delay exceeds the timeout?",
+      "options": ["It does not: both produce a timeout after the same wait, and the processor never sees the request", "A partition returns an explicit connection-refused error immediately, while latency waits", "A partition is retried by the gateway while an over-timeout latency is treated as terminal", "A partition reaches the processor and is deduplicated, while latency never arrives"],
+      "correct": 0,
+      "explanation": "The lesson implements Partition as latency that exceeds any timeout for exactly this reason: a caller cannot distinguish a cut link from a very slow dependency. Both advance the clock by the timeout, return TIMEOUT, and never call the processor. A connection-refused error is a different fault (the Error case), not a partition."
+    },
+    {
+      "stage": "check",
+      "question": "Why is the abort threshold (good rate below 80%) looser than the steady state (good rate at least 99%)?",
+      "options": ["Because the abort is evaluated on short checkpoints where noise would trip a tighter threshold", "Because the abort protects only the canary merchants, who have agreed to degraded service", "Because the steady state is measured in the recovery run, after the fault has been cleared", "Because aborting too early would leave the injector armed and prevent recovery"],
+      "correct": 0,
+      "explanation": "A 50-request checkpoint is noisy; set at the SLO level it would fire on ordinary variance and teach nothing. The abort is a tripwire against disaster, evaluated frequently, while the steady state is the hypothesis test, evaluated over the full window. Aborting always clears the injector, so an early abort cannot leave it armed."
+    },
+    {
+      "stage": "post",
+      "question": "In the latency +2500ms experiment the good rate was 98.4%, p99 was 4,000 ms, and the invariant line said HELD. What is the correct reading of this report?",
+      "options": ["The retry failed, because 1.6% of requests timed out and were not recovered by the second attempt", "The experiment should have been aborted, because the p99 exceeded the 1,500 ms steady state", "The retry and idempotency worked as designed, but retry-on-timeout doubled latency and broke the latency SLO", "The processor authorized some payments twice, which is why the good rate fell below 99%"],
+      "correct": 2,
+      "explanation": "No payment was authorized twice (the invariant held), and most affected requests succeeded on retry. The finding is that each affected request burned up to two full timeouts, pushing the p99 to 4,000 ms. The abort condition is on good rate, not p99, so a p99 breach is a violated hypothesis rather than an abort; that is the intended division of labour."
+    },
+    {
+      "stage": "post",
+      "question": "Six minutes of processor clock skew produced a 0% good rate. Which engineering change does the finding most directly support?",
+      "options": ["Increase the gateway timeout so that skewed requests have time to be accepted by the processor", "Retry STALE_REQUEST responses once, because the second attempt carries a fresher timestamp", "Switch the processor's dedup table from idempotency keys to request timestamps", "Monitor the processor's clock against your own and treat STALE_REQUEST as an alert, not a decline"],
+      "correct": 3,
+      "explanation": "The failure is a clock disagreement, so the fix is to detect clock disagreement (compare the dependency's Date header with your clock) and to stop classifying its symptom as a business decline. A retry does not help: the new timestamp is just as far from the skewed processor clock. Timeouts and dedup design are unrelated to the fault."
+    }
+  ]
+}

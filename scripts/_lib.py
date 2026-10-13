@@ -64,7 +64,11 @@ def lesson_status(path: Path, lesson_type: str) -> str:
     if lesson_type in ("Learn", "Capstone"):
         return "Complete" if quiz.is_file() else "In Progress"
     required = {lang["id"] for lang in load_languages(ci_only=True)}
-    have = {lang["id"] for lang in lesson_languages(path)}
+    have = set()
+    for lang in lesson_languages(path):
+        entry = path / "code" / lang["dir"] / lang["entry"]
+        if "TODO: replace with the lesson" not in entry.read_text(encoding="utf-8"):
+            have.add(lang["id"])
     if quiz.is_file() and required <= have:
         return "Complete"
     return "In Progress"

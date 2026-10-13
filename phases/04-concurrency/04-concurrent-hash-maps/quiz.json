@@ -1,0 +1,78 @@
+{
+  "lesson": "04-concurrent-hash-maps",
+  "title": "Concurrent Hash Maps: Striping and Lock-Free Reads",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service wraps a HashMap in Collections.synchronizedMap and serves 95% reads from 32 threads. What is the main reason throughput stops scaling?",
+      "options": [
+        "Readers of different keys wait for one another and for every resize on a single lock",
+        "synchronizedMap rehashes the whole table on every read to keep iteration order stable",
+        "Each read allocates a defensive copy of the bucket chain before returning the value",
+        "The JVM downgrades the map to a linked list once more than 16 threads touch it"
+      ],
+      "correct": 0,
+      "explanation": "One monitor serialises every operation, so a lookup for one key queues behind unrelated inserts and behind resizes. There is no per-read rehash or copy; the cost is purely contention and parking. Striping and lock-free reads exist to remove exactly this serialisation."
+    },
+    {
+      "stage": "check",
+      "question": "StripedHashMap picks the segment from the top 4 bits of the hash and the bucket from the low bits. What goes wrong if the segment is picked from the low 4 bits as well?",
+      "options": [
+        "Keys would migrate between segments on every resize, breaking putIfAbsent",
+        "Every key in a segment would share one bucket, turning each segment into a linked list",
+        "The unsigned shift would produce negative indexes for keys with negative hashes",
+        "Two threads could hold the same segment lock at once because the index repeats"
+      ],
+      "correct": 1,
+      "explanation": "If segment s is chosen by h mod 16, every key in segment s has the same low four bits, so a bucket index derived from those bits is constant: one chain per segment. Segment choice never depends on table size, so keys do not migrate; the lock is still exclusive regardless of how the index is computed."
+    },
+    {
+      "stage": "check",
+      "question": "In LockFreeReadMap.get, a reader performs two volatile loads (table, then bucket head) and then walks nodes with no synchronization. Which two JLS rules make this correct?",
+      "options": [
+        "Monitor reentrancy and the rule that a thread sees its own writes in program order",
+        "Thread.join happens-before and the guarantee that arrays are published atomically",
+        "Volatile write happens-before volatile read, and final fields are visible once the object is reachable",
+        "Garbage-collection safepoints and the rule that object headers are written before fields"
+      ],
+      "correct": 2,
+      "explanation": "The writer's volatile store of the new head pairs with the reader's volatile load (JLS 17.4.5), and every node field is final and written in a constructor before the node became reachable (JLS 17.5). Monitor rules are irrelevant because readers hold no monitor; arrays are not published atomically as a whole."
+    },
+    {
+      "stage": "check",
+      "question": "LockFreeReadMap writers release their stripe lock before calling growIfCrowded, which may take all stripe locks. Why not grow while still holding the stripe lock?",
+      "options": [
+        "Because a thread holding stripe 7 that then takes stripes 0..15 inverts the lock order and can deadlock with another writer",
+        "Because ReentrantLock cannot be acquired twice by the same thread and resizeTo re-acquires it",
+        "Because the AtomicInteger count can only be read when no stripe lock is held",
+        "Because readers would block on the stripe lock during the copy and lose their lock-free property"
+      ],
+      "correct": 0,
+      "explanation": "resizeTo acquires stripes in index order; a writer that already holds a higher stripe and then starts at 0 breaks that order, and two such writers can wait on each other forever. ReentrantLock is reentrant, the count is a lock-free atomic, and readers never touch stripe locks, so the other options describe non-problems."
+    },
+    {
+      "stage": "post",
+      "question": "Eight threads each run `if (store.get(k) == null) store.put(k, v)` with a CyclicBarrier(8) between the get and the put. What happens, and what is the one-line fix?",
+      "options": [
+        "One thread wins because the barrier serialises the puts; no fix is needed",
+        "All eight put; replace the pair with store.putIfAbsent(k, v) so check and act share one lock hold",
+        "The barrier throws BrokenBarrierException because get and put run on different stripes",
+        "All eight put; wrap the pair in synchronized(store) and keep the get-then-put shape"
+      ],
+      "correct": 1,
+      "explanation": "The barrier forces every thread to finish its check before any thread acts, so every thread sees absent and every thread writes. putIfAbsent performs the check and the insert under the key's stripe lock, so exactly one caller gets null back. A synchronized block would also work but reintroduces the global lock the lesson set out to remove."
+    },
+    {
+      "stage": "post",
+      "question": "Java 8's ConcurrentHashMap documents size() as an estimate. Which design choice causes that, and why is it accepted?",
+      "options": [
+        "Bins are converted to trees above eight entries, and tree nodes are not counted until rebalanced",
+        "Readers never take locks, so they cannot increment a shared counter without racing",
+        "The count is kept in striped counter cells updated without a global lock, so a snapshot can miss in-flight updates",
+        "Resize is cooperative, and entries being transferred are double-counted until the transfer finishes"
+      ],
+      "correct": 2,
+      "explanation": "Maintaining an exact size would require every write to synchronise on one counter, recreating the contention the map removes; striped cells (the LongAdder idea) trade exactness for scalability, and a writer that has published a node but not yet counted it is a legal state. Treeification and transfer do not change the count."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "06-cap-and-pacelc",
+  "title": "CAP, PACELC, and What They Actually Constrain",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A team says their two-region database is 'CA: consistent and available, we just don't tolerate partitions'. What is wrong with this statement?",
+      "options": [
+        "Nothing; CA is one of the three valid corners of the CAP triangle",
+        "Partitions are a property of the network, not a choice, so the system has made a C-or-A decision whether it knows it or not",
+        "Two regions are too few for CAP to apply; the theorem requires at least three nodes to form a quorum",
+        "Consistency and availability can only be combined when replication is synchronous, which two regions cannot afford"
+      ],
+      "correct": 1,
+      "explanation": "Message loss between nodes will happen; the only question is what each node does when it cannot reach its peers. A system that claims CA has simply not been partitioned yet, or has made an implicit choice nobody reviewed. The theorem needs only two nodes, and synchrony is not part of its statement."
+    },
+    {
+      "stage": "check",
+      "question": "In the Gilbert-Lynch proof, what does 'availability' mean?",
+      "options": [
+        "The system answers 99.99% of requests within its latency objective",
+        "Every request to a non-failing node eventually receives a non-error response",
+        "A majority of nodes remain reachable from every client at all times",
+        "Reads succeed from any replica while writes may be refused during a partition"
+      ],
+      "correct": 1,
+      "explanation": "The definition has no latency bound and no percentage; it rules out exactly one behaviour, a reachable node refusing to answer because it cannot reach its peers. Uptime percentages are an operational measure, not the theorem's term, and a majority-quorum system is available only to clients on the majority side."
+    },
+    {
+      "stage": "check",
+      "question": "Which of these does the CAP theorem constrain?",
+      "options": [
+        "The latency of writes when the network is healthy",
+        "Whether causal consistency can be provided with availability",
+        "What a node that cannot reach its peers may return for a linearizable register",
+        "How many replicas a transaction coordinator needs to commit atomically"
+      ],
+      "correct": 2,
+      "explanation": "The theorem is about a single read/write register during a partition: the isolated node must either refuse (giving up availability) or answer with possibly stale data (giving up linearizability). Latency is PACELC's subject, causal consistency is achievable with availability, and transactions have their own separate results."
+    },
+    {
+      "stage": "check",
+      "question": "A store is classified PA/EC under PACELC. What behaviour does that describe?",
+      "options": [
+        "It stays available during a partition, and when the network is healthy it chooses consistency over low latency",
+        "It refuses writes during a partition, and when the network is healthy it chooses low latency over consistency",
+        "It is available and consistent at all times because it uses a leader that never fails over",
+        "It replicates asynchronously always, accepting stale reads both during and outside partitions"
+      ],
+      "correct": 0,
+      "explanation": "The P clause describes partition behaviour (A: keep answering) and the E clause describes normal behaviour (C: synchronous replication, paying the round trip). Abadi classified MongoDB this way in 2012. The second option is PC/EL, the fourth is PA/EL, and the third describes nothing real."
+    },
+    {
+      "stage": "post",
+      "question": "A wallet balance of 500.00 USD is replicated across two regions. During a partition, what does an escrow design do that neither a pure CP nor a pure AP design does?",
+      "options": [
+        "Approves every spend on both sides and corrects overdrafts by charging a fee after the partition heals",
+        "Refuses all spends on both sides until a quorum can be re-established between the regions",
+        "Lets each region approve spends up to a pre-allocated share, so overspend is bounded at zero while most spends succeed",
+        "Routes every spend to the region with the most recent write timestamp and serves the other region read-only"
+      ],
+      "correct": 2,
+      "explanation": "Escrow splits the balance in advance; each side consumes its share without coordination and only a shortfall needs a cross-region call that may fail. The worst case is a refused spend when funds sit on the other side, never an overdraft. Pure CP refuses the minority side entirely; pure AP permits unbounded overdraft; routing by timestamp requires the very coordination the partition prevents."
+    },
+    {
+      "stage": "post",
+      "question": "Why does this lesson classify an idempotency key store as PC rather than PA, even though availability is normally prized for payment APIs?",
+      "options": [
+        "Because idempotency keys are small and cheap to replicate synchronously, so the latency cost is negligible",
+        "Because a store that answers 'key not seen' when it cannot check would cause exactly the duplicate it exists to prevent",
+        "Because regulators require that every payment request be recorded in a single authoritative region",
+        "Because key lookups are reads, and reads are always safe to serve from a quorum rather than a local replica"
+      ],
+      "correct": 1,
+      "explanation": "The store is a safety mechanism: its purpose is to detect a repeated request. If a partitioned replica cannot see a key written on the other side and reports it as new, the payment is executed twice. A safety mechanism that fails open is not one, so the correct partition behaviour is to refuse or queue, not to guess. The latency argument is a reason PC is affordable, not the reason it is required."
+    }
+  ]
+}

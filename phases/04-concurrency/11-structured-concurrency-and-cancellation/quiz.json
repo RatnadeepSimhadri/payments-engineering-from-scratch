@@ -1,0 +1,48 @@
+{
+  "lesson": "11-structured-concurrency-and-cancellation",
+  "title": "Structured Concurrency and Cancellation",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A request handler waits on three futures with a two-second timeout and returns 504 when it fires. What happens to the three tasks after the handler returns?",
+      "options": ["They keep running until they finish on their own", "The executor cancels them when the future is abandoned", "They are interrupted by the timeout automatically", "They are paused until the client retries the request"],
+      "correct": 0,
+      "explanation": "A timeout on Future.get only stops the caller from waiting; nothing tells the tasks to stop. They hold threads, connections, and rate-limit slots until they complete, which is how a slow vendor exhausts a pool. Nothing in the JDK cancels a task because its future went out of scope."
+    },
+    {
+      "stage": "check",
+      "question": "A request token has a 200 ms deadline. Code inside it creates a child token asking for an 800 ms deadline. What is the child's effective deadline?",
+      "options": ["800 ms, because the child asked for it explicitly", "200 ms, because a child takes the earlier of its own and its parent's", "1000 ms, because deadlines accumulate down the tree", "Whichever one expires first at run time, decided lazily"],
+      "correct": 1,
+      "explanation": "Deadlines compose by taking the minimum at construction, so a child can tighten its budget but never loosen it; otherwise a downstream call could outlive the request that needs its answer. The lazy part of the design is only when expiry is noticed, not what the deadline is."
+    },
+    {
+      "stage": "check",
+      "question": "Two threads call cancel on the same token at the same instant, one with reason \"deadline exceeded\" and one with \"fraud failed\". What does the design guarantee?",
+      "options": ["Both reasons are kept and callbacks run twice", "The later reason overwrites the earlier one", "Exactly one wins the CAS; callbacks run once with that reason", "The call throws because concurrent cancellation is invalid"],
+      "correct": 2,
+      "explanation": "cancel uses compareAndSet(null, reason), so only the first caller flips the token, runs the callbacks, and propagates to children; the second returns false. Running callbacks twice would double-release resources, and overwriting the reason would hide the real first cause."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the scope interrupt the subtask's recorded runner thread instead of calling future.cancel(true)?",
+      "options": ["Interrupting a thread is faster than cancelling a FutureTask", "future.cancel(true) is not allowed on virtual threads in Java 21", "Interrupting the runner also cancels the token automatically", "A FutureTask cancelled before it starts never runs, so its finally bookkeeping is skipped"],
+      "correct": 3,
+      "explanation": "If cancellation arrives before the executor has started the task, FutureTask.cancel marks it cancelled and the body, including the finally block that decrements the running count, never executes, so join waits forever. Interrupting the recorded thread only while it is non-null avoids that and keeps stale interrupts off pooled threads."
+    },
+    {
+      "stage": "post",
+      "question": "A subtask is blocked in a socket read when a sibling fails. The read throws IOException because the thread was interrupted. How does the scope record that subtask?",
+      "options": ["CANCELLED, because the token was already cancelled when it threw", "FAILED, because an IOException is a real failure of that subtask", "SUCCESS with a null value, since the read was never completed", "UNAVAILABLE until throwIfFailed decides how to classify it"],
+      "correct": 0,
+      "explanation": "The fork wrapper checks whether the token was cancelled before classifying a throwable; a throw that happens after cancellation is a consequence of it, not a new failure. Reporting it as FAILED would bury the sibling's exception, which is the real cause, under a misleading IOException."
+    },
+    {
+      "stage": "post",
+      "question": "A handler forks three subtasks, then its own validation code throws before join is called. What does the try-with-resources close guarantee?",
+      "options": ["The three subtasks continue and their results are discarded", "The scope cancels the subtasks and waits until none is still running", "close throws IllegalStateException because join was skipped", "The subtasks are moved to a background scope owned by the executor"],
+      "correct": 1,
+      "explanation": "close treats an un-joined exit as a cancellation with reason \"scope closed without join\", then joins anyway, so no forked task outlives the block that created the scope. That is the structured-concurrency invariant; letting the tasks continue would recreate the orphaned work from the Problem section."
+    }
+  ]
+}

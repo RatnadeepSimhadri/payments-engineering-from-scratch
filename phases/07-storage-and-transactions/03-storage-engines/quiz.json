@@ -1,0 +1,78 @@
+{
+  "lesson": "03-storage-engines",
+  "title": "Storage Engines: B-Tree vs LSM in Practice",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A 200-byte row is fetched with a single 8 KB page read from disk. What is the read amplification by bytes and by I/O operations?",
+      "options": [
+        "40x by bytes, 1x by I/Os",
+        "1x by bytes, 40x by I/Os",
+        "8x by bytes, 8x by I/Os",
+        "200x by bytes, 1x by I/Os"
+      ],
+      "correct": 0,
+      "explanation": "8192 bytes were read to deliver 200, so 41x (about 40x) by bytes; one I/O was issued for one lookup, so 1x by I/Os. Both figures matter: bytes govern bandwidth and cache efficiency, I/Os govern latency on a disk bounded by random IOPS. The 200x option divides the wrong way round."
+    },
+    {
+      "stage": "check",
+      "question": "Why is a B-tree's write amplification low for a hot balance row that is updated 500 times a minute but very high for random inserts into a cold secondary index?",
+      "options": [
+        "Hot rows are kept in the WAL only and are never written back to data pages at any checkpoint",
+        "The page cache coalesces many updates into one page write-back; cold inserts each dirty a page nobody else shares",
+        "B-trees compress hot pages on write-back but cannot compress secondary index pages that hold random keys",
+        "Secondary indexes are rebuilt from scratch at every checkpoint, while heap pages are written incrementally"
+      ],
+      "correct": 1,
+      "explanation": "The leaf page holding the hot row stays in the buffer pool and is written back once per checkpoint no matter how many updates it absorbed, so 500 updates cost one 8 KB write. A random insert into a cold index reads one random page and later writes one full page for a single small record, with nothing to share the cost. Every committed change is written to data pages eventually, and checkpoints write dirty pages, not whole indexes."
+    },
+    {
+      "stage": "check",
+      "question": "In a leveled LSM with a size multiplier of 10 and six levels, roughly why does a long-lived key end up with write amplification near 50x?",
+      "options": [
+        "Each of the six levels keeps its own full copy of the key permanently, so every byte is stored six times over",
+        "The WAL segment holding the key is rewritten ten times before the memtable is finally flushed to level 0",
+        "At each of five level transitions the key's file is merged with about ten times as much data in the level below",
+        "Bloom filters for every file at every level are regenerated on each write, and that rewriting is counted as write bytes"
+      ],
+      "correct": 2,
+      "explanation": "Moving a file from level L into level L+1 rewrites the overlapping L+1 files, which hold about ten times the data, so each transition costs about 10x. Five transitions plus the WAL and L0 flush give roughly 52x. Old copies are deleted after compaction rather than kept permanently, the WAL is written once, and Bloom filters are a small per-file cost."
+    },
+    {
+      "stage": "check",
+      "question": "RocksDB write latency jumps from 40 microseconds to 2 seconds while upstream traffic is unchanged. What is the most likely cause?",
+      "options": [
+        "The WAL has grown too large because old segments are never deleted, and every fsync now takes seconds",
+        "The block cache has filled with SSTable blocks and reads are evicting memtable entries before they flush",
+        "Level 0 or pending compaction bytes crossed the stall threshold because compaction is behind ingest",
+        "Bloom filter false positives have risen above one percent, so every write must first read from disk"
+      ],
+      "correct": 2,
+      "explanation": "A write stall is the LSM's characteristic failure: when too many L0 files accumulate or compaction debt exceeds its limit, the engine throttles or stops writers until compaction catches up. The WAL is truncated as memtables flush, so it does not grow unboundedly; the block cache holds immutable SSTable blocks and never evicts memtable entries; filter false positives affect reads, not write latency."
+    },
+    {
+      "stage": "post",
+      "question": "A payments team must place two tables: account balances (updated in place, hot, point reads) and a payment event log (append-only, random secondary key, scanned nightly). Which placement does the decision procedure give?",
+      "options": [
+        "Both on the LSM engine, because its write path is faster for both",
+        "Balances on a B-tree engine, the event log on an LSM engine",
+        "Balances on an LSM engine, the event log on a B-tree engine",
+        "Both on the B-tree engine, because point reads dominate both"
+      ],
+      "correct": 1,
+      "explanation": "Balances are updated in place with high locality, so a B-tree's page cache coalesces the updates to about 2x write amplification while an LSM would write and compact a new version every time. The event log's random secondary inserts are the B-tree's worst case and the LSM's best, and SSTable compression makes the nightly scan cheaper. The engine that is faster for one is slower for the other."
+    },
+    {
+      "stage": "post",
+      "question": "A single writer commits one transaction at a time on a disk where fsync takes 1 ms. How does the database reach 50,000 commits per second from that drive, and does switching from a B-tree to an LSM engine change this?",
+      "options": [
+        "Group commit flushes every transaction that arrived during the last fsync together; the engine choice does not alter fsync cost",
+        "The LSM engine skips fsync because the memtable is durable in memory; the B-tree cannot",
+        "The B-tree engine writes pages directly without a WAL, avoiding fsync; the LSM cannot",
+        "Both engines use asynchronous fsync by default so commits are acknowledged before durability"
+      ],
+      "correct": 0,
+      "explanation": "fsync latency bounds a single writer to about 1,000 commits per second. With 50 concurrent writers, group commit flushes all of their WAL records with one fsync, giving about 50,000 per second. Both engines have a WAL and both pay the same fsync; what differs is the deferred work (dirty pages vs compaction), not the synchronous part. Acknowledging before durability is a configuration choice that loses committed data on power failure, not a default for a payments system."
+    }
+  ]
+}

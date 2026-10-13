@@ -1,0 +1,78 @@
+{
+  "lesson": "03-balanced-trees",
+  "title": "Balanced Trees: AVL and Red-Black",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A plain binary search tree receives the keys 1, 2, 3, ..., 4000 in that order. What is its height afterwards?",
+      "options": [
+        "About 12, since log2(4000) is about 12",
+        "About 24, twice the optimal height",
+        "4000, because every key becomes a right child",
+        "About 64, one level per bit of the key"
+      ],
+      "correct": 2,
+      "explanation": "Each new key is larger than every existing key, so it is attached as the rightmost node and the tree is a linked list of height n. Sorted keys are the normal case for timestamps and sequence numbers, which is why balancing is not optional."
+    },
+    {
+      "stage": "check",
+      "question": "An AVL tree receives 30, then 10, then 20. Which case is triggered at the root, and how many rotations fix it?",
+      "options": [
+        "LL: one right rotation at 30",
+        "LR: a left rotation at 10, then a right rotation at 30",
+        "RL: a right rotation at 20, then a left rotation at 30",
+        "RR: one left rotation at 30"
+      ],
+      "correct": 1,
+      "explanation": "After inserting 20 the root 30 has balance +2 and its left child 10 leans right (balance -1), the zig-zag LR shape. Rotating left at 10 straightens it into LL, then rotating right at 30 balances it; the test asserts rotations == 2. LL would apply only if 20 were under 10's left."
+    },
+    {
+      "stage": "check",
+      "question": "In the red-black insert fix-up, the new red node's parent is red and its uncle is also red. What happens?",
+      "options": [
+        "Rotate at the grandparent, then recolour the parent and grandparent to restore black height",
+        "Rotate at the parent so the zig-zag becomes a straight line, then rotate at the grandparent",
+        "Recolour parent and uncle black and grandparent red, then continue from the grandparent",
+        "Colour the new node black instead of red so the red-red edge disappears without rotating"
+      ],
+      "correct": 2,
+      "explanation": "This is case 1: recolouring pushes the red up two levels without changing any black height, and the loop continues because the grandparent may now have a red parent. Rotations are reserved for a black uncle (cases 2 and 3). Colouring the new node black would add a black to its paths and break property 5."
+    },
+    {
+      "stage": "check",
+      "question": "Why is a red-black tree's height at most 2 log2(n+1)?",
+      "options": [
+        "Every insert performs at most two rotations, so the depth of any leaf grows by at most two per insert",
+        "Every path has the same black count and no two reds are adjacent, so no path exceeds twice the black height",
+        "Half of all nodes are red, and red nodes do not count towards the height that the bound measures",
+        "Each rotation halves the height of the subtree it touches, so the tree stays within a factor of two"
+      ],
+      "correct": 1,
+      "explanation": "Property 5 gives every root-to-leaf path the same black height bh, property 4 caps reds at one per black, so paths have at most 2bh nodes; an all-black tree of black height bh has 2^bh - 1 nodes, so bh <= log2(n+1). Rotation counts bound update cost, not height."
+    },
+    {
+      "stage": "post",
+      "question": "On 100,000 random inserts the demo measured AVL height 20 with 69,356 rotations and red-black height 20 with 57,968 rotations plus 231,220 recolourings. Which conclusion is justified?",
+      "options": [
+        "Red-black is slower because it performs more total operations",
+        "AVL should always be preferred because its worst-case height bound is lower",
+        "Red-black does less pointer work per update, which is why update-heavy libraries chose it",
+        "The two trees are equivalent and the choice is a matter of taste"
+      ],
+      "correct": 2,
+      "explanation": "A recolouring is a one-byte write; a rotation rewrites three pointers and invalidates cache lines. Fewer rotations with cheap recolourings is exactly the trade TreeMap, std::map, and the Linux scheduler made. AVL's lower height bound matters for lookup-dominated workloads, not always."
+    },
+    {
+      "stage": "post",
+      "question": "A hold-expiry sweeper needs 'all holds expiring before now' every second, for 4 million holds. Which structure and operation fit?",
+      "options": [
+        "A HashMap keyed by hold id, scanned fully each second",
+        "An ordered tree keyed by expiry, using range or pollFirstEntry from the smallest key",
+        "A HashMap keyed by expiry instant, looked up for each possible millisecond",
+        "A plain BST keyed by expiry, since expiries arrive in random order"
+      ],
+      "correct": 1,
+      "explanation": "Range and predecessor queries are what ordered trees provide and hash maps cannot; the sweep costs O(log n + k) for k expired holds. A full scan is O(n) per second, a per-millisecond lookup is O(window), and a plain BST degenerates because expiries arrive in nearly sorted order."
+    }
+  ]
+}

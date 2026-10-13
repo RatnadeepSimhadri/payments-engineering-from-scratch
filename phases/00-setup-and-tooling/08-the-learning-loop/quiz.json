@@ -1,0 +1,78 @@
+{
+  "lesson": "08-the-learning-loop",
+  "title": "The Learning Loop: Read, Build, Run, Keep Evidence",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Two learners study the same lesson. One rereads it twice and highlights. The other reads it once, then answers questions about it without looking. A week later, which is the better predictor of who remembers it, and why?",
+      "options": [
+        "The rereader, because two exposures to the text double the encoding strength",
+        "Neither; after a week both have forgotten most of it regardless of method",
+        "The question-answerer, because a retrieval attempt strengthens memory more than another exposure does",
+        "The rereader, because highlighting forces a judgment about importance that retrieval does not"
+      ],
+      "correct": 2,
+      "explanation": "Retrieval practice reliably beats restudy on delayed tests, even though restudy feels more effective at the time; the feeling is the illusion of competence. Highlighting and rereading are rated low-utility in the research literature because they produce familiarity without the ability to recall."
+    },
+    {
+      "stage": "check",
+      "question": "run_lesson.py prints `SKIP phases/.../03-testing-from-the-standard-library [python] (no python/ implementation)`. What does this mean for your evidence?",
+      "options": [
+        "The lesson failed in Python, and the summary line at the bottom of the run will count it as one failure",
+        "Nothing is wrong: the lesson has no Python port yet, and SKIP never counts as a failure unless --strict is given",
+        "Python is not installed on this machine, and the tutor cannot teach the lesson in any language until it is",
+        "The lesson is still Planned in ROADMAP.md and has no runnable content in any of the three languages yet"
+      ],
+      "correct": 1,
+      "explanation": "SKIP means either the language folder is absent or the toolchain is missing; it is reported separately from FAIL and does not make the run exit 1 without --strict. The Java run is still the evidence, and the tutor teaches from Java with the lesson's Porting notes. A Planned lesson would not run at all."
+    },
+    {
+      "stage": "check",
+      "question": "Which skill owns PROJECTS-LEARNING.md, and what happens to LEARNING.md when you finish a project through it?",
+      "options": [
+        "build-project owns it, and LEARNING.md is not touched because no skill copies progress between state files",
+        "learn owns it and marks the project's prerequisite phases Done in LEARNING.md",
+        "start-learning owns it and rewrites the Path table in LEARNING.md to reflect the project",
+        "check-understanding owns it and appends a completion row to LEARNING.md's Progress log"
+      ],
+      "correct": 0,
+      "explanation": "Each skill owns exactly one state file; build-project writes PROJECTS-LEARNING.md and never merges into LEARNING.md. That separation is deliberate so a route's progress is never silently credited to another. check-understanding does append to LEARNING.md, but only its own phase-quiz rows."
+    },
+    {
+      "stage": "check",
+      "question": "Which of these is the exact shape of an Evidence line the learn skill writes to LEARNING.md?",
+      "options": [
+        "`2026-10-13: Lesson 03 (testing-from-the-standard-library) passed all of its Java tests on the laptop`",
+        "`| 2026-10-13 | 00/03 | Java | 2/2 | predicted the backoff with the wrong cap once; solid on FakeClock |`",
+        "`cd phases/00-setup-and-tooling/03-testing-from-the-standard-library/code/java && javac -d .out *.java && java -cp .out MainTest`",
+        "`python3 scripts/run_lesson.py phases/00-setup-and-tooling/03-testing-from-the-standard-library --lang java -> exit 0, 38 passed, 0 failed`"
+      ],
+      "correct": 3,
+      "explanation": "Evidence is the exact command, the exit code, and the test count, so it can be checked later without re-running anything. The third option is a Progress log row, which records the quiz score and a note, not the run. The last is the raw test command with no result attached."
+    },
+    {
+      "stage": "post",
+      "question": "You run `project_test.py ledger-engine --lang java --all --solution --report completion.json`. What is in the report, and is it evidence?",
+      "options": [
+        "eligibleForCompletion is true because every stage passes, so it is valid evidence of completing the project",
+        "referenceSolution is true and eligibleForCompletion is false by construction; it proves only that the course's own solution passes",
+        "The report is not written at all, because --solution and --report cannot be combined",
+        "eligibleForCompletion is true but the fingerprint is empty, so it is evidence only if you attach your own sources"
+      ],
+      "correct": 1,
+      "explanation": "eligibleForCompletion requires that the run was not a --solution run, that nothing failed, and that every stage was graded. Grading the reference implementation produces a report with referenceSolution: true and eligibility false. Evidence is of what you built, which is why the fingerprint hashes the graded workspace."
+    },
+    {
+      "stage": "post",
+      "question": "The learn skill asks a check question and you want a hint. What is the only hint it will give in plain text, and why?",
+      "options": [
+        "It names the two options that are definitely wrong, so you can reason between the remaining two before you commit",
+        "It shows the explanation field from quiz.json with the correct option's text blanked out, so you can work backwards",
+        "`Reply with one letter: <A|B|C|D>.` A hint carrying a real answer letter or the answer distribution would defeat retrieval",
+        "It tells you which section of the lesson the answer is in, so you can reread that section before you answer"
+      ],
+      "correct": 2,
+      "explanation": "The skills enforce answer isolation: the correct option, the answer letter, and the distribution of answers stay private until you commit, because the learning event is the retrieval attempt. Eliminating options or revealing the explanation would turn the question back into reading."
+    }
+  ]
+}

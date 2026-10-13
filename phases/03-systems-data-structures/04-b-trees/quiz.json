@@ -1,0 +1,78 @@
+{
+  "lesson": "04-b-trees",
+  "title": "B-Trees and Why Databases Love Them",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A binary search tree and a B-tree both give O(log n) lookups. Why is the B-tree faster for an index that lives on disk?",
+      "options": [
+        "It compares keys with fewer CPU instructions per level",
+        "It performs far fewer dependent page reads because each node holds hundreds of keys",
+        "It stores keys in a hash table inside each node for O(1) access",
+        "It keeps the whole index in memory while the BST does not"
+      ],
+      "correct": 1,
+      "explanation": "Disk and memory move whole pages or cache lines, so the cost is the count of dependent accesses. A B-tree node fills a page with hundreds of sorted keys, cutting height from log2(n) to log_fanout(n): about 4 reads instead of 30 for billions of keys. Per-level comparison cost is similar, and neither structure is inherently in memory."
+    },
+    {
+      "stage": "check",
+      "question": "An order-4 B-tree (max 3 keys per node) holds the leaf [1 2 3]. Key 4 is inserted. What happens?",
+      "options": [
+        "The leaf grows to [1 2 3 4] and the order is raised to 5",
+        "The tree adds a new leaf [4] as a right child of the key 3",
+        "The leaf splits at its median: 3 moves up into a new root, leaving [1 2] and [4]",
+        "The leaf splits in half into [1 2] and [3 4] with no key promoted"
+      ],
+      "correct": 2,
+      "explanation": "A node with maxKeys + 1 keys splits at its median; the median becomes a separator in the parent, and since the leaf was the root a new root is created. That is the only way a B-tree gains height, which is why every leaf stays at the same depth. A B-tree never attaches a child to a key as a BST would."
+    },
+    {
+      "stage": "check",
+      "question": "After deleting a key, a leaf has fewer than minKeys keys and both of its siblings hold exactly minKeys. What does the tree do?",
+      "options": [
+        "Borrows one key from a sibling through the parent separator",
+        "Merges the leaf, a separator from the parent, and one sibling into a single node",
+        "Leaves the leaf underfull because only the root may violate occupancy",
+        "Deletes the leaf and moves its remaining keys up into the parent"
+      ],
+      "correct": 1,
+      "explanation": "Borrowing requires a sibling with spare keys; with none available the repair is a merge of left node, separator, and right node, which fits because 2 * minKeys <= maxKeys. The parent loses a key and may itself underflow, propagating upward. Non-root nodes are never left underfull."
+    },
+    {
+      "stage": "check",
+      "question": "Inserting 200,000 sequential keys into the naive B-tree produced 6,249 pages at ~51% occupancy, while 200,000 random keys produced 4,630 pages at ~69%. Why?",
+      "options": [
+        "Random keys compress better because consecutive keys share prefixes",
+        "Sequential keys cause more splits per insert because they always hit the root",
+        "Each median split leaves a half-full left page that sequential inserts never revisit",
+        "The random generator produced fewer distinct keys so fewer pages were needed"
+      ],
+      "correct": 2,
+      "explanation": "With ascending keys every insert lands on the rightmost leaf, so after a split the left half stays at 50% forever; random keys keep landing in half-full pages and fill them to about ln 2. Production engines fix this with a rightmost-split fill factor. The random keys were distinct, and the split count per insert was nearly identical."
+    },
+    {
+      "stage": "post",
+      "question": "PostgreSQL documentation describes its default index as a 'B-tree'. What does it actually build, and what does that change?",
+      "options": [
+        "A B-tree exactly like this lesson's, storing values at every level so a lookup can stop at an internal page",
+        "A B+ tree: values only in leaves, linked leaves, so range scans walk sideways without re-descending",
+        "A red-black tree serialized onto 8 KB pages, because the TreeMap design proved itself in the JDK",
+        "A hash index over the key column with a B-tree fallback used only when a query asks for a range"
+      ],
+      "correct": 1,
+      "explanation": "Nearly every database 'B-tree' is a B+ tree: internal pages hold only separators (higher fan-out) and leaf pages are linked, so a range scan follows next pointers. A point lookup always reads to the leaf, one page more than a B-tree that can stop early, in exchange for a shorter tree and cheap scans."
+    },
+    {
+      "stage": "post",
+      "question": "A team proposes UUIDv4 primary keys for a 2-billion-row postings table in InnoDB. Which consequence follows from this lesson?",
+      "options": [
+        "Lookups degrade to O(n) because random 128-bit values cannot be ordered or binary searched",
+        "Each insert lands on a random page, so inserts dirty random pages and leave ~69% fill, instead of appending to the rightmost page",
+        "The tree becomes roughly twice as tall because 128-bit keys halve the fan-out of every internal page",
+        "Range scans on the primary key become impossible because UUIDv4 values carry no usable ordering"
+      ],
+      "correct": 1,
+      "explanation": "Random keys scatter inserts across the whole clustered index: every insert is a likely cache miss and a dirtied random page, versus sequential keys that repeatedly touch the rightmost page. Fan-out shrinks a little with wider keys but height barely changes; UUIDs compare fine and ranges still work, they are just meaningless."
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "lesson": "01-partitioning-and-rebalancing",
+  "title": "Partitioning Strategies and Rebalancing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A table is partitioned by hash(key) mod 4 across four nodes. The team adds a fifth node and changes the modulus to 5. Roughly what fraction of existing keys now map to a different node?",
+      "options": ["About 20%, only the keys the new node takes over", "About 50%, since half the keys change parity", "About 80%, nearly every key moves somewhere", "About 0%, the hash of each key has not changed"],
+      "correct": 2,
+      "explanation": "A key stays only when hash mod 4 equals hash mod 5, which for a uniform hash happens about one time in five. So about 80% of keys move, and most of them move between existing nodes rather than to the new one. The 20% answer describes what a fixed partition count or consistent hashing achieves, which is exactly why they exist."
+    },
+    {
+      "stage": "check",
+      "question": "With split points [\"f\", \"m\", \"s\"], the range partitioner puts the key \"f\" in which partition, and why?",
+      "options": ["Partition 0, because \"f\" is the first boundary", "Partition 1, because intervals are half-open on the right", "Partition 2, because the search rounds up on ties", "It is rejected, because keys may not equal a split point"],
+      "correct": 1,
+      "explanation": "Partitions are [..f), [f..m), [m..s), [s..). A key equal to a split point belongs to the interval that starts there, so \"f\" is in partition 1. The binary search counts split points less than or equal to the key, which gives 1. Nothing is rejected; every string has exactly one partition."
+    },
+    {
+      "stage": "check",
+      "question": "One merchant is 60% of all requests and hashes to partition 2 of 16. The team salts its key with hash(payment_id) mod 8. What is the cost they have accepted?",
+      "options": ["Writes for that merchant are now slower by a factor of eight", "The merchant's rows can no longer be found by key at all", "Reading all of the merchant's rows now fans out to eight keys", "Every other merchant's key must also be salted the same way"],
+      "correct": 2,
+      "explanation": "The salt is derived from payment_id, so a single row is still found by recomputing its suffix; what changes is that a query for all of the merchant's rows must read megamart#0 through megamart#7 and merge. Writes are not slower, and only keys the detector flags are salted, which is why the salted set is tracked as routing metadata."
+    },
+    {
+      "stage": "check",
+      "question": "The routing table has 64 partitions on 4 nodes (16 each). planAddNode adds a fifth node. What does the plan contain?",
+      "options": ["12 moves, each from one of the existing nodes to the new one", "16 moves, so the new node ends up as loaded as the others", "13 moves taken from whichever node is alphabetically first", "64 moves, since every partition must be re-evaluated"],
+      "correct": 0,
+      "explanation": "The new node receives floor(64 / 5) = 12 partitions, taken one at a time from whichever node is currently most loaded, so the result is 13, 13, 13, 13, 12. Every move targets the new node; moving partitions between existing nodes would be wasted copying. 16 moves would over-load the new node and under-load the donors."
+    },
+    {
+      "stage": "post",
+      "question": "During a partition migration in the DUAL_WRITE phase, a client writes pay_42. After cutOver() a different client holding routing table version 1 reads pay_42 from the old owner. What happens?",
+      "options": ["The old owner serves the value, since it still holds a copy until dropSource", "The old owner returns null because the key was already deleted at cutover", "The read blocks until the client's routing table is refreshed by the coordinator", "The old owner rejects it with WrongOwner carrying version 2, and the client retries on the new owner"],
+      "correct": 3,
+      "explanation": "Every node checks ownership against the routing table on each request. After cutover the table says the destination owns the partition, so the source refuses with WrongOwnerException(partition, currentVersion = 2); the client fetches version 2 and retries. The source still physically holds the data until dropSource, but serving it would let a stale client read or write a copy that is about to be discarded."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the lesson add a SplitMix64 finaliser after FNV-1a before placing virtual nodes on the consistent-hash ring?",
+      "options": ["FNV-1a is not deterministic across JVM versions without it", "The ring sorts by the full 64-bit value and FNV-1a's high bits cluster for short keys", "The finaliser makes the hash cryptographically secure against HashDoS", "Without it, Long.remainderUnsigned would return negative partition indices"],
+      "correct": 1,
+      "explanation": "FNV-1a is fully deterministic, but for short similar keys its high bits are poorly mixed. A mod-P partitioner only looks at the low bits and is fine; a ring sorts by the whole value and ends up with uneven arcs. The first version of the lesson without the finaliser moved 7.5% of keys on a node add instead of the ideal 20%. The finaliser adds no cryptographic strength, and remainderUnsigned never returns negatives either way."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "05-lsm-trees",
+  "title": "LSM Trees: Memtables, SSTables, and Compaction",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A B-tree index receives 40,000 inserts per second with random keys. Why does the disk see far more than 40,000 small writes' worth of traffic?",
+      "options": [
+        "Each insert rewrites the whole index file from the root down",
+        "Each insert dirties a different full page, which is later written back whole",
+        "The B-tree logs every key three times for durability",
+        "Random keys force a split on almost every insert"
+      ],
+      "correct": 1,
+      "explanation": "The unit of disk I/O is the page: a 200-byte record dirties an 8 KB page, and with random keys each insert hits a different page, so write amplification approaches page size over record size. Splits happen on a small fraction of inserts, and the tree is never rewritten whole."
+    },
+    {
+      "stage": "check",
+      "question": "A key was written to an SSTable last week. Today the application deletes it. What does the LSM tree do?",
+      "options": [
+        "Opens the old SSTable and removes the entry in place",
+        "Writes a tombstone with a new sequence number to the memtable",
+        "Marks the old SSTable for deletion and rewrites it without the key",
+        "Removes the key from the memtable and the Bloom filter"
+      ],
+      "correct": 1,
+      "explanation": "SSTables are immutable, so a delete is a newer record saying 'gone'. Readers that find the tombstone stop; compaction later drops both the tombstone and the old value when it can prove no older copy survives. Bloom filters cannot have bits removed, and nothing is ever edited in place."
+    },
+    {
+      "stage": "check",
+      "question": "After size-tiered compactions the store holds a 16,000-entry table and a 1,000-entry table, both containing key x. How does get(x) decide which value to return?",
+      "options": [
+        "The larger table wins because compaction produced it most recently",
+        "The table that appears first in the file list wins",
+        "The entry with the higher sequence number wins, whichever table holds it",
+        "The smaller table wins because small tables are always newer"
+      ],
+      "correct": 2,
+      "explanation": "Size-tiered compaction merges by size, not age, so neither file position nor size reliably encodes recency; every entry carries the seq of its write and the highest seq is newest. The small table is often newer, but a tombstone written long ago can sit in a small table next to a large one holding a newer value."
+    },
+    {
+      "stage": "check",
+      "question": "A compaction merges three SSTables but leaves a fourth, older one untouched. A key has a tombstone in one of the three and a live value in the fourth. What must the output contain?",
+      "options": [
+        "Nothing for that key, since the tombstone wins the merge",
+        "The tombstone, because dropping it would let the old value reappear",
+        "The live value copied from the fourth table so the key is consistent",
+        "A tombstone in the fourth table as well, written during the merge"
+      ],
+      "correct": 1,
+      "explanation": "A tombstone can only be dropped when no table outside the compaction could hold an older value; here the fourth table does, so the tombstone must be carried forward. The fourth table is immutable and cannot be edited, and copying the old value would undo the delete."
+    },
+    {
+      "stage": "post",
+      "question": "The demo reports write amplification 4.25x: 1.5 MB written by the user, 6.4 MB written to disk. Where do the extra bytes come from?",
+      "options": [
+        "The Bloom filter and sparse index are stored on disk with each table",
+        "Each flushed byte is rewritten once per compaction tier it passes through",
+        "Every write is first appended to a log and then written again at flush",
+        "Tombstones double the size of every table that contains a deleted key"
+      ],
+      "correct": 1,
+      "explanation": "A byte is written at flush and then copied each time its table is merged into a larger tier; with four tiers in the demo that is about four to five writes per byte. The lesson keeps the Bloom filter and index in memory and has no log, and tombstones are a few bytes each."
+    },
+    {
+      "stage": "post",
+      "question": "A payment-status service writes 40,000 records per second and reads a few hundred, mostly recent keys. Which storage choice and reasoning fit?",
+      "options": [
+        "A B-tree, because every read must be a single page lookup and reads are what the service is judged on",
+        "An LSM tree with size-tiered compaction: sequential flushes, low write amplification, recent keys in the memtable or newest tables",
+        "A hash index on the UUID keys, because random keys give uniform bucket distribution and O(1) lookups",
+        "An LSM tree with compaction disabled, since reads are rare enough that scanning many files does not matter"
+      ],
+      "correct": 1,
+      "explanation": "Write-heavy with random keys is the LSM case: appends instead of random page writes, and size-tiered compaction keeps write amplification near the number of tiers. Recent-key reads hit the memtable or the newest tables. Without compaction the file count grows unboundedly and even rare reads degrade; a hash index still pays the random-page write cost."
+    }
+  ]
+}

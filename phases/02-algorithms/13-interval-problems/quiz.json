@@ -1,0 +1,78 @@
+{
+  "lesson": "13-interval-problems",
+  "title": "Interval Problems: Merging, Scheduling, and Sweep Lines",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A hotel hold expires at exactly 17:00:00 and a coffee purchase is attempted at 17:00:00. The risk engine declines because it still counts the hotel hold. What representation choice causes this?",
+      "options": [
+        "Storing times as strings so they compare lexicographically",
+        "Treating the hold window as a closed interval that includes its end instant",
+        "Storing the hold amount as a float that rounds the available credit down",
+        "Indexing holds by merchant rather than by cardholder"
+      ],
+      "correct": 1,
+      "explanation": "With a closed interval the instant 17:00:00 belongs to the hold, so the hold is counted as open at the moment it should be released. Half-open windows [start, end) make the end instant belong only to whatever starts there. The float distractor is a real bug elsewhere but does not produce a boundary-instant decline."
+    },
+    {
+      "stage": "check",
+      "question": "Merging [0,100) and [10,20) with code that always sets the merged end to the later interval's end produces what, and why is it wrong?",
+      "options": [
+        "[0,20), because the contained interval shrank the merged one",
+        "[0,100), which is correct",
+        "[10,100), because the later start replaced the earlier one",
+        "[0,120), because the lengths were added"
+      ],
+      "correct": 0,
+      "explanation": "The later interval is entirely inside the first, so its end (20) is smaller than the current merged end (100). Taking max(last.end, iv.end) keeps 100; taking iv.end unconditionally shrinks the result to [0,20) and loses 80 units of coverage."
+    },
+    {
+      "stage": "check",
+      "question": "In a sweep line over half-open intervals, two events share the same timestamp: one interval ends and another starts. Which must be processed first, and what goes wrong otherwise?",
+      "options": [
+        "The start, otherwise the count can go negative",
+        "The end, otherwise the count briefly includes both and reports a false overlap",
+        "Either; equal timestamps cannot affect the maximum",
+        "The one belonging to the longer interval, to keep the sort stable"
+      ],
+      "correct": 1,
+      "explanation": "An interval ending at t is not open at t and one starting at t is, so the -1 must come before the +1 or [0,10) and [10,20) report a peak of 2. Processing the start first cannot make the count negative; it inflates it. Length has nothing to do with the order."
+    },
+    {
+      "stage": "check",
+      "question": "Interval scheduling: which greedy rule is optimal for choosing the most pairwise non-overlapping intervals?",
+      "options": [
+        "Earliest start time first",
+        "Shortest interval first",
+        "Earliest end time first",
+        "Fewest conflicts first"
+      ],
+      "correct": 2,
+      "explanation": "Earliest end leaves the most room for what follows, and the exchange argument shows the i-th greedy choice ends no later than the i-th interval of any optimal solution. Earliest start fails on [0,100), [1,2), [3,4); shortest and fewest-conflicts fail on standard counterexamples."
+    },
+    {
+      "stage": "post",
+      "question": "The daily risk report computes peak exposure by sampling every minute. What does the weighted sweep line give that sampling cannot?",
+      "options": [
+        "A lower memory footprint, since no per-minute samples need to be stored anywhere",
+        "The exact peak and the exact instant, at a cost independent of timeline resolution",
+        "A time-weighted running average of exposure in place of a simple maximum",
+        "The ability to work with closed intervals as well as half-open ones"
+      ],
+      "correct": 1,
+      "explanation": "Exposure only changes at hold starts and ends, so visiting those events in order finds every peak, including ones lasting a second, in O(n log n) for n holds. Sampling misses peaks shorter than the sample period and its cost grows with resolution."
+    },
+    {
+      "stage": "post",
+      "question": "Maximum overlap of a set of intervals is 3. What does that number also tell you about scheduling them on identical resources?",
+      "options": [
+        "At least 3 intervals must be dropped to fit on one resource",
+        "Exactly 3 resources are necessary and sufficient to host all of them without conflict",
+        "The intervals can be merged into exactly 3 disjoint intervals",
+        "The earliest-end greedy will choose exactly 3 intervals"
+      ],
+      "correct": 1,
+      "explanation": "Three intervals open at one instant need three resources, and the interval-partitioning greedy (sort by start, assign to any free resource) never needs more than the maximum overlap. The number of merged intervals and the size of the greedy schedule are different quantities."
+    }
+  ]
+}

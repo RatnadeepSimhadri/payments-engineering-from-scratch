@@ -1,0 +1,78 @@
+{
+  "lesson": "04-linked-lists",
+  "title": "Linked Lists: Singly, Doubly, and Intrusive",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A report iterates a java.util.LinkedList of 100,000 transactions with for (i = 0; i < size; i++) list.get(i). What is the total cost?",
+      "options": [
+        "O(n), the same as on an ArrayList, because get is part of the List interface",
+        "O(n log n), because LinkedList keeps a skip index to speed up get",
+        "O(n^2), because every get(i) walks i nodes from the nearest end",
+        "O(n), because the JIT compiler recognizes the pattern and caches the cursor"
+      ],
+      "correct": 2,
+      "explanation": "A linked list cannot compute where element i lives; get(i) walks i links (LinkedList starts from whichever end is closer, which only halves the constant). Summed over the loop that is quadratic. The List interface promises get(int) exists, not what it costs; the type signature gives no warning."
+    },
+    {
+      "stage": "check",
+      "question": "Why can a doubly linked list unlink a node in O(1) given only that node, while a singly linked list cannot?",
+      "options": [
+        "The doubly linked list caches the index of every node in a side table",
+        "Unlinking requires writing the predecessor's next pointer, and only a doubly linked node knows its predecessor",
+        "The singly linked list must also update its size counter, which requires a full walk",
+        "A doubly linked list stores nodes contiguously so the predecessor is at a fixed offset"
+      ],
+      "correct": 1,
+      "explanation": "Removing cur means pred.next = cur.next. A singly linked node has no prev, so finding pred is an O(n) walk from the head; a doubly linked node has prev and the unlink is four pointer writes. Size is a field in both; neither stores nodes contiguously."
+    },
+    {
+      "stage": "check",
+      "question": "What does the sentinel node in the doubly linked list buy?",
+      "options": [
+        "O(1) get(i) for indices near the middle of the list, since the walk can start from the sentinel",
+        "It halves the memory per element by letting neighbouring nodes share a single object header",
+        "Every real node has non-null neighbours, so insert and unlink have no empty-list or end-of-list branches",
+        "It lets the list detect cycles introduced by a misused handle before they corrupt the size counter"
+      ],
+      "correct": 2,
+      "explanation": "The sentinel's next is the first element and its prev the last; in an empty list it points to itself. linkBefore and unlink are then the same five assignments at every position, which removes the four special cases (empty, head, tail, middle) and the off-by-one bugs that live in them. It costs one extra node per list and does nothing for indexing or memory."
+    },
+    {
+      "stage": "check",
+      "question": "In this lesson's design, spliceAll moves every node of list B onto list A. Which statement is correct?",
+      "options": [
+        "It is O(1) because only four pointers change and nothing else needs to be touched",
+        "It is O(size of B) because each moved node must have its owner field updated so later unlink calls are safe",
+        "It is O(size of A) because A must be walked to find its last node",
+        "It is O(size of A + size of B) because both lists must be re-counted"
+      ],
+      "correct": 1,
+      "explanation": "The relink is four pointer writes, but the owner field that makes unlink reject foreign or stale nodes must be updated on every moved node, which is the one loop in the method. Drop the owner field and splice is O(1), as in the Linux kernel's list_splice, at the cost of silent corruption on misuse. A's last node is reached through the sentinel's prev in O(1); sizes are fields, not recounted."
+    },
+    {
+      "stage": "post",
+      "question": "An authorization service holds two million pending authorizations and must remove one in O(1) when its capture arrives, holding only the authorization object. Which design achieves that?",
+      "options": [
+        "A java.util.LinkedList with remove(Object), since linked lists have O(1) removal",
+        "An ArrayList sorted by authorization id with binary search followed by remove(index)",
+        "An intrusive doubly linked list where PendingAuthorization carries its own prev and next links",
+        "A singly linked list with a tail pointer, removing by walking from the tail backwards"
+      ],
+      "correct": 2,
+      "explanation": "The element is its own node, so remove(auth) is four pointer writes with no search and no allocation. LinkedList.remove(Object) hides its nodes and must scan: O(n). Binary search finds the index in O(log n) but ArrayList.remove(index) shifts the tail: O(n). A singly linked list cannot walk backwards at all and cannot unlink without the predecessor."
+    },
+    {
+      "stage": "post",
+      "question": "The demo sums one million longs: 0.68 ms from a long[], 5.4 ms from a list whose nodes are in memory order, 132 ms from a list whose nodes are in shuffled order. What explains the third number?",
+      "options": [
+        "The shuffled list has more nodes because the shuffle duplicated some values",
+        "Each step is a dependent load to an unpredictable address, so every node costs a full DRAM round trip the prefetcher cannot overlap",
+        "Java's garbage collector moves shuffled objects more often, so the walk is interrupted by collections",
+        "The shuffled list is singly linked and must walk twice as far to find each next node"
+      ],
+      "correct": 1,
+      "explanation": "All three structures hold exactly one million values and compute the same sum. The array streams eight values per cache line with the prefetcher ahead of it; the in-order list still benefits from adjacent-line prefetch; the shuffled list defeats every hardware trick, so each node is a 60 to 100 ns miss serialized behind the previous one. The GC is not involved and the list type is identical in both cases."
+    }
+  ]
+}

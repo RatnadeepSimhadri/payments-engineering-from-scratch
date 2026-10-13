@@ -1,0 +1,78 @@
+{
+  "lesson": "03-delivery-guarantees",
+  "title": "At-Most-Once, At-Least-Once, and Effectively-Once",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A sender transmits a message and never receives the acknowledgement. What can it conclude?",
+      "options": [
+        "The message was lost in transit and must be resent",
+        "The message arrived and only the acknowledgement was lost",
+        "Nothing: either the message or the acknowledgement was lost, and it cannot tell which",
+        "The receiver has crashed and the message should be routed elsewhere"
+      ],
+      "correct": 2,
+      "explanation": "The two cases are indistinguishable from the sender's side, which is why it must choose between resending (possible duplicate) and not (possible loss). Assuming the message was lost is the at-least-once choice, not a deduction."
+    },
+    {
+      "stage": "check",
+      "question": "A consumer commits the batch's offset first, then processes each record. It crashes after processing the second of four records. What happens on restart?",
+      "options": [
+        "The first two records are processed again and the last two once",
+        "The last two records of the batch are never processed",
+        "All four records are processed again from the committed offset",
+        "Nothing is lost or duplicated because the commit was durable"
+      ],
+      "correct": 1,
+      "explanation": "The committed offset already points past the batch, so the restart begins after it; the two records that were committed but not processed are skipped forever. That is at-most-once. Reprocessing would require the commit to have happened after processing."
+    },
+    {
+      "stage": "check",
+      "question": "The idempotent consumer stores the processed payment ids in a separate cache from the ledger. Why does this reintroduce a window?",
+      "options": [
+        "Because the cache lookup adds latency that lengthens each batch and delays the commit",
+        "Because a crash between the cache write and the ledger write leaves a key marked done with no posting",
+        "Because cache keys are strings while payment ids are numeric and the comparison can silently fail",
+        "Because a cache evicts keys under memory pressure long before a day of traffic has passed"
+      ],
+      "correct": 1,
+      "explanation": "Two stores means two writes with a crash point between them. If the key is written first, a crash makes the record look processed when it was not, which is at-most-once in disguise; if the posting is written first, the redelivery is not detected, which is at-least-once. The set and the effect must be in one store."
+    },
+    {
+      "stage": "check",
+      "question": "In the transactional strategy the crash fires after `tx.post` and `tx.commitOffset` but before `tx.commit()`. What does the restarted process see?",
+      "options": [
+        "The posting is present and the offset has advanced, so it continues from the next record",
+        "The posting is present but the offset has not advanced, so it posts the record again",
+        "Neither the posting nor the offset change is present, so it processes the record once",
+        "The offset has advanced but the posting is absent, so the record is lost"
+      ],
+      "correct": 2,
+      "explanation": "The transaction buffered both writes and was never committed, so the store is exactly as it was before the record. The restart begins at the same offset and the record is posted once. The other three outcomes describe what happens when the two writes are not atomic."
+    },
+    {
+      "stage": "post",
+      "question": "A producer retries a publish after a lost acknowledgement, so the log holds the same capture at offsets 4 and 93. Which design posts it once?",
+      "options": [
+        "A consumer that posts and commits the offset in one transaction per record",
+        "A consumer that enforces insert-if-absent on the capture's business key in the ledger store",
+        "A consumer with batch size 1 that commits after every record",
+        "A consumer that commits the offset before processing each batch"
+      ],
+      "correct": 1,
+      "explanation": "Two offsets are two records, so any offset-based mechanism, transactional or not, processes both. Only a check on the business identifier of the capture recognises them as one event. The transactional route protects against the consumer's own crash, not against a duplicate on the log."
+    },
+    {
+      "stage": "post",
+      "question": "Reducing the batch size from 4 to 1 changes which of the following for the plain at-least-once consumer?",
+      "options": [
+        "The number of records duplicated per crash, but not whether duplicates occur",
+        "Whether duplicates occur at all, since one record cannot be redelivered",
+        "The ordering of process and commit, making it effectively once",
+        "Nothing about duplicates, since redelivery depends only on the broker"
+      ],
+      "correct": 0,
+      "explanation": "The window shrinks to one record but still exists: a crash after the side effect and before the commit redelivers that record. The guarantee is binary, so one duplicate credit is still a reconciliation break. Closing the window needs atomicity or idempotence, not a smaller batch."
+    }
+  ]
+}

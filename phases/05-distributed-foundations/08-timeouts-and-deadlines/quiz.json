@@ -1,0 +1,48 @@
+{
+  "lesson": "08-timeouts-and-deadlines",
+  "title": "Timeouts and Deadline Propagation",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Service A has a 500 ms timeout on its call to B. B has a 500 ms timeout on its call to C. What is the longest the chain can run before A's caller hears anything?",
+      "options": ["About 500 ms, because the tighter limit wins", "About 1000 ms, because the timeouts add up", "About 250 ms, because each hop gets half", "It cannot be bounded without knowing C's latency"],
+      "correct": 1,
+      "explanation": "Timeouts are relative to the hop they belong to, so B's 500 ms starts whenever A finishes its own work and can end up to 500 ms after A's limit. Timeouts compose by adding; only deadlines compose by taking a minimum, which is why the lesson propagates a deadline instead."
+    },
+    {
+      "stage": "check",
+      "question": "A parent context has deadline t = 500. At t = 90 a child calls withTimeout(clock, 2000). What deadline does the child get?",
+      "options": ["t = 2090, because the child asked for 2000 ms", "t = 2000, the child's own absolute value", "t = 500, because a child can only tighten the deadline", "t = 410, the parent's remaining budget at that moment"],
+      "correct": 2,
+      "explanation": "withTimeout takes min(parent deadline, now + timeout) = min(500, 2090) = 500. A child can shorten its parent's deadline but never extend it; that monotonic rule is the invariant that stops work outliving the edge. 410 is the remaining duration, not the absolute deadline."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the wire header carry a remaining duration such as 340m rather than the absolute deadline timestamp?",
+      "options": ["Durations compress better in HTTP/2 header tables", "The receiver's clock may differ from the sender's by more than the budget", "Absolute values overflow a 64-bit integer after 2038", "gRPC requires all header values to be under eight characters"],
+      "correct": 1,
+      "explanation": "Two machines' clocks can disagree by milliseconds or seconds, so an absolute instant means something different on the receiver. A duration is recomputed against the receiver's own clock and is off only by the network transit time, in the safe direction. The eight-digit limit is real but is a consequence of the format, not the reason for it."
+    },
+    {
+      "stage": "check",
+      "question": "In the simulated chain with a 500 ms edge budget, what stops the processor from charging the card when the deadline is propagated?",
+      "options": ["The client closes the socket at 500 ms and the processor notices", "The processor compares its 400 ms cost with the 340 ms remaining and refuses", "The payments service drops the request once 50 percent of the budget is used", "The processor's own 2 s timeout is overridden to 340 ms by the header"],
+      "correct": 1,
+      "explanation": "The admission check requireBudget runs before any irreversible work: 340 ms remain, the authorization costs 400 ms, so the processor throws DeadlineExceeded without touching the card network. Shortening the processor's timeout would still let it start the charge; only the explicit check prevents the side effect."
+    },
+    {
+      "stage": "post",
+      "question": "A retry loop allows three attempts of 300 ms each with 50 ms backoff, inside a 400 ms deadline, against a dependency that takes 150 ms and fails twice before succeeding. What does the deadline-aware retrier do?",
+      "options": ["Runs all three attempts and succeeds at 550 ms", "Runs two attempts, clips the second to a 200 ms budget, and stops at 400 ms", "Runs one attempt and gives up because 400 is less than 3 x 300", "Runs three attempts but reports TIMED_OUT because the third ends late"],
+      "correct": 1,
+      "explanation": "Attempt one fails at 150 ms; after 50 ms backoff, 200 ms remain so the second attempt's budget is clipped from 300 to 200; it fails at 350 ms; the backoff is clipped to 50 ms; at 400 ms nothing remains, so no third attempt starts. The naive loop would run until 550 ms for a caller who left at 400."
+    },
+    {
+      "stage": "post",
+      "question": "Hedging fires a duplicate request once the primary has been outstanding for a chosen delay. Why is that delay set near the p95 of latency rather than near the median?",
+      "options": ["Because below the p95 the backup replica would not have warmed its cache yet", "Because firing at the median doubles load for most calls while a p95 trigger adds about five percent", "Because hedging is only legal for the slowest five percent of requests under most APIs", "Because the backup's own timeout must be longer than the primary's median latency"],
+      "correct": 1,
+      "explanation": "A hedge is extra load spent on purpose. Triggering at the median duplicates roughly half of all requests for little tail benefit; triggering at the p95 duplicates about five percent, exactly the stalled calls, which is what the seeded study shows: p99 falls from 919 ms to 113 ms for 5.1 percent extra requests. Legality depends on idempotency, not on a percentage."
+    }
+  ]
+}

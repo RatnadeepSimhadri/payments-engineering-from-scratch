@@ -1,0 +1,78 @@
+{
+  "lesson": "05-divide-and-conquer",
+  "title": "Divide and Conquer and the Master Theorem",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Merge sort splits the array in half, sorts each half recursively, and merges in linear time. Which recurrence describes its running time?",
+      "options": [
+        "T(n) = T(n/2) + n",
+        "T(n) = 2 T(n/2) + n",
+        "T(n) = 2 T(n - 1) + 1",
+        "T(n) = T(n/2) + 1"
+      ],
+      "correct": 1,
+      "explanation": "Two subproblems (a = 2) of half the size (b = 2) plus a linear merge (f(n) = n). T(n/2) + 1 is binary search, T(n/2) + n would be a single half with a linear combine, and 2 T(n-1) + 1 is the exponential subset enumeration."
+    },
+    {
+      "stage": "check",
+      "question": "For T(n) = a T(n/b) + f(n), what does the quantity n^(log_b a) represent in the recursion tree?",
+      "options": [
+        "The work done at the root level of the tree",
+        "The number of leaves, and therefore the total work the leaves do",
+        "The depth of the tree in levels",
+        "The total work summed over all levels of the tree"
+      ],
+      "correct": 1,
+      "explanation": "There are a^(log_b n) = n^(log_b a) leaves, each doing constant work; the master theorem compares f(n), the root's work, against this leaf work to decide which end of the tree dominates. The depth is log_b n and the total is what the theorem computes."
+    },
+    {
+      "stage": "check",
+      "question": "Karatsuba replaces four half-size multiplications with three, keeping the O(n) additions. What happens to the running time?",
+      "options": [
+        "It drops from O(n^2) to O(n log n) because the additions now dominate",
+        "It drops from Θ(n^2) to Θ(n^1.585) because the leaf count falls from n^2 to n^(log2 3)",
+        "It stays Θ(n^2) because the combine step is unchanged and the combine step sets the bound",
+        "It drops by a constant factor of 3/4 since one quarter of the multiplications is saved"
+      ],
+      "correct": 1,
+      "explanation": "Both recurrences are case 1 (f = n is polynomially smaller than the critical exponent), so the leaves dominate and the answer is n^(log2 a): n^2 for a = 4, n^1.585 for a = 3. The number of subproblems sets the exponent; the combine cost only matters when it is as large as the leaf work."
+    },
+    {
+      "stage": "check",
+      "question": "T(n) = 2 T(n/2) + n log n. Which statement is correct?",
+      "options": [
+        "Case 3 applies because n log n is strictly larger than n for all large n, so the root dominates and T(n) = Θ(n log n)",
+        "Case 2 applies because n log n is asymptotically the same as n once constants are ignored, so T(n) = Θ(n log n)",
+        "No case applies because n log n exceeds n by less than any polynomial factor; the recursion tree gives Θ(n log^2 n)",
+        "Case 1 applies because log n grows more slowly than any polynomial, so the leaves dominate and T(n) = Θ(n)"
+      ],
+      "correct": 2,
+      "explanation": "The three cases need f(n) to differ from n^c by a factor of n^e for some e > 0; log n is not such a factor, so the recurrence falls in the gap. Summing the tree level by level gives n(log n + (log n - 1) + ... + 1) = Θ(n log^2 n), which the extended form of case 2 also states."
+    },
+    {
+      "stage": "post",
+      "question": "A team parallelises a linear two-pointer reconciliation by recursively splitting both lists at a matching timestamp (a linear scan) and reconciling halves on separate cores. Why is it slower?",
+      "options": [
+        "Because thread creation in the JVM costs more than the reconciliation work saved by splitting",
+        "Because the recurrence is 2 T(n/2) + n, which is Θ(n log n); the log n factor exceeds the gain from 32 cores",
+        "Because recursive algorithms cannot be parallelised without a shared lock on the output",
+        "Because the lists must be re-sorted at every level, adding an n log n sort per split"
+      ],
+      "correct": 1,
+      "explanation": "The split scan is a linear combine cost at every level, so the design is merge sort's recurrence and does about 28x more work than the single pass for n of a few hundred million; dividing by 32 cores does not recover it. Partitioning once into 32 ranges and running the linear merge on each is Θ(n / 32)."
+    },
+    {
+      "stage": "post",
+      "question": "Strassen's algorithm has a better exponent than the triple loop, yet a team found it slower on their matrices. What is the most likely reason?",
+      "options": [
+        "Strassen only applies to matrices whose dimension is a power of two, so padding doubled their work",
+        "The triple loop is Θ(n^2) on dense matrices, which Strassen cannot beat",
+        "Strassen's seven products and eighteen additions carry a large constant and poor cache behaviour, and their n was below the crossover",
+        "Strassen requires exact rational arithmetic, which is far slower than floating point"
+      ],
+      "correct": 2,
+      "explanation": "A better exponent wins only above the crossover size where the constant is amortised; for Strassen that is hundreds of rows depending on hardware, and production BLAS uses it only above a tuned threshold. Padding to a power of two is a minor cost, the triple loop is Θ(n^3), and Strassen works in any arithmetic."
+    }
+  ]
+}

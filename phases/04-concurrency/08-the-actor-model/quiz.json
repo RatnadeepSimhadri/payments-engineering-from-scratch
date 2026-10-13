@@ -1,0 +1,78 @@
+{
+  "lesson": "08-the-actor-model",
+  "title": "The Actor Model",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "An Account class has fourteen individually synchronized methods. The business rule 'check the daily limit, then debit, then record velocity' calls three of them. What is true?",
+      "options": [
+        "The sequence is atomic because each of the three methods it calls is individually atomic and they run in order",
+        "Each call is atomic but the sequence is not; another thread can run between calls unless the caller locks across all three",
+        "The JVM merges consecutive synchronized calls on the same object into one critical section, so no gap exists between them",
+        "The sequence is atomic as long as all three calls happen on the same thread, because a thread cannot interleave with itself"
+      ],
+      "correct": 1,
+      "explanation": "Per-method synchronization protects each method body, not the gaps between calls. Thread safety of the sequence has been pushed to every caller, which is the problem the actor model solves by making the whole handler for one message the unit of atomicity. The JVM does no such merging; same-thread execution does not exclude other threads."
+    },
+    {
+      "stage": "check",
+      "question": "Why does AccountActor's Withdraw handler need no lock around 'compare balance, then subtract'?",
+      "options": [
+        "Because Money is an immutable record, so the subtraction produces a new value and cannot race with another thread",
+        "Because the scheduler runs at most one receive() per actor at a time, so nothing interleaves between the check and the act",
+        "Because ConcurrentLinkedQueue delivers each message atomically, and an atomically delivered message has an atomic handler",
+        "Because the balance field is read and written through volatile semantics, and volatile writes are atomic on the JVM"
+      ],
+      "correct": 1,
+      "explanation": "The mailbox plus the single-run-per-actor contract is the lock: receive for message N+1 starts only after receive for N returns. Money's immutability protects the message contents, not the actor's field; the queue only orders delivery; and balance is a plain field whose visibility comes from the scheduler's flag, not from volatile."
+    },
+    {
+      "stage": "check",
+      "question": "In ThreadedScheduler.run, the finally block clears the scheduled flag and then re-checks the mailbox. What goes wrong if those two lines are swapped?",
+      "options": [
+        "Two runs for the same actor could execute at once because the flag is clear while messages are being processed",
+        "A message that arrives between the re-check and the clear is never scheduled: the sender saw the flag set, and nobody re-checks after it",
+        "The executor would reject the resubmission because the previous run has not returned yet",
+        "Throughput batching would stop working and every message would need its own run"
+      ],
+      "correct": 1,
+      "explanation": "Re-check first: the mailbox looks empty. A tell lands and sees scheduled == true, so it does not submit. Then the flag is cleared and the run exits. The message sits until some later tell happens to arrive. Clearing first and re-checking second closes that window. The flag is never clear during processing, so two runs cannot overlap either way."
+    },
+    {
+      "stage": "check",
+      "question": "A counter actor with RESTART supervision has processed two Increments when it receives Crash, then one more Increment, then a query. What does it report, and why?",
+      "options": [
+        "3, because the mailbox is preserved and all three increments were eventually processed",
+        "2, because the crash stops processing and the final increment becomes a dead letter",
+        "1, because RESTART replaces the actor with a fresh instance whose count starts at zero",
+        "0, because RESTART also clears the mailbox so the last increment is discarded"
+      ],
+      "correct": 2,
+      "explanation": "RESTART drops the failing message and swaps in a new instance from the factory; the mailbox survives, so the third Increment is processed by the new instance, which had never seen the first two. RESUME would report 3; STOP would report nothing and produce dead letters. This is why an account actor's state must live in a journal if RESTART is ever used."
+    },
+    {
+      "stage": "post",
+      "question": "Between Withdrawn and Deposited in the transfer protocol, what is true about 75.00 USD that a locked transfer would never allow?",
+      "options": [
+        "It exists in both accounts at once until the coordinator reconciles them",
+        "It is in neither account, so a balance query at that instant sums to less than the system total",
+        "It has been lost and must be recovered by the supervisor's RESTART of the coordinator",
+        "It is held in the coordinator's inFlight map as a third balance that GetBalance can read"
+      ],
+      "correct": 1,
+      "explanation": "The actor transfer is two steps separated by a message hop, and the funds are in transit between them; a locked transfer makes both changes under one lock so the intermediate state is unobservable. Nothing is lost: the Deposit is in a mailbox and will be processed. The coordinator records the transfer, not a balance."
+    },
+    {
+      "stage": "post",
+      "question": "The test runs the six-transfer script under 25 seeds and asserts conservation each time. What does this approach give you that a four-thread stress test does not?",
+      "options": [
+        "A proof that the code is correct under every possible interleaving, since the seeds enumerate the schedule space",
+        "Higher throughput than the threaded version, because the deterministic scheduler avoids thread hand-offs entirely",
+        "A failing seed that reproduces the same trace on every machine, so a bug can be debugged instead of hoped for",
+        "Coverage of hardware memory-model effects such as store buffering, which threads alone cannot exercise reliably"
+      ],
+      "correct": 2,
+      "explanation": "The scheduler is the test input: a failure under seed 17 is replayable with seed 17, with the same message order, forever. It is not a proof (25 seeds is a sample) and it says nothing about hardware reordering, which only the threaded test touches. Throughput is irrelevant to a correctness test."
+    }
+  ]
+}

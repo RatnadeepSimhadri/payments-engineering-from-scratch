@@ -1,0 +1,78 @@
+{
+  "lesson": "07-raft-safety-and-membership",
+  "title": "Raft III: Safety Proofs, Membership Changes, Snapshots",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "TODO",
+      "options": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "correct": 0,
+      "explanation": "TODO"
+    },
+    {
+      "stage": "check",
+      "question": "TODO",
+      "options": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "correct": 1,
+      "explanation": "TODO"
+    },
+    {
+      "stage": "check",
+      "question": "TODO",
+      "options": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "correct": 2,
+      "explanation": "TODO"
+    },
+    {
+      "stage": "check",
+      "question": "TODO",
+      "options": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "correct": 3,
+      "explanation": "TODO"
+    },
+    {
+      "stage": "post",
+      "question": "TODO",
+      "options": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "correct": 0,
+      "explanation": "TODO"
+    },
+    {
+      "stage": "post",
+      "question": "TODO",
+      "options": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "correct": 1,
+      "explanation": "TODO"
+    }
+  ]
+}

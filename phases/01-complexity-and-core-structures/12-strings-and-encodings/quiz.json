@@ -1,0 +1,78 @@
+{
+  "lesson": "12-strings-and-encodings",
+  "title": "Strings, Unicode, and Byte Encodings",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "In Java, what does \"Müller\".getBytes(StandardCharsets.UTF_8).length return?",
+      "options": [
+        "6, one byte per letter",
+        "7, because ü needs two bytes in UTF-8",
+        "12, because UTF-8 uses two bytes per character",
+        "8, because the string is null-terminated"
+      ],
+      "correct": 1,
+      "explanation": "Five letters are ASCII and take one byte each; ü is U+00FC, above U+007F, so it takes two bytes (C3 BC). UTF-8 is variable length, not fixed two-byte, and Java strings carry no terminator."
+    },
+    {
+      "stage": "check",
+      "question": "A payout file formats a name with String.format(\"%-22.22s\", name) and writes the result as UTF-8 into a fixed-width record. Why did the bank reject records with accented names?",
+      "options": [
+        "Java's format truncates to 22 UTF-16 code units, so multi-byte characters push the field past 22 bytes and shift later columns",
+        "UTF-8 cannot represent accented Latin letters, so each one was replaced by a question mark and the bank's parser rejected the substitution",
+        "The %-22.22s specifier pads with null bytes rather than spaces, and NACHA parsers treat a null byte as the end of the record",
+        "Fixed-width records require every character to be exactly two bytes, so the single-byte ASCII letters left the field short"
+      ],
+      "correct": 0,
+      "explanation": "The precision in %.22s counts code units, not bytes; each accented letter adds a byte, the field grows past 22 bytes, and every later column moves. UTF-8 represents every Unicode character; the problem is counting the wrong length."
+    },
+    {
+      "stage": "check",
+      "question": "Two strings both display as \"Nguyễn\" but equals returns false. What is the most likely cause and the fix?",
+      "options": [
+        "One has trailing whitespace that the display hides; call trim on both strings and compare again",
+        "Different normalization forms (precomposed vs combining marks); normalize both to NFC before comparing",
+        "Different case folding of the first letter; call toLowerCase without a locale on both before comparing",
+        "One is stored as UTF-16 and the other as UTF-8; re-encode both into the same charset and compare bytes"
+      ],
+      "correct": 1,
+      "explanation": "ễ can be one precomposed code point or a base letter plus two combining marks; both render identically and compare unequal by code unit. NFC picks one spelling. Java strings are always UTF-16 internally, so there is no charset to convert, and the case and whitespace are the same."
+    },
+    {
+      "stage": "check",
+      "question": "A UTF-8 byte array must be truncated to 14 bytes and byte 14 is 0xBA (binary 10111010). Where should the cut go, and why?",
+      "options": [
+        "At byte 14 as planned; the decoder will discard any partial character",
+        "At byte 15, so that the whole character starting at 14 is kept",
+        "Back up to the nearest byte that does not start with 10, because 10xxxxxx marks a continuation byte",
+        "At byte 12, because every multi-byte character in UTF-8 is exactly two bytes"
+      ],
+      "correct": 2,
+      "explanation": "Continuation bytes begin with the bits 10; backing up to the first byte that does not yields a boundary between complete characters and valid output. Cutting at 14 leaves a dangling lead byte that strict decoders reject. Multi-byte sequences are 2 to 4 bytes, not always two."
+    },
+    {
+      "stage": "post",
+      "question": "Which normalization should a system use to store a beneficiary name, and which to build a matching key for sanctions screening?",
+      "options": [
+        "NFKC for storage and NFC for matching, so the stored form is the most compact",
+        "NFC for storage and NFKC plus case folding for matching, because NFKC is lossy",
+        "NFD for both, because decomposed forms are the Unicode default",
+        "No normalization for storage and NFC for matching, to preserve the original bytes"
+      ],
+      "correct": 1,
+      "explanation": "NFC is canonical and lossless, so it is the right stored form. NFKC folds ligatures, fullwidth forms, and superscripts, which is what matching wants but destroys information, so it belongs only in the comparison key. Storing raw bytes loses equality guarantees; NFD is not the common interchange form."
+    },
+    {
+      "stage": "post",
+      "question": "Why did the overlong UTF-8 sequence C0 AF defeat a path-traversal filter in 2000, and what does a correct decoder do with it?",
+      "options": [
+        "It decodes to a slash the filter missed because it searched for the one-byte form; a strict decoder rejects it as overlong",
+        "It decodes to a null byte that terminated the path string early; a strict decoder replaces the null with U+FFFD",
+        "It is a valid two-byte encoding of a backslash on Windows; a strict decoder normalizes it to a forward slash",
+        "It is half of a UTF-16 surrogate pair that the filter misread; a strict decoder re-pairs the two surrogates"
+      ],
+      "correct": 0,
+      "explanation": "C0 AF would encode U+002F using two bytes where one suffices; the filter searched for the byte 2F and missed it, and a lenient decoder later produced the slash. RFC 3629 forbids overlong forms and a conforming decoder rejects them rather than decoding or substituting."
+    }
+  ]
+}

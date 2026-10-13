@@ -1,0 +1,48 @@
+{
+  "lesson": "12-leases-and-fencing-tokens",
+  "title": "Leases, Fencing Tokens, and Distributed Locks",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Why does a lock shared across processes on different machines need an expiry at all?",
+      "options": ["To keep the lock service's memory bounded as keys accumulate", "Because a holder that crashes can never release it and a slow holder is indistinguishable from a crashed one", "Because network protocols cannot carry a lock for longer than a connection lifetime", "To force holders to re-authenticate with the lock service periodically"],
+      "correct": 1,
+      "explanation": "In an asynchronous network nobody can tell a crashed node from a paused or partitioned one, so a lock that waits for an explicit release can wait forever. The lease expires on the service's clock without any action by the holder. Memory bounds and re-authentication are side benefits, not the reason."
+    },
+    {
+      "stage": "check",
+      "question": "Worker A holds a lease that expires at t = 1000. It is paused by a garbage collection from t = 0 to t = 1500. What is true at t = 1500?",
+      "options": ["A's write is blocked by the lock service until it renews", "A's local state still says it holds the lock, and another worker may have been granted it", "The lock service notified A of the expiry during the pause", "A's lease was automatically extended because A never released it"],
+      "correct": 1,
+      "explanation": "No code runs in A during the pause, so A cannot observe the expiry, renew, or receive a notification; it resumes with its pre-pause belief intact. Meanwhile the lock service has expired the lease on its own clock and will grant it to the next requester. The lock service does not sit between A and the storage, so it cannot block the write."
+    },
+    {
+      "stage": "check",
+      "question": "A fenced storage layer has accepted a write with token 2 for key acct-7. A write with token 1 arrives, then one with token 2, then one with token 3. Which are accepted?",
+      "options": ["Only the write with token 3", "Tokens 2 and 3; token 1 is rejected as stale", "Tokens 1 and 2 are rejected; only strictly larger tokens are accepted", "All three, because the lock service already validated each holder"],
+      "correct": 1,
+      "explanation": "The rule rejects tokens strictly smaller than the highest seen. Token 1 < 2 is a stale holder and is rejected. Token 2 equals the highest seen and is the current holder retrying, so it is accepted. Token 3 is newer and is accepted, raising the highest seen. Rejecting equal tokens would fence the legitimate holder's own retries."
+    },
+    {
+      "stage": "check",
+      "question": "Why does checking lease.isSafeToUse() immediately before the write not prevent the lost update?",
+      "options": ["Because the check reads the client's clock, which may be ahead of the service's", "Because the pause can occur between the check passing and the write arriving at storage", "Because isSafeToUse only consults the lease's grant time, not its expiry", "Because the storage layer resets the lease timer whenever a read occurs"],
+      "correct": 1,
+      "explanation": "The check and the write are two steps on the client, and a pause or a network delay can fall between them; the test with pauseAfterCheckMs = 1500 shows the check passing and the stale write landing anyway. Only a check performed at the storage, atomically with the write, closes that gap. Clock skew makes things worse but is not the core reason."
+    },
+    {
+      "stage": "post",
+      "question": "Redlock uses a random string per acquisition so a client deletes only its own lock. Why is that value unusable as a fencing token?",
+      "options": ["Random strings are too long to store alongside every row", "It proves identity but not order, so storage cannot tell which of two leases is newer", "Redis cannot compare strings atomically inside a single command", "The value changes on every renewal, so the holder's own writes would be rejected"],
+      "correct": 1,
+      "explanation": "A fence works by rejecting writes whose token is smaller than one already accepted, which requires a total order over grants. Two random strings have no order, so storage cannot distinguish a stale holder from a new one. A monotonic counter from the lock service, a ZooKeeper zxid, or an etcd revision provides the order; identity alone is enough for safe release but not for fencing."
+    },
+    {
+      "stage": "post",
+      "question": "A team uses a lease lock to stop two schedulers from both launching the same nightly report; a duplicate report is wasteful but harmless. Does this lock need a fencing token at the resource?",
+      "options": ["Yes, every distributed lock must be fenced or it is incorrect", "No, this is an efficiency lock where occasional double execution is tolerable", "Yes, because report generation reads the same tables as the payout job", "No, because schedulers never experience garbage-collection pauses"],
+      "correct": 1,
+      "explanation": "Kleppmann's distinction: when a lock's rare failure only wastes work, a lease alone is appropriate and a single lock instance is enough. When failure corrupts data or moves money, the resource must check a fencing token. The payout job in this lesson is the second kind; a duplicate report is the first. Schedulers pause like any other process; it is the consequence that differs."
+    }
+  ]
+}

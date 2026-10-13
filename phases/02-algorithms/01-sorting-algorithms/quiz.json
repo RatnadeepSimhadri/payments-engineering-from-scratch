@@ -1,0 +1,78 @@
+{
+  "lesson": "01-sorting-algorithms",
+  "title": "Sorting: Merge, Quick, Heap, and Why Libraries Use Timsort",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A sort is called stable when it guarantees which of the following?",
+      "options": [
+        "It never runs slower than O(n log n) on any input",
+        "Elements that compare equal keep their original relative order",
+        "It uses no extra memory beyond the array being sorted",
+        "Its output does not change when the input is already sorted"
+      ],
+      "correct": 1,
+      "explanation": "Stability is about ties: two elements with equal keys must appear in the output in the same order they had in the input. Worst-case time and memory are separate properties; merge sort is stable and uses O(n) memory, heap sort is in place and not stable."
+    },
+    {
+      "stage": "check",
+      "question": "In the merge step, the code emits from the left half when compare(left, right) <= 0. What happens if that is changed to < 0?",
+      "options": [
+        "The sort becomes unstable, because on ties the later element is emitted first",
+        "The sort produces an incorrectly ordered array on inputs with duplicates",
+        "The sort still works but makes twice as many comparisons on every input",
+        "The sort throws an exception when two elements compare equal"
+      ],
+      "correct": 0,
+      "explanation": "With < 0, a tie takes from the right half, which held the later input elements, so equal keys come out reversed: still sorted by key, no longer stable. The output remains correctly ordered and the comparison count is unchanged, which is why tests with distinct keys never notice."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the three-way partition make quicksort linear on an array where every element is equal?",
+      "options": [
+        "Because the random pivot is guaranteed to split the array exactly in half",
+        "Because equal keys are moved to the right side and sorted by insertion sort",
+        "Because equal keys stay in a middle block that the recursion never revisits",
+        "Because the comparator returns zero and the partition loop exits immediately"
+      ],
+      "correct": 2,
+      "explanation": "One pass compares each element to the pivot once and leaves all equal keys in the a[lt..gt] block, which is already in its final position; the recursion only enters the strictly-less and strictly-greater regions, which are empty. A two-way partition would peel off one element per level and go quadratic."
+    },
+    {
+      "stage": "check",
+      "question": "Heap sort on 4096 random integers made about 85,000 comparisons while merge sort made about 51,000. What explains the roughly 2x gap?",
+      "options": [
+        "Heap sort must rebuild the whole heap after every extraction",
+        "Each siftDown level compares both children, so each level costs two comparisons",
+        "Heap sort is quadratic in the worst case and this input was close to it",
+        "Merge sort skips comparisons whenever the two halves are already in order"
+      ],
+      "correct": 1,
+      "explanation": "siftDown compares the left child and then the right child against the current largest at every level, about 2 log n per extraction, where merge spends about one comparison per element per level. Heap sort is O(n log n) in every case, never quadratic, and the pre-merge check saves little on random input."
+    },
+    {
+      "stage": "post",
+      "question": "A service sorts a long[] of amounts and a parallel long[] of sequence numbers using Arrays.sort on the amounts, then reorders the sequence numbers to match. What is the risk?",
+      "options": [
+        "Arrays.sort(long[]) is dual-pivot quicksort, so equal amounts come out in an arbitrary order",
+        "Arrays.sort(long[]) allocates an O(n) buffer that can exhaust the heap on large batches",
+        "Arrays.sort(long[]) is quadratic on already-sorted input such as a time-ordered ledger",
+        "Arrays.sort(long[]) throws when the array contains duplicate values"
+      ],
+      "correct": 0,
+      "explanation": "Primitive arrays use an unstable in-place quicksort because primitives have no identity to preserve; the moment you attach identity through a parallel array, the lack of stability becomes visible as scrambled time order. Sort an array of records with a comparator, or use a total (amount, seq) key. The primitive sort uses no O(n) buffer and has an O(n log n) worst case since JDK 14."
+    },
+    {
+      "stage": "post",
+      "question": "A settlement query reads ORDER BY amount and a reviewer asks for ORDER BY amount, created_at, id. What does the change buy?",
+      "options": [
+        "It lets the planner use an index-only scan on the three columns so the query returns faster",
+        "It guarantees the returned rows are unique so the processor's de-duplication rule never fires",
+        "It makes the key total, so ties are ordered the same way whichever sort algorithm the planner picks",
+        "It forces the database to use a stable merge sort for the query instead of an in-memory quicksort"
+      ],
+      "correct": 2,
+      "explanation": "Databases do not promise stable sorts and may pick a heap, quick, or external merge sort per plan; adding columns until the key is unique removes ties, so every algorithm produces the same order. It does not change the planner's algorithm choice and says nothing about row uniqueness in the data."
+    }
+  ]
+}

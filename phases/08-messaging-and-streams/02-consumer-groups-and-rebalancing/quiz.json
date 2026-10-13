@@ -1,0 +1,78 @@
+{
+  "lesson": "02-consumer-groups-and-rebalancing",
+  "title": "Consumer Groups, Offsets, and Rebalancing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Three consumers in one group read a topic with eight partitions. What must be true about partition 5 at any moment?",
+      "options": [
+        "Every consumer in the group reads it so that no record is missed",
+        "Exactly one consumer in the group owns it and the others do not read it",
+        "The broker picks a consumer per record, like a work queue",
+        "The producer decides which consumer receives it by setting a header"
+      ],
+      "correct": 1,
+      "explanation": "The group invariant is one owner per partition: that is what gives per-partition ordering and prevents duplicate side effects. All consumers reading it would be fan-out across groups, not within one; per-record dispatch is a queue, which destroys ordering."
+    },
+    {
+      "stage": "check",
+      "question": "A member heartbeats with generation 3 while the coordinator is at generation 4. What does the member receive and what must it do?",
+      "options": [
+        "OK, because heartbeats only refresh the session and ignore the generation",
+        "UNKNOWN_MEMBER, because a stale generation proves it was evicted",
+        "REBALANCE_IN_PROGRESS; it must stop processing and re-join to get its new partitions",
+        "ILLEGAL_GENERATION; it must restart the process to obtain a fresh member id"
+      ],
+      "correct": 2,
+      "explanation": "A stale generation from a known member means the group moved on without it; the response tells it to re-join. UNKNOWN_MEMBER is for a member that is no longer in the group at all, which is the other case fencing must distinguish, because the recovery is different."
+    },
+    {
+      "stage": "check",
+      "question": "Eight partitions, members c1..c3 with sticky assignment c1=[0,3,6] c2=[1,4,7] c3=[2,5]. c4 joins. How many partitions move, and why that number?",
+      "options": [
+        "Two: c4 must end with two partitions and had none, so two is the lower bound",
+        "Five: the range boundaries shift and every member past the first loses something",
+        "Eight: a rebalance always revokes and reassigns every partition in the topic",
+        "Zero: sticky never moves a partition that already has a live owner"
+      ],
+      "correct": 0,
+      "explanation": "Sticky keeps survivors' partitions, finds no orphans, then levels by moving one partition at a time from the heaviest to c4 until the spread is at most one: partitions 6 and 7 move. Range moves five for the same change. Zero is impossible because c4 would otherwise sit idle while others hold three."
+    },
+    {
+      "stage": "check",
+      "question": "Why is a committed offset stored per (group, partition) rather than per (member, partition)?",
+      "options": [
+        "Because member ids are random and too long to use as a key",
+        "Because the next owner of the partition must resume from where the previous owner stopped",
+        "Because members never change and the extra key would be redundant",
+        "Because the broker cannot know which member sent the commit request"
+      ],
+      "correct": 1,
+      "explanation": "Progress belongs to the group: when partition 3 moves from c2 to c1, c1 must start at the group's committed offset for partition 3. That is also why fencing matters: a zombie's commit under the same key would overwrite the new owner's progress."
+    },
+    {
+      "stage": "post",
+      "question": "c2 is evicted at generation 3 after a GC pause, the group moves to generation 4, and c2 then tries to commit offset 1048 for partition 3. What happens to the duplicate ledger postings c2 made while it was a zombie?",
+      "options": [
+        "The coordinator rolls them back as part of rejecting the commit",
+        "They are prevented because the commit is checked before each side effect",
+        "They are merged with the new owner's postings by offset",
+        "They remain; fencing only stops the stale commit, not side effects already made outside the log"
+      ],
+      "correct": 3,
+      "explanation": "The coordinator sees only commits, so it can stop c2 from overwriting the committed offset but cannot undo postings c2 already made to the ledger. Removing those duplicates needs an idempotent consumer or a transactional commit, which is the next lesson's subject."
+    },
+    {
+      "stage": "post",
+      "question": "The session timeout is 10,000 ms and a member's last heartbeat was at t=0. The coordinator checks at t=10,000. With the lesson's `<=` deadline rule, is the member evicted, and what would `<` change?",
+      "options": [
+        "Evicted; with `<` a member silent for exactly the timeout would survive one more tick",
+        "Not evicted; with `<` it would be evicted one tick earlier than intended",
+        "Evicted either way; the comparison operator only affects the log message",
+        "Not evicted either way, because eviction needs two consecutive missed checks"
+      ],
+      "correct": 0,
+      "explanation": "The deadline is now minus the timeout, 0; a last heartbeat of 0 satisfies `<= 0`, so the member is evicted at exactly the timeout. With `<` it would survive until the next tick, which is the off-by-one the test pins with its 9,999 and 10,000 cases. Eviction is a single check against the deadline, not a count of misses."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "14-choosing-a-structure",
+  "title": "Choosing a Structure: A Decision Procedure",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A BIN table is implemented as a HashMap keyed by the first six digits of the card number. Which change in the data breaks it?",
+      "options": [
+        "Card numbers that start with a zero, which the map cannot store as a key",
+        "Issuer ranges that share a six-digit prefix but differ at the seventh or eighth digit",
+        "A monthly reload that doubles the number of entries in the file",
+        "Card numbers longer than sixteen digits, which overflow the key"
+      ],
+      "correct": 1,
+      "explanation": "A map keyed by a fixed six-digit prefix can hold one value per prefix, so two eight-digit ranges under the same six digits collide and one is lost; this is the 8-digit BIN migration incident. Hash maps handle growth and any string key, and the key length does not depend on the PAN length."
+    },
+    {
+      "stage": "check",
+      "question": "What is the first step of the decision procedure, before any structure is named?",
+      "options": [
+        "Estimate memory per entry so the structure fits the heap",
+        "Pick the structure with the best Big-O for lookup",
+        "List every operation with its frequency, latency budget, and working set",
+        "Check whether the standard library already provides an implementation"
+      ],
+      "correct": 2,
+      "explanation": "The access pattern is the input to every later step; invariants and constants are evaluated against it. Memory and library availability are Step 3 (constants), and Big-O for a single operation is how the BIN table ended up as a hash map."
+    },
+    {
+      "stage": "check",
+      "question": "A retry scheduler uses a binary heap keyed by due time. Cancelling a job by id is O(n). Which fix keeps the heap and makes cancel cheap?",
+      "options": [
+        "Replace the heap with a hash map keyed by job id, since cancel is now the dominant operation",
+        "Add a hash set of cancelled ids and skip those jobs when they reach the top (lazy deletion)",
+        "Rebuild the heap from scratch after each cancel so the removed job is gone",
+        "Sort the heap array after each cancel so the job can be found by binary search"
+      ],
+      "correct": 1,
+      "explanation": "Lazy deletion makes cancel O(1) and costs only the memory of ids that have not yet surfaced; a hash map from id to heap index is the other standard fix. Replacing the heap loses extract-min, and rebuilding or sorting after each cancel is O(n) or worse."
+    },
+    {
+      "stage": "check",
+      "question": "Why is a tree keyed by timestamp the wrong primary structure for an append-only audit log?",
+      "options": [
+        "Trees cannot store more than a few million entries before running out of heap",
+        "Append order already is time order, so the tree spends its work maintaining an order the log has for free",
+        "Timestamps are not unique, and a tree cannot store duplicate keys under any scheme",
+        "Range queries by time are impossible on a tree and require a hash map"
+      ],
+      "correct": 1,
+      "explanation": "A log answers time-range queries with a binary search for the start and a sequential scan, with no per-append cost; an unbalanced tree degenerates on monotonic inserts and a balanced one rotates for nothing. Duplicate timestamps are handled by a composite key, and trees do support range queries."
+    },
+    {
+      "stage": "post",
+      "question": "An idempotency store must hold 50 million keys for 24 hours and survive a process restart. What does the constants step conclude?",
+      "options": [
+        "Use an in-process HashMap with a background thread that sweeps expired keys every minute, since 50 million entries fit on a large heap",
+        "Use a TreeMap keyed by expiry time so the oldest entries can be removed first and lookups by key stay logarithmic",
+        "The working set and the durability invariant put the hash map in an external store with TTL (Redis SET NX EX, or a unique-indexed table)",
+        "Use a sorted array of keys, since 50 million entries fit in memory and binary search is fast enough for the 1 ms budget"
+      ],
+      "correct": 2,
+      "explanation": "At roughly 250 bytes per entry the set is about 12 GB, and surviving a restart is an invariant no in-process structure meets; the access pattern is still exact-key putIfAbsent, so the structure is a hash map, externalised. A tree keyed by expiry degenerates on monotonic time, and a sorted array has O(n) inserts."
+    },
+    {
+      "stage": "post",
+      "question": "What belongs in the design note's \"impossible operation\" section, and why?",
+      "options": [
+        "Every operation the structure supports, with its complexity, so reviewers can confirm the API is complete and matches the table",
+        "The operations the structure makes O(n) or cannot express, so a later request for one triggers a redesign instead of a workaround",
+        "The Big-O of each operation copied from the textbook table for the structure, so the note is self-contained for new readers",
+        "A list of competing structures that were considered, with their benchmark results, so the choice can be defended in review"
+      ],
+      "correct": 1,
+      "explanation": "Naming what the structure cannot do cheaply is what makes a future change recognisable as a change of access pattern. Supported operations and complexities are the access-pattern table; rejected candidates have their own section."
+    }
+  ]
+}

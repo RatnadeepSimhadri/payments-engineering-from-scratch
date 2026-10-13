@@ -1,0 +1,78 @@
+{
+  "lesson": "14-memory-layout-and-cache-lines",
+  "title": "Memory Layout, Cache Lines, and False Sharing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A loop sums one 8-byte field from each of 10 million objects. Roughly how much memory does the CPU fetch if each object is 56 bytes and allocated contiguously?",
+      "options": [
+        "80 MB: 8 bytes per object, because the CPU reads only the bytes the loop uses",
+        "560 MB: the whole object streams past, since the field sits in a line shared with the rest of the object",
+        "640 MB: one full 64-byte line per object regardless of object size",
+        "8 MB: the prefetcher collapses the reads into one line per eight objects"
+      ],
+      "correct": 1,
+      "explanation": "Memory is fetched in 64-byte lines, and with 56-byte objects laid end to end the amount fields are 56 bytes apart, so essentially every byte of the 560 MB of objects passes through the cache to use 80 MB of it. A long[] of the amounts fetches only the 80 MB, which is the six-to-seven-fold difference measured in the lesson."
+    },
+    {
+      "stage": "check",
+      "question": "On HotSpot with compressed class pointers and compressed oops, what is the size of an object with fields long a, int b, byte c?",
+      "options": [
+        "13 bytes",
+        "24 bytes",
+        "25 bytes",
+        "32 bytes"
+      ],
+      "correct": 3,
+      "explanation": "The header is 12 bytes. The long must be 8-aligned so it goes at offset 16; HotSpot fills the 4-byte gap at offset 12 with the int; the byte lands at offset 24, for 25 bytes of content, and the object is padded to the next multiple of 8: 32 bytes. 24 bytes would need the byte to fit in a gap, but the int already took the only one; 13 is the raw field total and ignores the header, alignment, and padding."
+    },
+    {
+      "stage": "check",
+      "question": "Which access pattern favours array-of-structs over struct-of-arrays?",
+      "options": [
+        "Summing a single field across every record",
+        "Reading every field of one record selected by index",
+        "Filtering all records on one field",
+        "Computing a histogram of one field"
+      ],
+      "correct": 1,
+      "explanation": "Reading a whole record touches all its fields, which in AoS sit together in one or two lines; in SoA they are spread across one array per field, each a separate line and potential miss. The other three patterns scan one field across records, where SoA's contiguous primitive array uses every fetched byte."
+    },
+    {
+      "stage": "check",
+      "question": "Eight threads each increment their own slot of a long[8] with no locks. Throughput falls as threads are added. What is happening?",
+      "options": [
+        "A data race: the plain increments are not atomic, so threads overwrite each other's values and retry",
+        "False sharing: the eight slots share one 64-byte line, so every write invalidates the other cores' copies",
+        "GC pressure: each increment allocates a boxed Long on the heap and the collector runs continuously",
+        "Lock contention: the JVM takes an internal lock to perform the array bounds check on every access"
+      ],
+      "correct": 1,
+      "explanation": "Eight longs are exactly 64 bytes, one line, and cache coherence tracks ownership per line, so each core's write forces a line transfer from whichever core wrote last. No two threads touch the same slot, so there is no race; nothing is boxed; bounds checks take no locks. Padding each slot to its own line, or using LongAdder, removes the effect."
+    },
+    {
+      "stage": "post",
+      "question": "A service sets its heap to 40 GB and memory use rises sharply compared with 31 GB, with the same data. The most likely cause?",
+      "options": [
+        "The JIT compiles more methods when more heap is available",
+        "Compressed oops switched off above 32 GB, so every reference went from 4 to 8 bytes",
+        "The garbage collector keeps more generations alive on a larger heap",
+        "Object headers grow from 12 to 16 bytes once the heap exceeds 32 GB"
+      ],
+      "correct": 1,
+      "explanation": "Compressed oops store references as 32-bit offsets scaled by the 8-byte alignment, which can only address 32 GB; past that HotSpot uses full 64-bit references, doubling the size of every reference field and reference array. Headers do grow by 4 bytes, but only because the class pointer is no longer compressed; the reference doubling is the dominant effect. GC and JIT behaviour do not change the data's size."
+    },
+    {
+      "stage": "post",
+      "question": "Summing a long[4096][4096] column by column is 17x slower than row by row on the lesson's machine. Which change fixes it without changing the result?",
+      "options": [
+        "Iterate rows in the outer loop and columns in the inner loop, or store the array transposed",
+        "Replace long with int so twice as many values fit in each line",
+        "Use parallel streams so several cores share the misses",
+        "Allocate the array with -XX:+AlwaysPreTouch so the pages are resident"
+      ],
+      "correct": 0,
+      "explanation": "The cost comes from touching a different line on every load and evicting it before the next column returns to it; matching the loop order to the layout (or the layout to the loop) makes each line fully used. Shrinking the element type halves the traffic but keeps the stride problem; more cores add bandwidth without fixing the access pattern; pre-touching pages addresses page faults, not cache misses."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "07-skip-lists",
+  "title": "Skip Lists",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A sorted singly linked list of n keys is searched for one key. What is the cost, and what would a second list over every other node change?",
+      "options": [
+        "O(log n), and the second list adds nothing",
+        "O(n), and the second list cuts it to about n/2 + 1 steps",
+        "O(n), and the second list makes it O(log n) immediately",
+        "O(1) with a hash, and the second list is unnecessary"
+      ],
+      "correct": 1,
+      "explanation": "A linked list must be walked, so O(n). One express lane over alternate nodes halves the walk plus one step down; log2(n) such lanes give about 2 log2(n). A single extra lane is not logarithmic, and a hash gives no order at all."
+    },
+    {
+      "stage": "check",
+      "question": "In the demo's ten-key list, searching for 456 starts at the top level, moves to 367, then steps down four times before finding 456 at level 0. Why does the search never move forward again until level 0?",
+      "options": [
+        "Because 367 is the highest node and search always stops there",
+        "Because at every level 367's next node is 831 or 674, both greater than 456",
+        "Because levels above 0 contain only keys that were inserted first",
+        "Because the skip list caches the last searched node"
+      ],
+      "correct": 1,
+      "explanation": "At each level the rule is: advance while the next key is less than the target, else step down. From 367, the next node at levels 4-2 is 831 and at level 1 is 674, both past 456, so the search descends until level 0 where the next node is 456 itself. Levels depend on coin flips, not insertion order."
+    },
+    {
+      "stage": "check",
+      "question": "What does a span of 4 on the header's level-4 pointer to key 367 mean, and what does it make possible?",
+      "options": [
+        "367 participates in four lists, one for each of its levels, and the header mirrors that count",
+        "The pointer jumps over four level-0 positions, so 367 has rank 4; summing spans gives rank in O(log n)",
+        "Four nodes were inserted into the list before 367 arrived, and the header remembers the insertion order",
+        "The header keeps four duplicate pointers at that level so a corrupted pointer can be recovered"
+      ],
+      "correct": 1,
+      "explanation": "A span counts level-0 steps the pointer skips. Accumulating spans along a search path yields the rank of the node reached, which is how Redis's ZRANK runs in O(log n). The node's own level and its insertion history are unrelated to the span value."
+    },
+    {
+      "stage": "check",
+      "question": "The demo inserts 100,000 keys in sorted order and measures 33.1 comparisons per search, the same as for random order. Why does sorted input not degrade a skip list the way it degrades a plain BST?",
+      "options": [
+        "Because the skip list rebalances itself after every insert, exactly as an AVL tree does with rotations",
+        "Because a node's level comes from an independent coin flip, so the shape does not depend on the keys or their order",
+        "Because sorted keys all land at the tail of the list, where a search starting from the head is cheapest",
+        "Because the skip list stores its keys in a contiguous array and uses binary search inside each level"
+      ],
+      "correct": 1,
+      "explanation": "Balance comes from randomness that is independent of the data: the level distribution is geometric regardless of what the keys are or when they arrive. There is no rebalancing step at all, and searches still start at the head and descend; a biased or key-derived coin is the only thing that can degrade it."
+    },
+    {
+      "stage": "post",
+      "question": "A list is built with a level source that always returns 1. What happens, and what does it demonstrate?",
+      "options": [
+        "Insert fails on the second key, because every non-header node must hold at least two levels to be linked",
+        "The list stays correct but search costs about n/2 comparisons: the randomness, not the data, is what balances it",
+        "Search still costs O(log n) because the header retains all of its levels and skips over the flat nodes",
+        "The list silently promotes every other node to level 2 so that the expected shape is preserved anyway"
+      ],
+      "correct": 1,
+      "explanation": "Without promotions the structure is a sorted linked list: still a correct map, but O(n) to search (11,364 comparisons for 20,000 keys in the demo). It shows that the probabilistic guarantee depends entirely on a fair, independent coin, which is why the RNG is injected and never derived from keys."
+    },
+    {
+      "stage": "post",
+      "question": "The JDK has ConcurrentSkipListMap but no concurrent red-black tree, and Redis chose a skip list for sorted sets. Which reasoning do these choices share?",
+      "options": [
+        "Skip lists use less memory than any balanced tree in every configuration of p and maxLevel",
+        "Skip lists have a strictly better worst-case search bound than red-black trees for the same n",
+        "An insert is a local splice of a few pointers with no rotations, which makes lock-free updates and rank maintenance practical",
+        "Skip lists do not need a comparator or an ordering on keys, so they work with any key type at all"
+      ],
+      "correct": 2,
+      "explanation": "Rotations change several pointers at once and are hard to make lock-free; a skip list insert links one new node at known predecessors, level by level, each with a single CAS, and spans are easy to maintain. Skip lists have a worse worst case than red-black trees and comparable memory, and both need a comparator."
+    }
+  ]
+}

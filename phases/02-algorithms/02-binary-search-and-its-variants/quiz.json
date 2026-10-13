@@ -1,0 +1,78 @@
+{
+  "lesson": "02-binary-search-and-its-variants",
+  "title": "Binary Search and Its Variants",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "What property must the data (or predicate) have for binary search to be correct?",
+      "options": [
+        "The elements must all be distinct so that each probe has one answer",
+        "The predicate must be monotone: false on a prefix, true on the rest",
+        "The array must fit in memory so that the midpoint is addressable",
+        "The number of elements must be a power of two so halving is exact"
+      ],
+      "correct": 1,
+      "explanation": "Binary search only needs a boundary between a false region and a true region; sortedness is one way to get that. Duplicates are fine (lower and upper bound handle them), and sizes that are not powers of two just take a ceil(log2 n) probes."
+    },
+    {
+      "stage": "check",
+      "question": "In firstTrue, why does the true branch set hi = mid rather than hi = mid - 1?",
+      "options": [
+        "Because mid might itself be the first true index, so it must stay inside the half-open range",
+        "Because hi = mid - 1 would make the range grow when mid equals lo and the loop would never end",
+        "Because the range is closed on the right and excluding mid would skip the last element",
+        "Because the predicate is only evaluated once per iteration and mid must be re-tested next time"
+      ],
+      "correct": 0,
+      "explanation": "The range [lo, hi) excludes hi, so hi = mid keeps mid as a candidate while ruling out everything after it. hi = mid - 1 would exclude mid, which may be the answer, and on the closed-range version that is exactly the off-by-one that makes searches skip the boundary."
+    },
+    {
+      "stage": "check",
+      "question": "On [30, 30, 30, 50, 75, 75, 100, 250, 250, 250, 250, 500], what do lowerBound(250) and upperBound(250) return, and what does the pair tell you?",
+      "options": [
+        "7 and 10: the first and last index holding 250",
+        "7 and 11: the run of 250s occupies [7, 11), so there are four of them",
+        "6 and 11: the neighbours on each side of the run of 250s",
+        "8 and 11: some index inside the run and one past its end"
+      ],
+      "correct": 1,
+      "explanation": "lowerBound is the first index with value >= 250 (index 7) and upperBound is the first index with value > 250 (index 11); their difference is the count. Returning the last index (10) would make count need a +1 and break for absent keys, where both bounds coincide."
+    },
+    {
+      "stage": "check",
+      "question": "Why is int mid = (lo + hi) / 2 a bug even though it is correct arithmetic?",
+      "options": [
+        "Integer division truncates, so mid can equal lo and the loop fails to shrink the range",
+        "When lo + hi exceeds Integer.MAX_VALUE the sum wraps negative and mid becomes an invalid index",
+        "It rounds toward lo, which biases the search and doubles the expected number of probes",
+        "It evaluates hi before lo, so a concurrent writer can observe an inconsistent midpoint"
+      ],
+      "correct": 1,
+      "explanation": "With about a billion elements lo + hi overflows 32 bits, wraps, and the search throws or loops; this exact defect sat in java.util.Arrays for nine years. lo + ((hi - lo) >>> 1) cannot overflow because hi - lo is always a valid non-negative int. Truncation toward lo is harmless since lo <= mid < hi always holds."
+    },
+    {
+      "stage": "post",
+      "question": "A treasury tool must find the largest per-payout cap c such that the sum of min(amount, c) over all payouts fits a budget. Why can this be solved with firstTrue, and over what range?",
+      "options": [
+        "The payouts are sorted by amount, so the cap is found by indexOf on the amounts array",
+        "The total is non-decreasing in c, so 'total exceeds budget' is monotone over caps from 0 to the largest payout",
+        "Each payout is independent, so the cap is the budget divided by the number of payouts, no search needed",
+        "The total is bounded above by the budget, so the cap is found by searching the budget's divisors"
+      ],
+      "correct": 1,
+      "explanation": "Raising the cap never lowers any min(amount, c), so the total is monotone and the first infeasible cap minus one is the answer; caps above the largest payout change nothing, which bounds the range. Dividing the budget evenly ignores that small payouts are not capped, and the amounts need not be sorted at all."
+    },
+    {
+      "stage": "post",
+      "question": "A fee-tier lookup uses Arrays.binarySearch on a thresholds array that contains duplicate values, and tiers occasionally flip between runs. What is the correct fix?",
+      "options": [
+        "Sort the thresholds array with a stable sort before each lookup so the duplicates keep their order",
+        "Replace the call with a lowerBound (first index with threshold >= amount) so ties resolve to a defined index",
+        "Switch to Collections.binarySearch, which is specified to return the lowest matching index",
+        "Wrap the array in a TreeMap and use get, which throws when a key appears more than once"
+      ],
+      "correct": 1,
+      "explanation": "Arrays.binarySearch documents that with duplicates there is no guarantee which index is returned; lowerBound (or upperBound minus one, depending on the rule) names a specific boundary. Collections.binarySearch has the same caveat, sorting does not change which duplicate is hit, and a TreeMap cannot hold duplicate keys in the first place."
+    }
+  ]
+}

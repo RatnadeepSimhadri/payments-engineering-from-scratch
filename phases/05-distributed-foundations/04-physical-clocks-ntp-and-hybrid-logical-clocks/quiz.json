@@ -1,0 +1,78 @@
+{
+  "lesson": "04-physical-clocks-ntp-and-hybrid-logical-clocks",
+  "title": "Physical Clocks, NTP, and Hybrid Logical Clocks",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service computes a request timeout as deadline = System.currentTimeMillis() + 5000 and checks it against currentTimeMillis(). What can go wrong?",
+      "options": [
+        "Nothing; the wall clock is the standard way to implement timeouts on the JVM",
+        "An NTP step can make the timeout fire early or never, because the wall clock can jump in either direction",
+        "The addition can overflow a long after 2038 and the deadline becomes negative",
+        "The timeout drifts by the clock's ppm error and fires about 4 seconds late per day"
+      ],
+      "correct": 1,
+      "explanation": "The wall clock is corrected by NTP and can be stepped forward (timeout fires immediately) or backward (timeout is extended). Durations belong on the monotonic clock, System.nanoTime(). Drift of 50 ppm over 5 seconds is 250 microseconds, not seconds; and long milliseconds do not overflow in 2038."
+    },
+    {
+      "stage": "check",
+      "question": "An NTP exchange records t1 = 1000, t2 = 1130, t3 = 1130, t4 = 1040 (client clock, server clock, server clock, client clock). What does the client conclude, and how much should it trust it?",
+      "options": [
+        "Offset 110 ms behind, delay 40 ms; the true offset is within 20 ms of the estimate",
+        "Offset 130 ms behind, delay 40 ms; the estimate is exact because processing time was zero",
+        "Offset 110 ms behind, delay 90 ms; the estimate could be wrong by up to 90 ms",
+        "Offset 90 ms behind, delay 40 ms; the server is slower than the client by the difference"
+      ],
+      "correct": 0,
+      "explanation": "offset = ((t2 - t1) + (t3 - t4)) / 2 = (130 + 90) / 2 = 110 and delay = (t4 - t1) - (t3 - t2) = 40. The asymmetry of the path is unknown but at most the delay, so the error is bounded by delay / 2 = 20 ms. In fact the true offset here is 100 (30 ms out, 10 ms back). Zero processing time removes one error source, not the asymmetry."
+    },
+    {
+      "stage": "check",
+      "question": "Two servers are kept within 3 ms of each other by NTP. Service A writes an event at wall time 14:02:00.004 and sends a message that causes service B to write an event stamped 14:02:00.002. What does this tell you?",
+      "options": [
+        "B's event happened first, since its timestamp is earlier and the clocks are synchronised",
+        "A bug in B produced a backdated timestamp, because causally later events cannot have earlier stamps",
+        "Nothing about order: the stamps are 2 ms apart and the skew is 3 ms, so either order is consistent with the readings",
+        "The message took negative time, which indicates the network reordered the packets"
+      ],
+      "correct": 2,
+      "explanation": "Wall-clock stamps closer together than the skew bound carry no ordering information. Here the causal order is known from the message, and it contradicts the stamps, which is exactly the misordering a 3 ms skew permits. An HLC would stamp B's event after A's regardless of skew."
+    },
+    {
+      "stage": "check",
+      "question": "An HLC node is at (l = T+300, c = 4) and its physical clock reads T+200. It receives a message stamped (T+300, 40). What is its new state?",
+      "options": [
+        "(T+300, 5): the local counter increments because the local l is the maximum",
+        "(T+300, 41): both sides share the same l, so the counter steps past the larger of the two",
+        "(T+200, 0): the physical clock wins and the counter resets",
+        "(T+300, 45): the two counters are added so that no value is reused"
+      ],
+      "correct": 1,
+      "explanation": "l' = max(l, l_m, pt) = T+300, and since l' equals both l and l_m, the rule is c' = max(c, c_m) + 1 = 41. This guarantees the receive is ordered after the message (41 > 40) and after the node's own previous event (41 > 4). The physical clock is behind, so it does not win, and counters are never summed."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the HLC implementation throw a ClockDriftException when a received l is more than maxDrift ahead of the local physical clock, instead of simply adopting it?",
+      "options": [
+        "Because the 48-bit l field would overflow if remote values far ahead of the local clock were adopted without any bound",
+        "Because adopting it would reset c to zero and lose the causal order of every local event recorded before the receive",
+        "Because a far-future l can only come from a broken clock or corrupt message, and adopting it would push every downstream clock ahead of real time",
+        "Because the Kulkarni paper requires l to equal the physical clock exactly on every receive, so a larger remote value is a protocol violation"
+      ],
+      "correct": 2,
+      "explanation": "The invariant l - pt <= epsilon holds only if remote clocks are within epsilon of ours. A message violating that means a node's clock is wrong, and since every receiver adopts the max, one bad timestamp would propagate through the whole system and make timestamps meaningless as times. CockroachDB applies the same policy by shutting down a node beyond max-offset. The 48-bit field has 8,900 years of headroom."
+    },
+    {
+      "stage": "post",
+      "question": "On the payment trace with the ledger's clock 80 ms behind, which statement about the three timestamp schemes is correct?",
+      "options": [
+        "Wall clock and Lamport both misorder some causal pairs; only HLC orders all of them correctly, because it merges the remote l on receive",
+        "Wall clock misorders some causal pairs; Lamport and HLC order all of them correctly, and only HLC also stays within the skew of true time",
+        "All three order every causal pair correctly, but only wall clock and HLC produce values that can be meaningfully compared across nodes",
+        "Lamport and HLC misorder the same causal pairs because both derive from the same max-plus-one counter rule applied on receive"
+      ],
+      "correct": 1,
+      "explanation": "Both logical clocks satisfy happens-before by construction; the wall clock does not, and the report shows two violated pairs. What HLC adds over Lamport is that its l component stays within the largest clock offset (35 ms in the trace) of true time, so it is still usable as a timestamp. Lamport's value of 9 says nothing about when anything happened."
+    }
+  ]
+}

@@ -3,7 +3,7 @@
 > A log is not a queue: nothing is removed when it is read, the position belongs to the reader, and the only write is an append.
 
 **Type:** Build
-**Languages:** Java, Python, Go
+**Languages:** Java
 **Prerequisites:** Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 7, Lesson 02 (Write-Ahead Logs)
 **Time:** ~120 minutes
 

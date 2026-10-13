@@ -1,0 +1,78 @@
+{
+  "lesson": "12-testing-concurrent-code",
+  "title": "Testing Concurrent Code: Stress, Model Checking, and Determinism",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A test starts 32 threads that each increment a shared counter 1000 times, then asserts the total. It passes 10,000 times in a row. What has been shown?",
+      "options": [
+        "The counter is thread-safe on every platform",
+        "The increment compiles to a single atomic instruction",
+        "The bad interleavings were not visited on this machine",
+        "The JIT has inlined the increment so no race is possible"
+      ],
+      "correct": 2,
+      "explanation": "A stress test samples the schedules the hardware happens to produce. Passing shows those schedules were fine, not that every schedule is. The racy counter from Lesson 02 passes this test routinely because the load-add-store window is nanoseconds wide and the OS scheduler rarely puts two threads in it at once."
+    },
+    {
+      "stage": "check",
+      "question": "Two threads each execute three instructions with no locks. How many distinct interleavings are there, and how is the number computed?",
+      "options": [
+        "6, one per instruction, since each must run once",
+        "20, the multinomial 6! / (3! x 3!)",
+        "64, since each of six steps picks one of two threads",
+        "9, the product of the two thread lengths"
+      ],
+      "correct": 1,
+      "explanation": "An interleaving is a total order of six steps that keeps each thread's own three in program order, which is the number of ways to choose which three of the six positions belong to thread one: C(6,3) = 20. 2^6 overcounts because it includes sequences like all six steps from one thread, which has only three."
+    },
+    {
+      "stage": "check",
+      "question": "The locked increment has 252 interleavings on paper but the exhaustive explorer reports explored = 2. Why?",
+      "options": [
+        "The explorer applies partial-order reduction to commuting steps",
+        "The explorer stops after the first two schedules once no violation is found",
+        "Both threads' instructions are identical, so the explorer deduplicates symmetric schedules",
+        "A thread whose next step is a held lock is not enabled, so the search never branches there"
+      ],
+      "correct": 3,
+      "explanation": "Once one thread takes the lock, the other thread's next instruction is lock L on a lock it does not own, so it is not enabled and the only choice is to keep running the holder until it unlocks. That leaves just the two sequential schedules. The explorer has no partial-order reduction or symmetry logic; blocking alone prunes the space."
+    },
+    {
+      "stage": "check",
+      "question": "The check-then-act debit subtracts with an indivisible AtomicAdd, yet the explorer finds 18 overdrawing schedules out of 20. Which schedules overdraw?",
+      "options": [
+        "Those in which both threads' loads happen before either AtomicAdd",
+        "Those in which either thread's AtomicAdd runs before its own load",
+        "Those in which the branch is taken by at least one thread",
+        "Those in which the two AtomicAdds run consecutively without a load between them"
+      ],
+      "correct": 0,
+      "explanation": "Both threads load 150, both pass the check against 100, and both subtract, leaving -50. Atomicity of the subtraction does not help because the check and the act are separate steps. Only the two sequential schedules, where one thread's AtomicAdd precedes the other's load, are safe."
+    },
+    {
+      "stage": "post",
+      "question": "The random explorer with seed 42 reports 735 violations in 1000 schedules. Which conclusion is justified?",
+      "options": [
+        "The bug fires about 73.5 percent of the time in production",
+        "Running with seed 42 again will reproduce exactly the same traces",
+        "The exhaustive explorer would also find roughly 735 of 1000 violations",
+        "The remaining 265 schedules are the only safe interleavings"
+      ],
+      "correct": 1,
+      "explanation": "The explorer is single-threaded and seeded, so the same seed yields identical results, which is what makes a CI failure reproducible. The violation rate is not a production probability: choosing uniformly among enabled threads at each step does not weight schedules the way hardware does, and the exhaustive count (18 of 20) is a different ratio again."
+    },
+    {
+      "stage": "post",
+      "question": "A team's model of a transfer passes exhaustive exploration with no violations, but the real code still corrupts balances under load. Which explanation is consistent with what the model checker guarantees?",
+      "options": [
+        "The explorer only samples schedules, so it missed the failing one",
+        "The invariant was checked after every step instead of only at the end",
+        "Exhaustive exploration cannot detect deadlocks, which is what the code hits",
+        "The model assumes sequential consistency or does not match the real code's steps"
+      ],
+      "correct": 3,
+      "explanation": "The explorer proves the model, under sequential consistency, for every schedule. If the real method has steps the model omitted (a re-read, a non-atomic subtraction) or relies on visibility the hardware does not provide without synchronisation, the proof does not transfer. Exhaustive exploration does enumerate every schedule and does detect deadlocks as dead ends."
+    }
+  ]
+}

@@ -4,20 +4,52 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** See the phase README
+**Prerequisites:** Phase 7, Lesson 08
 **Time:** ~90 minutes
-**Status:** Planned
 
 ## Learning Objectives
 
-- Explain the problem this lesson solves and where it appears in a payment or distributed system
-- Build or trace the core mechanism in Java, Python, or Go
-- Verify the invariant the mechanism must preserve with a test or a worked example
-- Connect the mechanism to the production system that depends on it
+- Explain the problem this lesson solves and where it appears in a payment system
+- Build the core mechanism from scratch in your chosen language
+- Measure or test the invariant the mechanism must preserve
+- Compare the from-scratch version with the standard-library or production equivalent
 
-## Outline
+## The Problem
 
-This lesson is registered in `curriculum/curriculum.json` and waiting for an author. Follow
-`AGENTS.md` and `LESSON_TEMPLATE.md`, then run `python3 scripts/scaffold_lesson.py 7 9` to
-replace this outline with the full skeleton. The hook above states the lesson's thesis; the
-objectives state what a finished lesson must deliver.
+TODO: two or three paragraphs. A concrete scenario where not knowing this costs money or uptime.
+
+## The Concept
+
+TODO: the mental model, with a mermaid diagram or table. No code yet.
+
+## Build It
+
+### Step 1: TODO
+
+```java
+// TODO
+```
+
+## Use It
+
+TODO: the standard-library or production equivalent, and what it hides.
+
+## Ship It
+
+TODO: the reusable artifact in outputs/.
+
+## Exercises
+
+1. TODO (reinforce)
+2. TODO (apply)
+3. TODO (extend)
+
+## Key Terms
+
+| Term | What people say | What it actually means |
+|------|-----------------|------------------------|
+| TODO | | |
+
+## Further Reading
+
+- TODO

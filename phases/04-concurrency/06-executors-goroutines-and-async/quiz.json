@@ -1,0 +1,78 @@
+{
+  "lesson": "06-executors-goroutines-and-async",
+  "title": "Executors, Goroutines, and asyncio",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service submits blocking HTTP calls to a fixed pool of 64 threads. One dependency stops responding and each call to it waits 30 seconds. What happens to calls to the other, healthy dependencies?",
+      "options": [
+        "They continue normally because each dependency gets its own share of the pool",
+        "They queue behind the blocked tasks once all 64 threads are parked on the slow dependency",
+        "They fail immediately with RejectedExecutionException as soon as one task blocks",
+        "They are promoted to new threads created automatically by the fixed pool"
+      ],
+      "correct": 1,
+      "explanation": "A fixed pool has no notion of which dependency a task talks to; blocked threads are in use, and once all 64 are waiting on the slow dependency, every other task sits in the queue. Rejection only happens when the queue itself is bounded and full, and a fixed pool never grows."
+    },
+    {
+      "stage": "check",
+      "question": "The same three blocking GatedTasks are submitted to a fixed pool of 2 and to a virtual-thread-per-task executor. Why do all three start on virtual threads?",
+      "options": [
+        "Virtual threads run the tasks one after another on a single carrier, so no task is ever actually blocked",
+        "Each task gets its own virtual thread, and a blocked virtual thread releases its carrier instead of holding it",
+        "Virtual threads treat CountDownLatch.await as a no-op and return immediately without waiting for the gate",
+        "The JVM detects the starvation risk at submit time and grows the carrier pool to match the number of tasks"
+      ],
+      "correct": 1,
+      "explanation": "Each task gets its own virtual thread; when it blocks in await, the JVM unmounts its stack from the carrier, so the carrier runs the next task. The tasks really do block; nothing is skipped. The carrier pool stays small, which is the whole point: concurrency is no longer bounded by platform threads."
+    },
+    {
+      "stage": "check",
+      "question": "In FanOut.withTimeout, the adapter's future is combined with an alarm future using applyToEither, and exceptionally maps failures to a FAILED quote. Why must every path produce a Quote rather than letting an exception escape?",
+      "options": [
+        "Because allOf would complete exceptionally and the checkout would see no quotes at all, even from healthy processors",
+        "Because CompletableFuture cannot carry exceptions across thenApply boundaries",
+        "Because the ManualTimer can only complete futures with null and would deadlock on an exception",
+        "Because exceptions in callbacks terminate the JVM when thrown on the common pool"
+      ],
+      "correct": 0,
+      "explanation": "allOf completes exceptionally if any input does, which would discard the healthy answers. Converting timeouts and failures into Quote outcomes keeps the fan-in total and lets cheapest() filter them. CompletableFuture propagates exceptions fine; the timer and the JVM are not involved."
+    },
+    {
+      "stage": "check",
+      "question": "At t=800 ms gamma's alarm wins and its quote is TIMED_OUT, yet gamma.outstanding() is still 1. What does this tell you about the design?",
+      "options": [
+        "There is a bug: a timed-out call should have been removed from the adapter",
+        "The timeout abandoned the wait but did not cancel the request, which may still complete at the processor",
+        "The adapter double-counted the call because applyToEither invoked quote twice",
+        "ManualTimer failed to fire because the alarm was cancelled by whenComplete"
+      ],
+      "correct": 1,
+      "explanation": "A timeout is a decision to stop waiting; the in-flight request is unaffected unless something explicitly cancels it. For quotes that is harmless; for an authorisation it means the payment may succeed after the caller gave up, which is why idempotency keys and reconciliation exist. The adapter was called once, and the alarm did fire."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the lesson route every delay through a Timer interface with a ManualTimer in tests instead of using CompletableFuture.orTimeout directly?",
+      "options": [
+        "orTimeout is not available on Java 21 and requires a third-party scheduler",
+        "So the fan-out's timeout behaviour can be exercised in microseconds, in a chosen order, without real sleeps or flaky waits",
+        "Because orTimeout holds a platform thread for the duration of the timeout, starving the pool",
+        "So the production code can run without any scheduler thread at all"
+      ],
+      "correct": 1,
+      "explanation": "Injecting time lets a test say 'beta answers at 250, delta fails at 550, the deadline fires at 800' and run instantly and deterministically. orTimeout exists in Java 9+ and uses a shared scheduler thread without blocking; RealTimer wraps the same delayed executor for production."
+    },
+    {
+      "stage": "post",
+      "question": "firstOk completes with the first OK quote, or empty when every adapter has failed or timed out. Why is CompletableFuture.anyOf not sufficient to implement it?",
+      "options": [
+        "anyOf requires all inputs to have the same generic type, which Quote futures do not",
+        "anyOf completes on the first completion of any kind, so a failed adapter would end the race before an OK one arrives",
+        "anyOf blocks the calling thread until one input completes, defeating the asynchronous design",
+        "anyOf cannot be combined with a ManualTimer because it schedules on the common pool"
+      ],
+      "correct": 1,
+      "explanation": "anyOf is 'first to complete', not 'first to succeed'; since failures and timeouts are completions, it would often return a non-OK quote while a good answer was seconds away. The lesson's version completes the winner only on OK and uses a countdown to detect the all-failed case. anyOf does not block and accepts heterogeneous inputs."
+    }
+  ]
+}

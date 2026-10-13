@@ -1,0 +1,78 @@
+{
+  "lesson": "07-hash-functions-and-collisions",
+  "title": "Hash Functions, Collisions, and HashDoS",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Which property does a hash table's hash function need that a cryptographic hash function provides but a table does not require?",
+      "options": [
+        "Determinism within a process",
+        "Collision resistance against an adversary searching for any colliding pair",
+        "Speed in the tens of nanoseconds",
+        "Roughly uniform distribution over the keys actually seen"
+      ],
+      "correct": 1,
+      "explanation": "A table needs determinism, speed, uniformity, and avalanche; it does not need collision resistance, which is a cryptographic property costing about 100x more. A table under attack needs unpredictability of the colliding set, which is weaker than collision resistance and is what keyed hashes like SipHash provide."
+    },
+    {
+      "stage": "check",
+      "question": "Why does Java's String.hashCode make collisions cheap to find on purpose?",
+      "options": [
+        "It truncates the computed hash to the low 16 bits, so only 65,536 distinct values can ever exist",
+        "It is a simple linear combination with no avalanche, so equal-hash blocks can be reasoned about and concatenated at will",
+        "It derives the value from the object's memory address, which an attacker can read directly off the heap",
+        "It inspects only the first character of the string and ignores the entire rest of the input text"
+      ],
+      "correct": 1,
+      "explanation": "h = 31*h + c is linear with essentially no avalanche: one-character changes move the hash predictably, so colliding blocks combine and a large equal-hash set costs work proportional to its bit-length, not its size. The hash is a full 32 bits, uses no address, and reads every character; the weakness is the linear structure, not the width."
+    },
+    {
+      "stage": "check",
+      "question": "A chaining hash map receives n keys that all hash to one bucket. What is the total cost to insert them, and why?",
+      "options": [
+        "O(n), because each insert into the flooded bucket is still just a single constant-time array write",
+        "O(n log n), because the overfull bucket stays automatically balanced as a self-adjusting search tree",
+        "O(n^2), because insert number i must compare the new key against the i-1 keys already in that bucket",
+        "O(1) amortized, because the periodic table resize redistributes the colliding keys across new buckets"
+      ],
+      "correct": 2,
+      "explanation": "To honour uniqueness, each insert compares the new key against every key already in its bucket; with all n in one bucket that is 1 + 2 + ... + (n-1) = n(n-1)/2 comparisons. Resizing adds buckets but every key still shares the one, so it does not help. Treeifying the bin is what would bring a single bucket down to O(log n) per operation."
+    },
+    {
+      "stage": "check",
+      "question": "Why is adding a random secret constant to String.hashCode (h = hashCode(x) + seed) not a real defence?",
+      "options": [
+        "The secret seed value can be read directly out of the running process memory by a determined attacker",
+        "The differences between the keys that produce a collision are left unchanged by adding any constant offset",
+        "The addition overflows the signed 32-bit integer range and silently discards the secret seed on every call",
+        "The seed used would have to be widened to at least 128 bits before it could make any practical difference"
+      ],
+      "correct": 1,
+      "explanation": "Collisions depend on differences between hashes; adding the same constant to every hash leaves all those differences identical, so every previously colliding pair still collides regardless of the seed. The seed must feed a function whose output is a pseudorandom function of the key (SipHash), which is why the industry fix replaced the function rather than offsetting it."
+    },
+    {
+      "stage": "post",
+      "question": "How does drawing a hash function at random from a universal family at process startup restore expected O(1) against adversarial keys?",
+      "options": [
+        "It makes the hash function fully collision-resistant, so that no two distinct keys can share a bucket at all",
+        "Any fixed pair collides with probability at most 1/m over the family, and the chosen function is a startup secret",
+        "It sorts every key into order before hashing them, so the resulting bucket chains are always kept balanced",
+        "It causes the backing table to grow far faster than before, so the load factor can never rise under the flood"
+      ],
+      "correct": 1,
+      "explanation": "Universality guarantees that any fixed pair collides with probability at most 1/m averaged over the family; because the specific function is chosen from a secret at startup, the attacker cannot predict the colliding set and the keys spread as if random, giving expected chain length n/m. It is not collision resistance, does not sort, and is independent of table growth."
+    },
+    {
+      "stage": "post",
+      "question": "You must deduplicate requests by card number (PAN) without storing the PAN in the clear. Why is a bare SHA-256 of the PAN the wrong map key?",
+      "options": [
+        "SHA-256 is simply too slow to run on the key of every single incoming request at payment-gateway scale",
+        "A 16-digit PAN has about 10^16 values, so an unkeyed digest is brute-force reversible; use an HMAC keyed from a vault",
+        "SHA-256 produces far too many collisions when it is fed short fixed-length 16-digit numeric inputs like a PAN",
+        "A 256-bit SHA-256 output is simply too wide a value to be usable as a key in a standard hash-map structure"
+      ],
+      "correct": 1,
+      "explanation": "The PAN space is small enough that any unkeyed digest is trivially reversible by hashing all candidates, so SHA-256 provides no confidentiality for a PAN. A keyed hash (HMAC-SHA-256) or a token with the secret held in a KMS is required; the concern here is confidentiality of the key, which is a different requirement from the CPU-DoS defence and uses a different kind of key."
+    }
+  ]
+}

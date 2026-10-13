@@ -1,0 +1,78 @@
+{
+  "lesson": "02-amortized-analysis",
+  "title": "Amortized Analysis: Why Dynamic Arrays Are O(1)",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A dynamic array doubles its capacity when full. Which statement about appending n elements starting from empty is true?",
+      "options": [
+        "Every append costs O(1) because doubling is rare",
+        "The total cost is O(n) even though some single appends cost O(n)",
+        "The total cost is O(n log n) because there are log n doublings each costing n",
+        "The average append costs O(log n) because of the copies"
+      ],
+      "correct": 1,
+      "explanation": "The copies sum to 1 + 2 + 4 + ... < 2n, so the total over n appends is under 3n: linear. Individual appends at a doubling cost O(n), so the first option is wrong. There are log n doublings, but each copies only the current size, not n, so the sum is geometric rather than n log n."
+    },
+    {
+      "stage": "check",
+      "question": "In the accounting method for the doubling array, why must each append be charged 3 rather than 2?",
+      "options": [
+        "One unit writes the element, one is banked for its own future copy, and one pays for an older element whose credit is gone",
+        "Three is the number of pointer fields the backing array must update on each append: the slot, the size, and the capacity",
+        "The first doubling from capacity 1 to 2 happens to cost 3, and the accounting method fixes the charge at the first expensive step",
+        "Two covers the write and the element's own copy; the third unit is a safety margin reserved for a possible later shrink"
+      ],
+      "correct": 0,
+      "explanation": "When the array of capacity m fills, only the m/2 elements appended since the last doubling still hold credit; the other m/2 spent theirs. Each new element must therefore bank 2 credits: one for itself and one for an old element. Charging 2 makes the credit go negative (17 appends cost 48 but collect 34), which is how the method tells you the bound is wrong."
+    },
+    {
+      "stage": "check",
+      "question": "Using the potential function Phi = 2 * size - capacity, what is the amortized cost of an append that triggers a copy from capacity m to 2m?",
+      "options": [
+        "m + 1, because the copy of m elements dominates",
+        "1, because the potential drop exactly cancels the copy",
+        "3, because the actual cost m + 1 plus the potential change 2 - m equals 3",
+        "2, because only the write and one credit are involved"
+      ],
+      "correct": 2,
+      "explanation": "Before the copy, size = m and capacity = m, so Phi = m. After it, size = m + 1 and capacity = 2m, so Phi = 2. The change is 2 - m, and the actual cost is m + 1, giving m + 1 + 2 - m = 3. The potential built up by the cheap appends collapses to pay for the copy; it does not cancel it to 1."
+    },
+    {
+      "stage": "check",
+      "question": "After a chain of unions produces the path 7 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1 -> 0, find(7) with path compression costs 7 links. What does the next find(5) cost, and why?",
+      "options": [
+        "5 links, because compression only affects the node that was searched for",
+        "1 link, because compression pointed every node on the walked path directly at the root",
+        "7 links, because path compression only takes effect after union by rank is also applied",
+        "0 links, because find(7) cached the root for the whole set"
+      ],
+      "correct": 1,
+      "explanation": "Path compression re-parents every node visited during find(7) to the root 0, so nodes 1 through 7 are now all one link from the root. The expensive find improved the structure, and every later find on those nodes is O(1). This is amortization in its purest form: the cost was paid once and is recovered by all subsequent operations."
+    },
+    {
+      "stage": "post",
+      "question": "An authorization service must respond in under 50 ms at p99.9. Its duplicate list is a doubling array whose average append is 30 ns. Which statement is correct?",
+      "options": [
+        "The amortized O(1) bound guarantees the deadline, since 30 ns is six orders of magnitude below 50 ms and doublings are rare",
+        "The bound says nothing about one append; a copy of two million elements can take 180 ms, so only a worst-case or de-amortized design meets the deadline",
+        "The deadline is met as long as the array is pre-sized to the expected daily volume plus a ten percent margin for busy days",
+        "Replacing the array with a linked list removes the copies entirely and therefore meets the deadline with no other change needed"
+      ],
+      "correct": 1,
+      "explanation": "Amortized analysis bounds the sum over a sequence, not the cost of one operation. De-amortization (migrating two elements per append into a second array) converts the bound to worst-case O(1). Pre-sizing works only if the volume estimate is never exceeded, which is exactly the day the service fails; a linked list has no copies but makes the duplicate check O(n) per request."
+    },
+    {
+      "stage": "post",
+      "question": "A multi-tenant service shares one dynamic array across tenants. Tenant A performs a million cheap appends; tenant B's single append then triggers the full copy. What does the amortized guarantee say about B's cost?",
+      "options": [
+        "B's append is O(1) amortized like every other append in the sequence, so its latency is covered by the same guarantee",
+        "Nothing: the bound covers the whole sequence from empty, and B inherited a structure whose credit A's operations already spent",
+        "B's append is O(log n) because the copy cost is split evenly across the doublings that A's appends triggered earlier",
+        "The guarantee transfers to B because both tenants share the same potential function over the same underlying array"
+      ],
+      "correct": 1,
+      "explanation": "The amortized bound is about totals over a sequence starting from empty; it does not say which operation pays. In the accounting metaphor, A's appends banked the credit and B's append spends it all at once. In a shared or persistent structure this is a fairness problem and, if B can time the operation, a denial-of-service lever, which is why latency-critical shared structures use de-amortized designs."
+    }
+  ]
+}

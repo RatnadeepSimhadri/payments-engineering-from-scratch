@@ -1,0 +1,78 @@
+{
+  "lesson": "13-unique-id-generation",
+  "title": "Unique ID Generation: UUIDs, ULIDs, and Snowflake",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A table's primary key is a random UUIDv4 and the index is much larger than the buffer pool. What happens on each insert?",
+      "options": [
+        "The row is appended to the rightmost leaf page, which is almost always cached",
+        "The row lands on a uniformly random leaf page, usually a cache miss, with splits spread across the whole index",
+        "The database rejects the insert until the index is rebuilt with a sequential key",
+        "The insert is fast but every later range scan by time needs a full table scan only because of the data type"
+      ],
+      "correct": 1,
+      "explanation": "A B-tree places keys in order, so a random key goes to a random leaf: a page miss with high probability, half-full leaves from splits everywhere, and a hot set the size of the index. Time-ordered keys append at the right edge instead. Range scans by time are also impossible on a random key, but that is a query problem, not an insert cost."
+    },
+    {
+      "stage": "check",
+      "question": "In a UUIDv7, which bits make two ids generated in the same millisecond by the same generator sort in generation order?",
+      "options": [
+        "The 48-bit timestamp, which has sub-millisecond resolution in version 7",
+        "The 62 random bits in rand_b, which are drawn from a monotone random source",
+        "The 12-bit rand_a field used as a counter that increments within the millisecond",
+        "The 2 variant bits, which alternate between 10 and 11 on consecutive ids"
+      ],
+      "correct": 2,
+      "explanation": "RFC 9562 method 1 seeds the 12-bit rand_a with random bits each new millisecond and increments it for each id in the same millisecond, so same-timestamp ids differ in a field that sorts before the random part. The timestamp itself is millisecond-resolution and identical for both ids; rand_b is independent randomness and gives no order."
+    },
+    {
+      "stage": "check",
+      "question": "Twelve workers each generate ids as millisecond timestamp plus a 4-digit random suffix (about 13 bits). Why do they collide every few thousand milliseconds?",
+      "options": [
+        "Because 4 decimal digits can only represent 4,096 distinct values and the workers exhaust them in order every few seconds",
+        "Because the birthday bound makes a collision likely once about sqrt(2 * 10^4) ~ 140 ids share a millisecond, and 12 per ms gets there often",
+        "Because the millisecond timestamps drift between the twelve workers by a few milliseconds and the drifted ranges overlap",
+        "Because the random suffix is seeded from the millisecond timestamp on every worker and therefore repeats across them"
+      ],
+      "correct": 1,
+      "explanation": "With 10,000 suffix values, 12 ids in one millisecond collide with probability about 12 * 11 / (2 * 10,000) = 0.0066, so roughly one millisecond in 150 produces a duplicate: a few thousand milliseconds between failures matches. The exhaustion and seeding explanations describe different bugs; the drift one is irrelevant since the timestamp is the same by assumption."
+    },
+    {
+      "stage": "check",
+      "question": "A Snowflake generator sees the clock 60 seconds behind its last issued timestamp. Why does this lesson's version throw instead of continuing on the last timestamp, as the UUIDv7 generator does?",
+      "options": [
+        "Because Snowflake has no random bits: a stale timestamp for a minute means ids that sort wrongly against other workers, and only the timestamp protects uniqueness",
+        "Because Snowflake ids are 63-bit positive integers and the layout cannot represent a timestamp that is earlier than the last issued one",
+        "Because the 12-bit sequence field would wrap many times during 60 seconds of generation on a single frozen timestamp and duplicate ids",
+        "Because the worker id must be released and re-acquired from the coordinator whenever the clock changes by more than the tolerance"
+      ],
+      "correct": 0,
+      "explanation": "UUIDv7 can keep counting on a stale timestamp because its uniqueness comes from random bits and its timestamp is only for ordering. Snowflake's uniqueness depends entirely on (timestamp, worker, sequence), and a minute of stale time also makes this worker's ids interleave wrongly with others', so a large step is refused and surfaced. The sequence does not overflow by itself; it only wraps when 4,096 ids are issued in one timestamp."
+    },
+    {
+      "stage": "post",
+      "question": "Why does ULID's text form sort correctly as a string while a hex UUID's does too but MySQL's UUID() does not?",
+      "options": [
+        "ULID and hex UUID use ASCII-ordered alphabets with the timestamp first; MySQL's UUID() is a version 1 with the low bits of the time first",
+        "ULID is shorter, and shorter strings always sort in numeric order; MySQL pads with spaces",
+        "ULID and hex UUID are compared as integers by the database; MySQL stores UUIDs as strings",
+        "MySQL's UUID() is random, so it has no time to sort by; the other two are time-based by definition"
+      ],
+      "correct": 0,
+      "explanation": "Lexical order equals numeric order when the encoding alphabet is in ASCII order and the most significant field is written first; both Crockford base32 and lowercase hex satisfy that, and UUIDv7 and ULID put the timestamp first. MySQL's UUID() is version 1, which places time_low before time_mid and time_hi, so string order does not follow time; UUID_TO_BIN(uuid, 1) swaps the fields to fix it."
+    },
+    {
+      "stage": "post",
+      "question": "A ledger must assign ids to postings in two active regions with no cross-region call at write time, keep its B-tree index compact, and let auditors scan 'postings between 09:00 and 09:05'. Which scheme fits with the least machinery?",
+      "options": [
+        "Database BIGSERIAL in each region, with odd and even ranges",
+        "UUIDv4 with a separate indexed created_at column",
+        "UUIDv7 or ULID generated in the service, stored as 16 bytes",
+        "Snowflake with the region number as the worker id"
+      ],
+      "correct": 2,
+      "explanation": "Time-prefixed random ids need no coordination between regions, append at the right edge of the index, and make a time range a contiguous key range. Snowflake also works but requires unique worker ids per process, not per region (two processes in one region would collide), which is extra machinery. BIGSERIAL ranges break at the third region, and v4 needs a second index to answer the time query."
+    }
+  ]
+}

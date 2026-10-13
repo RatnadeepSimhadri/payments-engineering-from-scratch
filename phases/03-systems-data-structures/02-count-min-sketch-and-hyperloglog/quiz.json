@@ -1,0 +1,48 @@
+{
+  "lesson": "02-count-min-sketch-and-hyperloglog",
+  "title": "Count-Min Sketch and HyperLogLog",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A risk service keeps a HashSet of card tokens per merchant to count distinct cards. What does its memory use grow with?",
+      "options": ["The number of authorizations per second", "The number of distinct cards each merchant has seen", "The length of the velocity window in minutes", "The number of risk rules evaluated per request"],
+      "correct": 1,
+      "explanation": "A set stores every distinct key, so memory is proportional to distinct cards. Throughput and window length affect how fast it grows, not what it is proportional to. This is the cost a sketch removes by hashing keys into a fixed-size array."
+    },
+    {
+      "stage": "check",
+      "question": "A Count-Min Sketch reports 1,383 for a merchant whose true count is 1,363. Which statement about the estimate is guaranteed, not just likely?",
+      "options": ["It is within 1% of the true count", "It is exactly the average of the five rows", "It is never below the true count", "It is the count in the first row"],
+      "correct": 2,
+      "explanation": "Every counter a key maps to has been incremented on every add of that key, so each is at least the truth, and the minimum is too. The epsilon*N bound holds only with probability 1 - delta, so 'within 1%' is likely but not guaranteed; the estimate is the minimum, not the average, of the rows."
+    },
+    {
+      "stage": "check",
+      "question": "For epsilon = 0.01 and delta = 0.01, what shape does forErrorBounds produce, and which parameter buys accuracy more cheaply?",
+      "options": ["width 100, depth 100; both cost the same", "width 272, depth 5; depth, since it grows as ln(1/delta)", "width 272, depth 5; width, since it grows as 1/epsilon", "width 5, depth 272; width, since it is the row count"],
+      "correct": 1,
+      "explanation": "width = ceil(e/epsilon) = 272 and depth = ceil(ln(1/delta)) = 5. Halving delta adds less than one row because of the logarithm, while halving epsilon doubles the width, so tightening the failure probability is far cheaper than tightening the error bound."
+    },
+    {
+      "stage": "check",
+      "question": "At p = 12 a HyperLogLog has seen 100 distinct keys and its raw estimate is about 3,000. Why does cardinality() still return 100?",
+      "options": ["The alpha constant for m = 4096 scales the raw value down", "Register values are capped so the harmonic sum cannot exceed m", "The raw estimate is below 2.5m with empty registers, so linear counting m*ln(m/V) is used", "The sketch stores the exact count until 2.5m keys have been added"],
+      "correct": 2,
+      "explanation": "With most registers still zero the harmonic mean is badly biased, so the paper switches to linear counting when E <= 2.5m and V > 0: 4096 * ln(4096/3997) is about 100. Alpha is a constant and cannot fix a bias that depends on fill level, and the sketch never stores exact counts."
+    },
+    {
+      "stage": "post",
+      "question": "Two authorization servers each keep an HLL of cards for merchant 42. The aggregator merges them by taking the register-wise maximum. What does the merged sketch represent?",
+      "options": ["The sum of the two distinct counts", "The union of the two card sets, exactly as one sketch over both would be", "The larger of the two sets, since max discards the smaller", "An approximation that drifts further from truth with every merge"],
+      "correct": 1,
+      "explanation": "Each register holds the longest zero-run of the keys routed to it; the union's longest run is the max of the two parts' longest runs, so the merged registers equal a sketch built over the union, and a card seen by both servers is counted once. Summing cardinalities would double-count shared cards."
+    },
+    {
+      "stage": "post",
+      "question": "A velocity rule flags any card seen more than 20 times per merchant per hour. Which failure mode does implementing it with a Count-Min Sketch introduce?",
+      "options": ["Some cards over the threshold are missed because of hash collisions", "Some cards under the threshold are flagged because collisions inflate their counters", "Cards from the previous hour are counted because sketches cannot be reset", "The sketch loses counts when the total exceeds the error bound"],
+      "correct": 1,
+      "explanation": "Count-Min only overestimates, so a card truly over 20 is always reported over 20 (no misses), but a light card sharing counters with heavy ones can be pushed over the threshold (false alarms). Sketches are reset by allocating a new one per window, and counts are never lost; they are only inflated."
+    }
+  ]
+}

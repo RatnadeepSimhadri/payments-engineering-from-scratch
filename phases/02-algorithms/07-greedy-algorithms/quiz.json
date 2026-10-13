@@ -1,0 +1,78 @@
+{
+  "lesson": "07-greedy-algorithms",
+  "title": "Greedy Algorithms and Exchange Arguments",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Paying 6 units with coins {1, 3, 4} by taking the largest coin first gives 4 + 1 + 1. What does this show?",
+      "options": [
+        "That the greedy algorithm has a bug in its remainder handling",
+        "That greedy change-making is not optimal for every denomination set, since 3 + 3 uses fewer coins",
+        "That the amount 6 cannot be made with these coins without a 2-unit coin",
+        "That greedy is optimal but the coin set should be sorted ascending instead"
+      ],
+      "correct": 1,
+      "explanation": "The greedy ran correctly and produced a valid but suboptimal answer; the denomination set is not canonical. Sorting ascending would be a different and worse algorithm, and 6 is clearly makeable."
+    },
+    {
+      "stage": "check",
+      "question": "In the exchange argument for earliest-finish-first interval scheduling, why can the first interval of any optimal solution be swapped for the greedy's first pick?",
+      "options": [
+        "Because the greedy pick is the shortest interval, so it fits wherever the optimal's first interval fit",
+        "Because the greedy pick ends no later, so everything after the optimal's first interval still starts after the greedy pick ends",
+        "Because the greedy pick starts earliest, so no interval in the optimal solution can precede it",
+        "Because every optimal solution has the same size, so any interval can replace any other"
+      ],
+      "correct": 1,
+      "explanation": "The swap preserves disjointness precisely because the greedy interval has the earliest end: the rest of the optimal set started at or after the replaced interval's end, hence after the greedy's end. Shortest-first and earliest-start-first are the wrong criteria and both have counterexamples."
+    },
+    {
+      "stage": "check",
+      "question": "Why is it safe for Huffman's algorithm to merge the two least frequent symbols first?",
+      "options": [
+        "Because in some optimal tree those two symbols are sibling leaves at the deepest level, so merging them loses nothing",
+        "Because the two rarest symbols contribute the fewest bits, so their codes do not affect the total",
+        "Because merging in frequency order guarantees the tree is balanced and therefore minimal",
+        "Because the heap always returns the two most recently inserted nodes first"
+      ],
+      "correct": 0,
+      "explanation": "The exchange argument shows that swapping any deeper symbol with a rarer one never increases total length, so the two rarest can be assumed to be deepest siblings; collapsing them into one node yields a smaller instance of the same problem. Huffman trees are usually unbalanced, and the rare symbols' codes do matter, just less."
+    },
+    {
+      "stage": "check",
+      "question": "The minResources algorithm checks only whether the lane with the earliest end time is free before opening a new lane. Why is that sufficient?",
+      "options": [
+        "Because lanes are closed in the order they were opened, so the earliest-ending lane is the oldest",
+        "Because if the earliest-ending lane is still busy at the new start, every other lane ends later and is busy too",
+        "Because the heap stores at most one lane and the check is therefore exhaustive",
+        "Because intervals are processed in order of end time, so earlier lanes always finish first"
+      ],
+      "correct": 1,
+      "explanation": "The heap's minimum is the earliest end time among all lanes; if even that lane has not freed up, none has. Intervals are processed by start time, not end time, and the heap holds one entry per open lane."
+    },
+    {
+      "stage": "post",
+      "question": "A payments team configures a new market whose coinage is {1, 3, 6, 12, 24, 30, 60, 240} and keeps the largest-first dispensing algorithm. What should they have run first?",
+      "options": [
+        "A benchmark of the greedy against a brute-force search for amounts up to the largest denomination",
+        "The Kozen-Zaks canonicality check: compare greedy to the DP optimum for every amount below 240 + 60",
+        "A verification that the denominations are sorted and that a 1-unit coin exists",
+        "A check that each denomination divides the next, which guarantees greedy optimality"
+      ],
+      "correct": 1,
+      "explanation": "Greedy is optimal for all amounts if and only if it is optimal for every amount below the sum of the two largest denominations; this set fails at 48 (30+12+6 versus 24+24). Divisibility is sufficient but not necessary (US coins do not satisfy it), and a 1-coin only guarantees every amount is makeable, not optimally."
+    },
+    {
+      "stage": "post",
+      "question": "A design document proposes filling payout batches by 'largest fee tier first' to minimise processor fees under a tiered schedule. What is the right review response?",
+      "options": [
+        "Approve: a greedy allocation is optimal whenever the cost function is monotone non-decreasing in the batch size",
+        "Approve: tier schedules are canonical by construction because each tier's range is nested inside the next one",
+        "Ask for an exchange argument or a test against a DP oracle, because tier boundaries behave like non-canonical coin denominations",
+        "Reject: greedy algorithms are never an appropriate tool for cost-minimisation problems and dynamic programming must be used"
+      ],
+      "correct": 2,
+      "explanation": "Step-function costs create exactly the structure where largest-first overpays, as {1, 3, 4} does for coins; the burden is on the proposal to show the greedy-choice property or to test it against the true optimum. Monotonicity is not enough, and greedy is optimal for many cost problems (Huffman, MST) when the proof exists."
+    }
+  ]
+}

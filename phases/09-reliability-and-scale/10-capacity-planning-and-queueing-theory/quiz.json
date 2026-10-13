@@ -1,0 +1,48 @@
+{
+  "lesson": "10-capacity-planning-and-queueing-theory",
+  "title": "Capacity Planning and Queueing Theory",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service receives 1,200 requests per second and each request holds a worker thread for 150 ms on average. How many threads are busy on average?",
+      "options": ["8", "180", "1,200", "It cannot be known without the latency distribution"],
+      "correct": 1,
+      "explanation": "Little's Law: L = lambda x W = 1,200 x 0.150 = 180. The law needs only the means and holds for any distribution, so the last option is wrong; the distribution matters for percentiles, not for the mean occupancy."
+    },
+    {
+      "stage": "check",
+      "question": "An M/M/1 server with a 10 ms service time runs at 80% utilization. Raising utilization to 90% does what to the mean residence time?",
+      "options": ["Raises it from 50 ms to 100 ms, because the 1/(1 - rho) factor doubles", "Raises it by 12.5%, in proportion to the extra load", "Raises it from 10 ms to 11 ms, since service time is unchanged", "Leaves it unchanged until utilization reaches 100%"],
+      "correct": 0,
+      "explanation": "W = S / (1 - rho): 10 / 0.2 = 50 ms at 80%, 10 / 0.1 = 100 ms at 90%. The last 10% of throughput costs a doubling of latency. Latency is not proportional to load; it is proportional to 1 / (1 - rho), which is the hockey stick."
+    },
+    {
+      "stage": "check",
+      "question": "Four servers each run at 80% utilization with a 10 ms service time. Compared with four private queues, what does one shared queue (M/M/4) do to the mean queue wait?",
+      "options": ["Nothing: the utilization per server is the same, so the wait is the same", "Cuts it from 40 ms to about 7.5 ms, because an idle server can take waiting work", "Cuts it by exactly a factor of four, to 10 ms", "Raises it slightly, because the shared queue adds coordination"],
+      "correct": 1,
+      "explanation": "Four private queues are four M/M/1 systems at 80%: 40 ms each. With one shared queue the Erlang C probability of waiting falls to 0.60 and the mean wait is 0.60 / (400 - 320) = 7.5 ms. The improvement is more than four-fold here, and coordination cost is real but small compared with the gain."
+    },
+    {
+      "stage": "check",
+      "question": "An authorization fans out to five dependencies in parallel, each with a p99 of 100 ms. What fraction of authorizations take longer than 100 ms?",
+      "options": ["About 1%, since each dependency individually meets its p99", "About 5%, because 1 - 0.99^5 = 0.049", "About 0.2%, because the slow calls rarely coincide", "Exactly 5%, because the probabilities add"],
+      "correct": 1,
+      "explanation": "The request finishes when the slowest of five returns, so it is slow if any one is: 1 - 0.99^5 = 4.9%. Probabilities of independent events do not simply add (that would give 5.0% and would exceed 100% for n > 100); the per-dependency p99 must become a p99.8 to hold an end-to-end p99."
+    },
+    {
+      "stage": "post",
+      "question": "A load test with 200 virtual users, each sending the next request after the previous response, never shows a latency cliff. Why is this not evidence the service is safe?",
+      "options": ["The test used too few virtual users; a thousand users would have exposed the cliff", "The closed loop caps in-flight requests at 200, so production's open-loop queue never forms", "Virtual users do not generate realistic payloads, so CPU usage in the test is understated", "A latency cliff can only be observed against real dependency traffic, never in a synthetic test"],
+      "correct": 1,
+      "explanation": "A closed-loop generator slows down as the service slows down, which is the opposite of production traffic from independent merchants. The number of users bounds the queue regardless of how many there are relative to capacity; the fix is an open-loop generator with scheduled send times. Dependency realism matters too, but the loop shape is the reason the cliff cannot appear."
+    },
+    {
+      "stage": "post",
+      "question": "Daily peak is 1,200 TPS, the seasonal factor is 2.0, growth over the horizon is 40%, one instance handles 100 TPS at target utilization, and there are 3 availability zones. How many instances does the plan call for?",
+      "options": ["34, the design peak divided by per-instance capacity", "24, because 1,200 x 2.0 / 100 covers the seasonal peak", "51 to 54, because 34 must be served by two zones when one is lost", "102, doubling 51 for safety"],
+      "correct": 2,
+      "explanation": "Design peak is 1,200 x 2.0 x 1.4 = 3,360 TPS, so 34 instances at target utilization. Losing one of three zones leaves two, so 34 x 3/2 = 51, rounded to 54 for 18 per zone. 34 ignores failure headroom; 24 ignores growth; doubling again has no rule behind it."
+    }
+  ]
+}

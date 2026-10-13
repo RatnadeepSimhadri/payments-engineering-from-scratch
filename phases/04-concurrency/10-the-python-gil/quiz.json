@@ -1,0 +1,78 @@
+{
+  "lesson": "10-the-python-gil",
+  "title": "The Python GIL and Free-Threaded Python",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A Python service with a 64-thread pool runs at 105 percent CPU on a 16-core machine while handling pure-Python work. What is the most likely explanation?",
+      "options": [
+        "The thread pool is too small for the number of cores",
+        "The GIL lets only one thread execute bytecode at a time",
+        "The operating system has pinned the process to one core",
+        "Python threads are green threads that never use a second core"
+      ],
+      "correct": 1,
+      "explanation": "Python threads are real OS threads, but on the standard build only the one holding the GIL runs bytecode, so CPU-bound Python saturates roughly one core regardless of thread count. More threads would not help, and OS pinning would show a different pattern across processes."
+    },
+    {
+      "stage": "check",
+      "question": "Which of these does the GIL actually guarantee on the standard CPython build?",
+      "options": [
+        "balance += amount completes without another thread interleaving",
+        "A check of the balance followed by a debit runs as one unit",
+        "A single list.append never corrupts the list's internal structure",
+        "Writes by one thread become visible to other threads in program order"
+      ],
+      "correct": 2,
+      "explanation": "The GIL protects the interpreter's own structures: reference counts and the C-level operations on containers. A single append is one such operation. Compound statements are several bytecodes with possible switch points between them, and the language reference makes no visibility promise; the lock handoff happens to provide one, which is not the same thing."
+    },
+    {
+      "stage": "check",
+      "question": "Four threads hash forty 10 MB files with hashlib and finish nearly four times faster than one thread. Why does this not contradict the GIL?",
+      "options": [
+        "The C implementation releases the GIL for the duration of each large hash",
+        "hashlib is implemented in Python but uses vectorised bytecode",
+        "The GIL is only acquired for I/O, not for CPU-bound computation",
+        "Each thread was silently started as a separate process"
+      ],
+      "correct": 0,
+      "explanation": "C extensions can drop the GIL around long computations (Py_BEGIN_ALLOW_THREADS), and hashlib does so for buffers above about 2 KB, so the hashing runs on four cores while Python bytecode remains serialised. The GIL is held during ordinary bytecode execution, including CPU-bound Python, which is exactly the case where threads do not help."
+    },
+    {
+      "stage": "check",
+      "question": "A service mixes one CPU-bound thread with twenty I/O-bound threads in one process. What does the convoy effect predict?",
+      "options": [
+        "The CPU-bound thread speeds up because it is rarely interrupted",
+        "The interpreter raises the switch interval automatically to compensate",
+        "The I/O-bound threads starve the CPU-bound one completely",
+        "I/O-bound requests gain latency of up to a switch interval per GIL reacquisition"
+      ],
+      "correct": 3,
+      "explanation": "When an I/O-bound thread's socket becomes ready it needs the GIL for a few microseconds, but the CPU-bound thread holds it for the whole 5 ms interval, so every I/O thread waits behind it on every wake-up. The CPU-bound thread does not get faster; the I/O threads get slower, which is why CPU-bound work belongs in a separate process."
+    },
+    {
+      "stage": "post",
+      "question": "A team moves from one JVM to sixteen Python worker processes. Which consequence is a direct result of the process model rather than of the GIL?",
+      "options": [
+        "Bytecode from different requests can no longer run in parallel",
+        "Reference counting becomes slower because of atomic operations",
+        "The in-process rate limiter becomes sixteen independent counters",
+        "The switch interval must be reduced to keep latency acceptable"
+      ],
+      "correct": 2,
+      "explanation": "Processes share nothing by default, so every in-process resource (caches, counters, pools, loaded models) is duplicated per worker; a per-merchant limit of 100 silently becomes 1,600. Parallelism is restored by the process model, not lost; atomic reference counting is a free-threaded build property, not a process-model one."
+    },
+    {
+      "stage": "post",
+      "question": "Code that was correct under the GIL because it used threading.Lock around every read-modify-write is moved to the free-threaded 3.13 build. What changes?",
+      "options": [
+        "It must be rewritten because Lock no longer serialises threads",
+        "It stays correct; code that relied on the GIL by accident is what breaks",
+        "It becomes incorrect because biased reference counting reorders writes",
+        "It fails to import until every lock is replaced with a per-object lock"
+      ],
+      "correct": 1,
+      "explanation": "The free-threaded build keeps the interpreter safe with per-object locks and biased reference counting, and threading.Lock works exactly as before. What it removes is the accidental protection the GIL gave to unlocked compound operations like a bare += or a check-then-act, which now lose updates routinely instead of rarely."
+    }
+  ]
+}

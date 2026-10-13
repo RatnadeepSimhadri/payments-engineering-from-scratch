@@ -1,0 +1,78 @@
+{
+  "lesson": "09-jvm-gc-and-go-runtime",
+  "title": "JVM Garbage Collection and the Go Runtime",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service's median latency is 9 ms and its p99 is 96 ms, with a 420 ms spike roughly every 70 seconds that no request explains. What is the most likely cause?",
+      "options": [
+        "A slow downstream dependency with a retry loop",
+        "A garbage collection pause stopping every thread",
+        "Lock contention on a hot account during peak load",
+        "Network packet loss between the service and its database"
+      ],
+      "correct": 1,
+      "explanation": "A periodic spike that affects every in-flight request at once and ties to no particular input is the signature of a stop-the-world pause. A slow dependency or contention would correlate with specific requests or accounts, and packet loss would not be periodic."
+    },
+    {
+      "stage": "check",
+      "question": "Why is a minor (young-generation) collection cheap even when eden is several gigabytes?",
+      "options": [
+        "Because the young generation is kept in a faster tier of memory",
+        "Because eden is collected by many threads in parallel",
+        "Because its cost scales with the live objects copied out, not with the size of eden",
+        "Because objects in eden have no references that need scanning"
+      ],
+      "correct": 2,
+      "explanation": "The generational hypothesis says most young objects are already dead, so the collector copies the few survivors and reclaims the rest in one step. Parallelism helps, but the fundamental reason is that cost is proportional to survivors; a 3 GB eden that is 99 percent garbage is a few tens of megabytes of real work."
+    },
+    {
+      "stage": "check",
+      "question": "A service allocates 400 KB per request at 2,000 requests per second with a 3 GB young generation. How often does a minor collection run?",
+      "options": [
+        "About every 3.75 seconds",
+        "About every 0.4 seconds",
+        "About every 15 seconds",
+        "About every 70 seconds"
+      ],
+      "correct": 0,
+      "explanation": "400 KB x 2,000/s = 800 MB/s of allocation; 3 GB / 800 MB/s = 3.75 s. The 70-second figure in the lesson is the mixed collection driven by the much smaller promotion rate, not the young collection."
+    },
+    {
+      "stage": "check",
+      "question": "In the gctrace line '0.041+2.8+0.019 ms clock', how long was the application actually stopped?",
+      "options": [
+        "About 2.86 ms, the sum of all three phases",
+        "About 2.8 ms, the concurrent marking phase",
+        "Nothing; Go's collector never stops the world",
+        "About 60 microseconds, the two STW phases around marking"
+      ],
+      "correct": 3,
+      "explanation": "The three fields are STW sweep-termination/mark-start, concurrent marking, and STW mark termination. Only the first and third stop goroutines, for 41 and 19 microseconds. The 2.8 ms of marking ran alongside the application, costing CPU rather than pause time."
+    },
+    {
+      "stage": "post",
+      "question": "A G1 log shows 'Pause Full (G1 Compaction Pause) 7811M->3390M(8192M) 421.883ms'. What happened, and what does it imply?",
+      "options": [
+        "A normal mixed collection ran; the heap is healthy at 41 percent occupancy",
+        "An evacuation ran out of free regions and G1 fell back to a stop-the-world compaction of the whole heap",
+        "The application called System.gc(), which G1 always honours with a full compaction",
+        "ZGC was enabled alongside G1 and the two collectors conflicted"
+      ],
+      "correct": 1,
+      "explanation": "'Pause Full' in a G1 log is always a finding: G1's concurrent design is supposed to avoid it, and reaching it means to-space exhaustion or metadata pressure. The cause tag 'G1 Compaction Pause' points at exhaustion; a System.gc() call would be tagged as such. The heap dropping to 3,390 MB shows the live set was fine; fragmentation and headroom were the problem."
+    },
+    {
+      "stage": "post",
+      "question": "A Go service runs with GOMEMLIMIT set 5 percent above its live heap. What behaviour should you expect?",
+      "options": [
+        "Collections run nearly continuously and GC CPU approaches the 50 percent cap",
+        "The runtime kills the process when the limit is reached",
+        "Pause times grow to several milliseconds per cycle",
+        "The pacer disables GOGC and collects only when the limit is hit"
+      ],
+      "correct": 0,
+      "explanation": "With almost no room between live heap and limit, each cycle frees little and the next starts at once; the runtime caps GC CPU near 50 percent so the application is not fully starved, but it runs at roughly half speed. Pauses stay short because the design is concurrent; the cost is CPU and mark assist, which is Go's form of the death spiral."
+    }
+  ]
+}

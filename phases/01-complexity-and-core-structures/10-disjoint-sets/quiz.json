@@ -1,0 +1,78 @@
+{
+  "lesson": "10-disjoint-sets",
+  "title": "Disjoint Sets (Union-Find) with Path Compression",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A fraud system must answer \"is account A connected, through any chain of shared devices or cards, to account B?\" at 40,000 requests per second. Why is a breadth-first search per query the wrong tool?",
+      "options": [
+        "BFS cannot handle graphs with more than a few million edges",
+        "BFS cost grows with the size of the component, which one shared device can make enormous",
+        "BFS only works on directed graphs and identifier sharing is undirected",
+        "BFS finds the shortest path, and the risk engine needs the longest one"
+      ],
+      "correct": 1,
+      "explanation": "The query is a membership question, not a path question, and BFS pays for the whole reachable component on every call. Union-find answers membership in near-constant time by precomputing the partition. BFS handles undirected graphs and large edge counts fine; the problem is per-query cost."
+    },
+    {
+      "stage": "check",
+      "question": "What is the invariant of a disjoint-set forest stored as a parent array?",
+      "options": [
+        "Every element's parent has a strictly smaller index than the element itself does",
+        "Following parent pointers from any element ends at exactly one root, and same root means same set",
+        "Every tree in the forest is kept balanced to within one level of height by union",
+        "Each root's rank is always equal to the exact current height of the tree beneath it"
+      ],
+      "correct": 1,
+      "explanation": "Correctness depends only on the partition the forest encodes: one root per set, reachable from every member. Tree shape is a performance concern, not a correctness one. Rank is an upper bound on height, not the exact height, and nothing constrains index order."
+    },
+    {
+      "stage": "check",
+      "question": "Why does union by rank guarantee that no find follows more than log2(n) pointers?",
+      "options": [
+        "Because rank is recomputed from the actual tree height after every union",
+        "Because a root only gains rank when it absorbs a root of equal rank, so a rank-r tree has at least 2^r elements",
+        "Because the forest is rebuilt from scratch whenever any tree becomes deeper than log2(n)",
+        "Because path compression runs inside union and flattens both trees before they are joined"
+      ],
+      "correct": 1,
+      "explanation": "The induction on rank gives 2^r elements under a rank-r root; with n elements total, rank cannot exceed log2(n), and rank bounds height. Rank is never recomputed and compression is a separate heuristic that does not touch ranks at all."
+    },
+    {
+      "stage": "check",
+      "question": "The chain 0 -> 1 -> 2 -> 3 -> 4 has root 4. After one call to find(0) with path compression, what is the depth of element 2?",
+      "options": [
+        "2, because only elements below 2 on the path are moved",
+        "0, because element 2 becomes a new root",
+        "1, because every node on the path now points directly at 4",
+        "3, because compression only affects the element passed to find"
+      ],
+      "correct": 2,
+      "explanation": "The second pass of find rewrites the parent of every node on the walked path (0, 1, 2, 3) to the root 4, so each is now at depth 1. Compression never creates roots and never leaves intermediate nodes untouched."
+    },
+    {
+      "stage": "post",
+      "question": "Accounts 1001 and 1004 have never appeared in the same observation, yet sameRing(\"acct:1001\", \"acct:1004\") is true. Why?",
+      "options": [
+        "The linker stores a direct edge between every pair of accounts it has ever observed together",
+        "Union is transitive: device, card, and email form a chain of merges, so both accounts share one root",
+        "String identifiers that begin with the same prefix are assigned to the same set at creation",
+        "sameRing returns true whenever both identifiers have been registered with the linker before"
+      ],
+      "correct": 1,
+      "explanation": "Each shared identifier is a union, and unions compose: 1001~A, A~1002, 1002~card, card~1003, 1003~email, email~1004. find on either account reaches the same root. The linker never stores pairwise edges and never groups by prefix; unknown or unrelated identifiers return false."
+    },
+    {
+      "stage": "post",
+      "question": "A reviewer decides that linking acct:1004 into the ring was a false positive. What can the disjoint-set forest do about it?",
+      "options": [
+        "Call a split operation that removes 1004 and re-roots the remaining members of the ring",
+        "Nothing directly: it cannot delete or split, so rebuild the forest from the log without that edge",
+        "Set parent[1004] back to 1004 so that it becomes a singleton set again immediately",
+        "Decrement the component size stored at the root and mark 1004 as cleared in a side table"
+      ],
+      "correct": 1,
+      "explanation": "Other elements may point through 1004, and the forest records only that identifiers are connected, not which observation connected them. Resetting its parent would orphan nodes beneath it and break the invariant. The audit log is the source of truth; the forest is an index that can be recomputed from it."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "05-stacks-queues-and-deques",
+  "title": "Stacks, Queues, and Ring Buffers",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A queue is implemented as an ArrayList with add(e) for enqueue and remove(0) for dequeue. What is the cost of dequeue when 10,000 elements are queued?",
+      "options": [
+        "O(1): removing the first element only updates a start index",
+        "O(log n): the list binary-searches for the first element",
+        "O(n): every remaining element is shifted one slot left",
+        "O(1) amortized: the shift happens only when the list shrinks"
+      ],
+      "correct": 2,
+      "explanation": "ArrayList has no head pointer; remove(0) moves every remaining element with System.arraycopy, so each dequeue copies 10,000 references. A ring buffer avoids this by advancing a head sequence instead of moving data. Amortization does not apply because there is no cheap operation to pay for the shift."
+    },
+    {
+      "stage": "check",
+      "question": "With head and tail as monotonically increasing sequence numbers, how does the ring buffer tell a full buffer from an empty one when head % capacity == tail % capacity?",
+      "options": [
+        "It keeps one slot permanently unused so that full and empty differ by one position",
+        "size is tail minus head: zero means empty and capacity means full, regardless of the slot indices",
+        "It stores a boolean flag that is flipped on every wrap of the tail pointer",
+        "It checks whether the slot at head is null, which is only true when the buffer is empty"
+      ],
+      "correct": 1,
+      "explanation": "Because the sequences never wrap, their difference is the exact element count, so no slot is wasted and no flag is needed. Checking the slot for null fails as soon as the element type permits nulls or a slot was not cleared. The wasted-slot design works but is the one Knuth describes and this lesson replaces."
+    },
+    {
+      "stage": "check",
+      "question": "A capacity-4 buffer has head = 2 and tail = 6 after offers of e0..e5 and two polls. Which slot holds e5, and what is the logical order?",
+      "options": [
+        "Slot 3; logical order is e4, e5, e2, e3",
+        "Slot 1; logical order is e2, e3, e4, e5",
+        "Slot 2; logical order is e5, e4, e3, e2",
+        "Slot 1; logical order is e4, e5, e2, e3"
+      ],
+      "correct": 1,
+      "explanation": "e5 has sequence 5 and 5 % 4 = 1. Logical order follows sequences from head (2) to tail - 1 (5): e2, e3, e4, e5. The physical slot order e4 e5 e2 e3 is what a loop over slots 0..3 would see, which is why the iterator walks sequences, not slots."
+    },
+    {
+      "stage": "check",
+      "question": "Under DROP_OLDEST, a full buffer receives offerLast(x). Why is it safe to write x into slot indexOf(tail) after advancing head?",
+      "options": [
+        "Because when full, head and tail map to the same slot, so the slot overwritten is exactly the oldest element head just released",
+        "Because offerLast first copies every remaining element one slot toward the front of the array to make room at the back",
+        "Because tail is reset to zero whenever the buffer is full, so the new element always lands in slot 0 and nothing live is there",
+        "Because DROP_OLDEST nulls every slot before writing the new element, so no live element can be overwritten by accident"
+      ],
+      "correct": 0,
+      "explanation": "When size equals capacity, head and tail are exactly one full turn apart, so they map to the same slot; advancing head evicts the element in that slot and the new element takes its place. Nothing is copied or reset; the dropped counter records the eviction. The other options describe behaviour the ring buffer never does."
+    },
+    {
+      "stage": "post",
+      "question": "An outbound queue of payment instructions to a card network fills up during a traffic spike. Which overflow policy is correct, and what must the producer do?",
+      "options": [
+        "DROP_OLDEST, because the newest instructions are the most urgent and old ones can be re-sent later",
+        "REJECT, so the producer sees a false return and must slow down, retry later, or shed load upstream",
+        "Grow the queue, because payment instructions must never be refused by a transport layer",
+        "DROP_OLDEST with a larger capacity, so the drops become rare enough not to matter"
+      ],
+      "correct": 1,
+      "explanation": "A payment instruction cannot be silently lost, so the only acceptable response to a full queue is backpressure: the producer learns it was refused and the overload propagates toward something that can slow down. Growing the queue recreates the OutOfMemoryError failure. DROP_OLDEST is right for metrics and market data where the latest value supersedes older ones, never for commands."
+    },
+    {
+      "stage": "post",
+      "question": "A Kafka consumer stored offset 2 for a partition whose log start offset is now 4 and end offset is 12. In ring-buffer terms, what happened and what can the consumer do?",
+      "options": [
+        "The consumer is 10 messages behind and can read offset 2 next, since Kafka retains everything",
+        "The consumer fell below head: messages 2 and 3 were evicted by retention, and it must reset to 4 (earliest) or 12 (latest)",
+        "The partition wrapped around, so offset 2 now refers to the message formerly at offset 10",
+        "The consumer committed a future offset by mistake and must rewind to 0"
+      ],
+      "correct": 1,
+      "explanation": "The log start offset is the ring's head; offsets below it are gone. The consumer's lag was tail - 2 = 10 but two of those messages no longer exist, so auto.offset.reset decides whether it resumes at head (earliest) and processes 8 messages or jumps to tail (latest) and skips them all. Offsets are sequences, not slot indices, so they never wrap or get reassigned."
+    }
+  ]
+}

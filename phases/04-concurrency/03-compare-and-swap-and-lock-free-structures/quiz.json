@@ -1,0 +1,78 @@
+{
+  "lesson": "03-compare-and-swap-and-lock-free-structures",
+  "title": "Compare-and-Swap and Lock-Free Structures",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A compare-and-swap instruction CAS(addr, expected, next) does which of the following atomically?",
+      "options": [
+        "Writes next to addr and returns the value that was there before the write",
+        "Writes next to addr only if addr currently holds expected, and reports whether it did",
+        "Locks addr until the calling thread writes next and releases it explicitly",
+        "Swaps the contents of addr and expected so both threads see each other's value"
+      ],
+      "correct": 1,
+      "explanation": "CAS is a conditional store: the write happens only when the word still equals the value the caller read earlier, and the boolean result tells the caller whether it won. Option 0 describes an unconditional exchange (getAndSet), which cannot detect that another thread intervened."
+    },
+    {
+      "stage": "check",
+      "question": "In the ABA trace, thread A read head = N3 and next = N2, then thread B popped N3, popped N2, and pushed a new job that reused node N3. Why does A's CAS(head, N3, N2) succeed?",
+      "options": [
+        "Because the CAS compares the stack's size, which is 2 both before and after B's operations",
+        "Because B's push re-linked N2 under N3, restoring the exact structure A observed",
+        "Because the CAS compares only the reference held in head, and head is N3 again",
+        "Because the JVM's garbage collector reused N3's memory address for the new node"
+      ],
+      "correct": 2,
+      "explanation": "The CAS asks one question: is head still the reference I read? Node reuse makes the answer yes even though two pops and a push happened. N2 is in the free list, not under N3, so option 1 is false; the GC is not involved because the pool, not the collector, recycled N3."
+    },
+    {
+      "stage": "check",
+      "question": "The first TreiberStack in the lesson allocates a fresh Node on every push and never recycles nodes. Why is it immune to ABA on the JVM?",
+      "options": [
+        "Because AtomicReference.compareAndSet internally compares a hidden version number as well",
+        "Because a node A still references cannot be collected and reused, so head equal to A's node means nothing changed",
+        "Because the JIT compiler reorders the CAS to run before the read of current.next",
+        "Because push and pop take an implicit monitor lock on the AtomicReference object"
+      ],
+      "correct": 1,
+      "explanation": "Garbage collection guarantees a live reference is never recycled, so if head still equals the node A read, no pop of that node has happened in between. AtomicReference has no hidden stamp (that is what AtomicStampedReference adds), and there is no lock anywhere in the structure."
+    },
+    {
+      "stage": "check",
+      "question": "In the Michael-Scott queue, an enqueuer finds tail.next is not null. What does it do, and why is this safe?",
+      "options": [
+        "Spins until tail.next becomes null again, because another enqueue is in progress",
+        "Swings tail forward to tail.next with a CAS and retries; at most one of the competing CASes succeeds",
+        "Appends its node to tail.next.next so that both enqueues are linked in one step",
+        "Aborts and returns false, leaving the caller to retry after a backoff"
+      ],
+      "correct": 1,
+      "explanation": "A non-null tail.next means another thread linked a node but has not yet moved tail. The observer helps by performing that second CAS itself; the original enqueuer's CAS then fails harmlessly because both expected the same old tail. Spinning on another thread's progress would make the queue blocking, not lock-free."
+    },
+    {
+      "stage": "post",
+      "question": "A pull request describes a structure as lock-free. Under the formal definition, which statement must be true of it?",
+      "options": [
+        "Every thread finishes each operation within a bounded number of its own steps",
+        "No thread ever retries an operation, because each CAS is guaranteed to succeed",
+        "The code contains no synchronized blocks, ReentrantLock, or other mutual exclusion",
+        "Across all threads, some operation completes within a bounded number of total steps"
+      ],
+      "correct": 3,
+      "explanation": "Lock-free guarantees system-wide progress: a CAS fails only because another thread's CAS succeeded, so someone always advances. Per-thread bounded completion is the stronger wait-free guarantee. Merely avoiding synchronized is neither necessary nor sufficient; a spin-wait on another thread's flag has no locks and is still blocking."
+    },
+    {
+      "stage": "post",
+      "question": "Which production mechanism is the closest analogue of the stamp in AtomicStampedReference?",
+      "options": [
+        "A row-level SELECT ... FOR UPDATE that blocks concurrent writers until commit",
+        "An UPDATE ... WHERE id = ? AND version = ? that affects zero rows if the row changed",
+        "A Redis INCRBY that adds to a counter without reading it first",
+        "A database sequence that hands out unique identifiers to concurrent inserters"
+      ],
+      "correct": 1,
+      "explanation": "Optimistic locking stores a version with the row and makes the write conditional on the version the writer read; a zero-row update is a failed CAS, and the writer re-reads. FOR UPDATE is pessimistic locking, the blocking alternative; INCRBY is an unconditional atomic add with no stale-read detection."
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "lesson": "08-binary-search-trees",
+  "title": "Binary Search Trees and Ordered Maps",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service stores 40 million transactions in a HashMap keyed by transaction id. Why is \"every transaction between 14:00 and 15:00\" slow?",
+      "options": ["Hash maps cannot hold more than a few million entries", "The hash function scatters nearby keys, so a range has no structure to exploit", "Timestamps cannot be used as hash keys because they repeat", "Iterating a HashMap is O(n log n) because buckets must be sorted"],
+      "correct": 1,
+      "explanation": "A hash map promises O(1) exact-key lookup by deliberately destroying key order; a range query therefore degenerates to a full scan. Iteration is O(n), not O(n log n), and size and repeated timestamps are not the issue; the missing property is order."
+    },
+    {
+      "stage": "check",
+      "question": "Which statement is the BST invariant that lookups actually depend on?",
+      "options": ["Each left child is smaller than its parent and each right child is larger", "Every key in a node's left subtree is smaller and every key in its right subtree is larger", "The tree's height is at most 2 log2(n) for n keys", "Keys at the same depth are in ascending order from left to right"],
+      "correct": 1,
+      "explanation": "The property must hold for whole subtrees, not just direct children; otherwise a grandchild on the wrong side of its grandparent is unreachable by the search walk. The height bound is a balanced-tree guarantee, not part of the BST definition."
+    },
+    {
+      "stage": "check",
+      "question": "You remove a node that has two children. What replaces it, and why does that preserve the invariant?",
+      "options": ["Its left child, because every key in the left subtree is smaller than the removed key", "Its right child, because every key in the right subtree is larger than the removed key", "Its in-order successor: larger than all of the left subtree, smaller than the rest of the right", "Whichever child has the greater subtree height, because that keeps the tree balanced"],
+      "correct": 2,
+      "explanation": "The successor is the minimum of the right subtree: larger than everything on the left (it exceeds the removed key) and smaller than everything else on the right. Promoting a child directly leaves the other child's whole subtree with nowhere to go; height plays no role in a plain BST."
+    },
+    {
+      "stage": "check",
+      "question": "During an in-order range query for [lo, hi], the walk reaches a node whose key is less than lo. What can it skip?",
+      "options": ["The node's right subtree, because everything there is even further from lo", "The node's left subtree, because every key there is smaller still", "Both subtrees, because the node itself is out of range", "Nothing; pruning is only possible once a key above hi is found"],
+      "correct": 1,
+      "explanation": "Keys in the left subtree are all smaller than the node's key, hence also below lo, so the left subtree cannot contribute. The right subtree may contain in-range keys and must be visited. Pruning above hi is the second cut: once in-order reaches a key beyond hi, the traversal stops."
+    },
+    {
+      "stage": "post",
+      "question": "4,096 keys are inserted into a plain BST in ascending order and then each is looked up. What does the demo measure?",
+      "options": ["Height 12 and about 12 comparisons per lookup, because the tree self-adjusts", "Height 25 and about 14 comparisons, the same as a random insertion order", "Height 4,095 and about 2,048 comparisons per lookup, because the tree is a chain", "Height 4,095 but about 12 comparisons, because lookups binary-search the chain"],
+      "correct": 2,
+      "explanation": "Every ascending insert goes to the right of the previous one, so the tree is a linked list of height n-1 and a lookup walks on average half of it. Nothing in insert looks at height, so it does not self-adjust; that is what Phase 3's balanced trees add. A random order gives height near 25."
+    },
+    {
+      "stage": "post",
+      "question": "Three transactions arrive in the same millisecond. Why does the index key them by (timestamp, sequence) rather than by timestamp alone?",
+      "options": ["Because a BST keyed by timestamp alone would overwrite two of them and the settlement total would be short", "Because comparing two longs is faster when a second field breaks the tie early", "Because the range query needs an even number of fields to form its lo and hi bounds", "Because sequence numbers let the tree stay balanced when timestamps arrive in order"],
+      "correct": 0,
+      "explanation": "Keys are unique in the tree and put replaces on an equal key, so duplicates would be silently lost. The composite key keeps every posting and still lets a timestamp range be expressed as a key range with sentinel sequences. It does nothing for balance: ascending timestamps still degenerate the tree."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "12-time-wheels-and-timers",
+  "title": "Hierarchical Timing Wheels",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A gateway holds 40 million pending timeouts in a binary heap, and most are cancelled before they fire. What does lazy cancellation (marking the entry and leaving it in the heap) cost?",
+      "options": [
+        "Nothing measurable: a marked entry is skipped in O(1) when it eventually reaches the top of the heap",
+        "Memory and heap size: cancelled entries stay until their deadline, slowing every other operation",
+        "O(n) per cancel, because the heap has to be re-sorted from scratch after each entry is marked",
+        "Precision: marked entries delay the live entries queued behind them by at least one full tick"
+      ],
+      "correct": 1,
+      "explanation": "The mark is O(1), but the entry occupies the heap until it surfaces, so the live heap is everything scheduled within the maximum delay, not everything still pending. In the lesson's demo that is 200,000 entries in the heap versus 133,333 in the wheel. Re-sorting does not happen; the heap property is undisturbed by a flag."
+    },
+    {
+      "stage": "check",
+      "question": "A wheel has a 1 ms tick, 8 buckets, and currentTime = 0. Where does an entry with deadline 12 go?",
+      "options": [
+        "Bucket 4 of this wheel, because 12 mod 8 = 4",
+        "Bucket 1 of the overflow wheel, because 12 is beyond the 8 ms interval and 12 / 8 = 1",
+        "It fires immediately, because 12 cannot be represented in an 8-bucket wheel",
+        "Bucket 7 of this wheel, the furthest slot, with a rounds counter of 1"
+      ],
+      "correct": 1,
+      "explanation": "12 is not less than currentTime + interval = 8, so the entry goes to the lazily created overflow wheel (tick 8), bucket floor(12 / 8) mod 8 = 1. It cascades back to bucket 4 of the lower wheel at t = 8. Placing it in bucket 4 now would fire it at t = 4; a rounds counter is Netty's design, not this lesson's."
+    },
+    {
+      "stage": "check",
+      "question": "Why does a cascade re-insert entries starting from the lowest wheel (the root) rather than the wheel directly below the one being flushed?",
+      "options": [
+        "Because the lower wheel's buckets are full and only the root has free slots",
+        "Because only the root can recognise an entry due at exactly this boundary and fire it now",
+        "Because the lower wheel's currentTime has not been updated yet at that point",
+        "Because re-inserting at the root is cheaper: it avoids one recursive call per level"
+      ],
+      "correct": 1,
+      "explanation": "An entry due at exactly the boundary has deadline == root.currentTime; the root's add returns false and the entry fires on time. The wheel just below the coarse one would also report 'due now' for entries that are still several fine ticks away, firing them early. The root's add then walks up the levels as needed, so no slot or cost argument is involved."
+    },
+    {
+      "stage": "check",
+      "question": "With a 10 ms tick, two timers are scheduled at t = 0 for 29 ms and then 23 ms. When and in what order do they fire?",
+      "options": [
+        "At t = 23 and t = 29, in deadline order, because the wheel sorts within a bucket",
+        "Both at t = 20, the start of their tick, in insertion order",
+        "Both at t = 30, the first boundary at or after each deadline, in insertion order: 29 then 23",
+        "At t = 30 for 23 ms and t = 40 for 29 ms, since each is rounded up to a distinct tick"
+      ],
+      "correct": 2,
+      "explanation": "Deadlines are rounded up to the next tick boundary, so both become 30 and share a bucket; a bucket is a FIFO list, so the 29 ms timer, inserted first, fires first. Firing at t = 20 would be early, which this lesson's rounding rule forbids (Kafka's purgatory makes that other choice)."
+    },
+    {
+      "stage": "post",
+      "question": "Which workload is the hierarchical wheel the wrong choice for?",
+      "options": [
+        "Forty million authorization holds with seven-day expiry and a one-second precision requirement",
+        "Per-request deadlines on a gateway handling 50,000 requests per second, 99% of which complete and cancel the timer",
+        "Three hundred scheduled batch jobs that must start within a millisecond of their configured time",
+        "Idempotency-key TTLs for every payment request in the last 24 hours"
+      ],
+      "correct": 2,
+      "explanation": "A few hundred timers needing exact firing is the heap's territory: O(log 300) is nine comparisons, there is no cancel pressure, and a wheel would add tick-granularity error and idle ticking for nothing. The other three have millions of entries, heavy cancellation, and coarse precision needs, which is exactly what the wheel trades for O(1)."
+    },
+    {
+      "stage": "post",
+      "question": "A wheel with 1 ms tick and 64 buckets per level needs to hold deadlines up to 600,000 ms away. How many levels does it use, and what does each entry pay for the hierarchy?",
+      "options": [
+        "Two levels; each entry is hashed once and never moves",
+        "Four levels (64, 4096, 262144, 16777216 ms); each entry cascades at most three times, O(1) each",
+        "Ten levels, one per decimal digit of the delay; each cascade costs O(log n)",
+        "One level of 600,000 buckets; the hierarchy is only needed when memory is constrained"
+      ],
+      "correct": 1,
+      "explanation": "Level intervals grow by a factor of 64: 64 ms, 4,096 ms, 262,144 ms, 16,777,216 ms, so the fourth level is the first that covers 600,000 ms. An entry moves down one level per cascade, each an O(1) unlink and re-link, and never more than levels minus one times. A single 600,000-bucket wheel would work but wastes memory and makes idle ticking expensive."
+    }
+  ]
+}
