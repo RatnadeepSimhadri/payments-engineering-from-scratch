@@ -144,6 +144,9 @@ def audit_quiz(audit: Audit, lesson: Path, planned: bool) -> None:
         others = [l for j, l in enumerate(lengths) if j != correct]
         if others and lengths[correct] > 1.4 * max(others):
             audit.add("quiz-bias", lesson, quiz, f"question {i}: correct option is >40% longer than every distractor")
+    blob = json.dumps(data)
+    if "TODO" in blob or any(q.get("options") == ["A", "B", "C", "D"] for q in questions):
+        audit.add("quiz-placeholder", lesson, quiz, "quiz still contains scaffold placeholder questions")
     if stages != QUIZ_STAGES:
         audit.add("quiz-stages", lesson, quiz, f"expected stages {QUIZ_STAGES}, found {stages}")
 
@@ -183,6 +186,24 @@ def audit_code(audit: Audit, lesson: Path, declared: list[str], planned: bool) -
                 audit.add("code-undeclared", lesson, folder, f"code exists but header does not list {lang['name']}")
 
 
+MIN_LINES = {"Build": 350, "Learn": 300, "Capstone": 300}
+
+
+def audit_depth(audit: Audit, lesson: Path, lesson_type: str) -> None:
+    docs = lesson / "docs" / "en.md"
+    if not docs.is_file():
+        return
+    text = docs.read_text(encoding="utf-8")
+    if re.search(r"^\*\*Status:\*\*\s*Planned", text, re.MULTILINE):
+        return
+    lines = len(text.splitlines())
+    if lines < MIN_LINES[lesson_type]:
+        audit.add("docs-depth", lesson, docs, f"{lines} lines; {lesson_type} lessons need at least {MIN_LINES[lesson_type]}")
+    outputs = lesson / "outputs"
+    if lesson_type == "Build" and not any(outputs.glob("*.md")):
+        audit.add("outputs-missing", lesson, None, "Build lessons must ship at least one outputs/ artifact")
+
+
 def audit_outputs(audit: Audit, lesson: Path) -> None:
     outputs = lesson / "outputs"
     if not outputs.is_dir():
@@ -220,6 +241,7 @@ def main() -> int:
         if lesson["type"] == "Build":
             audit_code(audit, path, declared, planned)
         audit_outputs(audit, path)
+        audit_depth(audit, path, lesson["type"])
         if args.strict and lesson_status(path, lesson["type"]) == "In Progress":
             audit.add("status", path, None, "lesson is In Progress (missing quiz or a CI language)")
 

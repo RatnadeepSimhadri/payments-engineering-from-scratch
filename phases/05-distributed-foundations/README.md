@@ -2,7 +2,7 @@
 
 > The network is not reliable, and the clock is lying.
 
-13 lessons, 13 complete, ~18 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
+13 lessons, 12 complete, ~18 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
 
 ## Start this phase
 
@@ -17,7 +17,7 @@ With an agent tutor: `/learn` (Claude Code), `learn` (Codex), or `Use learn to t
 |:---:|--------|:----:|:----:|:------:|------|
 | 01 | [The Fallacies of Distributed Computing](01-the-fallacies-of-distributed-computing/) | Learn | ~45 min | ✅ | Eight assumptions that have each caused a payments outage. |
 | 02 | [Failure Models: Crash-Stop, Omission, Byzantine](02-failure-models/) | Learn | ~60 min | ✅ | Which failures you tolerate determines which protocol you need. |
-| 03 | [Time, Order, and Clocks: Lamport and Vector Clocks](03-lamport-and-vector-clocks/) | Build | ~120 min | ✅ | Two events, two machines, no shared clock: who went first? |
+| 03 | [Time, Order, and Clocks: Lamport and Vector Clocks](03-lamport-and-vector-clocks/) | Build | ~120 min | 🚧 | Two events, two machines, no shared clock: who went first? |
 | 04 | [Physical Clocks, NTP, and Hybrid Logical Clocks](04-physical-clocks-ntp-and-hybrid-logical-clocks/) | Build | ~75 min | ✅ | Clock skew is why your timestamps cannot order transactions. |
 | 05 | [Consistency Models: Linearizability to Eventual](05-consistency-models/) | Learn | ~90 min | ✅ | The hierarchy, with a history checker you can run. |
 | 06 | [CAP, PACELC, and What They Actually Constrain](06-cap-and-pacelc/) | Learn | ~60 min | ✅ | Partition tolerance is not optional, so the choice is simpler than the triangle. |

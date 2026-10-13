@@ -61,6 +61,9 @@ def lesson_status(path: Path, lesson_type: str) -> str:
         return "Planned"
     if "TODO" in text:
         return "In Progress"
+    quiz_text = quiz.read_text(encoding="utf-8") if quiz.is_file() else ""
+    if '"TODO"' in quiz_text:
+        return "In Progress"
     if lesson_type in ("Learn", "Capstone"):
         return "Complete" if quiz.is_file() else "In Progress"
     required = {lang["id"] for lang in load_languages(ci_only=True)}

@@ -2,7 +2,7 @@
 
 > A ledger is a data structure with a legal obligation.
 
-12 lessons, 12 complete, ~18 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
+12 lessons, 10 complete, ~18 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
 
 ## Start this phase
 
@@ -23,9 +23,9 @@ With an agent tutor: `/learn` (Claude Code), `learn` (Codex), or `Use learn to t
 | # | Lesson | Type | Time | Status | Hook |
 |:---:|--------|:----:|:----:|:------:|------|
 | 01 | [Representing Money: Minor Units, Currencies, and Rounding](01-representing-money/) | Build | ~90 min | ✅ | A Money type that makes 0.1 + 0.2 impossible to get wrong. |
-| 02 | [Currencies, Exchange Rates, and FX Conversion](02-currency-and-fx/) | Build | ~90 min | ✅ | ISO 4217, exponents, and where the rounding residue goes. |
+| 02 | [Currencies, Exchange Rates, and FX Conversion](02-currency-and-fx/) | Build | ~90 min | 🚧 | ISO 4217, exponents, and where the rounding residue goes. |
 | 03 | [The Double-Entry Ledger from Scratch](03-double-entry-ledger/) | Build | ~150 min | ✅ | Debits equal credits or the entry does not exist. |
-| 04 | [Chart of Accounts and Account Types](04-chart-of-accounts/) | Learn | ~60 min | ✅ | Assets, liabilities, revenue: which direction increases each. |
+| 04 | [Chart of Accounts and Account Types](04-chart-of-accounts/) | Learn | ~60 min | 🚧 | Assets, liabilities, revenue: which direction increases each. |
 | 05 | [Balances, Running Totals, and Snapshots](05-balances-and-snapshots/) | Build | ~90 min | ✅ | Sum a million postings in milliseconds without summing a million postings. |
 | 06 | [Immutability, Reversals, and Corrections](06-immutability-and-reversals/) | Build | ~75 min | ✅ | You never update a posting; you post its opposite. |
 | 07 | [Holds, Pending Transactions, and Available Balance](07-holds-and-available-balance/) | Build | ~90 min | ✅ | Authorized is not settled; available is not ledger balance. |

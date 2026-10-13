@@ -172,12 +172,12 @@ flowchart TB
 </details>
 
 <details id="phase-1">
-<summary><b>Phase 1 — Complexity & Core Data Structures</b> &nbsp;<code>14 lessons · 14 complete</code>&nbsp; <em>Every structure is a trade between time, space, and what you can promise.</em></summary>
+<summary><b>Phase 1 — Complexity & Core Data Structures</b> &nbsp;<code>14 lessons · 13 complete</code>&nbsp; <em>Every structure is a trade between time, space, and what you can promise.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
-| 01 | [Complexity Analysis: Big-O, Big-Theta, and What Hardware Does to Them](phases/01-complexity-and-core-structures/01-complexity-and-big-o/) | Learn | — | ✅ |
+| 01 | [Complexity Analysis: Big-O, Big-Theta, and What Hardware Does to Them](phases/01-complexity-and-core-structures/01-complexity-and-big-o/) | Learn | — | 🚧 |
 | 02 | [Amortized Analysis: Why Dynamic Arrays Are O(1)](phases/01-complexity-and-core-structures/02-amortized-analysis/) | Learn | — | ✅ |
 | 03 | [Dynamic Arrays from Scratch](phases/01-complexity-and-core-structures/03-dynamic-arrays/) | Build | Java | ✅ |
 | 04 | [Linked Lists: Singly, Doubly, and Intrusive](phases/01-complexity-and-core-structures/04-linked-lists/) | Build | Java | ✅ |
@@ -267,14 +267,14 @@ flowchart TB
 ### Track B: Distributed Systems
 
 <details id="phase-5">
-<summary><b>Phase 5 — Distributed Systems Foundations</b> &nbsp;<code>13 lessons · 13 complete</code>&nbsp; <em>The network is not reliable, and the clock is lying.</em></summary>
+<summary><b>Phase 5 — Distributed Systems Foundations</b> &nbsp;<code>13 lessons · 12 complete</code>&nbsp; <em>The network is not reliable, and the clock is lying.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
 | 01 | [The Fallacies of Distributed Computing](phases/05-distributed-foundations/01-the-fallacies-of-distributed-computing/) | Learn | — | ✅ |
 | 02 | [Failure Models: Crash-Stop, Omission, Byzantine](phases/05-distributed-foundations/02-failure-models/) | Learn | — | ✅ |
-| 03 | [Time, Order, and Clocks: Lamport and Vector Clocks](phases/05-distributed-foundations/03-lamport-and-vector-clocks/) | Build | Java, Python, Go | ✅ |
+| 03 | [Time, Order, and Clocks: Lamport and Vector Clocks](phases/05-distributed-foundations/03-lamport-and-vector-clocks/) | Build | Java, Python, Go | 🚧 |
 | 04 | [Physical Clocks, NTP, and Hybrid Logical Clocks](phases/05-distributed-foundations/04-physical-clocks-ntp-and-hybrid-logical-clocks/) | Build | Java | ✅ |
 | 05 | [Consistency Models: Linearizability to Eventual](phases/05-distributed-foundations/05-consistency-models/) | Learn | — | ✅ |
 | 06 | [CAP, PACELC, and What They Actually Constrain](phases/05-distributed-foundations/06-cap-and-pacelc/) | Learn | — | ✅ |
@@ -289,15 +289,15 @@ flowchart TB
 </details>
 
 <details id="phase-6">
-<summary><b>Phase 6 — Replication & Consensus</b> &nbsp;<code>12 lessons · 12 complete</code>&nbsp; <em>Agreement is expensive. Know exactly what you are paying for.</em></summary>
+<summary><b>Phase 6 — Replication & Consensus</b> &nbsp;<code>12 lessons · 10 complete</code>&nbsp; <em>Agreement is expensive. Know exactly what you are paying for.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
 | 01 | [Replication: Leader-Based, Multi-Leader, Leaderless](phases/06-replication-and-consensus/01-replication-strategies/) | Learn | — | ✅ |
 | 02 | [Replication Lag and Read-Your-Writes](phases/06-replication-and-consensus/02-replication-lag-and-read-your-writes/) | Build | Java | ✅ |
-| 03 | [Quorums: R + W > N and Its Limits](phases/06-replication-and-consensus/03-quorums/) | Build | Java | ✅ |
-| 04 | [Single-Decree Paxos from Scratch](phases/06-replication-and-consensus/04-paxos/) | Build | Java, Python, Go | ✅ |
+| 03 | [Quorums: R + W > N and Its Limits](phases/06-replication-and-consensus/03-quorums/) | Build | Java | 🚧 |
+| 04 | [Single-Decree Paxos from Scratch](phases/06-replication-and-consensus/04-paxos/) | Build | Java, Python, Go | 🚧 |
 | 05 | [Raft I: Terms, Leader Election, and a Simulated Network](phases/06-replication-and-consensus/05-raft-leader-election/) | Build | Java, Python, Go | ✅ |
 | 06 | [Raft II: Log Replication and Commit](phases/06-replication-and-consensus/06-raft-log-replication/) | Build | Java, Python, Go | ✅ |
 | 07 | [Raft III: Safety Proofs, Membership Changes, Snapshots](phases/06-replication-and-consensus/07-raft-safety-and-membership/) | Build | Java | ✅ |
@@ -353,12 +353,12 @@ flowchart TB
 </details>
 
 <details id="phase-9">
-<summary><b>Phase 9 — Reliability, Observability & Scale</b> &nbsp;<code>13 lessons · 13 complete</code>&nbsp; <em>You cannot operate what you cannot observe.</em></summary>
+<summary><b>Phase 9 — Reliability, Observability & Scale</b> &nbsp;<code>13 lessons · 12 complete</code>&nbsp; <em>You cannot operate what you cannot observe.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
-| 01 | [SLIs, SLOs, and Error Budgets](phases/09-reliability-and-scale/01-slis-slos-and-error-budgets/) | Learn | — | ✅ |
+| 01 | [SLIs, SLOs, and Error Budgets](phases/09-reliability-and-scale/01-slis-slos-and-error-budgets/) | Learn | — | 🚧 |
 | 02 | [Load Balancing: Round Robin, Least Connections, Power of Two Choices](phases/09-reliability-and-scale/02-load-balancing-algorithms/) | Build | Java, Python, Go | ✅ |
 | 03 | [Caching Strategies: Cache-Aside, Write-Through, Write-Behind](phases/09-reliability-and-scale/03-caching-strategies/) | Build | Java | ✅ |
 | 04 | [Cache Invalidation, Stampedes, and Request Coalescing](phases/09-reliability-and-scale/04-cache-invalidation-and-stampedes/) | Build | Java | ✅ |
@@ -377,15 +377,15 @@ flowchart TB
 ### Track C: Payments Engineering
 
 <details id="phase-10">
-<summary><b>Phase 10 — Money & Ledgers</b> &nbsp;<code>12 lessons · 12 complete</code>&nbsp; <em>A ledger is a data structure with a legal obligation.</em></summary>
+<summary><b>Phase 10 — Money & Ledgers</b> &nbsp;<code>12 lessons · 10 complete</code>&nbsp; <em>A ledger is a data structure with a legal obligation.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
 | 01 | [Representing Money: Minor Units, Currencies, and Rounding](phases/10-money-and-ledgers/01-representing-money/) | Build | Java, Python, Go | ✅ |
-| 02 | [Currencies, Exchange Rates, and FX Conversion](phases/10-money-and-ledgers/02-currency-and-fx/) | Build | Java | ✅ |
+| 02 | [Currencies, Exchange Rates, and FX Conversion](phases/10-money-and-ledgers/02-currency-and-fx/) | Build | Java | 🚧 |
 | 03 | [The Double-Entry Ledger from Scratch](phases/10-money-and-ledgers/03-double-entry-ledger/) | Build | Java, Python, Go | ✅ |
-| 04 | [Chart of Accounts and Account Types](phases/10-money-and-ledgers/04-chart-of-accounts/) | Learn | — | ✅ |
+| 04 | [Chart of Accounts and Account Types](phases/10-money-and-ledgers/04-chart-of-accounts/) | Learn | — | 🚧 |
 | 05 | [Balances, Running Totals, and Snapshots](phases/10-money-and-ledgers/05-balances-and-snapshots/) | Build | Java | ✅ |
 | 06 | [Immutability, Reversals, and Corrections](phases/10-money-and-ledgers/06-immutability-and-reversals/) | Build | Java | ✅ |
 | 07 | [Holds, Pending Transactions, and Available Balance](phases/10-money-and-ledgers/07-holds-and-available-balance/) | Build | Java, Python, Go | ✅ |
@@ -398,19 +398,19 @@ flowchart TB
 </details>
 
 <details id="phase-11">
-<summary><b>Phase 11 — Payment Rails & Card Networks</b> &nbsp;<code>15 lessons · 15 complete</code>&nbsp; <em>Every rail is a protocol, a rulebook, and a settlement cycle.</em></summary>
+<summary><b>Phase 11 — Payment Rails & Card Networks</b> &nbsp;<code>15 lessons · 12 complete</code>&nbsp; <em>Every rail is a protocol, a rulebook, and a settlement cycle.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
 | 01 | [How a Card Payment Works: Issuer, Acquirer, Network, Processor](phases/11-payment-rails/01-how-a-card-payment-works/) | Learn | — | ✅ |
 | 02 | [Authorization, Capture, Void, Refund: The Card Lifecycle State Machine](phases/11-payment-rails/02-card-authorization-lifecycle/) | Build | Java, Python, Go | ✅ |
-| 03 | [ISO 8583: Parsing the Card Network Message](phases/11-payment-rails/03-iso-8583/) | Build | Java, Python, Go | ✅ |
+| 03 | [ISO 8583: Parsing the Card Network Message](phases/11-payment-rails/03-iso-8583/) | Build | Java, Python, Go | 🚧 |
 | 04 | [PANs, Luhn, and BIN Range Routing](phases/11-payment-rails/04-pan-luhn-and-bin-ranges/) | Build | Java | ✅ |
-| 05 | [Tokenization and PCI DSS Scope Reduction](phases/11-payment-rails/05-tokenization-and-pci-scope/) | Build | Java | ✅ |
+| 05 | [Tokenization and PCI DSS Scope Reduction](phases/11-payment-rails/05-tokenization-and-pci-scope/) | Build | Java | 🚧 |
 | 06 | [3-D Secure and Strong Customer Authentication](phases/11-payment-rails/06-3ds-and-strong-customer-authentication/) | Learn | — | ✅ |
 | 07 | [Interchange, Scheme Fees, and Merchant Pricing](phases/11-payment-rails/07-interchange-and-scheme-fees/) | Build | Java | ✅ |
-| 08 | [ACH and the NACHA File Format](phases/11-payment-rails/08-ach-and-nacha/) | Build | Java, Python, Go | ✅ |
+| 08 | [ACH and the NACHA File Format](phases/11-payment-rails/08-ach-and-nacha/) | Build | Java, Python, Go | 🚧 |
 | 09 | [SEPA, Wires, and ISO 20022 (pain.001, pacs.008)](phases/11-payment-rails/09-sepa-and-iso-20022/) | Build | Java | ✅ |
 | 10 | [Real-Time Payments: RTP, FedNow, UPI, Faster Payments](phases/11-payment-rails/10-real-time-payments/) | Learn | — | ✅ |
 | 11 | [IBAN, BIC, and Account Number Validation](phases/11-payment-rails/11-iban-bic-and-account-validation/) | Build | Java, Python, Go | ✅ |
@@ -422,20 +422,20 @@ flowchart TB
 </details>
 
 <details id="phase-12">
-<summary><b>Phase 12 — Payment Systems Design</b> &nbsp;<code>14 lessons · 14 complete</code>&nbsp; <em>Correctness first, then availability, then everything else.</em></summary>
+<summary><b>Phase 12 — Payment Systems Design</b> &nbsp;<code>14 lessons · 11 complete</code>&nbsp; <em>Correctness first, then availability, then everything else.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
-| 01 | [Designing an Idempotent Payment API](phases/12-payment-systems-design/01-idempotent-payment-api/) | Build | Java, Python, Go | ✅ |
+| 01 | [Designing an Idempotent Payment API](phases/12-payment-systems-design/01-idempotent-payment-api/) | Build | Java, Python, Go | 🚧 |
 | 02 | [The Payment State Machine](phases/12-payment-systems-design/02-payment-state-machine/) | Build | Java, Python, Go | ✅ |
-| 03 | [Payment Orchestration Across Processors](phases/12-payment-systems-design/03-payment-orchestration/) | Build | Java | ✅ |
+| 03 | [Payment Orchestration Across Processors](phases/12-payment-systems-design/03-payment-orchestration/) | Build | Java | 🚧 |
 | 04 | [Smart Routing, Cascading, and Retry Policies](phases/12-payment-systems-design/04-smart-routing-and-retries/) | Build | Java | ✅ |
 | 05 | [Webhooks: Signing, Delivery, Ordering, and Replay](phases/12-payment-systems-design/05-webhooks-and-callbacks/) | Build | Java | ✅ |
 | 06 | [Refunds, Partial Refunds, and Refund Windows](phases/12-payment-systems-design/06-refunds-and-partial-refunds/) | Build | Java | ✅ |
 | 07 | [Disputes and Chargebacks: The Lifecycle and the Evidence](phases/12-payment-systems-design/07-disputes-and-chargebacks/) | Build | Java | ✅ |
 | 08 | [Payouts, Balances, and Negative Balance Handling](phases/12-payment-systems-design/08-payouts-and-balance-management/) | Build | Java | ✅ |
-| 09 | [Limits, Velocity Controls, and Exposure](phases/12-payment-systems-design/09-limits-and-velocity-controls/) | Build | Java | ✅ |
+| 09 | [Limits, Velocity Controls, and Exposure](phases/12-payment-systems-design/09-limits-and-velocity-controls/) | Build | Java | 🚧 |
 | 10 | [Payment Method Abstraction and Processor Adapters](phases/12-payment-systems-design/10-payment-method-abstraction/) | Build | Java | ✅ |
 | 11 | [Recurring Payments, Subscriptions, and Dunning](phases/12-payment-systems-design/11-recurring-and-subscriptions/) | Build | Java | ✅ |
 | 12 | [Currency Conversion at Checkout and DCC](phases/12-payment-systems-design/12-currency-conversion-at-checkout/) | Build | Java | ✅ |
@@ -465,7 +465,7 @@ flowchart TB
 </details>
 
 <details id="phase-14">
-<summary><b>Phase 14 — Payments at Scale</b> &nbsp;<code>11 lessons · 11 complete</code>&nbsp; <em>At scale, every rare bug is a daily event.</em></summary>
+<summary><b>Phase 14 — Payments at Scale</b> &nbsp;<code>11 lessons · 10 complete</code>&nbsp; <em>At scale, every rare bug is a daily event.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
@@ -473,7 +473,7 @@ flowchart TB
 | 01 | [Architecture of a High-Availability Payment Gateway](phases/14-payments-at-scale/01-high-availability-payment-gateway/) | Learn | — | ✅ |
 | 02 | [Multi-Region Ledgers and Home-Region Routing](phases/14-payments-at-scale/02-multi-region-ledgers/) | Learn | — | ✅ |
 | 03 | [Exactly-Once Money Movement End to End](phases/14-payments-at-scale/03-exactly-once-money-movement/) | Build | Java, Python, Go | ✅ |
-| 04 | [Reconciliation at Scale: Streams, Buckets, and Breaks](phases/14-payments-at-scale/04-reconciliation-at-scale/) | Build | Java | ✅ |
+| 04 | [Reconciliation at Scale: Streams, Buckets, and Breaks](phases/14-payments-at-scale/04-reconciliation-at-scale/) | Build | Java | 🚧 |
 | 05 | [Batch vs Real-Time Settlement Pipelines](phases/14-payments-at-scale/05-batch-vs-real-time-settlement/) | Build | Java | ✅ |
 | 06 | [Observability for Money Movement](phases/14-payments-at-scale/06-observability-for-money-movement/) | Build | Java | ✅ |
 | 07 | [Incident Management for Payments](phases/14-payments-at-scale/07-payment-incident-management/) | Learn | — | ✅ |
@@ -485,7 +485,7 @@ flowchart TB
 </details>
 
 <details id="phase-15">
-<summary><b>Phase 15 — Capstone Projects</b> &nbsp;<code>8 lessons · 8 complete</code>&nbsp; <em>Build the platform, keep the evidence.</em></summary>
+<summary><b>Phase 15 — Capstone Projects</b> &nbsp;<code>8 lessons · 6 complete</code>&nbsp; <em>Build the platform, keep the evidence.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
@@ -493,10 +493,10 @@ flowchart TB
 | 01 | [Capstone: A Durable Double-Entry Ledger Service](phases/15-capstone-projects/01-capstone-ledger-service/) | Capstone | — | ✅ |
 | 02 | [Capstone: An Idempotent Multi-Processor Payment Gateway](phases/15-capstone-projects/02-capstone-payment-gateway/) | Capstone | — | ✅ |
 | 03 | [Capstone: A Raft-Replicated Key-Value Store](phases/15-capstone-projects/03-capstone-replicated-kv-store/) | Capstone | — | ✅ |
-| 04 | [Capstone: An Event-Sourced Wallet with CQRS](phases/15-capstone-projects/04-capstone-event-sourced-wallet/) | Capstone | — | ✅ |
+| 04 | [Capstone: An Event-Sourced Wallet with CQRS](phases/15-capstone-projects/04-capstone-event-sourced-wallet/) | Capstone | — | 🚧 |
 | 05 | [Capstone: Real-Time Fraud Decisioning](phases/15-capstone-projects/05-capstone-fraud-decisioning/) | Capstone | — | ✅ |
 | 06 | [Capstone: A Reconciliation Engine](phases/15-capstone-projects/06-capstone-reconciliation-engine/) | Capstone | — | ✅ |
-| 07 | [Capstone: A Settlement and Payout Pipeline](phases/15-capstone-projects/07-capstone-settlement-pipeline/) | Capstone | — | ✅ |
+| 07 | [Capstone: A Settlement and Payout Pipeline](phases/15-capstone-projects/07-capstone-settlement-pipeline/) | Capstone | — | 🚧 |
 | 08 | [Capstone: End-to-End Payments Platform](phases/15-capstone-projects/08-capstone-end-to-end-payments-platform/) | Capstone | — | ✅ |
 
 </details>

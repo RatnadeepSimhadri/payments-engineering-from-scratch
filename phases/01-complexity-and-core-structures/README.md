@@ -2,11 +2,11 @@
 
 > Every structure is a trade between time, space, and what you can promise.
 
-14 lessons, 14 complete, ~16 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
+14 lessons, 13 complete, ~16 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
 
 ## Start this phase
 
-**First lesson:** [Complexity Analysis: Big-O, Big-Theta, and What Hardware Does to Them](01-complexity-and-big-o/)
+**First lesson:** [Amortized Analysis: Why Dynamic Arrays Are O(1)](02-amortized-analysis/)
 
 
 With an agent tutor: `/learn` (Claude Code), `learn` (Codex), or `Use learn to teach the next lesson.` The tutor reads your language from `LEARNING.md`.
@@ -15,7 +15,7 @@ With an agent tutor: `/learn` (Claude Code), `learn` (Codex), or `Use learn to t
 
 | # | Lesson | Type | Time | Status | Hook |
 |:---:|--------|:----:|:----:|:------:|------|
-| 01 | [Complexity Analysis: Big-O, Big-Theta, and What Hardware Does to Them](01-complexity-and-big-o/) | Learn | ~75 min | ✅ | O(n) with cache misses loses to O(n log n) without them. |
+| 01 | [Complexity Analysis: Big-O, Big-Theta, and What Hardware Does to Them](01-complexity-and-big-o/) | Learn | ~75 min | 🚧 | O(n) with cache misses loses to O(n log n) without them. |
 | 02 | [Amortized Analysis: Why Dynamic Arrays Are O(1)](02-amortized-analysis/) | Learn | ~60 min | ✅ | The accounting method, applied to the structure you use most. |
 | 03 | [Dynamic Arrays from Scratch](03-dynamic-arrays/) | Build | ~75 min | ✅ | Growth factors, memory layout, and why 1.5x beats 2x in some runtimes. |
 | 04 | [Linked Lists: Singly, Doubly, and Intrusive](04-linked-lists/) | Build | ~75 min | ✅ | Pointer chasing is slow; here is when linked lists still win. |
