@@ -2,6 +2,14 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-10-13 — Python port paused; learner starts the course in Java
+
+- Decision: take the course in Java now; Python and Go ports deferred.
+- The Python port was started (wave 1, 6 agents) and stopped within minutes. Partial work parked on branch `wip/python-port`, not merged: 7 lessons pass Python tests (parity unchecked), 1 incomplete.
+- `main` is unchanged: Java-only, 199/199 lessons, audit 0 issues, 143/143 Java Build lessons pass, 3/3 projects.
+- Resume plan, batches, and the agent brief: `docs/porting/python-port-plan.md`.
+- Reference-parity items added to the plan (not started): book/PDF, website, practice assessments, manuals, translations.
+
 ## 2026-10-13 — High-priority gap fixes (199/199, verified by the stricter audit)
 
 - Audit tightened: now fails placeholder quizzes, docs below 350 (Build) / 300 (Learn, Capstone) lines, and Build lessons without an `outputs/` artifact. The tracker dropped from 199 to 183 complete, exposing the gaps.
