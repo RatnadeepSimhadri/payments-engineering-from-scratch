@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A client performs two write() calls of 36 bytes each on a TCP socket. What may the server's read() calls return?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Exactly 36 bytes, then exactly 36 bytes, always",
+        "Any split of the 72 bytes, in order, with no boundary information",
+        "72 bytes in one read, because TCP coalesces back-to-back writes",
+        "Two reads whose sizes depend only on the MTU, never on timing"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "TCP is a byte stream: it preserves order and content but not write boundaries, so 72 bytes may arrive as 1 read, 2 reads, or 72 reads split anywhere. 'Exactly 36 then 36' is what loopback tests show and what breaks in production; coalescing into one read is possible but not guaranteed."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "In the length-prefixed framer, why must the length be compared against maxFrame before the body is copied or allocated?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because a frame larger than maxFrame takes too long to checksum",
+        "Because the length field is attacker-controlled and a huge value would exhaust memory",
+        "Because Java arrays cannot exceed 2 GiB, so the copy would throw anyway",
+        "Because the reader must know the length to compute the next request id"
+      ],
+      "correct": 1,
+      "explanation": "The length is just bytes the peer sent; a single frame claiming 0xFFFFFFFF bytes makes a naive server allocate 4 GiB and die, so the check must precede allocation. The 2 GiB array limit is real but it is a crash, not a defence, and no checksum or request id is involved."
+    },
+    {
+      "stage": "check",
+      "question": "After a framing error (a length above the maximum), the server closes the connection rather than skipping the bad frame. Why?",
+      "options": [
+        "Closing is cheaper than logging the error and continuing",
+        "The protocol has no delimiter, so the reader cannot find where the next frame starts",
+        "The client is required to reconnect after every error of any kind",
+        "The Framer object cannot be reused once feed() has thrown"
+      ],
+      "correct": 1,
+      "explanation": "Once a length is wrong the reader has lost synchronisation and every later 'frame' would be garbage parsed from inside a payload; without a delimiter there is no way to resynchronise, so closing is the only honest option. A decode error inside a complete frame, by contrast, is skipped because the next boundary is still known."
+    },
+    {
+      "stage": "check",
+      "question": "The client's request-id counter lives in the client and keeps counting across reconnects. What does this prevent?",
+      "options": [
+        "The server running out of ids when many clients connect",
+        "Two pipelined requests on one connection sharing an id",
+        "A late reply from the old connection being matched to a call on the new one",
+        "The framer confusing a request frame with a response frame"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "If ids restarted at 1 on each connection, a reply to old request 5 that was still in flight could be mistaken for the answer to new request 5. A per-connection counter would already keep pipelined requests distinct, so that is not what surviving reconnects buys; frame kinds are distinguished by the kind byte, not by ids."
     },
     {
-      "stage": "check",
-      "question": "TODO",
+      "stage": "post",
+      "question": "A Credit call times out after 200 ms. Which statement is exactly what the client knows?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The server did not receive the request",
+        "The server received the request but did not finish processing it",
+        "The server processed the request and the reply was lost",
+        "No reply arrived within 200 ms; whether the credit was applied is unknown"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "A deadline tells the client only that no reply arrived in time. The demo shows the same exception for a slow server (credit applied), a lost request (not applied), and a lost reply (applied). Each of the other options is one possible world; the client cannot distinguish them, which is why a naive retry can double-post."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "A gateway holds 40 TCP connections to a balance service. A middlebox is swapped and loses all connection state without sending FIN or RST. What does the gateway observe on those connections?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "write() succeeds and read() never returns data; no error is raised",
+        "write() fails immediately with 'connection reset by peer'",
+        "read() returns -1 (end of stream) on the next call",
+        "The kernel reports the failure through SO_ERROR within one round trip"
       ],
       "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
+      "explanation": "This is a half-open connection (RFC 9293 section 3.6.2): the kernel buffers writes and retransmits for minutes, and reads wait for data that will never come, so the application sees silence rather than an error until its own deadline fires. A reset or end-of-stream would require the peer to send RST or FIN, which is exactly what did not happen."
     }
   ]
 }

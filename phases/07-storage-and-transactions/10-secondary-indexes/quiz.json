@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A payments table is hash-partitioned by payment_id across 32 shards. With no secondary index, how many shards must a query for \"all payments of customer C\" contact?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Exactly one shard, found by hashing the customer id C and taking it mod 32",
+        "All 32, because the hash of payment_id tells you nothing about the customer",
+        "At most as many shards as C has payments, located by hashing each payment",
+        "Two shards: the one that owns customer C and its synchronous replica"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The hash deliberately destroys any relationship between a row's location and its other attributes, so rows for one customer are spread arbitrarily and every shard must be asked. Hashing C would only work if the table were partitioned by customer, which it is not."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "What distinguishes a local (document-partitioned) secondary index from a global (term-partitioned) one?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A local index is held in memory on each node while a global index is persisted to disk",
+        "A local index covers a single column while a global index can cover several columns",
+        "A local index lives with the rows it points at; a global index is partitioned by the indexed attribute",
+        "A local index serves reads only while a global index also accepts and buffers writes"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "The difference is where the entries live. Local entries sit on the same shard as their rows and are written in the same transaction; global entries for one attribute value are gathered onto one index partition, on a different machine from most of the rows. Memory versus disk and column count are unrelated to the distinction."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "With N shards and a customer whose rows span k distinct shards, what do scatter-gather and a global index cost in requests?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Scatter-gather N, global 1 + k",
+        "Scatter-gather k, global N + 1",
+        "Both cost N; the global index only saves latency",
+        "Scatter-gather 1, global k"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Scatter-gather must ask every shard regardless of hits, so it costs N. The global path does one index lookup and then one batch fetch per shard that actually holds a hit, so 1 + k. The global index wins whenever k is less than N - 1, which is usually true as N grows. The claim that both cost N confuses the worst case (k = N) with the general one."
+    },
+    {
+      "stage": "check",
+      "question": "In ASYNC mode a payment is written and immediately queried by customer before the index queue drains. What happens?",
+      "options": [
+        "The primary-key get fails because the row is not yet durable",
+        "The global index query misses the row while the scatter-gather query over local indexes returns it",
+        "Both the global and scatter-gather queries miss the row until the drain",
+        "The global index query returns the row because puts block until the index is written"
+      ],
+      "correct": 1,
+      "explanation": "The row and its local index entry are written together on the shard, so a key lookup and a scatter-gather both see it at once. The global index entry is only a queued update, so the global query misses the row until the queue drains. Puts do not block on the index in ASYNC mode; that is the whole point of the mode."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "A row is deleted but its global index delete is still queued. Why does findByCustomerGlobal not return a ghost payment?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because the index partition checks the shard before answering the lookup",
+        "Because deletes are applied synchronously even in ASYNC mode",
+        "Because the queue is drained automatically before every query",
+        "Because the query fetches each located row from its shard and drops locators whose row is gone"
       ],
-      "correct": 1,
-      "explanation": "TODO"
+      "correct": 3,
+      "explanation": "The index is trusted only for locations. The fetch step asks the owning shard for each id and skips ids that no longer exist, so a dangling locator is filtered out before the caller sees it. The audit still reports the entry as dangling until the delete drains. Nothing in the design drains automatically or applies deletes synchronously."
+    },
+    {
+      "stage": "post",
+      "question": "A team proposes making the global index covering by storing the payment amount in each index entry so queries skip the shard fetch. What new risk does this introduce?",
+      "options": [
+        "The amount copy can be stale independently of the locator, so a query may show an outdated amount for a row that exists",
+        "The index partitions can no longer be hashed by customer and must be range-partitioned",
+        "The index becomes impossible to rebuild from a scan of the shards",
+        "Scatter-gather queries stop working because the local indexes are removed"
+      ],
+      "correct": 0,
+      "explanation": "A projected copy is updated through the same asynchronous queue as the locator, so an amount changed on the shard is wrong in the index until that update drains, and a covering query has no fetch step to notice. The partitioning scheme, rebuildability, and local indexes are untouched by projection."
     }
   ]
 }

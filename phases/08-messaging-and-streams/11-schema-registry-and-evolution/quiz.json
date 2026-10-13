@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A producer renames the field amount to grossAmount in an Avro record. Which consumers break, assuming each resolves by field name?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "None of them; a rename is cosmetic because the encoded bytes on the topic are unchanged",
+        "Only consumers that were compiled against the new schema and have not yet been redeployed",
+        "Every consumer whose reader schema has amount with no default and no alias, because to them the field was deleted",
+        "Only consumers that resolve fields by position rather than by name, since positions shifted"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Avro resolves writer to reader by field name, so a renamed field is a removed field plus an added one. A reader expecting amount with no default has no source for it and resolution fails. Option D has it backwards: positional readers are the ones that misread silently rather than fail."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "What does the schema id at the front of each message buy a consumer that replays three years of retained events?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Each message names the exact writer schema, so every version ever written can be fetched and decoded correctly",
+        "It allows the broker to reject messages whose schema the consumer does not support",
+        "It lets the consumer skip the registry entirely by embedding the whole schema in the message",
+        "It guarantees that all messages in the topic were written with the same schema version"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The id identifies an immutable schema in the registry; the deserializer fetches it (once) and decodes with the writer schema, then resolves into the reader. Without it a consumer would have to guess which version wrote each old message. The id is a four-byte reference, not the schema itself, so option C is wrong."
+    },
+    {
+      "stage": "check",
+      "question": "A subject is set to BACKWARD compatibility. Which change is allowed, and which deployment order does the mode require?",
+      "options": [
+        "Add a field without a default; deploy producers first",
+        "Add a field with a default; deploy consumers first",
+        "Remove a field that had no default; deploy producers first",
+        "Change a long to an int; deploy in any order"
+      ],
+      "correct": 1,
+      "explanation": "BACKWARD means the new reader can read old data: an added field needs a default so old records resolve, and consumers must upgrade before producers start writing the new shape. Removing a field is also allowed under BACKWARD (new readers ignore it), but option C pairs it with the wrong rollout order; long to int is not an Avro promotion."
+    },
+    {
+      "stage": "check",
+      "question": "In Protobuf, field string card_last4 = 4 is deleted and later int64 surcharge_minor = 4 is added without a reserved declaration. What happens when an old message is decoded with the new schema?",
+      "options": [
+        "Decoding fails with a type mismatch error on field 4",
+        "The old field is ignored because its name no longer exists in the schema",
+        "The card digits are decoded into surcharge_minor as a garbage integer with no error",
+        "The registry refuses to register the new schema because the number was used before"
+      ],
+      "correct": 2,
+      "explanation": "Protobuf identifies fields by number on the wire, so the bytes tagged 4 are interpreted as whatever field 4 now is; a string wire type read as an integer field produces nonsense silently in most decoders. reserved 4; exists to prevent exactly this. Compatibility checkers can catch it only if they are configured to track reserved numbers."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "The producer changes amount from gross to net while keeping the field name and type. Which safeguard catches this?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "BACKWARD_TRANSITIVE compatibility, because the meaning changed across versions",
+        "FULL compatibility, because both directions are checked",
+        "The Avro schema resolution rules, because the default no longer applies",
+        "None of the registry's checks; only a human review or a semantic reconciliation test"
+      ],
+      "correct": 3,
+      "explanation": "Compatibility checks are structural: same name, same type, same default means pass under every mode. A change in meaning is invisible to them, which is why the decision procedure ends with a question the registry cannot answer. Such a change needs a new field name or a new event version, regardless of the check passing."
+    },
+    {
+      "stage": "post",
+      "question": "An event-sourced aggregate must replay PaymentAuthorized v1 (amount as a string in major units) through v3 code. Which design handles this, and what is the rule about the v1 upcaster?",
+      "options": [
+        "Set the subject to NONE so any version decodes; the upcaster can be removed once no v1 events remain in the topic",
+        "A chain of pure upcasters v1 to v2 to v3 applied at read time, and the v1 upcaster is never deleted while any v1 event exists in the store",
+        "Rewrite the stored v1 events in place to v3 so no upcaster is needed afterwards",
+        "Have the aggregate's command handler branch on eventVersion and handle each shape directly"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Upcasters carry meaning across versions the registry allowed; each is pure and total for its version, the chain runs in the repository, and the command handler sees only the latest shape. Deleting the v1 upcaster makes 2019 events unreplayable. Option C violates the append-only property of an event store; option D spreads version handling through business logic."
     }
   ]
 }

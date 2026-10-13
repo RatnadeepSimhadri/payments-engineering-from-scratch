@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "Authorization success drops from 97% to 71%. Three engineers notice at once: one restarts the adapter, one reads logs, one calls the acquirer. Which single missing thing most explains why this response goes badly?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A faster log search tool",
+        "Someone in charge who coordinates and sequences the actions",
+        "More engineers joining the response",
+        "A direct line to the acquirer's engineering team"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Without an Incident Commander the three act independently: the restart destroys evidence, nobody tells support, and a fourth engineer deploys into the incident. Tooling and headcount do not fix uncoordinated action; more people without a coordinator make it worse."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Why does the Incident Commander deliberately not debug or run commands during a SEV1?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "ICs are usually managers who do not hold production access during an incident",
+        "Commands run by the IC cannot be captured in the timeline because the scribe is not watching them",
+        "The IC role rotates every thirty minutes, too quickly to keep useful context on the system",
+        "Debugging absorbs attention exactly when coordination, communication, and sequencing are needed most"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "The IC's job is to keep one change in flight, keep the roles filled, and make decisions; an IC who starts debugging stops doing all three the moment the debugging gets interesting. The role is often held by a senior engineer with full access; the restriction is about attention, not permissions."
     },
     {
-      "stage": "post",
-      "question": "TODO",
+      "stage": "check",
+      "question": "What is the test of a good runbook?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Its author can execute every step of it from memory in under five minutes without the document",
+        "It explains the architecture and the design history of the system in enough detail to debug anything",
+        "The newest engineer on the rotation can execute it at 03:00 without asking anyone for help",
+        "It has been reviewed and signed off by the security team and the platform owners each quarter"
+      ],
+      "correct": 2,
+      "explanation": "A runbook exists for responders under stress who did not build the system. Exact commands, expected values, and what to do when a step does not work are what make that possible. Architecture explanations belong in design docs; the author's speed proves nothing about anyone else's."
+    },
+    {
+      "stage": "check",
+      "question": "A postmortem lists 'Lin entered 800 instead of 8000' as the root cause and 'be more careful with config' as the action. What is wrong with this?",
+      "options": [
+        "It names a person rather than the conditions, so the unit-less field, missing validation, and absent canary all survive",
+        "Nothing is wrong: the cause is accurately identified and the action directly addresses the mistake",
+        "It should have listed the acquirer as a contributing party as well, since their timeout behaviour mattered",
+        "The action should have been assigned to Lin's manager so that it carries organisational accountability"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Blameless analysis asks what made a competent person's action lead to an incident: a field with no unit, a schema with no range check, a config service with no canary, no alert on change events. Each yields a system change. 'Be more careful' changes nothing and teaches people to hide mistakes."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "Why does the lesson say rollback is usually the first mitigation to try, before the cause is understood?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because rollbacks are always reversible and always safe, whatever the change was and however long ago it shipped",
+        "Because most incidents follow a change and returning to a known state has a small downside, while fixing forward under stress has the worst odds",
+        "Because the postmortem template requires that a rollback has been attempted before any other mitigation is recorded",
+        "Because rolling back a deploy is always faster than enabling a brownout level or failing over to another region"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Mitigate-first means restoring service on suspicion; rollback is the cheapest suspicion to act on. Rollbacks are not always possible (applied migrations), which is why irreversible changes need their own runbook. Degradation can be faster still, but it applies to load- and dependency-shaped failures, not to a bad change."
+    },
+    {
+      "stage": "post",
+      "question": "What makes a payments SEV1 different from a web outage of the same duration, according to the lesson?",
+      "options": [
+        "Payments incidents are almost always caused by third parties such as acquirers, so the response is mostly vendor management",
+        "Payments platforms are not permitted to use public status pages, so all communication must go through account managers",
+        "Severity for payments is measured in minutes of downtime rather than customer impact, because downtime is contractually defined",
+        "The incident cannot be closed until reconciliation confirms whether money moved incorrectly, and scheme or regulatory notification windows may apply"
+      ],
+      "correct": 3,
+      "explanation": "A timeout on the platform's side does not mean the acquirer did not approve the authorization; the worked example finds 212 such holds. That money question stays open after the technical fix, and card schemes and regulators have notification rules with deadlines. Severity is still customer impact; the difference is what impact includes."
     }
   ]
 }

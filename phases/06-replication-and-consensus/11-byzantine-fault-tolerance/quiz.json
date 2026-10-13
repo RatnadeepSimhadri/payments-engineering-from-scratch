@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A Raft follower with a failing memory module acknowledges log entries it does not actually hold. Which failure model does this fall under, and does Raft tolerate it?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Crash-stop; Raft tolerates it because a majority of nodes are still correct",
+        "Omission; Raft tolerates it because it only needs a majority to respond",
+        "Byzantine; Raft does not tolerate it because it trusts every node's report of its own state",
+        "Network partition; Raft tolerates it by electing a new leader on the majority side"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "The node kept running and sent a false message about its own log, which is Byzantine behaviour regardless of intent. Raft's safety proof assumes nodes report their logs honestly, so a false matchIndex can lead the cluster to commit or overwrite the wrong entries. A crashed or silent node would have been handled; a lying one is outside the model."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Why does asynchronous Byzantine agreement need n >= 3f + 1 replicas rather than 2f + 1?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because signatures cannot be verified unless two thirds of replicas share a key",
+        "Because a quorum of n - f may contain f faulty replicas, and the honest ones in it must still outnumber them",
+        "Because each decision needs three phases and each phase consumes f replicas' votes",
+        "Because the primary and its two backups must each be replicated f times"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Progress requires acting on n - f responses, since f replicas may be silent. If the silent ones were honest and slow, the quorum may hold f faulty responders, leaving n - 2f honest ones, which must exceed f: n > 3f. Equivalently, two quorums of 2f + 1 out of 3f + 1 overlap in f + 1 replicas, at least one honest. The three phases are a consequence of the protocol, not the source of the bound."
+    },
+    {
+      "stage": "check",
+      "question": "In PBFT, a replica is 'prepared' for a request once it has the pre-prepare and 2f matching prepares. What does the prepared certificate guarantee?",
+      "options": [
+        "That the request will survive a view change and be re-proposed by the next primary",
+        "That the client has already received f + 1 matching replies for this request",
+        "That no other request can be prepared at the same sequence number within this view",
+        "That at least f + 1 honest replicas have executed the request"
+      ],
+      "correct": 2,
+      "explanation": "Two prepared certificates for different digests at the same (view, sequence) would be two quorums with no honest replica in common, which cannot happen. That fixes the order within the view. Surviving a view change is what the commit phase adds; execution and client replies come later still."
+    },
+    {
+      "stage": "check",
+      "question": "Why does PBFT need a commit phase when the prepare phase already fixes the order of a request?",
+      "options": [
+        "Because prepare messages are authenticated with MACs and commits with signatures",
+        "Because the commit phase is where the primary learns that the backups accepted its proposal",
+        "Because without it the client could receive replies from fewer than f + 1 replicas",
+        "Because a request prepared at only one honest replica could be lost in a view change that never hears from it"
+      ],
+      "correct": 3,
+      "explanation": "Prepare fixes order within a view. If an honest replica executed as soon as it was prepared, and it alone was prepared, a view change collecting 2f + 1 messages might exclude it and the new primary would not know to re-propose the request. Commit ensures at least f + 1 honest replicas were prepared before anyone executes, so every view-change quorum includes one of them."
+    },
+    {
+      "stage": "post",
+      "question": "A bank's internal settlement ledger runs on five Raft nodes under one operations team. A design review proposes replacing it with a seven-node PBFT cluster to defend against corrupted nodes. What is the strongest objection?",
+      "options": [
+        "PBFT cannot run on seven nodes, because the replica count must be an exact multiple of four",
+        "One admin team and one deploy pipeline can compromise f + 1 nodes at once, and checksums already turn corruption into crashes",
+        "Raft already tolerates Byzantine faults as long as a strict majority of its nodes remain honest and reachable",
+        "PBFT's finality is probabilistic, which is unacceptable for settlement that needs a known final instant"
+      ],
+      "correct": 1,
+      "explanation": "BFT defends against independent faults among parties without a shared administrator; inside one organisation the realistic Byzantine faults are accidental corruption, which end-to-end integrity checks convert into crashes Raft handles, at far lower cost. Seven nodes is a valid 3f + 1 with f = 2; Raft does not tolerate Byzantine faults; and PBFT's finality is deterministic, not probabilistic."
+    },
+    {
+      "stage": "post",
+      "question": "A client of a PBFT service receives one reply from a load balancer in front of the four replicas. Why is this insufficient?",
+      "options": [
+        "Because a single reply may have come from the one faulty replica, and only f + 1 matching replies guarantee an honest source",
+        "Because the load balancer must participate in the prepare phase to be counted in the quorum",
+        "Because PBFT replies are only valid when they include the full prepared certificate",
+        "Because a load balancer cannot forward MAC-authenticated messages without the session keys"
+      ],
+      "correct": 0,
+      "explanation": "At most f replicas are faulty, so among f + 1 identical replies at least one is from an honest replica that executed the agreed sequence. A single reply, however routed, might be the faulty replica's lie. The load balancer does not participate in consensus at all, and replies carry the result, not the certificate."
     }
   ]
 }

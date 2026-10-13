@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A Kafka consumer fails to parse the record at offset 48,211,907 on partition 7, does not commit, and polls again. The partition carries thousands of account keys. What is the effect on accounts whose records are at later offsets on that partition?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Only the account the bad record belongs to is affected; other keys continue",
+        "Every account on partition 7 stops receiving records until the bad one is handled",
+        "The broker skips the record automatically after a timeout and consumption continues",
+        "Other consumers in the group take over partition 7 and process past the bad record"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A partition is a FIFO: the consumer cannot reach offset n+1 without finishing offset n, so every key on the partition is blocked (head-of-line blocking). Option A describes the goal of per-key quarantine, which the default consumer does not have; option D is wrong because a rebalanced consumer resumes from the same uncommitted offset and hits the same record."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "The handler throws because the payload says 12.345 USD and the currency allows two decimals. How should the consumer treat this failure?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Retry with exponential backoff up to maxAttempts, since the next attempt might succeed",
+        "Round the amount to 12.35 in the consumer and post it so the partition keeps moving",
+        "Park it immediately as a permanent failure with attempts = 1, since the bytes will never parse differently",
+        "Skip the offset, log a warning, and commit, since one small posting is not worth a stall"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "A parse failure is deterministic: no retry changes the input, so each attempt is wasted partition time. The handler classifies it PERMANENT and the consumer parks it on the first attempt. Option B silently changes money without an approver; option D is the drop-with-a-log anti-pattern that the conservation invariant exists to catch."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Offset 2 (acct-A) is parked. Offset 4 is acct-A again, a well-formed -40.00 USD debit. Why does the resilient consumer park offset 4 as KEY_QUARANTINED instead of posting it?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because the final balance would be wrong if offset 4 were posted before offset 2 and could never be corrected",
+        "Because it would apply a debit before the credit that precedes it, corrupting the account's history even though the final balance would match",
+        "Because the handler cannot parse any event for a key that already has a parked event in the dead-letter queue",
+        "Because Kafka requires all events for a key to be committed together once any one of them has failed"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Per-key order is the guarantee; the intermediate balance after offset 2 and before offset 4 is what overdraft checks, interest, and audit trails depend on. The final balance is the same either way, which is why option A is wrong and why this failure is so hard to notice. Option C confuses quarantine (a consumer decision) with parsing (a handler decision)."
+    },
+    {
+      "stage": "check",
+      "question": "maxAttempts is 3 and the base backoff is 100 ms. An event fails transiently three times. What is the simulated clock after it is parked, and what ParkReason does it carry?",
+      "options": [
+        "700 ms, MAX_ATTEMPTS_EXCEEDED",
+        "300 ms, MAX_ATTEMPTS_EXCEEDED",
+        "300 ms, PERMANENT_FAILURE",
+        "600 ms, KEY_QUARANTINED"
+      ],
+      "correct": 1,
+      "explanation": "Backoff happens between attempts, not after the last one: 100 ms after attempt 1 and 200 ms after attempt 2, then attempt 3 fails and the event is parked with attempts = 3 as MAX_ATTEMPTS_EXCEEDED. Option A adds a third backoff of 400 ms that never runs because there is no fourth attempt."
+    },
+    {
+      "stage": "post",
+      "question": "A handler writes the posting, then the database connection drops before the acknowledgement, so it throws TRANSIENT. The consumer retries. What prevents a double posting, and what happens without it?",
+      "options": [
+        "The DLQ deduplicates by offset before replay; without it the DLQ grows",
+        "The consumer commits the offset before calling the handler; without it the event is reprocessed",
+        "The handler checks an applied set keyed by offset and returns early; without it every retry after a late success posts again",
+        "Exponential backoff gives the database time to roll back; without it the write is lost"
+      ],
+      "correct": 2,
+      "explanation": "Retries re-invoke the handler, so the handler must be idempotent: LedgerPostingHandler keeps an applied set per offset (a unique constraint in production). Without it a DLQ with retries double-posts, which is worse than the stall it replaced. Option B describes at-most-once delivery, which would lose the posting rather than duplicate it."
+    },
+    {
+      "stage": "post",
+      "question": "An operator replays acct-D's dead letters without fixing the unknown currency code. What state is the system in afterwards?",
+      "options": [
+        "The replay is rejected up front because the DLQ detects that no correction map was supplied for a permanent failure",
+        "The event is dropped from the DLQ because it has now failed twice, and acct-D leaves quarantine with its followers applied",
+        "The event is posted with the consumer's default currency so acct-D can continue, and the mismatch is logged",
+        "The event fails again, is re-parked as PERMANENT_FAILURE, and acct-D is quarantined again with any followers re-parked in order"
+      ],
+      "correct": 3,
+      "explanation": "Replay reuses the same attempt path: the unfixed poison message fails, is parked again, re-quarantines the key, and any followers are re-parked behind it in offset order so per-key ordering survives a failed replay. Option A would be a reasonable guard to add but is not how the mechanism works; option B is a silent drop."
     }
   ]
 }

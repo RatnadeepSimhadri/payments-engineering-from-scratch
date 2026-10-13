@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A ledger replicates asynchronously to a second region with about two seconds of lag. The primary region is destroyed. What is lost?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Nothing, because the replica has every committed write",
+        "Roughly the last two seconds of acknowledged writes",
+        "Everything since the last nightly backup",
+        "Only the writes that were in flight and not yet acknowledged"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Asynchronous replication acknowledges a write before the replica has it, so writes applied on the primary in the last lag interval never reached the replica. That is the RPO of async replication: the lag at the moment of failure. Unacknowledged in-flight writes are lost too, but the client knows about those; the acknowledged-then-lost ones are the problem."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Which pair of numbers describes a system with synchronous replication to a warm standby that takes 40 minutes to promote by hand?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "RPO zero, RTO 40 minutes",
+        "RPO 40 minutes, RTO zero",
+        "RPO zero, RTO zero",
+        "RPO 40 minutes, RTO 40 minutes"
       ],
-      "correct": 2,
-      "explanation": "TODO"
+      "correct": 0,
+      "explanation": "Synchronous replication means no acknowledged write is missing from the standby, so RPO is zero. The 40 minutes of manual promotion is downtime, so RTO is 40 minutes. The two objectives are independent: one is about data, the other about time."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Two regions both accept payouts against the same account, each checking the balance it can see. Why can no conflict-resolution rule applied after replication converges fix the resulting negative balance?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because asynchronous replication streams cannot carry a posting whose amount is negative",
+        "Because last-writer-wins needs synchronized clocks that two regions can never share precisely",
+        "Because a double-entry ledger forbids deleting or amending any posting once it has been written",
+        "Because the balance checks used stale views and both payouts had already left before the conflict was visible"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "The defect is in the check-then-act: each region's check was correct for the state it saw, and the external action (sending the payout) happened before the conflict was visible. Discarding a posting makes the ledger lie about money that moved; keeping both leaves the invariant broken. The fix must prevent the second check, which means a single writer per account or cross-region consensus."
     },
     {
-      "stage": "post",
-      "question": "TODO",
+      "stage": "check",
+      "question": "In home-region routing, a merchant homed in the EU sends a payout request that lands on the US edge. What happens?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The US region writes it and replicates to the EU",
+        "The US edge looks up the home in the directory and forwards the write to the EU ledger",
+        "The request is rejected because it arrived in the wrong region",
+        "Both regions write it and the directory picks a winner"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The edge is stateless about accounts; it consults the consistent home directory and forwards writes to the one region allowed to write that account. Writing locally would create two writers. Rejecting would make the system unusable for travellers and global integrations; forwarding costs one inter-region hop."
+    },
+    {
+      "stage": "post",
+      "question": "The lesson argues that failover of a ledger should be automated up to the decision and after it, but not the decision itself. Why?",
+      "options": [
+        "Regulators in most jurisdictions require a named human to sign off on every regional failover event",
+        "Automated probes cannot measure replication lag precisely enough to know whether the standby is current",
+        "Partitions and monitoring failures look like a dead region from one vantage point, and an automatic re-home then creates two writers",
+        "Humans are faster than automation at DNS and routing changes because they can skip the propagation delays"
+      ],
+      "correct": 2,
+      "explanation": "The dangerous false positive is a region that is alive but unreachable from the prober; re-homing its accounts while it still accepts writes recreates the active-active ledger problem by accident. A human with two independent signals and a confirmation window is the guard. Everything else, detection, routing, promotion, and verification, should be automated to shrink RTO."
+    },
+    {
+      "stage": "post",
+      "question": "A platform quotes its ledger RPO as 'about 0.4 seconds' from median replication lag. What is wrong with that figure for DR planning?",
+      "options": [
+        "Regional failures correlate with load, when lag is at p99 and posting rate at peak, so real loss can be ten times larger",
+        "RPO must be quoted in bytes or records lost, never in seconds, because seconds hide the write rate",
+        "Median lag is always zero for asynchronous replication, so the quoted figure is meaningless by construction",
+        "The figure ignores that synchronous replication has no lag at all and would therefore be the only honest option"
+      ],
+      "correct": 0,
+      "explanation": "Lag is worst exactly when the system is busiest, and disasters do not wait for quiet periods. Quoting p99 lag times peak posting rate, in records, gives the number the business must accept. Seconds are a fine unit; the problem is which seconds and how many postings they hold."
     }
   ]
 }

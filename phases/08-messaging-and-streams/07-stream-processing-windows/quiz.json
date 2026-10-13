@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A fraud rule says 'more than three transactions on one card within any sixty seconds'. A job groups authorizations by calendar minute and counts. A card transacts at 12:00:50, 12:00:56, 12:01:03 and 12:01:09. What does the job report?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A breach in the 12:00 minute, since the first two transactions started the burst there",
+        "A breach in the 12:01 minute, since that is where the fourth transaction landed",
+        "No breach: each calendar minute saw only two transactions, so the span was split in half",
+        "A breach in both minutes, because the four transactions are within sixty seconds of each other"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Grouping by calendar minute is a tumbling window: each record belongs to exactly one window, and the 19-second burst straddles the 12:01:00 boundary, so each window counts two and neither exceeds three. The rule as written is about any sixty-second span, which is a sliding window; the tumbling implementation has a hole at every boundary, and that is where the breach fell."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "With sliding windows of size 60 s and slide 10 s, how many windows does a record at 1:03 belong to, and what is the earliest one?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Six windows, the earliest being [0:10, 1:10), since every window starting in (0:03, 1:03] at a 10 s multiple contains it",
+        "One window, [1:00, 2:00), because a record has one home and the slide only changes emission timing",
+        "Seven windows, the earliest being [0:00, 1:00), since 1:03 is within sixty seconds of 0:03",
+        "Ten windows, one per second of slide between 0:53 and 1:03, each sixty seconds long"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "A record is in size/slide = 6 windows: those whose start is a multiple of the slide and lies in (t - size, t], here 0:10 through 1:00. [0:00, 1:00) is half-open and ends before 1:03, so it does not contain the record; that is the seventh window the wrong answer counts. One home per record is the tumbling model, and ten windows would need a 6 s slide."
+    },
+    {
+      "stage": "check",
+      "question": "A tumbling operator holds [0:00, 1:00) for card-A with count=2. The timer fires at 0:59, then at 1:00. When is the window emitted, and what happens to its state?",
+      "options": [
+        "At 0:59, because the timer fires before the window ends and emits whatever is accumulated so far",
+        "At 1:00, and the state is kept so that a later record for 0:58 can still be added to it",
+        "At 1:00, the first tick at which end <= now, and the state is dropped so the window is emitted once",
+        "At 1:10, because a window is only safe to emit one full timer interval after its end"
+      ],
+      "correct": 2,
+      "explanation": "The processing-time trigger emits a window at the first timer tick where its end is at or before the current time, which is 1:00, and removes it from state so it is never emitted again. The 0:59 tick does nothing because the window has not ended. Keeping the state for a later 0:58 record is impossible under processing time: time is monotonic and such a record is rejected as a programming error. Lesson 08's event-time model is what adds allowed lateness."
+    },
+    {
+      "stage": "check",
+      "question": "Session windows use a 30-second gap. A card transacts at 0:00, 0:25, and 0:55. How many sessions are open after the third record, and why?",
+      "options": [
+        "One session [0:00, 1:25): each record arrived within the gap of the previous one, so the session kept extending",
+        "Two sessions, [0:00, 0:55) and [0:55, 1:25): the third record arrived exactly at the session's end, which is excluded",
+        "Three sessions, because session windows are per record and merge only when the timer fires",
+        "One session [0:00, 0:30): the first record fixes the window and later records within a minute join it"
+      ],
+      "correct": 1,
+      "explanation": "The record at 0:25 proposes [0:25, 0:55), overlaps [0:00, 0:30), and merges into [0:00, 0:55). The record at 0:55 proposes [0:55, 1:25); windows are half-open, so 0:55 is not inside [0:00, 0:55), the overlap test fails, and a new session starts. Had the record arrived at 0:54 it would have extended the first session, which is what the first option describes. Sessions merge in process, not on the timer, and a session has no fixed size."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "The demo's sliding operator reports the same 4-transaction burst in five consecutive windows. What is the correct reading of that output?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Five independent breaches occurred and each should be investigated separately",
+        "The operator double-counted records; sliding windows should assign each record to one window",
+        "A single burst is visible to every window that fully contains it, so repeats are expected and need suppression downstream",
+        "The timer interval is too coarse; a 1-second timer would emit the breach exactly once"
       ],
-      "correct": 1,
-      "explanation": "TODO"
+      "correct": 2,
+      "explanation": "Sliding windows overlap by design, so a burst lasting less than size minus slide is wholly inside several windows and each reports it; the repeats are the cost of catching the burst at all and are removed by suppressing further breaches per card until the count drops. Assigning each record to one window is the tumbling model that missed the burst, and the timer interval decides when windows emit, not how many of them see the burst."
+    },
+    {
+      "stage": "post",
+      "question": "A team wants the velocity rule to decline the fourth transaction in the authorization path, and to produce identical results when the day's log is replayed for audit. Which combination does that?",
+      "options": [
+        "Processing-time tumbling windows with a 1-second timer, since that is the lowest-latency configuration",
+        "Processing-time session windows with a short gap, emitted on a 1-second timer and fed to the authorizer",
+        "Sliding windows with a 1-second slide, emitted on the timer; the replay will match because the slide is small",
+        "A per-record sliding count consulted inside process, computed on event time so a replay reproduces it"
+      ],
+      "correct": 3,
+      "explanation": "Declining in the authorization path means the count must be available when the record arrives, which no timer-driven emission provides; it has to be read inside process from a per-record window. Reproducibility on replay requires event time, because processing time puts replayed records into the replay day's windows. Every timer-driven option decides after the fact, and processing time breaks the replay requirement regardless of window shape or slide."
     }
   ]
 }

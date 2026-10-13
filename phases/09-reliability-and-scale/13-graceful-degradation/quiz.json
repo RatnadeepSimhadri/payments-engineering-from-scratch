@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A service with capacity 1,250 requests per second receives 2,400 per second into one unbounded FIFO queue for three seconds. What happens to a card authorization that arrives two seconds in?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "It is served promptly because authorizations are small",
+        "It waits behind every earlier request of every kind, roughly a second or more",
+        "It is rejected because the queue has a default bound",
+        "It is served first because the queue is sorted by arrival time"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "FIFO means arrival order and nothing else; with arrivals exceeding service by 1,150 per second the backlog grows by that much every second and so does everyone's wait. Unbounded queues have no default bound to reject at, and request size does not change position in the line."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "In CoDel, 50 requests are queued at once and drained one per millisecond, so the last one waits 49 ms against a 5 ms target and a 100 ms interval. How many are dropped?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "None, because sojourn never stayed above target for a full interval",
+        "About 5, one per interval/sqrt(count)",
+        "All requests older than the target",
+        "Exactly one, the request at the head when sojourn first exceeded target"
       ],
-      "correct": 2,
-      "explanation": "TODO"
+      "correct": 0,
+      "explanation": "CoDel starts a timer when sojourn first exceeds target and drops only if it is still above target when a whole interval has elapsed. The spike clears in 50 ms, under the 100 ms interval, so the timer never fires. This tolerance for short bursts is the design goal; dropping at the first excursion would punish normal variance."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Why does the brownout controller observe only CRITICAL and HIGH sojourn times, ignoring NORMAL and LOW?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Lower classes have no queue, so they have no sojourn",
+        "NORMAL and LOW requests are too numerous to measure cheaply",
+        "The CoDel queue already drops lower classes, so observing them is redundant",
+        "A backlog of reports should not trigger shedding unless it is actually delaying important work"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "The failure the controller exists to prevent is late authorizations. With strict priority, a mountain of waiting LOW requests harms nobody important until workers run out; shedding before that point would reject reports needlessly. Every class has its own queue and sojourn; the choice is about what the signal should mean."
     },
     {
-      "stage": "post",
-      "question": "TODO",
+      "stage": "check",
+      "question": "The controller escalates when the window's worst CRITICAL/HIGH sojourn exceeds 5 ms and de-escalates only after several windows below 2.5 ms. What is the gap between those thresholds for?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "To give CoDel enough time to empty every queue before the level is allowed to change",
+        "To stop the controller flipping levels every window when sojourn sits near the threshold",
+        "To ensure the fraud model has been reloaded into memory before it is used again",
+        "To align the controller's windows with the card network's authorization timeout"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "That gap is hysteresis: with a single threshold the controller would escalate at 5.1 ms, de-escalate at 4.9 ms, and oscillate every window. Requiring sojourn to fall well below the escalate threshold, for a sustained period, makes each change deliberate. It has nothing to do with model loading or network timeouts."
+    },
+    {
+      "stage": "post",
+      "question": "Under the seeded overload, FIFO completed 10,403 requests and the degrading policy 9,212. Why does the lesson call the degrading policy the better outcome?",
+      "options": [
+        "Because it eventually completed every LOW request once the overload had passed",
+        "Because CoDel dropped many more stale requests than FIFO ever could have done",
+        "Because its CRITICAL p99 stayed at 25 ms where FIFO's reached 2.7 s, so its completions were useful",
+        "Because it achieved the result with fewer workers than the FIFO policy needed"
+      ],
+      "correct": 2,
+      "explanation": "An authorization that completes after 1.4 s has already timed out at the card network, so most of FIFO's CRITICAL completions were failures in practice. The degrading policy shed reports and polls at the door to keep authorizations fast. CoDel dropped only three requests; admission control did the work, and both policies used the same eight workers."
+    },
+    {
+      "stage": "post",
+      "question": "The transition log shows the controller going SHED_LOW -> NORMAL -> SHED_LOW within 100 ms during the overload. What is the root cause of this oscillation?",
+      "options": [
+        "The sojourn that justified de-escalation was measured under the degraded configuration, so it does not predict load once LOW traffic and full fraud return",
+        "A bug in the controller: the cooldown counter is reset on the wrong branch of the window check",
+        "The CoDel interval is shorter than the controller window, so drops and level changes interfere with one another",
+        "The seeded arrival process has a periodic component at exactly 100 ms that aliases with the controller window"
+      ],
+      "correct": 0,
+      "explanation": "At SHED_LOW with rules-only fraud the service has spare capacity and sojourn looks healthy, so the controller steps down; restoring full fraud and LOW traffic immediately overloads it again. This is inherent to inferring capacity from delay and is mitigated by staged recovery or probing, not by a one-line fix. The arrivals are Bernoulli draws with no periodicity."
     }
   ]
 }

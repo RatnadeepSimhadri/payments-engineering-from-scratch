@@ -2,6 +2,12 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-10-13 — Batch 2: Phases 5–9 complete (Java)
+
+- Authored the 24 remaining Track B lessons: 137 → 161 complete. Track B (Phases 5–9) is now 63/63.
+- Audit: 199 lessons, 0 issues. Every Phase 5–9 Build lesson runs and passes in Java (49 lessons).
+- Next: Batch 3 = Phases 10–14 (38 lessons), which finishes the Java pass.
+
 ## 2026-10-13 — Batch 1: Phases 0–4 complete (Java)
 
 - Authored the 45 remaining Track A lessons (Phases 0–4) in Java: 73 → 118 complete.

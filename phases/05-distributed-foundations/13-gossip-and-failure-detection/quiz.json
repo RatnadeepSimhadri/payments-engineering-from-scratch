@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "In a cluster where every node heartbeats every other node once per second, how does the number of heartbeats each node sends per second change when the cluster grows from 40 to 400 nodes?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "It stays the same: each node still sends one heartbeat per second",
+        "It grows tenfold, from 39 to 399 per node per second",
+        "It grows by log of the cluster size, roughly from 5 to 9",
+        "It halves, because the load balancer shares the work"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "All-to-all heartbeating costs N-1 messages per node per period, so per-node load grows linearly with the group and the fleet total grows quadratically. SWIM's point is that detection can cost a constant number of messages per node regardless of N; the logarithm appears only in dissemination time, not in load."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Node M pings M_j and gets no ACK within the ack timeout. What does SWIM do next, and why?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Marks M_j dead immediately, because a missed ACK means the process has crashed",
+        "Sends PING-REQ to k other members so that a bad path between M and M_j is not mistaken for a failure",
+        "Pings M_j again from the same node with a longer timeout until it answers",
+        "Broadcasts a suspicion to every member and waits for a majority to confirm"
+      ],
+      "correct": 1,
+      "explanation": "The most common cause of a missed ACK is a bad path or a slow prober, not a dead target, so SWIM asks k helpers to probe through independent paths; only if all fail does M_j become suspect, never dead directly. Re-pinging from the same node re-uses the same bad path, and there is no broadcast or majority vote in SWIM."
+    },
+    {
+      "stage": "check",
+      "question": "A node holds suspect@2 for n4. Which incoming update changes its view back to alive?",
+      "options": [
+        "alive@2, because alive always wins over suspect",
+        "alive@1, because it was sent before the suspicion",
+        "alive@3, because only a strictly higher incarnation refutes a suspicion",
+        "suspect@3, because a newer suspicion resets the state"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "At equal incarnations suspicion beats alive, so alive@2 is ignored; alive@1 is older still. Only n4 itself can produce alive@3 by incrementing its incarnation, which is what makes the refutation trustworthy. suspect@3 is accepted but keeps the node suspect, not alive."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Why does each membership update get piggybacked on only about lambda * log2(N) messages before being retired?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because after that many transmissions the update has reached every member with high probability and further copies are waste",
+        "Because the piggyback field in each message can hold at most log2(N) updates before the message exceeds the datagram size",
+        "Because the update's incarnation number is considered expired after log2(N) protocol periods have elapsed since it was created",
+        "Because each node is permitted to gossip about at most log2(N) other members per period to keep the view bounded in size"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Infection-style spread roughly doubles the informed set each round, so O(log N) rounds reach everyone; lambda adds a safety margin, and retiring after that bound keeps old news from circulating forever. The piggyback capacity is a separate constant (maxPiggyback), and incarnation numbers never expire."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "In the demo, n1 cannot reach n2 but n0, n3, and n4 can. With k = 3 indirect probes there were no false positives in 600 ticks; with k = 0 the same cut eventually produced one. What does this show?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Indirect probes make the protocol period shorter, so refutations arrive within the window more often than before",
+        "The suspicion mechanism alone cannot save a node whose refutations keep arriving late through other paths forever",
+        "Indirect probes are only needed when message loss is above 10 percent; below that the suspicion timeout is sufficient",
+        "With k = 0 the incarnation number stops increasing, so the target has no way to refute the repeated accusations"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Suspicion plus refutation buys time, and n2 did refute (its incarnation rose), but each period n1 re-suspects and eventually one refutation misses the window and n2 is declared dead. Indirect probes fix the cause by routing the probe around the bad link, so the suspicion never arises. The period length and the loss rate are unchanged between the two runs."
+    },
+    {
+      "stage": "post",
+      "question": "Consul runs SWIM for membership and Raft for its service catalog. Why not derive leadership from the gossip view?",
+      "options": [
+        "Because gossip messages are too small to carry a leader id and a term number alongside updates",
+        "Because gossip converges only eventually, so two nodes may hold different views and both act as leader",
+        "Because SWIM secretly requires a coordinator, which would have to be the Raft leader anyway",
+        "Because Raft's election timeouts detect a crashed leader faster than SWIM probes in every configuration"
+      ],
+      "correct": 1,
+      "explanation": "SWIM gives each node a locally consistent, eventually convergent view; it never guarantees that all nodes agree at one instant, which is exactly what safe leadership needs. SWIM has no coordinator by design, and Raft's election timeouts are not generally faster than SWIM's probes; the difference is agreement, not speed."
     }
   ]
 }

@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A primary-backup service is CPU-bound on reads. An engineer proposes sending reads to the backups. What is the risk?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Backups cannot parse read requests because they only receive replication traffic",
+        "A backup may not yet have applied the latest acknowledged write, so a client can read a stale balance",
+        "Reads on a backup block the replication stream and increase write latency on the primary",
+        "The primary loses track of which backup is authoritative and failover becomes impossible"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A backup lags the primary by whatever is in flight, so a client who just received a write acknowledgement can read the old value from a backup, which violates read-your-writes (Lesson 02). Backups can certainly serve reads mechanically; the problem is consistency, not capability, and failover is unaffected."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "In a chain, why is a query answered only by the tail, even though the head has the most recent state?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because the tail's state is exactly the committed state: every update it holds has been applied by all replicas",
+        "Because the head is busy assigning sequence numbers and must not be slowed down by reads",
+        "Because the master routes all client traffic through the last replica for load balancing",
+        "Because the tail holds the only durable copy and the others keep state in memory"
+      ],
+      "correct": 0,
+      "explanation": "An update is replied to only when the tail applies it, so the tail holds precisely the updates clients could have observed; the head may hold updates nobody has been told about yet, and answering from it would expose uncommitted state. Load relief at the head is a side benefit, not the reason, and durability is the same at every replica."
+    },
+    {
+      "stage": "check",
+      "question": "Replica p's successor s fails. The master links p to s's successor t. What does p send t, and which invariant guarantees it is enough?",
+      "options": [
+        "Its entire history from the first update onward; the Update Propagation invariant guarantees t accepts it",
+        "Its Sent set; the Inprocess Requests invariant, since Hist_p minus Hist_t is contained in Sent_p",
+        "Nothing at all; the clients time out and retry any update that was lost together with s",
+        "Only the most recent update; FIFO links guarantee that t already holds every earlier one"
+      ],
+      "correct": 1,
+      "explanation": "Everything p has that t lacks was forwarded by p and not yet acknowledged, so it is in Sent_p; resending Sent_p (with t skipping what it already has) restores the chain without a full copy. The whole history would work but is unnecessary; relying on client retries would lose updates that were already replied to."
+    },
+    {
+      "stage": "check",
+      "question": "The tail fails. Its predecessor becomes the new tail. What must it do about the updates in its Sent set?",
+      "options": [
+        "Discard them, because the tail that would have committed them is gone",
+        "Forward them to the master so it can decide whether they were committed",
+        "Reply to the clients and ack upstream, because as the last replica it has now committed them",
+        "Wait for the clients to retry them so they can be assigned fresh sequence numbers"
       ],
       "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
+      "explanation": "Sent holds updates the predecessor applied but had not seen acknowledged; once it is the tail, its history is the committed state by definition, so those updates are committed and the clients must be told. Discarding them would lose applied updates, and nothing about commitment is decided by the master."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "In the demo, the chain's busiest replica handled about 1,200 messages while the primary-backup primary handled about 1,600 on the same 200-update, 1,000-query workload. What explains the difference?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The chain sends far fewer acknowledgements, because only the tail acknowledges and middle replicas forward silently",
+        "Chain update messages are smaller, because each hop strips the client address and the request identifier",
+        "The chain's updates and acks land on the head while queries land on the tail; the primary takes updates, queries, and every backup's ack",
+        "Primary-backup replicates each update twice, once to each backup, to guarantee durability before replying"
+      ],
+      "correct": 2,
+      "explanation": "Chain replication splits the two kinds of client work across two different machines and spreads ack handling along the chain, while the primary absorbs all client traffic plus one ack per backup per update. Message sizes and durability are the same in both designs."
+    },
+    {
+      "stage": "post",
+      "question": "Why does a newly promoted primary in primary-backup push its history to the remaining backups, while a newly promoted chain tail does nothing of the kind?",
+      "options": [
+        "Because the old primary may have reached some backups and not others, whereas each chain replica's history is a prefix of its predecessor's",
+        "Because backups discard their in-memory state on promotion and must be rebuilt from the new primary's durable log before serving",
+        "Because chain replicas share one replicated history object through the master, so they are identical at every instant by construction",
+        "Because the chain master performs the re-sync centrally, copying the predecessor's history, before it announces the new tail to clients"
       ],
       "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Parallel fan-out means backups can diverge by the last in-flight update, so the new primary must re-establish a common prefix; in a chain the Update Propagation invariant already guarantees the new tail's predecessor has a superset of its history. Backups keep their state on promotion, and the chain master only publishes links."
     }
   ]
 }

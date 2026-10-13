@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "In classic two-phase commit, why do participants that have voted yes stay blocked when the coordinator crashes?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because the participants' prepare records were never written to disk",
+        "Because the commit decision exists only in the coordinator's log and memory",
+        "Because the participants are waiting for each other's votes, not the coordinator's",
+        "Because the network partitions the participants from the client"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A prepared participant cannot unilaterally commit (the coordinator may have decided abort) or abort (it may have decided commit); only the coordinator knows, and that knowledge is unreachable until it recovers. Participants do write their prepare records; that is why they cannot simply forget the transaction. Percolator and Spanner fix this by putting the decision somewhere any client, or a replicated group, can read."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "In Percolator, what single operation is the commit point of a transaction?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The timestamp oracle issuing the commit timestamp to the client",
+        "The last secondary cell's write column being updated and its lock erased",
+        "The primary cell's write record being written and its lock erased in one row transaction",
+        "The client receiving acknowledgements from every prewrite"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Writing write@commit_ts and erasing lock@start_ts on the primary, atomically, is the moment the transaction becomes committed; everything after it is cleanup that any reader can finish. The oracle only hands out a number, prewrite acknowledgements only mean 'can commit', and secondaries may be resolved long after the fact by someone else."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A Percolator reader at start_ts 110 finds lock@100 on a secondary cell. It reads the primary and finds no lock@100 and write@107 = 100. What does it do?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Erases the secondary's lock and returns the previous version, because the writer is gone",
+        "Waits for the writer to finish, because the lock means the transaction is still running",
+        "Aborts its own transaction, because it has encountered a write-write conflict",
+        "Writes write@107 = 100 on the secondary, erases its lock, and returns the value at data@100"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "The primary says the transaction committed at 107, which is at or below the reader's snapshot of 110, so the write is visible and the reader rolls the secondary forward before returning the new value. Erasing the lock without a write record would be a rollback, which is only correct when the primary shows the transaction aborted. The lock belongs to an older transaction, so the reader cannot skip it."
     },
     {
-      "stage": "post",
-      "question": "TODO",
+      "stage": "check",
+      "question": "Spanner's coordinator picks commit timestamp s = TT.now().latest and then waits until TT.after(s) before acknowledging. What does this wait guarantee?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "That every participant has applied the commit before the client hears about it",
+        "That any transaction starting after the acknowledgement receives a timestamp greater than s",
+        "That the Paxos log of the coordinator group has been replicated to a majority",
+        "That the clock uncertainty epsilon has shrunk to zero for the next transaction"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "After TT.after(s) is true, the true time is past s, and since every machine's TT.now().latest is at least the true time, any later transaction's timestamp exceeds s and its snapshot includes this commit. That is external consistency. Paxos replication happens before the wait, participants apply asynchronously, and epsilon is a property of the clock hardware, not of waiting."
+    },
+    {
+      "stage": "post",
+      "question": "CockroachDB does not commit-wait by default. How does it avoid returning stale data when a reader's clock is behind a writer's by less than max_offset?",
+      "options": [
+        "It routes every read to the Raft leader, which has the authoritative clock",
+        "It treats values timestamped within (t, t + max_offset] as uncertain and restarts the reader above them",
+        "It rejects any write whose timestamp is ahead of the reader's clock",
+        "It synchronizes clocks with atomic hardware so that skew is always below one millisecond"
+      ],
+      "correct": 1,
+      "explanation": "A value in the uncertainty interval might have been committed before the reader started by a node whose clock was ahead, so the reader cannot safely ignore it; the transaction restarts at a timestamp above the value and re-reads. Leaders do not have special clocks, writes are not rejected for being ahead, and CockroachDB runs on commodity NTP, which is exactly why the interval exists."
+    },
+    {
+      "stage": "post",
+      "question": "A fraud service learns from a message queue that a payment committed and immediately reads two accounts on different shards. Which system guarantees it sees the payment, and why?",
+      "options": [
+        "Percolator, because the timestamp oracle assigns commit timestamps in real-time order",
+        "CockroachDB in its default mode, because the uncertainty interval covers out-of-band communication",
+        "Spanner, because commit wait ensures any transaction starting after the acknowledgement has a larger timestamp",
+        "None of them; only a single-node database can order a read after a commit it learned of externally"
+      ],
+      "correct": 2,
+      "explanation": "The reader learned of the commit outside the database, so only external consistency helps, and Spanner's commit wait provides exactly that. Percolator's oracle orders snapshots but says nothing about when the client was acknowledged relative to the reader's start. CockroachDB's uncertainty interval only catches values the reader actually encounters on overlapping keys; a causal reverse through an out-of-band channel is possible unless linearizable mode is on."
     }
   ]
 }

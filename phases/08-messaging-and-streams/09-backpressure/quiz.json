@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A producer emits 1,200 events per second and the consumer processes 1,000 per second, sustained for one hour, through an unbounded in-memory queue. What is the queue depth after the hour, and how long does an event entering then wait?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "About 200 events; it waits 0.2 seconds",
+        "About 720,000 events; it waits about 12 minutes",
+        "About 72,000 events; it waits about 72 seconds",
+        "The depth stays near zero because the queue drains between bursts"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The backlog is the rate gap times the duration: (1200 - 1000) * 3600 = 720,000 events, and by Little's Law an event behind 720,000 others at 1,000 per second waits 720 seconds. Option D describes a burst, not a sustained gap; a sustained gap never drains."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Under the DROP_OLDEST policy a full queue receives a new item. What does the queue do, and for which kind of data is this the correct choice?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Refuses the new item and keeps the old ones; correct for approved payment events",
+        "Evicts the head and appends the new item; correct for latest-value data such as prices",
+        "Grows by one to make room; correct for any data that must not be lost",
+        "Evicts the head and appends the new item; correct for approved payment events"
+      ],
+      "correct": 1,
+      "explanation": "DROP_OLDEST removes the oldest queued item to make room, so the consumer always sees the freshest data, which is what a market-data or sensor feed wants. Option D has the right mechanism but the wrong data: an approved authorization that is evicted is money missing from the ledger with no record of the loss."
+    },
+    {
+      "stage": "check",
+      "question": "A Reactive Streams consumer calls request(2) and then request(3) before the producer emits anything. How many items may the producer emit, and what happens if the consumer calls request(0)?",
+      "options": [
+        "Three, because the latest request replaces the earlier one; request(0) is ignored",
+        "Two, because the first request wins until it is satisfied; request(0) cancels",
+        "Five, because demand is additive; request(0) is a specification violation and an error",
+        "Unlimited, because any request switches the stream to push mode; request(0) resets it"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Rule 3.17 makes demand additive, so 2 + 3 = 5 outstanding. Rule 3.9 requires n > 0, so request(0) is an error the lesson's DemandSubscription throws on. Option D describes request(Long.MAX_VALUE), which is the only request that means unbounded."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Under identical seeded overload, BLOCK and PULL throttle the same number of upstream requests and deliver the same number of events. What is the measurable difference between them in the simulation?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "BLOCK records rejected offers because it discovers a full queue by collision; PULL records none",
+        "PULL delivers events with lower latency because demand bypasses the queue",
+        "BLOCK drops the in-flight event when the next tick's requests arrive; PULL never drops",
+        "PULL needs a larger queue capacity to reach the same throughput as BLOCK"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "With pull, the consumer declares demand before the producer builds an event, so the producer never offers into a full queue and rejectedOffers is zero; with block, the producer builds the event, offers it, and is refused 1,977 times in the demo. Neither strategy drops anything, and both bound the queue at the same capacity with the same latency."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "Executors.newFixedThreadPool(8) is used to post ledger entries, and the submitting HTTP handlers are much faster than the database. What happens under sustained overload, and which change applies backpressure?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Submissions throw RejectedExecutionException immediately; raise the thread count to fix it",
+        "The pool's unbounded LinkedBlockingQueue grows until the heap is exhausted; use a bounded queue with a rejection handler",
+        "The pool drops the oldest tasks silently; switch to a LinkedBlockingQueue to stop the drops",
+        "The database connection pool blocks the handlers; add more connections to fix it"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "newFixedThreadPool uses a LinkedBlockingQueue with no capacity, which is the UNBOUNDED strategy: nothing is refused, the backlog grows at the rate gap, and the process eventually dies of memory. A ThreadPoolExecutor with an ArrayBlockingQueue and an AbortPolicy or CallerRunsPolicy surfaces the overload at the submitter. Option A describes what happens only after the fix."
+    },
+    {
+      "stage": "post",
+      "question": "An acquirer receives settlement files pushed by a card network; the sender cannot be told to slow down, and no record may be lost. Which arrangement does the lesson recommend?",
+      "options": [
+        "A bounded in-memory queue with DROP_NEWEST and an alert on the drop counter",
+        "An unbounded in-memory queue sized by the largest file seen so far",
+        "A bounded in-memory queue with BLOCK, accepting that the network's connection will time out",
+        "Write into a durable log whose retention is the capacity, then pull from it at the consumer's pace"
+      ],
+      "correct": 3,
+      "explanation": "When the producer cannot be slowed and the data cannot be dropped, the buffer must live in a tier whose capacity is measured in days of disk rather than heap: a log such as Kafka or a WAL, from which the consumer pulls. Option C applies backpressure to a party that cannot honour it, so the file transfer fails and the data is lost anyway."
     }
   ]
 }

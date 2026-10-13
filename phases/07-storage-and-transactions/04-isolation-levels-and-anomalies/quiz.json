@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "Two concurrent deposits each read a balance of 10.00, add their own amount, and write the result. Both commit and the final balance reflects only one deposit. What is this anomaly called?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A dirty read",
+        "A phantom read",
+        "A lost update",
+        "A write skew"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Both transactions read the same value and both wrote it; the second write was based on a stale read, so the first update vanished. It is not a dirty read (no uncommitted data was seen) and not write skew (both wrote the same item, not disjoint ones)."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "In the lesson's store, why can lock-based REPEATABLE_READ still produce a phantom when it prevents non-repeatable reads?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because its shared locks are released as soon as each read statement finishes",
+        "Because it locks the items it read, and a row that does not exist yet has no lock to take",
+        "Because the scan reads from a private snapshot that is refreshed on each call",
+        "Because writes are applied in place and become visible before commit"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Item locks protect existing rows; an insert into the scanned range touches a key nobody could have locked, so the second scan sees it. The locks are held to commit (so repeated reads of an existing row are stable), there is no snapshot at this level, and in-place writes are a READ_UNCOMMITTED mechanism."
+    },
+    {
+      "stage": "check",
+      "question": "Under SNAPSHOT, two withdrawals each read checking and savings, each see 12.00 in total, and each debit a different pocket by 10.00. Why do both commits pass first-committer-wins?",
+      "options": [
+        "Because the snapshot version is bumped by reads, so both appear current",
+        "Because the validation loop iterates over writes only, and the two write sets are disjoint",
+        "Because first-committer-wins only applies when the two transactions began at different versions",
+        "Because the invariant check happened in application code, which the store cannot see"
+      ],
+      "correct": 1,
+      "explanation": "Commit validation asks, for each key this transaction wrote, whether someone else committed it after the snapshot. T1 wrote checking, T2 wrote savings, so neither finds a conflict. The read set, which is where the invariant lived, is never examined; that is exactly the hole Lesson 07 closes. The last option is true but irrelevant: SERIALIZABLE sees the same application code and still refuses one of them."
+    },
+    {
+      "stage": "check",
+      "question": "At REPEATABLE_READ the same write-skew interleaving aborts T1 instead. Which lock conflict causes it?",
+      "options": [
+        "T1's X lock on checking conflicts with T2's shared lock on checking from its read",
+        "T1's commit conflicts with T2's buffered write on savings",
+        "T2's read of savings conflicts with T1's earlier shared lock on savings",
+        "T1's predicate lock on acct:alice:* conflicts with T2's write to savings"
+      ],
+      "correct": 0,
+      "explanation": "Both transactions took S locks on both pockets when they read them. T1's write needs X on checking, and T2 still holds S on it, so the request is refused and T1 aborts. The lock on what was read is what protects the invariant. S locks are compatible with each other, commits do not conflict with buffered writes, and predicate locks exist only at SERIALIZABLE."
+    },
+    {
+      "stage": "post",
+      "question": "A service asks PostgreSQL for REPEATABLE READ and expects the lock-based behaviour from the lesson's matrix. Which statement is correct?",
+      "options": [
+        "PostgreSQL will prevent phantoms and allow write skew, the opposite of the lesson's REPEATABLE_READ column",
+        "PostgreSQL will behave exactly like the lesson's REPEATABLE_READ: phantoms possible, write skew impossible",
+        "PostgreSQL will upgrade the request to SERIALIZABLE because it does not implement REPEATABLE READ",
+        "PostgreSQL will downgrade the request to READ COMMITTED because repeatable reads need row locks"
+      ],
+      "correct": 0,
+      "explanation": "PostgreSQL's REPEATABLE READ is snapshot isolation: it reads from a snapshot (no phantoms) and validates only write-write conflicts (write skew possible). That is the lesson's SNAPSHOT column, not its lock-based REPEATABLE_READ column. The engine neither upgrades nor downgrades; it simply has a different mechanism under the same name."
+    },
+    {
+      "stage": "post",
+      "question": "A withdrawal must keep checking + savings at or above zero. Which approach is NOT sufficient on its own?",
+      "options": [
+        "Run the transaction at SERIALIZABLE and retry on conflict",
+        "Run at snapshot isolation and SELECT ... FOR UPDATE both pocket rows before checking",
+        "Run at snapshot isolation (PostgreSQL REPEATABLE READ) with plain reads of both pockets",
+        "Keep a single account-total row, and debit it with UPDATE ... WHERE total >= amount"
+      ],
+      "correct": 2,
+      "explanation": "Plain snapshot reads of the two pockets are exactly the write-skew interleaving: both checks pass on their snapshots, the writes are disjoint, both commit. SERIALIZABLE detects it; FOR UPDATE turns the reads into writes so first-committer-wins or locking catches the conflict; a single conditional UPDATE on a materialized total serializes on one row."
     }
   ]
 }

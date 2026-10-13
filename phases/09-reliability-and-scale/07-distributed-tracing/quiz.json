@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "Six services each report their own latency histogram. The gateway's p99 is 1.4 s but the five downstream p99s sum to 164 ms. What kind of data would show where the remaining time went?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A higher-resolution histogram in each service",
+        "A single request's timeline across every service it touched",
+        "The CPU utilisation of each service's hosts",
+        "The error rate of each service over the same window"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Per-service metrics measure from arrival to response inside each service and aggregate across requests, so time spent between services (queueing for a connection, serialisation, network) is invisible to all of them. A trace records one request's spans across services with shared ids, exposing the gaps. Finer histograms are still per service and still blind to the gaps."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Which parts of a span must be transmitted to the next service for the trace to continue?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The trace id, the span id, and the sampling flag",
+        "The full span including start time and attributes",
+        "Only the trace id; the callee generates everything else",
+        "The trace id and the root span's start time"
+      ],
+      "correct": 0,
+      "explanation": "That triple is the span context, serialised as traceparent. The callee generates its own span id and sets parent to the incoming span id, so the tree can be reassembled. Sending only the trace id would lose the parent link and flatten the tree; sending the whole span wastes bytes on data the collector gets from the exporter."
+    },
+    {
+      "stage": "check",
+      "question": "A service receives traceparent: 00-0000...0000-00f067aa0ba902b7-01 (an all-zero trace id). What should it do?",
+      "options": [
+        "Reject the request with 400 because the header is invalid",
+        "Continue the trace using the all-zero id since the span id is valid",
+        "Start a new trace with a fresh id and treat itself as the root",
+        "Forward the header unchanged and let the collector sort it out"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "The W3C spec makes all-zero ids invalid, and the prescribed response to an invalid header is to restart the trace, not to fail the request. Tracing is observability and must never affect the payment. Continuing with the zero id would merge every broken trace into one giant one."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A span lasts 50 ms and has two children that both run from 10 ms to 40 ms (concurrently). What is the span's exclusive time?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "-10 ms",
+        "0 ms",
+        "50 ms",
+        "20 ms"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "Exclusive time subtracts the union of child intervals, which is 10 to 40, i.e. 30 ms, leaving 20 ms. Subtracting the sum of child durations (60 ms) would give -10, which is the naive bug the lesson's sweeping-cursor implementation avoids."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "In the collector you find a payment's trace with seven spans instead of eight, plus a separate one-span trace from the notifications service carrying the same payment id. What happened?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The notifications span was exported before its parent ended",
+        "The notifications hop did not forward the traceparent header, so it started a new trace",
+        "The collector lost the parent span and marked notifications as an orphan",
+        "Head-based sampling dropped the notifications span but kept the rest"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A dropped header makes the receiver a new root: the original trace is one span short and a new single-span trace appears. A lost parent span would instead produce an orphan inside the same trace, because the child still carries the original trace id. Sampling is decided per trace and would never remove one span."
+    },
+    {
+      "stage": "post",
+      "question": "Why should a payments platform's trace sampling policy be unable to live entirely at the root span?",
+      "options": [
+        "Root spans finish too quickly to compute a stable sampling rate for the trace",
+        "Child services run different vendors' tracers and so ignore the propagated sampled flag",
+        "The rule 'always keep traces that contain an error' needs information the root lacks when it starts",
+        "The W3C Trace Context specification forbids a root span from setting the sampled flag itself"
+      ],
+      "correct": 2,
+      "explanation": "An error in the processor adapter happens after the root has already decided and propagated its flag, so keeping all error traces requires a decision made after the trace completes (tail-based sampling or a buffering collector). Vendors do honour the sampled flag; that is the point of standardising it."
     }
   ]
 }

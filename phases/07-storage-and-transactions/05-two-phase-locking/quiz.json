@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "Two transactions each lock a different account row, then each tries to lock the row the other holds. What is the state of the system?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Both wait forever unless something outside them intervenes",
+        "The database serializes them automatically by lock age",
+        "The second transaction's lock request fails with an error",
+        "Both proceed because row locks only block writes, not reads"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Each holds what the other needs and each is waiting, so neither can ever release: a deadlock. Nothing resolves it unless a detector or a timeout aborts one of them. Locks do not fail fast by default, and 'serialize by age' is a prevention scheme (wait-die) that a plain lock manager does not implement."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "What does the two-phase rule add beyond 'lock every item before you access it'?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Locks must be acquired in ascending key order to avoid deadlock",
+        "A transaction may acquire no lock after it has released any lock",
+        "Shared locks must be upgraded to exclusive before commit",
+        "Every lock must be held for at least the duration of one statement"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Locking each item is not enough: a transaction that releases and re-acquires lets another slip in between and causes a lost update. The two-phase rule, growing then shrinking with no acquisition after the first release, is what the 1976 serializability theorem relies on. Ascending-order acquisition is a deadlock prevention technique, not part of 2PL itself."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "T1 and T2 both hold S on account A and both request X on it. The lock manager queues both. What does the wait-for graph look like?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "T1 waits for T2 only, because T1's request was queued first",
+        "No edges: upgrades jump the queue and are granted immediately",
+        "T1 waits for T2 and T2 waits for T1, a cycle, so one must be aborted",
+        "Both wait for the lock manager, which resolves them in FIFO order"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Each X request is incompatible with the other transaction's held S lock, so each waits for the other: a two-node cycle and therefore a deadlock. Upgrades do jump the queue, but jumping the queue does not help when the obstacle is another holder. This read-then-write shape is the most common deadlock in application code."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Why does the scheduler undo the victim's in-place writes before releasing its locks, rather than after?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because the undo map is cleared by releaseAll and would be lost",
+        "Because releasing first would let a waiter read a half-undone value",
+        "Because the lock manager cannot release locks on modified keys",
+        "Because the victim must hold its locks to be restarted correctly"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Under strict 2PL, holding X until the data is back to its committed value is exactly what keeps other transactions from seeing uncommitted or partially rolled-back state. If locks were released first, a transaction granted the lock could read the victim's intermediate balance. The undo map is a separate structure; release order does not destroy it."
+    },
+    {
+      "stage": "post",
+      "question": "Basic 2PL lets a transaction release an X lock before commit. The lesson's demo shows a reader committing after reading such a value and the writer then aborting. What is the resulting problem called, and what fixes it?",
+      "options": [
+        "A phantom read; fixed by predicate or gap locking on the scanned range",
+        "A write skew; fixed by serializable snapshot isolation's dangerous-structure test",
+        "A lost update; fixed by taking the X lock at the first read instead of the write",
+        "A dirty read leading to a cascading abort; fixed by holding X locks until commit (strict 2PL)"
+      ],
+      "correct": 3,
+      "explanation": "The reader observed an uncommitted value (a dirty read) and, to be recoverable, would have to abort when the writer does, which cascades. Strict 2PL removes both by never releasing X before commit. Phantoms and write skew are different anomalies with different mechanisms, and lost update is prevented by 2PL already."
+    },
+    {
+      "stage": "post",
+      "question": "PostgreSQL aborts your transfer with SQLSTATE 40P01. What should the application do?",
+      "options": [
+        "Retry only the failed UPDATE statement, since the earlier statements succeeded",
+        "Re-run the whole transaction from the start, re-reading balances, with the same idempotency key, a bounded number of times",
+        "Switch the connection to READ UNCOMMITTED so that the lock wait cannot occur again",
+        "Report the payment as failed to the customer, because the database has already rolled it back"
+      ],
+      "correct": 1,
+      "explanation": "The victim has been rolled back in full, so any values it read may be stale; the only correct response is to repeat the entire transaction, including the reads, under the same idempotency key so a double retry cannot double-apply, and to stop after a few attempts. Retrying one statement would commit a transaction built on reads from a state that no longer exists."
     }
   ]
 }

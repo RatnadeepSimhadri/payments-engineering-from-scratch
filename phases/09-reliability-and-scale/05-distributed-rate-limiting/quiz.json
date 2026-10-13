@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A single-node token bucket (100 tokens, refilling 100 per second) is copied unchanged onto four API nodes behind a round-robin load balancer. A client sends 900 requests per second. Roughly how many per second reach the backend?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "About 100, because the limit is 100",
+        "About 225, one node's share of the traffic",
+        "About 400, each node admits its own 100",
+        "About 900, the buckets never fill in time"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Each node holds an independent bucket, so each admits 100 per second and the cluster admits N times the limit. 225 is what each node sees offered, not what it admits; the limit of 100 is only enforced if the four nodes share one counter."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A token bucket with rate 100 per second and capacity 100 has been idle for a minute and is then hit with a burst. What is the most it can admit in the first second?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "100, the rate",
+        "200, one full burst plus one second of refill",
+        "6,100, a minute's refill plus the rate",
+        "Unbounded, because refill is lazy"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Lazy refill clamps the stored tokens at capacity, so idleness banks at most one bucketful. The first second can spend that 100 plus the 100 refilled during the second. The invariant is admitted <= rate * T + capacity for any interval T; 6,100 is what you would get without the clamp."
+    },
+    {
+      "stage": "check",
+      "question": "In the local-buckets-with-periodic-sync strategy, why does the code call refill(now) on each bucket before setRatePerSecond(newShare)?",
+      "options": [
+        "So the store sees a consistent snapshot of the tokens",
+        "So the bucket is reset to full at the start of every interval",
+        "So the sync can detect a clock that has gone backwards",
+        "So tokens earned at the old rate are banked before the new rate applies"
+      ],
+      "correct": 3,
+      "explanation": "Refill computes (now - lastRefill) * rate, so changing the rate first would retroactively recompute the tokens for the whole elapsed interval at the new rate. Banking first makes a share change apply only from the sync onward. The bucket is never reset to full; that would grant an extra burst every interval."
+    },
+    {
+      "stage": "check",
+      "question": "The demo's 'vs ideal' column shows -100 for the sliding-window log under 400 offered requests per second. What does that number mean?",
+      "options": [
+        "The log grants no burst allowance, so it admits exactly the limit per window",
+        "The log leaked 100 requests over the limit in some window",
+        "The log lost 100 timestamps to deque expiry",
+        "The log's memory is capped at 100 entries and dropped the rest"
+      ],
+      "correct": 0,
+      "explanation": "The ideal is computed against the token-bucket invariant rate * T + capacity, which includes one burst. The log enforces a stricter invariant, at most L in any window, so it admits 1,000 in ten seconds instead of 1,100. It did not leak; the two limiters enforce different contracts and the comparison must say which one it means."
+    },
+    {
+      "stage": "post",
+      "question": "Under skewed load (one node receives 85% of traffic) the local+sync strategy admitted 1,052 requests while the centralized bucket admitted 1,099. Which statement about this gap is correct?",
+      "options": [
+        "It over-admitted because its shares were stale after the first sync",
+        "It under-admitted: the hot node ran dry while cold nodes held unused tokens",
+        "The gap is random noise because the two runs saw different arrival sequences",
+        "The centralized bucket used a longer window and therefore admitted more"
+      ],
+      "correct": 1,
+      "explanation": "Shares always sum to at most L, so local+sync cannot over-admit; its failure mode is stinginess until the next sync rebalances shares toward demand. The arrival sequence is identical for every strategy because the generator is seeded, so the difference is entirely the limiter's doing."
+    },
+    {
+      "stage": "post",
+      "question": "A production token bucket in Redis is implemented as GET tokens, compute refill in the application, then SET tokens. What goes wrong?",
+      "options": [
+        "Two nodes can read the same token count and both spend the last token",
+        "The TTL on the key expires between the two commands",
+        "Redis rejects SET after GET on the same key in one connection",
+        "The refill is computed with the application clock, which is fine but slow"
+      ],
+      "correct": 0,
+      "explanation": "The read-modify-write is not atomic across clients: both read 1, both decide to admit, both write 0, and two requests were admitted on one token. The fix is a Lua script via EVAL so the whole operation runs atomically on the Redis node. Using the application clock is a real but secondary concern; the race is the correctness bug."
     }
   ]
 }

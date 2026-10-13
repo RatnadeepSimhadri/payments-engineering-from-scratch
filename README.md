@@ -267,7 +267,7 @@ flowchart TB
 ### Track B: Distributed Systems
 
 <details id="phase-5">
-<summary><b>Phase 5 — Distributed Systems Foundations</b> &nbsp;<code>13 lessons · 11 complete</code>&nbsp; <em>The network is not reliable, and the clock is lying.</em></summary>
+<summary><b>Phase 5 — Distributed Systems Foundations</b> &nbsp;<code>13 lessons · 13 complete</code>&nbsp; <em>The network is not reliable, and the clock is lying.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
@@ -278,18 +278,18 @@ flowchart TB
 | 04 | [Physical Clocks, NTP, and Hybrid Logical Clocks](phases/05-distributed-foundations/04-physical-clocks-ntp-and-hybrid-logical-clocks/) | Build | Java | ✅ |
 | 05 | [Consistency Models: Linearizability to Eventual](phases/05-distributed-foundations/05-consistency-models/) | Learn | — | ✅ |
 | 06 | [CAP, PACELC, and What They Actually Constrain](phases/05-distributed-foundations/06-cap-and-pacelc/) | Learn | — | ✅ |
-| 07 | [RPC, Framing, and Serialization Over Raw Sockets](phases/05-distributed-foundations/07-rpc-and-serialization/) | Build | Java | 🚧 |
+| 07 | [RPC, Framing, and Serialization Over Raw Sockets](phases/05-distributed-foundations/07-rpc-and-serialization/) | Build | Java | ✅ |
 | 08 | [Timeouts and Deadline Propagation](phases/05-distributed-foundations/08-timeouts-and-deadlines/) | Build | Java | ✅ |
 | 09 | [Idempotency Keys: Exactly-Once Effects on At-Least-Once Networks](phases/05-distributed-foundations/09-idempotency-keys/) | Build | Java, Python, Go | ✅ |
 | 10 | [Retries, Exponential Backoff, and Jitter](phases/05-distributed-foundations/10-retries-backoff-and-jitter/) | Build | Java, Python, Go | ✅ |
 | 11 | [Circuit Breakers and Bulkheads](phases/05-distributed-foundations/11-circuit-breakers-and-bulkheads/) | Build | Java, Python, Go | ✅ |
 | 12 | [Leases, Fencing Tokens, and Distributed Locks](phases/05-distributed-foundations/12-leases-and-fencing-tokens/) | Build | Java | ✅ |
-| 13 | [Gossip Protocols and Failure Detection](phases/05-distributed-foundations/13-gossip-and-failure-detection/) | Build | Java | 🚧 |
+| 13 | [Gossip Protocols and Failure Detection](phases/05-distributed-foundations/13-gossip-and-failure-detection/) | Build | Java | ✅ |
 
 </details>
 
 <details id="phase-6">
-<summary><b>Phase 6 — Replication & Consensus</b> &nbsp;<code>12 lessons · 9 complete</code>&nbsp; <em>Agreement is expensive. Know exactly what you are paying for.</em></summary>
+<summary><b>Phase 6 — Replication & Consensus</b> &nbsp;<code>12 lessons · 12 complete</code>&nbsp; <em>Agreement is expensive. Know exactly what you are paying for.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
@@ -300,17 +300,17 @@ flowchart TB
 | 04 | [Single-Decree Paxos from Scratch](phases/06-replication-and-consensus/04-paxos/) | Build | Java, Python, Go | ✅ |
 | 05 | [Raft I: Terms, Leader Election, and a Simulated Network](phases/06-replication-and-consensus/05-raft-leader-election/) | Build | Java, Python, Go | ✅ |
 | 06 | [Raft II: Log Replication and Commit](phases/06-replication-and-consensus/06-raft-log-replication/) | Build | Java, Python, Go | ✅ |
-| 07 | [Raft III: Safety Proofs, Membership Changes, Snapshots](phases/06-replication-and-consensus/07-raft-safety-and-membership/) | Build | Java | 🚧 |
+| 07 | [Raft III: Safety Proofs, Membership Changes, Snapshots](phases/06-replication-and-consensus/07-raft-safety-and-membership/) | Build | Java | ✅ |
 | 08 | [CRDTs: Counters, Sets, and Convergence](phases/06-replication-and-consensus/08-crdts/) | Build | Java | ✅ |
 | 09 | [Conflict Resolution: LWW, Version Vectors, Merge Functions](phases/06-replication-and-consensus/09-conflict-resolution/) | Build | Java | ✅ |
-| 10 | [Chain Replication and Primary-Backup](phases/06-replication-and-consensus/10-chain-and-primary-backup/) | Build | Java | 🚧 |
-| 11 | [Byzantine Fault Tolerance: PBFT in Outline](phases/06-replication-and-consensus/11-byzantine-fault-tolerance/) | Learn | — | 🚧 |
+| 10 | [Chain Replication and Primary-Backup](phases/06-replication-and-consensus/10-chain-and-primary-backup/) | Build | Java | ✅ |
+| 11 | [Byzantine Fault Tolerance: PBFT in Outline](phases/06-replication-and-consensus/11-byzantine-fault-tolerance/) | Learn | — | ✅ |
 | 12 | [Linearizability Checking with Recorded Histories](phases/06-replication-and-consensus/12-linearizability-checking/) | Build | Java, Python, Go | ✅ |
 
 </details>
 
 <details id="phase-7">
-<summary><b>Phase 7 — Partitioning, Storage & Transactions</b> &nbsp;<code>14 lessons · 8 complete</code>&nbsp; <em>Durability is a promise; isolation is a contract.</em></summary>
+<summary><b>Phase 7 — Partitioning, Storage & Transactions</b> &nbsp;<code>14 lessons · 14 complete</code>&nbsp; <em>Durability is a promise; isolation is a contract.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
@@ -318,22 +318,22 @@ flowchart TB
 | 01 | [Partitioning Strategies and Rebalancing](phases/07-storage-and-transactions/01-partitioning-and-rebalancing/) | Build | Java | ✅ |
 | 02 | [Write-Ahead Logs and Crash Recovery](phases/07-storage-and-transactions/02-write-ahead-logs/) | Build | Java, Python, Go | ✅ |
 | 03 | [Storage Engines: B-Tree vs LSM in Practice](phases/07-storage-and-transactions/03-storage-engines/) | Learn | — | ✅ |
-| 04 | [Isolation Levels and Their Anomalies](phases/07-storage-and-transactions/04-isolation-levels-and-anomalies/) | Build | Java | 🚧 |
-| 05 | [Two-Phase Locking and Deadlock Detection](phases/07-storage-and-transactions/05-two-phase-locking/) | Build | Java | 🚧 |
+| 04 | [Isolation Levels and Their Anomalies](phases/07-storage-and-transactions/04-isolation-levels-and-anomalies/) | Build | Java | ✅ |
+| 05 | [Two-Phase Locking and Deadlock Detection](phases/07-storage-and-transactions/05-two-phase-locking/) | Build | Java | ✅ |
 | 06 | [MVCC and Snapshot Isolation](phases/07-storage-and-transactions/06-mvcc-and-snapshot-isolation/) | Build | Java | ✅ |
 | 07 | [Serializable Snapshot Isolation](phases/07-storage-and-transactions/07-serializable-snapshot-isolation/) | Build | Java | ✅ |
 | 08 | [Two-Phase Commit and Its Blocking Problem](phases/07-storage-and-transactions/08-two-phase-commit/) | Build | Java, Python, Go | ✅ |
-| 09 | [Percolator and Spanner-Style Transactions](phases/07-storage-and-transactions/09-percolator-and-spanner-style-transactions/) | Learn | — | 🚧 |
-| 10 | [Secondary Indexes: Local vs Global](phases/07-storage-and-transactions/10-secondary-indexes/) | Build | Java | 🚧 |
-| 11 | [Change Data Capture](phases/07-storage-and-transactions/11-change-data-capture/) | Build | Java | 🚧 |
+| 09 | [Percolator and Spanner-Style Transactions](phases/07-storage-and-transactions/09-percolator-and-spanner-style-transactions/) | Learn | — | ✅ |
+| 10 | [Secondary Indexes: Local vs Global](phases/07-storage-and-transactions/10-secondary-indexes/) | Build | Java | ✅ |
+| 11 | [Change Data Capture](phases/07-storage-and-transactions/11-change-data-capture/) | Build | Java | ✅ |
 | 12 | [The Saga Pattern: Compensations Instead of Locks](phases/07-storage-and-transactions/12-saga-pattern/) | Build | Java | ✅ |
 | 13 | [The Transactional Outbox and Dual-Write Problem](phases/07-storage-and-transactions/13-transactional-outbox/) | Build | Java | ✅ |
-| 14 | [Schema Migrations at Scale: Expand, Migrate, Contract](phases/07-storage-and-transactions/14-schema-migrations-at-scale/) | Learn | — | 🚧 |
+| 14 | [Schema Migrations at Scale: Expand, Migrate, Contract](phases/07-storage-and-transactions/14-schema-migrations-at-scale/) | Learn | — | ✅ |
 
 </details>
 
 <details id="phase-8">
-<summary><b>Phase 8 — Messaging, Streams & Event-Driven Systems</b> &nbsp;<code>11 lessons · 4 complete</code>&nbsp; <em>The log is the database turned inside out.</em></summary>
+<summary><b>Phase 8 — Messaging, Streams & Event-Driven Systems</b> &nbsp;<code>11 lessons · 11 complete</code>&nbsp; <em>The log is the database turned inside out.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
@@ -341,19 +341,19 @@ flowchart TB
 | 01 | [The Append-Only Log: Partitions, Offsets, and Segments](phases/08-messaging-and-streams/01-the-append-only-log/) | Build | Java | ✅ |
 | 02 | [Consumer Groups, Offsets, and Rebalancing](phases/08-messaging-and-streams/02-consumer-groups-and-rebalancing/) | Build | Java | ✅ |
 | 03 | [At-Most-Once, At-Least-Once, and Effectively-Once](phases/08-messaging-and-streams/03-delivery-guarantees/) | Build | Java | ✅ |
-| 04 | [Message Ordering, Keys, and Head-of-Line Blocking](phases/08-messaging-and-streams/04-message-ordering-and-keys/) | Build | Java | 🚧 |
+| 04 | [Message Ordering, Keys, and Head-of-Line Blocking](phases/08-messaging-and-streams/04-message-ordering-and-keys/) | Build | Java | ✅ |
 | 05 | [Event Sourcing: State as a Fold Over Events](phases/08-messaging-and-streams/05-event-sourcing/) | Build | Java | ✅ |
-| 06 | [CQRS and Projections](phases/08-messaging-and-streams/06-cqrs-and-projections/) | Build | Java | 🚧 |
-| 07 | [Stream Processing: Tumbling, Sliding, and Session Windows](phases/08-messaging-and-streams/07-stream-processing-windows/) | Build | Java | 🚧 |
-| 08 | [Watermarks, Event Time, and Late Data](phases/08-messaging-and-streams/08-watermarks-and-late-data/) | Build | Java | 🚧 |
-| 09 | [Backpressure and Flow Control](phases/08-messaging-and-streams/09-backpressure/) | Build | Java | 🚧 |
-| 10 | [Dead-Letter Queues and Poison Messages](phases/08-messaging-and-streams/10-dead-letter-queues-and-poison-messages/) | Build | Java | 🚧 |
-| 11 | [Schema Registries and Compatible Evolution](phases/08-messaging-and-streams/11-schema-registry-and-evolution/) | Learn | — | 🚧 |
+| 06 | [CQRS and Projections](phases/08-messaging-and-streams/06-cqrs-and-projections/) | Build | Java | ✅ |
+| 07 | [Stream Processing: Tumbling, Sliding, and Session Windows](phases/08-messaging-and-streams/07-stream-processing-windows/) | Build | Java | ✅ |
+| 08 | [Watermarks, Event Time, and Late Data](phases/08-messaging-and-streams/08-watermarks-and-late-data/) | Build | Java | ✅ |
+| 09 | [Backpressure and Flow Control](phases/08-messaging-and-streams/09-backpressure/) | Build | Java | ✅ |
+| 10 | [Dead-Letter Queues and Poison Messages](phases/08-messaging-and-streams/10-dead-letter-queues-and-poison-messages/) | Build | Java | ✅ |
+| 11 | [Schema Registries and Compatible Evolution](phases/08-messaging-and-streams/11-schema-registry-and-evolution/) | Learn | — | ✅ |
 
 </details>
 
 <details id="phase-9">
-<summary><b>Phase 9 — Reliability, Observability & Scale</b> &nbsp;<code>13 lessons · 7 complete</code>&nbsp; <em>You cannot operate what you cannot observe.</em></summary>
+<summary><b>Phase 9 — Reliability, Observability & Scale</b> &nbsp;<code>13 lessons · 13 complete</code>&nbsp; <em>You cannot operate what you cannot observe.</em></summary>
 <br/>
 
 | # | Lesson | Type | Lang | Status |
@@ -362,15 +362,15 @@ flowchart TB
 | 02 | [Load Balancing: Round Robin, Least Connections, Power of Two Choices](phases/09-reliability-and-scale/02-load-balancing-algorithms/) | Build | Java, Python, Go | ✅ |
 | 03 | [Caching Strategies: Cache-Aside, Write-Through, Write-Behind](phases/09-reliability-and-scale/03-caching-strategies/) | Build | Java | ✅ |
 | 04 | [Cache Invalidation, Stampedes, and Request Coalescing](phases/09-reliability-and-scale/04-cache-invalidation-and-stampedes/) | Build | Java | ✅ |
-| 05 | [Distributed Rate Limiting](phases/09-reliability-and-scale/05-distributed-rate-limiting/) | Build | Java | 🚧 |
+| 05 | [Distributed Rate Limiting](phases/09-reliability-and-scale/05-distributed-rate-limiting/) | Build | Java | ✅ |
 | 06 | [Metrics: Counters, Gauges, and Histograms Without Averages](phases/09-reliability-and-scale/06-metrics-and-histograms/) | Build | Java | ✅ |
-| 07 | [Distributed Tracing and Context Propagation](phases/09-reliability-and-scale/07-distributed-tracing/) | Build | Java | 🚧 |
-| 08 | [Structured Logging and Log Correlation](phases/09-reliability-and-scale/08-structured-logging/) | Build | Java | 🚧 |
+| 07 | [Distributed Tracing and Context Propagation](phases/09-reliability-and-scale/07-distributed-tracing/) | Build | Java | ✅ |
+| 08 | [Structured Logging and Log Correlation](phases/09-reliability-and-scale/08-structured-logging/) | Build | Java | ✅ |
 | 09 | [Chaos Engineering and Fault Injection](phases/09-reliability-and-scale/09-chaos-engineering/) | Build | Java | ✅ |
 | 10 | [Capacity Planning and Queueing Theory](phases/09-reliability-and-scale/10-capacity-planning-and-queueing-theory/) | Learn | — | ✅ |
-| 11 | [Multi-Region Architecture and Disaster Recovery](phases/09-reliability-and-scale/11-multi-region-and-disaster-recovery/) | Learn | — | 🚧 |
-| 12 | [Incident Response and Blameless Postmortems](phases/09-reliability-and-scale/12-incident-response/) | Learn | — | 🚧 |
-| 13 | [Graceful Degradation and Load Shedding](phases/09-reliability-and-scale/13-graceful-degradation/) | Build | Java | 🚧 |
+| 11 | [Multi-Region Architecture and Disaster Recovery](phases/09-reliability-and-scale/11-multi-region-and-disaster-recovery/) | Learn | — | ✅ |
+| 12 | [Incident Response and Blameless Postmortems](phases/09-reliability-and-scale/12-incident-response/) | Learn | — | ✅ |
+| 13 | [Graceful Degradation and Load Shedding](phases/09-reliability-and-scale/13-graceful-degradation/) | Build | Java | ✅ |
 
 </details>
 

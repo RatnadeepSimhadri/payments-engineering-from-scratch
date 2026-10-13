@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "Six services each log in their own prose format. A support agent asks what happened to payment pay_8f3k2. What makes the question hard to answer?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The log platform cannot store records from more than one service",
+        "Only services whose developers put the id in the message text can be found by it",
+        "Log messages are too long to search efficiently",
+        "The payment id is encrypted in transit between services"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A free-text message is searchable by the payment id only if someone wrote it in, and each service chose differently. A structured record with a payment_id field bound at the edge makes the id present on every record mechanically. Storage and message length are not the obstacle."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Why does the lesson's logger keep the message a constant template (\"authorize started\") and put the varying parts in fields?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Constant messages compress far better in the log store and cut ingestion cost",
+        "JSON cannot carry variable text inside the msg value without breaking the parser",
+        "Fields are encrypted at rest by the platform while the message is stored in clear text",
+        "A constant message can be counted like a metric, and the fields filtered without regexes"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "Low-cardinality messages turn 'count of authorize started per minute' into a trivial query and let dashboards group by message. Variable data in named fields is indexable and type-stable. Compression is a minor side benefit; JSON allows any string in msg."
     },
     {
-      "stage": "post",
-      "question": "TODO",
+      "stage": "check",
+      "question": "The redactor scans for 13-19 digit runs and then applies the Luhn check before masking. What does the Luhn check buy?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "It leaves most order ids and timestamps readable because random digit runs usually fail it",
+        "It confirms the card is not expired",
+        "It identifies the card brand so the mask can keep the right prefix",
+        "It is required by RFC 8259 before a number may appear in JSON"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Every card number satisfies Luhn, but only about one in ten random digit runs does, so the check separates PANs from other long numbers with few false positives. It says nothing about expiry or brand (the BIN does that), and JSON has no such requirement."
+    },
+    {
+      "stage": "check",
+      "question": "At a 1-in-4 sampling rate decided by hashing the trace id, a payment fails with an ERROR in the processor adapter. Which records for that payment are in the store?",
+      "options": [
+        "None, because the trace was not selected by the hash",
+        "All of them, because an ERROR forces the whole trace to be kept retroactively",
+        "The ERROR and WARN records, plus the DEBUG/INFO ones only if the trace's hash was selected",
+        "Exactly one in four of its records chosen at random"
+      ],
+      "correct": 2,
+      "explanation": "WARN and ERROR bypass the sampler, so failures are never lost. DEBUG and INFO follow the per-trace hash decision, which means an unselected failing trace keeps only its failure records. Keeping the earlier records retroactively needs tail-based buffering, which is Exercise 2; per-record random dropping would leave holes in every story."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "A worker thread picks up a settlement task submitted by a request thread and logs through a framework whose MDC is a ThreadLocal. What payment_id does the record carry?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The submitting request's id, because the framework copies MDC into every task",
+        "Whatever the worker thread's MDC last held: another request's id, or nothing",
+        "The id is recomputed from the task's payload by the framework before writing",
+        "A null id, which the framework rejects at write time with an exception"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "ThreadLocal state belongs to the thread, not the task, so the worker sees whatever was left there, which is either empty or stale. That is why the lesson's logger carries context as an immutable object captured by the task, and why frameworks need a context-copying executor. Nothing recomputes the id, and frameworks do not reject a missing field."
+    },
+    {
+      "stage": "post",
+      "question": "A pull request adds logger.debug(\"request body\", \"body\", rawJson) to the processor adapter, where rawJson contains a card number. Which statement is correct under the lesson's design and PCI DSS?",
+      "options": [
+        "It is acceptable because DEBUG is disabled in production and never enabled during incidents",
+        "It is acceptable because PCI DSS does not consider log platforms to be cardholder data storage",
+        "The record must be encrypted at rest, after which the PAN may legitimately remain inside it",
+        "The redactor masks the PAN, but the statement is still a defect: the control is never logging a PAN"
+      ],
+      "correct": 3,
+      "explanation": "The redactor is a last line of defence and will mask a Luhn-valid PAN in the body, but PCI DSS Requirement 3 treats logs as storage, DEBUG gets enabled during incidents, and a PAN split or encoded differently would slip through. Encryption at rest does not license storing PAN in logs."
     }
   ]
 }

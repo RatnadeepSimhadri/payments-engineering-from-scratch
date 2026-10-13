@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "Compliance lowers the large-withdrawal threshold from 1000.00 to 500.00. Which system can produce the correct historical alert list without touching external data?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "One that stores only current balances and writes alert rows from a trigger when a withdrawal exceeds the threshold",
+        "One that keeps every withdrawal as an event in a log and derives the alert list by folding that log",
+        "One that snapshots the accounts table nightly so any day's balances can be restored on demand",
+        "One that logs every SQL statement to a file for audit so the trigger can be re-run by hand"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The alert list is a derived view; it can be recomputed for a new rule only if its inputs, the withdrawals themselves, are still available, which is what an event log provides. The trigger-based design discarded the inputs below the old threshold, nightly balance snapshots do not contain individual withdrawals, and a statement log is not a reliable or ordered record of what was committed."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A projector reads a batch of four events, applies all four to its view, and the process dies before it saves its checkpoint. On restart, what happens?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The four events are skipped because the view already reflects them and the store knows it",
+        "The checkpoint is advanced by the store on restart, so processing resumes with event five",
+        "The same four events are read and applied again, so the apply step must be idempotent",
+        "The projector detects the mismatch and triggers a rebuild of the view from position 0"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "The checkpoint is the projector's only memory of progress, and it was not saved, so the restart re-reads from the old checkpoint and re-applies the batch; a projection that does not guard against this double-counts. The store has no knowledge of which views have applied what; nothing advances the checkpoint except the projector itself; and a rebuild is the remedy for wrong code, not for a routine crash."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A new version of the large-withdrawals projection has been registered and has processed 4 of the log's 9 events. The team wants to switch queries to it now. What should happen?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Promotion is refused: the new version is 5 events behind and a query would see a half-built view",
+        "Promotion succeeds and the remaining 5 events are applied to both versions on the next poll",
+        "Promotion succeeds because the new version is correct for every event it has already applied",
+        "The old version is deleted first so the new version becomes the only candidate automatically"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "A view that has not read the whole log is incomplete, not merely stale: it is missing alerts for positions 5 to 9 entirely. Promotion must wait until lag is zero. Being correct about the first four events does not make the view answerable; applying to both versions after promotion does not retroactively fill in the missing rows for queries served in between; and the old version is kept until the switch is confirmed so a rollback is a pointer change."
+    },
+    {
+      "stage": "check",
+      "question": "A projector polls every 50 ms and comfortably keeps up with the producer. What is the staleness of an event in the balances projection?",
+      "options": [
+        "Exactly 50 ms for every event, because each event waits one full poll interval",
+        "Between 0 and 50 ms depending on when the event landed relative to the next poll, mean about 25 ms",
+        "Zero, because the projector reads the event in the same transaction that appended it",
+        "Unbounded, because the projector cannot know how many events arrived since its last poll"
+      ],
+      "correct": 1,
+      "explanation": "An event appended just before a poll is applied almost immediately; one appended just after waits nearly the whole interval, so staleness is spread between 0 and the poll interval with a mean near half of it, which the lesson's probe measures as 24 ms. Staleness becomes unbounded only when the projector processes fewer events per poll than arrive, which the question excludes; and the projector runs after the append, never inside it."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "A mobile app withdraws 50.00 and immediately requests the balance from the balances projection, which shows the old amount. Which fix is wrong?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Return the new balance from the command handler's response, since it has just computed it",
+        "Have the command return its global position and have the read wait until the projection reaches it",
+        "Route that client's reads to the write model for a few seconds after the write",
+        "Check the projected balance inside the withdrawal command instead of folding the stream, so both agree"
+      ],
+      "correct": 3,
+      "explanation": "Deciding a withdrawal against the projection makes the authorization depend on a value that is behind the log by the consistency window, so two quick withdrawals can both be approved against the same stale balance: an overdraft. The other three are legitimate read-your-own-writes strategies with different costs: return the state directly, wait for the projection to reach the write's position, or temporarily read from the write model."
+    },
+    {
+      "stage": "post",
+      "question": "A bug in the daily-activity projection's code counted reversed withdrawals twice for three months. What is the correct remedy?",
+      "options": [
+        "Write a script that corrects the affected rows in place and keep the projection running",
+        "Register a new version with the fixed code, rebuild it from position 0, and promote it when caught up",
+        "Delete the three months of events from the log and re-enter them through corrected commands",
+        "Add a compensating event to each affected account's stream so the next apply undoes the error"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A projection's rows are derived; when the code was wrong the fix is new code and a rebuild, which can be checked against the log and cannot be undone by the next rebuild. Patching rows in place is unverifiable and is silently reverted the next time the view is rebuilt. Events are facts and are never deleted; compensating events belong to the write model and would corrupt every other projection to fix one."
     }
   ]
 }

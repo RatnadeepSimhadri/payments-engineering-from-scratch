@@ -1,10 +1,10 @@
 # Progress Tracker
 
-Generated 2026-10-13T18:04:58+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
+Generated 2026-10-13T18:59:22+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
 
 ## Overall
 
-**Lessons complete: 137 / 199**  `█████████████████████░░░░░░░░░` 68%
+**Lessons complete: 161 / 199**  `████████████████████████░░░░░░` 80%
 
 | Area | Status |
 |---|---|
@@ -13,7 +13,7 @@ Generated 2026-10-13T18:04:58+00:00 by `python3 scripts/progress.py` from the re
 | Go implementations | 40 / 143 Build lessons (port in progress, not gating) |
 | Projects | 3 ready: `idempotent-payment-gateway` (4 stages, Java), `ledger-engine` (4 stages, Java), `raft-kv` (4 stages, Java) |
 | Skills | 9 / 9 present and mirrored to `.claude/skills/` |
-| Git | HEAD `c6a3f28 feat: payments-engineering-from-scratch — curriculum, tooling, skills, 73 lessons, 3 projects`; 330 uncommitted files |
+| Git | HEAD `4d532fb feat: Phases 0-4 complete in Java; partial Phases 5-9; progress tracker`; 113 uncommitted files |
 
 ## By track and phase
 
@@ -25,12 +25,12 @@ Generated 2026-10-13T18:04:58+00:00 by `python3 scripts/progress.py` from the re
 | 2 | [Algorithms](phases/02-algorithms/) | 16 / 16 | `████████████████████` | ~20 |
 | 3 | [Systems Data Structures](phases/03-systems-data-structures/) | 15 / 15 | `████████████████████` | ~22 |
 | 4 | [Concurrency & Runtime Internals](phases/04-concurrency/) | 12 / 12 | `████████████████████` | ~15 |
-| | **Track B: Distributed Systems** | **39 / 63** | `████████████░░░░░░░░` | |
-| 5 | [Distributed Systems Foundations](phases/05-distributed-foundations/) | 11 / 13 | `█████████████████░░░` | ~18 |
-| 6 | [Replication & Consensus](phases/06-replication-and-consensus/) | 9 / 12 | `███████████████░░░░░` | ~19 |
-| 7 | [Partitioning, Storage & Transactions](phases/07-storage-and-transactions/) | 8 / 14 | `███████████░░░░░░░░░` | ~22 |
-| 8 | [Messaging, Streams & Event-Driven Systems](phases/08-messaging-and-streams/) | 4 / 11 | `███████░░░░░░░░░░░░░` | ~15 |
-| 9 | [Reliability, Observability & Scale](phases/09-reliability-and-scale/) | 7 / 13 | `███████████░░░░░░░░░` | ~16 |
+| | **Track B: Distributed Systems** | **63 / 63** | `████████████████████` | |
+| 5 | [Distributed Systems Foundations](phases/05-distributed-foundations/) | 13 / 13 | `████████████████████` | ~18 |
+| 6 | [Replication & Consensus](phases/06-replication-and-consensus/) | 12 / 12 | `████████████████████` | ~19 |
+| 7 | [Partitioning, Storage & Transactions](phases/07-storage-and-transactions/) | 14 / 14 | `████████████████████` | ~22 |
+| 8 | [Messaging, Streams & Event-Driven Systems](phases/08-messaging-and-streams/) | 11 / 11 | `████████████████████` | ~15 |
+| 9 | [Reliability, Observability & Scale](phases/09-reliability-and-scale/) | 13 / 13 | `████████████████████` | ~16 |
 | | **Track C: Payments Engineering** | **33 / 71** | `█████████░░░░░░░░░░░` | |
 | 10 | [Money & Ledgers](phases/10-money-and-ledgers/) | 5 / 12 | `████████░░░░░░░░░░░░` | ~18 |
 | 11 | [Payment Rails & Card Networks](phases/11-payment-rails/) | 8 / 15 | `███████████░░░░░░░░░` | ~23 |
@@ -43,30 +43,6 @@ Generated 2026-10-13T18:04:58+00:00 by `python3 scripts/progress.py` from the re
 
 | Phase | # | Lesson | Type | Status |
 |:---:|:---:|---|:---:|:---:|
-| 5 | 07 | [RPC, Framing, and Serialization Over Raw Sockets](phases/05-distributed-foundations/07-rpc-and-serialization/) | Build | 🚧 In Progress |
-| 5 | 13 | [Gossip Protocols and Failure Detection](phases/05-distributed-foundations/13-gossip-and-failure-detection/) | Build | 🚧 In Progress |
-| 6 | 07 | [Raft III: Safety Proofs, Membership Changes, Snapshots](phases/06-replication-and-consensus/07-raft-safety-and-membership/) | Build | 🚧 In Progress |
-| 6 | 10 | [Chain Replication and Primary-Backup](phases/06-replication-and-consensus/10-chain-and-primary-backup/) | Build | 🚧 In Progress |
-| 6 | 11 | [Byzantine Fault Tolerance: PBFT in Outline](phases/06-replication-and-consensus/11-byzantine-fault-tolerance/) | Learn | 🚧 In Progress |
-| 7 | 04 | [Isolation Levels and Their Anomalies](phases/07-storage-and-transactions/04-isolation-levels-and-anomalies/) | Build | 🚧 In Progress |
-| 7 | 05 | [Two-Phase Locking and Deadlock Detection](phases/07-storage-and-transactions/05-two-phase-locking/) | Build | 🚧 In Progress |
-| 7 | 09 | [Percolator and Spanner-Style Transactions](phases/07-storage-and-transactions/09-percolator-and-spanner-style-transactions/) | Learn | 🚧 In Progress |
-| 7 | 10 | [Secondary Indexes: Local vs Global](phases/07-storage-and-transactions/10-secondary-indexes/) | Build | 🚧 In Progress |
-| 7 | 11 | [Change Data Capture](phases/07-storage-and-transactions/11-change-data-capture/) | Build | 🚧 In Progress |
-| 7 | 14 | [Schema Migrations at Scale: Expand, Migrate, Contract](phases/07-storage-and-transactions/14-schema-migrations-at-scale/) | Learn | 🚧 In Progress |
-| 8 | 04 | [Message Ordering, Keys, and Head-of-Line Blocking](phases/08-messaging-and-streams/04-message-ordering-and-keys/) | Build | 🚧 In Progress |
-| 8 | 06 | [CQRS and Projections](phases/08-messaging-and-streams/06-cqrs-and-projections/) | Build | 🚧 In Progress |
-| 8 | 07 | [Stream Processing: Tumbling, Sliding, and Session Windows](phases/08-messaging-and-streams/07-stream-processing-windows/) | Build | 🚧 In Progress |
-| 8 | 08 | [Watermarks, Event Time, and Late Data](phases/08-messaging-and-streams/08-watermarks-and-late-data/) | Build | 🚧 In Progress |
-| 8 | 09 | [Backpressure and Flow Control](phases/08-messaging-and-streams/09-backpressure/) | Build | 🚧 In Progress |
-| 8 | 10 | [Dead-Letter Queues and Poison Messages](phases/08-messaging-and-streams/10-dead-letter-queues-and-poison-messages/) | Build | 🚧 In Progress |
-| 8 | 11 | [Schema Registries and Compatible Evolution](phases/08-messaging-and-streams/11-schema-registry-and-evolution/) | Learn | 🚧 In Progress |
-| 9 | 05 | [Distributed Rate Limiting](phases/09-reliability-and-scale/05-distributed-rate-limiting/) | Build | 🚧 In Progress |
-| 9 | 07 | [Distributed Tracing and Context Propagation](phases/09-reliability-and-scale/07-distributed-tracing/) | Build | 🚧 In Progress |
-| 9 | 08 | [Structured Logging and Log Correlation](phases/09-reliability-and-scale/08-structured-logging/) | Build | 🚧 In Progress |
-| 9 | 11 | [Multi-Region Architecture and Disaster Recovery](phases/09-reliability-and-scale/11-multi-region-and-disaster-recovery/) | Learn | 🚧 In Progress |
-| 9 | 12 | [Incident Response and Blameless Postmortems](phases/09-reliability-and-scale/12-incident-response/) | Learn | 🚧 In Progress |
-| 9 | 13 | [Graceful Degradation and Load Shedding](phases/09-reliability-and-scale/13-graceful-degradation/) | Build | 🚧 In Progress |
 | 10 | 02 | [Currencies, Exchange Rates, and FX Conversion](phases/10-money-and-ledgers/02-currency-and-fx/) | Build | ⬚ Planned |
 | 10 | 05 | [Balances, Running Totals, and Snapshots](phases/10-money-and-ledgers/05-balances-and-snapshots/) | Build | ⬚ Planned |
 | 10 | 06 | [Immutability, Reversals, and Corrections](phases/10-money-and-ledgers/06-immutability-and-reversals/) | Build | ⬚ Planned |

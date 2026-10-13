@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "An ALTER TABLE on a busy PostgreSQL table waits for an ACCESS EXCLUSIVE lock behind a long-running SELECT. What happens to new INSERTs that arrive while it waits?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "They proceed normally, because an INSERT takes a lock that is compatible with the SELECT's lock",
+        "They are rejected immediately with a lock-not-available error and the API must retry them",
+        "They queue behind the waiting ALTER even though they would not conflict with the SELECT",
+        "They are routed to a read replica until the ALTER completes and the primary is unlocked"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "PostgreSQL grants locks in request order. The ALTER's exclusive request is ahead of the INSERTs in the queue and conflicts with them, so they wait behind it even though they would be compatible with the SELECT that is actually holding the lock. This is why a short DDL can exhaust a connection pool, and why lock_timeout plus retry is mandatory."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Which schema change can be made directly on a 2-billion-row table without a rewrite or a long blocking lock in PostgreSQL 14?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Adding a nullable BIGINT column with no default",
+        "Changing a NUMERIC column's type to BIGINT in place",
+        "Adding a column with DEFAULT now()",
+        "Adding NOT NULL to an existing column in one statement"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "A nullable column with no default (or a constant default) is a catalog-only change that holds its lock for milliseconds. A type change always rewrites the table, a volatile default like now() forces a rewrite, and a one-step NOT NULL scans every row under an exclusive lock; the safe form is a CHECK ... NOT VALID followed by VALIDATE CONSTRAINT."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the backfill UPDATE include the predicate \"AND amount_minor IS NULL\"?",
+      "options": [
+        "To make the planner use the primary-key index for the range instead of a sequential scan of the table",
+        "To make each batch idempotent so a crash-and-restart or a dual-written row causes no double work or overwrite",
+        "To skip rows that belong to accounts held in a currency other than USD until a later pass handles them",
+        "To reduce the size of the write-ahead log entry for the batch by touching fewer pages per transaction"
+      ],
+      "correct": 1,
+      "explanation": "Rows already filled, whether by a previous run of the same batch or by the application's dual-write, match nothing and are left alone, so the batch can be rerun safely after a crash and never overwrites a value the application wrote. Index use comes from the id range, not this predicate, and currency is not what it tests."
+    },
+    {
+      "stage": "check",
+      "question": "During the migrate phase, what does a database trigger that fills amount_minor from amount provide that application-level dual-write does not?",
+      "options": [
+        "It fills the column for every write path, including scripts and services the team did not change",
+        "It avoids the extra storage of holding both columns at once",
+        "It makes the backfill unnecessary because existing rows are filled on the next read",
+        "It allows the reads to switch to the new column before verification"
+      ],
+      "correct": 0,
+      "explanation": "The trigger runs on every INSERT and UPDATE regardless of which code issued it, so a forgotten importer or manual fixup still produces complete rows. It does not touch rows that are never written again, so the backfill is still needed, it costs database CPU rather than saving storage, and verification is still required before any reader switches."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "The team wants to ship the DROP COLUMN amount in the same release that stops writing it. Why does the lesson insist on at least one release between them?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because PostgreSQL requires a VACUUM FULL to run between a column going unused and the column being dropped",
+        "Because the previous application version still running during the rollout, and any unknown reader, would break the moment the column disappears",
+        "Because the drop must wait for the backfill job to finish filling the old column for rows written during the migration",
+        "Because the CDC connector must take a fresh snapshot before any change to the table's schema can be applied"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A rolling deploy runs old and new versions together, and the old version still writes and may read the column. A gap of a release, with the statement log reviewed, is how unknown readers surface as log lines rather than outages. The backfill fills the new column, not the old one, and neither VACUUM FULL nor a CDC re-snapshot is a prerequisite for a drop."
+    },
+    {
+      "stage": "post",
+      "question": "Verification finds 1,912 ledger rows whose NUMERIC(19,4) amount has three or four decimal places and so cannot round-trip to integer cents. What is the correct handling?",
+      "options": [
+        "Let the backfill round them HALF_UP and proceed, since the difference is under a cent per row and finance will not notice it",
+        "Exclude those rows from the verify query with an extra predicate so the mismatch count reaches zero and the switch can proceed",
+        "Treat it as a business decision: get a ruling on what those values meant, correct them by a reviewed script with an audit trail, then re-verify",
+        "Keep the old column permanently for those rows and have the application read it whenever amount_minor is null for a ledger entry"
+      ],
+      "correct": 2,
+      "explanation": "The old schema admitted values no currency has; deciding what a half-cent fee from 2019 means is not a rounding default to pick silently in a backfill. The fix is a ruling, a reviewed and audited correction, and a re-run of the verify query to zero. Hiding the rows from verification or keeping a permanent dual read defeats the migration's purpose."
     }
   ]
 }

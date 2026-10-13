@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A ledger consumer must apply each account's events in the order they happened, and the topic has twelve partitions read by twelve consumers. Which choice of record key makes that possible?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A random UUID per event, so load is spread evenly across the twelve partitions",
+        "The account id, so every event for one account lands in one partition in production order",
+        "The event type, so all authorizations are ordered relative to all captures",
+        "No key, so the broker can assign each event to the least loaded partition"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The partition is the only ordering domain a log offers, and the partitioner sends one key to one partition, so keying by account id puts each account's events in one ordered sequence. A random or null key spreads load perfectly and orders nothing; the event type orders all authorizations relative to each other, which is not the order the ledger needs."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "In a partition processed by one sequential consumer, a 40 ms record is followed by a 2 ms record for a different account that arrived 10 ms later. What latency does the 2 ms record see?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "32 ms: it starts when the slow record finishes, 30 ms after it arrived, then takes 2 ms",
+        "2 ms, because it belongs to a different account and is not ordered after the slow record",
+        "12 ms, the 10 ms arrival gap plus its own 2 ms of processing",
+        "40 ms, because every record behind a slow one inherits the slow record's full service time"
+      ],
+      "correct": 0,
+      "explanation": "A sequential consumer is one FIFO: the record starts at max(arrival, busyUntil), which is 30 ms after its arrival, and completes 2 ms later for a latency of 32 ms. It does not inherit the full 40 ms because 10 ms of the slow record's service time had already elapsed when it arrived; and it does not get 2 ms, because offset order, not key, decides when a sequential consumer reaches it."
+    },
+    {
+      "stage": "check",
+      "question": "A consumer dispatches each partition's records to one of 8 per-key lanes. Lanes finish offsets 1, 2, and 4 while offset 0 and 3 are still running. What offset may it commit?",
+      "options": [
+        "5, because the highest finished offset is 4 and committed offsets are next-to-read",
+        "3, because offsets 1 and 2 are done and 3 is the next one that is not",
+        "0, because committable is the smallest offset that has not completed, and 0 is still running",
+        "2, because that is the highest offset in the first contiguous run of finished records"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "The committable offset is the low-water mark: the smallest offset not yet complete. Offset 0 is still running, so nothing may be committed yet; committing 5 would mean a crash loses offsets 0 and 3 forever, since everything below the committed offset is treated as processed. Once 0 completes the mark jumps to 3, because 1 and 2 were already waiting in the finished-ahead set."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A producer has five sends in flight to one partition. Send 2 fails once and is retried; sends 3 and 4 succeeded on their first attempt. Without any sequence check, what does the log contain?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "0, 1, 2, 3, 4: the broker buffers sends until the retry arrives so order is kept",
+        "0, 1, 3, 4, 2: the retry of send 2 lands after the sends that were already in flight behind it",
+        "0, 1, 3, 4 only: a failed send is dropped and the producer reports the loss to the application",
+        "0, 1, 2, 2, 3, 4: the retry is appended twice because the first attempt partially succeeded"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The broker appends whatever arrives in the order it arrives; sends 3 and 4 were already on the wire when 2 failed, so the retried 2 is appended after them. The broker has no way to buffer and wait because without sequence numbers it does not know a send is missing; that is exactly what the idempotent producer's sequence check adds. Nothing is lost and nothing is duplicated; only the order changes."
+    },
+    {
+      "stage": "post",
+      "question": "A consumer's SequenceTracker reports, for one account, the verdicts IN_ORDER, GAP, IN_ORDER, DUPLICATE for seqs 1, 3, 4, 2. What most likely happened?",
+      "options": [
+        "The producer lost seq 2 and later re-sent an old message by mistake",
+        "The consumer committed too early and re-read seq 2 after a restart",
+        "Two producers shared the account key and both started their counters at 2",
+        "A retry of seq 2 was reordered behind seqs 3 and 4 by a producer with several sends in flight"
+      ],
+      "correct": 3,
+      "explanation": "A GAP followed shortly by a seq below the expectation is the signature of a reordered retry: seq 2 failed its first attempt and landed after 3 and 4. A restart redelivering seq 2 would also have redelivered 3 and 4 after it; a lost message produces a GAP with no later lower seq; two producers would produce repeated low seqs, not a single late one."
+    },
+    {
+      "stage": "post",
+      "question": "The platform team wants to raise a keyed topic from 12 to 16 partitions to spread load. What is the consequence for ordering?",
+      "options": [
+        "None: the partitioner is deterministic, so each key continues to hash to the partition it always used",
+        "Only keys whose hash is divisible by 16 move, so ordering is lost for one key in sixteen",
+        "Most keys change partition, splitting each moved key's history across two partitions with no order between the halves",
+        "Order is preserved as long as the consumer group is restarted at the same time as the change"
+      ],
+      "correct": 2,
+      "explanation": "The partition is hash(key) mod N, and changing N changes the result for most keys: a key keeps its home only when hash mod 12 equals hash mod 16, which is one key in four here, not one in sixteen. A moved key's old records sit in the old partition and new records in the new one, and no reader can order across them. Determinism of the hash is irrelevant once the modulus changes, and restarting consumers does nothing about the split history."
     }
   ]
 }

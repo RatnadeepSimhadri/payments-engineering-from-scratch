@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "Raft's Election Safety property (at most one leader per term) depends on which fact about majorities?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Any two majorities of the same set of servers share at least one server",
+        "A majority of servers is always online in a correctly deployed cluster",
+        "The leader always belongs to the majority that elected it",
+        "Majorities are recomputed by the leader at the start of every term"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Each server votes once per term, and two candidates would each need a majority; since two majorities of one set intersect, some server would have voted twice, which is impossible. Availability of a majority is a liveness concern, not what makes two leaders impossible, and nothing in Raft recomputes majorities per term."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A cluster switches directly from C_old = {0,1,2} to C_new = {0,1,2,3,4} by pushing the new list to servers one at a time. What can go wrong?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Servers 3 and 4 cannot vote because their logs are empty",
+        "Two leaders in the same term: {0,1} is a majority of C_old and {2,3,4} is a majority of C_new",
+        "The commit index goes backwards when the configuration changes",
+        "Log Matching fails because the new servers use a different sentinel index"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "During the switch some servers count majorities of C_old and others of C_new, and those majorities can be disjoint, so both groups can elect a leader in one term. Empty logs do not prevent voting (the election restriction only compares candidates against the voter's own log), and neither the commit index nor the sentinel is involved."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Under the joint configuration C_old,new, when does the leader start using it for quorum decisions?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "As soon as the C_old,new entry is in its own log, before it is committed",
+        "Only after a majority of C_new has acknowledged the C_old,new entry",
+        "Only after the C_old,new entry has been committed and applied",
+        "After every server in both C_old and C_new has acknowledged it"
+      ],
+      "correct": 0,
+      "explanation": "A server always uses the latest configuration in its log, committed or not. This is safe because every quorum of C_old,new contains a quorum of C_old, so no decision under the joint configuration conflicts with one under C_old if the entry is later lost. Waiting for commitment would itself require choosing which configuration decides the commit."
+    },
+    {
+      "stage": "check",
+      "question": "A follower receives InstallSnapshot with lastIncludedIndex 3, lastIncludedTerm 1, and its own log already holds entries 1 to 5 with entry 3 in term 1. What does it do?",
+      "options": [
+        "Discards its entire log and replaces it with the snapshot",
+        "Rejects the snapshot because it already has index 3",
+        "Compacts entries through index 3 and keeps entries 4 and 5",
+        "Keeps its log unchanged and only resets the state machine"
       ],
       "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
+      "explanation": "Figure 13 rule 6: if the existing log has the snapshot's last entry with the same term, the follower retains the entries after it, since by Log Matching they are consistent with the leader's. Rule 7 (discard everything) applies only when the entry is missing or has a different term; rejecting applies only when the follower's own snapshot is already at or past the index."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "In the safety proof, why does the voter S in the intersection of the two majorities still hold the committed entry e when it votes for the later leader?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Because committed entries are copied into a separate immutable store on every server the moment they commit",
+        "Because only a conflicting AppendEntries can delete an entry, and every leader between the two terms had e",
+        "Because S refuses all AppendEntries from the moment it votes until the new leader has sent its first heartbeat",
+        "Because the entry's term is lower than S's current term, and Raft never truncates entries from earlier terms"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The proof picks the smallest violating term U, so every leader of terms between T and U has e; truncation happens only on a conflict with a leader's log, and those leaders agree with S at e's index, so S keeps it. There is no separate store, servers do not refuse AppendEntries during elections, and a lower term provides no protection by itself (Lesson 06's Figure 8 scenario shows older-term entries being overwritten)."
+    },
+    {
+      "stage": "post",
+      "question": "A leader appends C_old,new, commits it, and crashes before appending C_new. A new leader is elected with the joint configuration in its log. What must it do?",
+      "options": [
+        "Revert to C_old, because the change was never completed by its initiator",
+        "Wait for an operator to resubmit the membership change request",
+        "Append C_new itself, since a committed C_old,new means the transition must be finished",
+        "Switch directly to C_new without an entry, because C_old,new was already committed"
+      ],
+      "correct": 2,
+      "explanation": "The joint configuration is committed and therefore durable; the only safe way forward is to complete the protocol by appending C_new, which the lesson's afterCommit does when the latest configuration is joint and committed (including when it lives in a snapshot). Reverting would discard a committed entry, waiting leaves the cluster unable to accept further changes, and skipping the C_new entry would let servers disagree about the configuration."
     }
   ]
 }

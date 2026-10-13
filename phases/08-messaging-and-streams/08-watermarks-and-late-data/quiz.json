@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A payment is authorized at 11:59:40 and the event reaches the stream processor at 12:03:12. A job computing hourly totals by the processor's wall clock puts it in which hour, and is that the hour the business asked about?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The 11:00 hour, which is what the business asked about",
+        "The 12:00 hour, which is what the business asked about",
+        "The 12:00 hour, which is not the hour the business asked about",
+        "Both hours, because the job cannot tell which one is correct"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Processing-time windows use the arrival clock, so 12:03 lands the event in the 12:00 hour. The business asked how much was authorized between 11:00 and 12:00, which is an event-time question. Option A describes the right answer, but a processing-time job does not produce it."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A bounded-out-of-orderness watermark with a 5-minute bound has observed a maximum event time of 12:09. An event with time 11:30 then arrives. What is the watermark after observing it?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "11:25, because the watermark tracks the most recent event",
+        "12:04, because the watermark never moves backwards",
+        "11:30, because the watermark equals the minimum unfired time",
+        "12:09, because a late event forces the watermark to catch up"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The watermark is max(eventTime) - bound = 12:09 - 5 min = 12:04, and a late event does not lower the maximum. If it moved to 11:25, windows that already fired would have to un-fire. Option D confuses the maximum observed time with the watermark itself."
+    },
+    {
+      "stage": "check",
+      "question": "The 11:00-12:00 window fired ON_TIME with 4 events. Allowed lateness is 10 minutes and the watermark is 12:04. An event with time 11:57 arrives. What does the operator emit?",
+      "options": [
+        "Nothing; the event is placed in the side output because the window has fired",
+        "A LATE_UPDATE result for the window containing only the one late event's amount",
+        "A second ON_TIME result for the window because the watermark has not passed 12:10",
+        "A LATE_UPDATE result for the window carrying the corrected count of 5 and full sum"
+      ],
+      "correct": 3,
+      "explanation": "The watermark (12:04) is below windowEnd + allowedLateness (12:10), so the window state is still retained; the event is folded in and a corrected result is re-emitted marked LATE_UPDATE with the full aggregate so downstream can overwrite. Option B describes discarding mode, which would make a consumer that overwrites lose the first four events."
+    },
+    {
+      "stage": "check",
+      "question": "Which statement about the watermark bound and allowed lateness is correct?",
+      "options": [
+        "The bound delays the first result; allowed lateness delays finality",
+        "The bound delays finality; allowed lateness delays the first result",
+        "Both delay the first result, and neither affects memory usage",
+        "Both are measured in processing time against the wall clock"
+      ],
+      "correct": 0,
+      "explanation": "A window fires when the watermark (max event time minus bound) passes its end, so a larger bound means a later first result. Allowed lateness keeps the state after firing so corrections can be issued, delaying the point at which the result is final and costing memory. Both are event-time quantities, not wall-clock ones."
+    },
+    {
+      "stage": "post",
+      "question": "The operator keeps the invariant eventsSeen == inOpenWindows + inClosedWindows + sideOutput.size(). A refactor makes process() return early for events whose window has been garbage-collected, without touching the side output. What happens?",
+      "options": [
+        "The invariant still holds because garbage-collected windows count their events",
+        "The invariant fails because those events are in none of the three places",
+        "The invariant fails because the same event is now counted in two places",
+        "The invariant holds but ON_TIME results fire twice for the affected windows"
+      ],
+      "correct": 1,
+      "explanation": "The late event was seen (eventsSeen incremented) but is neither in an open window, nor in a closed window's count, nor in the side output: it was silently dropped, which is exactly the failure the invariant exists to catch. Option A is wrong because inClosedWindows counts only events that were in the window when it was collected, not events that arrived afterwards."
+    },
+    {
+      "stage": "post",
+      "question": "A single partition of the input topic carries a sleeping region and receives no events overnight. The job's watermark is the minimum across partitions. What is the observable effect, and what is the fix?",
+      "options": [
+        "Windows for that region fire early with partial data; raise the bound",
+        "No window in the whole job fires until that partition sends data; mark idle sources as not contributing",
+        "Events from other partitions land in the side output; increase allowed lateness",
+        "The watermark jumps forward when the region wakes; clamp future-dated events"
+      ],
+      "correct": 1,
+      "explanation": "A silent partition's watermark stays at its last event time, and the minimum across partitions is held there, so every window across every partition stalls. Idleness detection (Flink's withIdleness) excludes the silent source from the minimum. Option D describes a different failure, the future-dated clock, which drags the watermark forward rather than holding it back."
     }
   ]
 }
