@@ -1,0 +1,78 @@
+{
+  "lesson": "06-consistent-hashing",
+  "title": "Consistent Hashing and Virtual Nodes",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A ledger routes accounts with shard = hash(account_id) mod 8. The team adds a ninth shard and switches to mod 9. Roughly what fraction of accounts now map to a different shard than before?",
+      "options": [
+        "About one ninth, because only the new shard's share has to be filled",
+        "About half, because the parity of the divisor changed",
+        "About eight ninths, because the remainder changes for almost every key",
+        "None, because the hash of each account id has not changed"
+      ],
+      "correct": 2,
+      "explanation": "The shard is the remainder, and changing the divisor changes the remainder for all keys except the roughly 1/(N+1) that coincide by chance, so about 8/9 of accounts move. The hash itself is unchanged, but the hash is not the shard; the remainder is. 'About one ninth' is the fraction a consistent hash ring would move, which is the point of the lesson."
+    },
+    {
+      "stage": "check",
+      "question": "On the nine-point ring in the lesson, the key acct-000001 hashes to position 0.333 and the points above it are 0.432 (beta), 0.531 (alpha), 0.596 (gamma), 0.643 (beta). What is lookupN(acct-000001, 3)?",
+      "options": [
+        "[beta, alpha, gamma]",
+        "[beta, alpha, gamma, beta]",
+        "[alpha, beta, gamma]",
+        "[beta, beta, alpha]"
+      ],
+      "correct": 0,
+      "explanation": "The owner is the first point clockwise, 0.432 (beta); the walk then collects distinct physical nodes: alpha at 0.531 and gamma at 0.596, giving exactly three. A second point of beta is skipped because the preference list counts physical nodes, not points, and the result has exactly n entries."
+    },
+    {
+      "stage": "check",
+      "question": "The demo adds an eleventh shard to a ten-shard ring with 100 virtual nodes each and reports '1543 keys moved to the new shard, 0 moved anywhere else'. Which property does that zero demonstrate?",
+      "options": [
+        "Balance: every shard holds the same number of keys after the change",
+        "Monotonicity: a membership change only moves keys to or from the node that changed",
+        "Spread: all clients agree on the owner of every key",
+        "Minimal memory: the ring stores one entry per physical node"
+      ],
+      "correct": 1,
+      "explanation": "Monotonicity is Karger's guarantee that adding a node takes keys only from existing nodes to the new one and never shuffles keys between existing nodes; the zero is that guarantee measured. Balance is about the size of each share, not about which keys move, and the 1543 (7.7%) versus the ideal 9.1% shows balance is only approximate."
+    },
+    {
+      "stage": "check",
+      "question": "With ten shards and one point per shard, the demo measures a maximum load 3.24 times the mean. Why does giving each shard 100 points fix this?",
+      "options": [
+        "Because 100 points per node makes every arc on the ring exactly the same length",
+        "Because the lookup becomes O(1) when the ring has more than 1,000 points",
+        "Because each node's share becomes a sum of 100 random gaps, whose variance shrinks roughly as 1/sqrt(100)",
+        "Because virtual nodes are placed at evenly spaced positions rather than hashed"
+      ],
+      "correct": 2,
+      "explanation": "A node's arc with one point is a single random gap, and the largest of N random gaps is about ln(N)/N rather than 1/N. With V points the node's total share is a sum of V independent gaps, which concentrates around the mean with coefficient of variation falling about as 1/sqrt(V). The points are still hashed, not evenly spaced, and the arcs are still unequal, just much less so."
+    },
+    {
+      "stage": "post",
+      "question": "After addNode('ledger-shard-k') the ring says acct-000777 now belongs to shard-k. What is true about the account's data at that moment?",
+      "options": [
+        "It has already been copied to shard-k by addNode and can be read from there immediately",
+        "It is still on its old shard; the ring only changed the answer to lookup, and migration is a separate step",
+        "It now exists on both shards and stays duplicated until removeNode is called on the old one",
+        "It is unreachable from every client until each of them has reloaded the new ring version"
+      ],
+      "correct": 1,
+      "explanation": "A hash ring is a routing function, not a data mover: addNode changes which shard a key maps to and nothing else. The moved keys must be copied with a dual-read or dual-write window and a per-key cutover, which is what the runbook in outputs/ describes. The ring never copies, duplicates, or deletes data, and a stale client simply routes to the old shard, which is exactly the split-brain risk the lesson warns about."
+    },
+    {
+      "stage": "post",
+      "question": "Two ledger services share a ring configuration, but one was deployed with a hash function that omits the mix64 finaliser. What happens?",
+      "options": [
+        "Both services still agree on owners, because the finaliser only affects balance",
+        "The modified service routes most accounts to different shards than the other, so writes split across shards",
+        "The modified service fails fast because the ring detects the hash mismatch",
+        "Only the virtual node positions differ; key lookups are unaffected"
+      ],
+      "correct": 1,
+      "explanation": "The owner is a pure function of the key hash and the point hashes, so a service with a different hash computes different positions for both and disagrees with its peer on almost every account, writing to the wrong shard with no error. Nothing in the ring can detect this; only a cross-service test asserting identical owners for fixed keys, as the lesson's tests do across Java, Python, and Go, catches it."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "05-raft-leader-election",
+  "title": "Raft I: Terms, Leader Election, and a Simulated Network",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A standby node has missed three heartbeats from the primary and promotes itself. What has the node actually learned from the missed heartbeats?",
+      "options": [
+        "That the primary has crashed and its process is no longer running",
+        "That it has not heard from the primary; the primary may be alive and partitioned",
+        "That a majority of the cluster has also stopped hearing from the primary",
+        "That the primary has already stepped down and stopped accepting writes"
+      ],
+      "correct": 1,
+      "explanation": "A timeout is local evidence of silence, nothing more. From inside a minority partition a live primary looks identical to a dead one, which is why promotion on a local timeout alone eventually produces two primaries. Raft replaces the local decision with a majority vote and a term number so a stale primary can be recognised and rejected."
+    },
+    {
+      "stage": "check",
+      "question": "A follower in term 5 receives RequestVote(term 3) from a candidate. According to Figure 2 of the Raft paper, what does it do?",
+      "options": [
+        "Grants the vote if votedFor is null, since the candidate may simply be slow",
+        "Moves to term 3 so the cluster stays on one term, then evaluates the vote",
+        "Replies false and includes term 5 so the candidate learns it is behind",
+        "Ignores the message entirely because stale requests need no reply"
+      ],
+      "correct": 2,
+      "explanation": "Receiver rule 1 says reply false if term < currentTerm, and every reply carries the receiver's current term, so the candidate sees 5 and converts to follower. Terms only ever move forward, so option B is impossible, and silently dropping the request (option D) would leave the stale candidate retrying until its own timer fired."
+    },
+    {
+      "stage": "check",
+      "question": "Why must votedFor be written to stable storage before the vote reply is sent, rather than after?",
+      "options": [
+        "Because a node that replies, crashes, and restarts with votedFor null could grant a second vote in the same term",
+        "Because the candidate needs an acknowledgement that the write completed before counting the vote",
+        "Because the election timer cannot be reset until the vote has been durably recorded on disk",
+        "Because followers compare votedFor values with each other to detect a split vote early"
+      ],
+      "correct": 0,
+      "explanation": "Election Safety rests on each node granting at most one vote per term. If the reply leaves first and the node crashes before the write, it has promised its vote to one candidate and will, on restart, promise it to another, and two candidates can each assemble a majority. The candidate never sees or waits for the write (option B); it only sees the reply."
+    },
+    {
+      "stage": "check",
+      "question": "Two of four nodes time out in the same tick, become candidates for term 1, and each collects two votes. What resolves the split?",
+      "options": [
+        "The candidate with the lower node id wins the tie-break and the other steps down",
+        "Each candidate redraws a random election timeout; whichever fires first starts term 2 and usually wins alone",
+        "The two candidates exchange their vote counts and the one with more votes becomes leader",
+        "Both candidates stay candidates until a follower changes its vote to break the tie"
+      ],
+      "correct": 1,
+      "explanation": "Raft has no tie-break and votes in a term are final. Each candidate's timer was redrawn uniformly from [150, 300] when it started the election, so they are unlikely to collide again; the first to fire increments the term, and every other node adopts the higher term with votedFor reset to null, so it gets a clean majority. The paper rejected id-based priority (option A) because it needed a second timeout and was slower in practice."
+    },
+    {
+      "stage": "post",
+      "question": "A leader is partitioned with one follower in a 5-node cluster for 700 ticks; the other three elect a new leader for term 2. During the partition, how many nodes believe they are leader, and does this violate Election Safety?",
+      "options": [
+        "One; the old leader steps down as soon as it stops receiving heartbeat replies from a majority",
+        "Two, in different terms; Election Safety is not violated because it only forbids two leaders in the same term",
+        "Two, in the same term; this is a violation that only the partition heal can repair",
+        "One; the minority side cannot keep a leader because its follower will time out and depose it"
+      ],
+      "correct": 1,
+      "explanation": "The old leader keeps heartbeating its one follower and, lacking CheckQuorum, never notices it lost the majority, so it still leads term 1 while the majority side leads term 2. Election Safety is per term, and the two terms differ. The follower on the minority side keeps receiving heartbeats, so its timer never fires (option D is wrong), and the old leader cannot be in term 2 because it never saw a term-2 message."
+    },
+    {
+      "stage": "post",
+      "question": "The simulated network draws a drop roll and a delay from the seeded generator on every send, even when the message is then dropped. Why not skip the delay draw for dropped messages?",
+      "options": [
+        "Because the delay value is kept in the trace so dropped messages can be audited after a run finishes",
+        "Because drawing fewer values would bias the generator toward smaller delays as the simulation runs on",
+        "Because every call site must consume the same number of random values whatever the outcome, or runs and languages diverge",
+        "Because the dropped message is retransmitted later by the network with the already-drawn delay applied"
+      ],
+      "correct": 2,
+      "explanation": "Determinism across runs and languages depends on the random stream being consumed identically. If a drop consumed one value and a delivery two, a single different branch would shift every later draw, and a seed that reproduces a bug in Java would show a different schedule in Go. SplitMix64 has no bias problem (option B), and the simulator has no retry of dropped messages (option D); Raft's own retransmission handles loss."
+    }
+  ]
+}

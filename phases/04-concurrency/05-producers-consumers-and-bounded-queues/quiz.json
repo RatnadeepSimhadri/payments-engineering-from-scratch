@@ -1,0 +1,48 @@
+{
+  "lesson": "05-producers-consumers-and-bounded-queues",
+  "title": "Producers, Consumers, and Bounded Queues",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service hands events from a network thread to a database-writer thread through an in-memory queue with no capacity limit. The database slows to half speed for twenty minutes. What happens to the process?",
+      "options": ["The network thread slows down automatically because the queue takes longer to append to", "The queue grows without limit, heap and GC pressure rise, and the process eventually dies with an out-of-memory error", "The database writer catches up as soon as it recovers because queue operations are O(1)", "The oldest events are dropped once the queue reaches the JVM's default collection size"],
+      "correct": 1,
+      "explanation": "An unbounded queue accepts everything, so the producer never slows down and the backlog lives in the heap until it runs out. Appends stay O(1), so nothing slows the producer; and standard queues do not drop items by default. The fix is a bound that makes the producer wait or be refused."
+    },
+    {
+      "stage": "check",
+      "question": "Why is every wait in the queue written as `while (count == capacity) notFull.await()` rather than `if`?",
+      "options": ["Because await() can return spuriously or another producer can fill the slot before the woken one re-acquires the lock", "Because a while loop releases the lock on each iteration, which an if statement cannot do", "Because the JIT compiler cannot inline a condition wait inside an if statement", "Because await() returns a boolean that must be checked repeatedly until it becomes true"],
+      "correct": 0,
+      "explanation": "Both the JVM and POSIX permit spurious wakeups, and a third thread can take the freed slot between the signal and the woken thread re-acquiring the lock (a stolen wakeup). Re-checking the predicate makes both harmless. The lock is released by await() itself, not by the loop, and await() returns void."
+    },
+    {
+      "stage": "check",
+      "question": "The queue signals `notEmpty` (one waiter) after each enqueue rather than calling signalAll. When is signal correct and when would it cause a lost wakeup?",
+      "options": ["signal is correct only when there is exactly one consumer thread; with two or more consumers it must be signalAll", "signal is correct when every waiter on the condition needs the same predicate; it loses wakeups when predicates are mixed", "signal is correct when the queue is unbounded; a bounded queue must always use signalAll to wake blocked producers", "signal is never correct for a queue because it wakes an arbitrary thread; it is only used for one-shot latches"],
+      "correct": 1,
+      "explanation": "Every waiter on notEmpty is waiting for count > 0, and one enqueue satisfies exactly one of them, so waking one is both sufficient and efficient. If producers and consumers shared one condition, a signal could wake a thread whose predicate is still false while the one that could proceed stays parked. The number of consumers does not matter."
+    },
+    {
+      "stage": "check",
+      "question": "offer(item, 250 ms) is called on a full queue whose Clock is a FakeClock starting at 1,000 ns. What is observed, and what does this test not prove?",
+      "options": ["It returns true after the fake clock reaches the deadline; it does not prove the item was stored", "It returns false and the clock reads 250,001,000 ns; it does not prove that a real awaitNanos wakes on signal", "It blocks the test thread for 250 ms; it does not prove the deadline arithmetic", "It throws because FakeClock cannot be used with timed operations; it proves nothing"],
+      "correct": 1,
+      "explanation": "FakeClock.await advances its time by the requested amount and returns, so the loop sees remaining <= 0 on the next check and returns false with the clock exactly at the deadline, instantly. What it cannot show is the real wakeup path through Condition.awaitNanos, which the blocking tests with real threads cover."
+    },
+    {
+      "stage": "post",
+      "question": "After the backpressure demo, the stats read highWaterMark 4, producerWaits 5, consumerWaits 4. Which of these numbers should a test assert exactly, and why?",
+      "options": ["All three, because the demo is deterministic once the consumer starts after the producer blocks", "Only producerWaits, because it counts the number of items beyond capacity", "Only highWaterMark, because the capacity bound guarantees it; the wait counts depend on scheduling", "None of them, because statistics kept under a lock are inherently approximate"],
+      "correct": 2,
+      "explanation": "The queue can never hold more than capacity items, and the consumer was held until the producer blocked, so the high-water mark is exactly 4 in every run. How many times each side parked depends on the interleaving the scheduler chose, so a test asserts producerWaits >= 1 and nothing more precise. The stats are exact, not approximate; they are just scheduler-dependent."
+    },
+    {
+      "stage": "post",
+      "question": "A request handler must enqueue a payment event for a slow downstream. Which policy at the queue boundary matches 'reply 429 with Retry-After and let the client retry'?",
+      "options": ["put(item): block the handler thread until a slot opens", "offer(item, 0): refuse immediately when the queue is full", "offer(item, requestTimeout): wait up to the latency budget, then refuse", "Grow the queue capacity so the handler is never refused"],
+      "correct": 1,
+      "explanation": "An immediate refusal is load shedding at admission: the caller's retry schedule becomes the buffer. A timed offer is right when there is a latency budget to spend first; a blocking put ties up the handler thread and its resources; and growing the capacity is the unbounded queue by another name."
+    }
+  ]
+}

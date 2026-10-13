@@ -1,0 +1,78 @@
+{
+  "lesson": "13-tries",
+  "title": "Tries and Prefix Trees",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A routing table holds 500,000 card-number prefixes of up to eight digits. Roughly how does the cost of one trie lookup scale?",
+      "options": [
+        "With the number of stored prefixes, about log2(500000) comparisons",
+        "With the length of the query, at most eight child-pointer steps regardless of table size",
+        "With both: the walk is eight steps, each of which binary-searches the stored prefixes",
+        "With the alphabet size, since every node must be scanned for the matching digit"
+      ],
+      "correct": 1,
+      "explanation": "A trie walks one node per character of the query, so an eight-digit prefix is found in at most eight steps whether the table holds 50 or 500,000 entries. A balanced BST or sorted array would need about 19 comparisons. Child lookup inside a node is a map or array access, not a scan of the whole table."
+    },
+    {
+      "stage": "check",
+      "question": "The trie stores the keys 4, 4111, and 51. What does longestPrefixMatch(\"411\") return?",
+      "options": [
+        "(\"4111\", ...) because 411 is a prefix of the stored key 4111",
+        "null, because 411 is a path in the trie but not a stored key",
+        "(\"4\", ...) because 4 is the deepest terminal node on the path to 411",
+        "(\"411\", ...) because the walk reaches a node spelling 411"
+      ],
+      "correct": 2,
+      "explanation": "Longest-prefix match returns the longest stored key that is a prefix of the query, not the other way round. On the path 4 -> 41 -> 411 only the node for 4 is terminal, so (\"4\", ...) is returned. The node for 411 exists but is not terminal, and 4111 is longer than the query, so it cannot be a prefix of it."
+    },
+    {
+      "stage": "check",
+      "question": "Keys 4111, 411, and 4 are stored on one path of five nodes. After delete(\"4111\") and then delete(\"4\"), how many nodes remain and which keys are still found?",
+      "options": [
+        "3 nodes; only 411 is found, because deleting 4 also pruned its subtree",
+        "4 nodes; only 411 is found, because the 4111 leaf was pruned and the 4 node stayed as a path",
+        "5 nodes; 411 and 4 are found, because delete only unmarks and never removes nodes",
+        "2 nodes; nothing is found, because deleting an ancestor key removes every descendant key"
+      ],
+      "correct": 1,
+      "explanation": "Deleting 4111 unmarks its node, which now has no children and is not terminal, so it is pruned (5 -> 4 nodes); pruning stops at 411 because it is terminal. Deleting 4 unmarks that node but it still has a child, so nothing is removed and 411 remains reachable. A trie never deletes descendants when an ancestor key is removed."
+    },
+    {
+      "stage": "check",
+      "question": "Why does rangeToPrefixes(\"2221\", \"2720\") produce 23 prefixes rather than 500 four-digit keys?",
+      "options": [
+        "Because any block of numbers that starts on a trailing-zero boundary and fits inside the range is covered by one shorter prefix, such as 23 for 2300-2399",
+        "Because the trie merges single-child chains automatically, collapsing 2300 through 2399 into one node after insertion",
+        "Because card numbers only use the digits 2 through 7 in those positions, so most four-digit combinations never occur",
+        "Because the algorithm rounds the range outward to the nearest hundreds, trading exactness for a smaller table"
+      ],
+      "correct": 0,
+      "explanation": "The greedy decomposition widens a block while its start ends in zeros and its last number stays within hi: 2300-2399 is exactly the prefix 23. The result covers the range exactly, verified by the test over 2000-2999. The plain trie does not merge chains (that is a radix tree), and no rounding takes place."
+    },
+    {
+      "stage": "post",
+      "question": "A processor's router uses a six-digit hash map and, on a miss, retries with five, four, three, two, then one digit. Which failure does a trie with longest-prefix match remove?",
+      "options": [
+        "The hash map cannot store the two-digit Amex prefixes 34 and 37, because every key in it has to be padded to exactly six digits",
+        "A stale short rule such as 27 can win before the correct 2720 rule is ever checked, and every range must be expanded into tens of thousands of six-digit keys",
+        "Hash lookups are slower than trie walks for keys longer than four characters, so six attempts cost far more than one eight-step walk",
+        "The retry loop cannot handle 15-digit Amex PANs, because it assumes a 16-digit input when it slices off the leading six digits"
+      ],
+      "correct": 1,
+      "explanation": "The retry loop encodes 'longest wins' by hand and is only as correct as the order and completeness of its six tables; a leftover 27 rule wins over 2720 if the four-digit table was never consulted first, and every range has to be expanded to the fixed key length. A trie stores each rule at its natural length and one walk returns the deepest match. Hash maps can hold short keys fine, and lookup speed is not the issue."
+    },
+    {
+      "stage": "post",
+      "question": "The router's error message for an unroutable PAN prints 272100******0008 rather than the full number. Why is that a correctness requirement and not just a style choice?",
+      "options": [
+        "Because the full PAN would push the exception message past the 80-character limit that most logging frameworks truncate at",
+        "Because the trailing digits are not part of the BIN and are therefore irrelevant to the routing decision",
+        "Because masking makes the message identical for every card in a BIN, which lets log aggregation group the errors",
+        "Because exception messages end up in logs, and PCI DSS forbids storing a full PAN anywhere but a protected cardholder-data store"
+      ],
+      "correct": 3,
+      "explanation": "PCI DSS requirement 3 limits display and storage of the PAN to the first six and last four digits outside of protected systems, and a log line is storage. An exception message that includes the full PAN turns every log aggregator into cardholder data. The other options describe side effects, not the requirement."
+    }
+  ]
+}

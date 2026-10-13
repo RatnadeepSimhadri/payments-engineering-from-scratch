@@ -1,0 +1,48 @@
+{
+  "lesson": "10-retries-backoff-and-jitter",
+  "title": "Retries, Exponential Backoff, and Jitter",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "1000 clients time out against a processor at the same instant and each one retries after exactly 100 ms. What does the processor see 100 ms later?",
+      "options": ["A smooth trickle, since the network spreads the arrivals", "1000 requests arriving inside the same window, over capacity again", "Roughly half the clients, because half give up after one timeout", "Nothing, because the clients wait for the processor to announce recovery"],
+      "correct": 1,
+      "explanation": "A fixed delay preserves the synchronization the shared failure created, so the whole population arrives together and exceeds capacity again. The network adds jitter measured in microseconds, far too little to spread 1000 arrivals across a 100 ms window; that spreading has to be done deliberately by the client."
+    },
+    {
+      "stage": "check",
+      "question": "With base 100 ms, cap 1000 ms, and no jitter, what is the delay before the sixth retry (attempt index 5)?",
+      "options": ["3200 ms, since 100 times 2 to the fifth is 3200", "1000 ms, because doubling stops once the cap is reached", "1600 ms, because the cap applies only after attempt 5", "500 ms, because the cap halves the computed value"],
+      "correct": 1,
+      "explanation": "exp(attempt) = min(cap, base * 2^attempt). The uncapped value 3200 exceeds the cap, so the delay is 1000 ms, and the implementation stops doubling as soon as the running value reaches the cap rather than computing a power that could overflow. The cap applies at every attempt, not only after a threshold."
+    },
+    {
+      "stage": "check",
+      "question": "Which strategy produces delays that can be smaller than the previous delay, and what range does it draw from?",
+      "options": ["Equal jitter, drawing from [exp / 2, exp] so each delay stays near the midpoint", "None, since every strategy multiplies the previous delay by a factor above one", "Decorrelated jitter, drawing from [base, min(cap, 3 * previous)]", "Full jitter, drawing from [exp, 2 * exp] so it is always above the backoff"],
+      "correct": 2,
+      "explanation": "Decorrelated jitter forgets the attempt counter and draws each delay from a range set by the last one, so the sequence 190, 474, 675, 569 is possible. Full jitter also produces non-monotonic sequences, but its range is [0, exp], not [exp, 2 * exp]; the distractor describes a range no strategy uses. Equal jitter is monotonic in expectation because exp grows."
+    },
+    {
+      "stage": "check",
+      "question": "A retry budget deposits 20% of a token per first attempt and withdraws one token per retry. During a total outage with no banked tokens, what fraction of incoming requests get a retry?",
+      "options": ["None, because the budget only grants retries banked during healthy periods", "All of them, since each failed request deposits before it withdraws", "Half of them, because withdrawals alternate with deposits", "One in five, since five deposits are needed to afford one withdrawal"],
+      "correct": 3,
+      "explanation": "Each request deposits 200 millitokens; a retry needs 1000, so every fifth request has enough balance for exactly one retry. The retry load is therefore bounded at 20% of organic load for as long as the outage lasts. The budget does grant retries without a banked balance, just at the deposit rate, which is why it is a ratio rather than a quota."
+    },
+    {
+      "stage": "post",
+      "question": "In the 1000-client storm, full jitter brought the peak after recovery down from 1000 to 146 per bucket but two clients gave up. Why did they give up?",
+      "options": ["Full jitter can draw very short delays, so they spent all eight attempts before the processor recovered", "The retry budget ran out of tokens before they could use their final attempt", "Their decorrelated range collapsed to the base value and they retried too early", "The simulation horizon ended while they were still waiting in the queue"],
+      "correct": 0,
+      "explanation": "Full jitter draws from [0, exp], so a client can draw several near-zero delays in a row and burn through its attempts inside the one-second outage. That is the known cost of full jitter and the reason equal jitter sets a floor at exp / 2. No budget is attached in the storm, decorrelated jitter was not in use, and clients still in the queue at the horizon are counted as waiting, not as gave up."
+    },
+    {
+      "stage": "post",
+      "question": "A call to the processor returns CARD_DECLINED. What should the retrier do, and why?",
+      "options": ["Retry with backoff, since the issuer's risk model may approve the next attempt", "Retry once immediately without jitter, since declines are usually transient", "Return after one attempt with no delay, because the decline is a valid answer and a retry is a second authorization", "Retry only if the retry budget has a token, since the budget exists for exactly this case"],
+      "correct": 2,
+      "explanation": "A decline is business data from the issuer, not a transport failure. Re-sending the same authorization is a new request against the cardholder, which card networks limit and penalize. The retrier returns NON_RETRYABLE after one attempt with zero delay. The budget governs how many retryable failures may be retried; it has no bearing on outcomes that must never be retried."
+    }
+  ]
+}

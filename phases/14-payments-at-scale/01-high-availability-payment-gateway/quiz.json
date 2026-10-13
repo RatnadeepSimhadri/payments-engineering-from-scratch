@@ -1,0 +1,78 @@
+{
+  "lesson": "01-high-availability-payment-gateway",
+  "title": "Architecture of a High-Availability Payment Gateway",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A gateway's edge node receives a request, writes PENDING to the database, calls the processor, then writes APPROVED. The edge process is killed between the processor call returning and the second write. Who holds the only record that the processor approved?",
+      "options": [
+        "The database, because the PENDING row implies a call was made",
+        "Nobody in the gateway; the approval existed only in the dead process's memory",
+        "The load balancer, which logs the response body of every upstream call",
+        "The client, which received the approval in the HTTP response before the write"
+      ],
+      "correct": 1,
+      "explanation": "The approval was in the edge's memory between the processor response and the second write, so it died with the process; the PENDING row says a call was intended, not what it returned. The client never received a response and the load balancer does not log upstream bodies. This window is why the reference design never calls the processor before a durable record of the attempt exists."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the reference architecture put the idempotency key in the payment store as a unique index rather than in a separate cache written before the payment transaction?",
+      "options": [
+        "Because a relational unique index answers the lookup faster than a network round trip to a cache under peak load",
+        "Because caches cannot store the serialized response body that a replay must return to the retrying client",
+        "Because the key and the payment then commit or roll back together, closing both holes: key without payment and payment without key",
+        "Because the cache would need its own cross-region replication for disaster recovery, doubling the operational cost"
+      ],
+      "correct": 2,
+      "explanation": "With a separate store there is always an instant where one of the two writes has happened and the other has not, and a crash there either tells a retry 'already processed' for a non-existent payment or lets it create a duplicate. One transaction removes the instant. The index is slower than a cache, not faster; caches can hold responses; replication is a separate concern."
+    },
+    {
+      "stage": "check",
+      "question": "The database primary fails. Request R1 was committed and acknowledged 200 ms earlier; request R2's transaction was open. After the synchronous replica is promoted, what is the correct state of each?",
+      "options": [
+        "R1 is on the replica with its outbox row and proceeds; R2 never existed, so its client's retry creates a fresh payment",
+        "Both are lost, and both clients' retries create fresh payments with new processor calls",
+        "R1 is lost because the relay had not yet published its outbox row; R2 is on the replica",
+        "Both are on the replica because the replica receives the write-ahead log before the primary applies it"
+      ],
+      "correct": 0,
+      "explanation": "Synchronous replication means an acknowledged commit is on the replica, so R1 survives along with its outbox row and the relay publishes it after reconnecting. R2 was never acknowledged, so its absence is correct and the retry starts clean. Publication status does not affect durability of the row, and an open transaction is not on any replica."
+    },
+    {
+      "stage": "check",
+      "question": "During a processor outage, 37 authorizations time out. Which handling matches the reference architecture?",
+      "options": [
+        "Mark them DECLINED so the merchant can ask the customer to try another card quickly and the checkout is not blocked",
+        "Mark them UNKNOWN with the processor idempotency key recorded, and have a resolver query the processor by that key until each is settled",
+        "Delete the payment rows and their outbox rows so the clients' retries can start from a clean state with no stale keys",
+        "Re-send each authorization immediately to the secondary processor with a new processor key so the customer is not kept waiting"
+      ],
+      "correct": 1,
+      "explanation": "A timeout means the result is not known, and the processor may have approved; UNKNOWN is a durable state that a resolver settles by query or void. Declining would invite a second charge on another card, deleting loses the key that makes the query possible, and re-sending to another processor with a new key is a guaranteed double authorization if the first succeeded."
+    },
+    {
+      "stage": "post",
+      "question": "The latency budget has the processor at 280 ms p50 and 1,100 ms p99, with a 1,500 ms end-to-end p99 target. The team proposes a 1,000 ms processor timeout 'for safety'. What is the consequence?",
+      "options": [
+        "The end-to-end p99 improves because the slowest processor calls are cut short and the edge frees its workers sooner",
+        "The circuit breaker opens more slowly because fewer failures are counted in its window when calls are abandoned early",
+        "The edge's connection pool must grow, because abandoned requests now occupy connections until the processor finally answers",
+        "Roughly 1% or more of successful authorizations become UNKNOWN outcomes that a resolver must settle, lowering the effective approval rate"
+      ],
+      "correct": 3,
+      "explanation": "A timeout below the processor's p99 turns the tail of successful calls into unknowns: the processor approved but the gateway stopped waiting. The budget sets the timeout at p99 plus margin (1,200 ms) for exactly this reason. Cutting calls short does not improve correctness, the breaker would open faster, and shorter waits reduce pool occupancy rather than increase it."
+    },
+    {
+      "stage": "post",
+      "question": "Region EU-1 loses power. Payments replicate asynchronously to EU-2. Why does the lesson make promotion of EU-2 an operator decision with a resolver step rather than an automatic failover?",
+      "options": [
+        "Because automatic failover requires a third region to break ties in the leader election, and the gateway only runs in two",
+        "Because the processors must be notified of the new region's egress IP addresses before they will accept its traffic",
+        "Because the last seconds of EU-1 commits may be missing from EU-2, so retries of those keys would create duplicates unless the processor is queried first",
+        "Because the ledger in EU-2 must be rebuilt from the replicated outbox before any new entries can be posted against it"
+      ],
+      "correct": 2,
+      "explanation": "Asynchronous replication has a lag window; keys committed in EU-1 during that window are absent in EU-2, so a retry looks new and the processor may already have approved the original. Querying the processor for every PENDING payment in the last snapshot before accepting traffic is the mitigation. Tie-breaking, IP allow-lists, and ledger rebuilds are not the reason."
+    }
+  ]
+}

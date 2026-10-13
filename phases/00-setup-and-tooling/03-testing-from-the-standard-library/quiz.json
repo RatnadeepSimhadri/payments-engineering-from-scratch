@@ -1,0 +1,78 @@
+{
+  "lesson": "03-testing-from-the-standard-library",
+  "title": "Testing from the Standard Library",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A test asserts that a retry loop took between 1.5 and 4 seconds of wall-clock time. It passes locally and fails on the build agent about one run in twenty. What is the most likely root cause?",
+      "options": [
+        "The build agent's JVM has a smaller default heap, so garbage collection runs more often and slows the loop",
+        "The build agent runs an older Java version whose timers are coarser and less accurate than the laptop's",
+        "The test samples wall-clock time and random jitter, so its outcome is a distribution, not a verdict",
+        "The retry loop has a data race that only manifests on the agent's multi-core virtual machine"
+      ],
+      "correct": 2,
+      "explanation": "Elapsed time and unseeded jitter are inputs the test did not choose; a GC pause or a run of small jitter draws moves the result outside the window. Injecting a FakeClock and a SeededRandom turns the sample into a deterministic assertion. A race condition is possible but would not explain why the window-based assertion is the thing that fails."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the Java track carry a hand-written check() harness in every MainTest.java instead of using JUnit?",
+      "options": [
+        "JUnit cannot assert on thrown exceptions, which the money and ledger lessons depend on heavily",
+        "The course is standard-library only and the JDK ships no test runner, so the harness lives in the file",
+        "JUnit needs a build tool such as Maven or Gradle, and javac alone cannot process its annotations",
+        "The hand-written harness starts faster than JUnit, which matters for the benchmarking lesson's timings"
+      ],
+      "correct": 1,
+      "explanation": "Rule 3 forbids libraries, and unlike Python (unittest) and Go (testing) the JDK has no built-in runner, so each lesson's test file contains its own check, checkEquals, and checkThrows plus a main that exits 1. JUnit does assert on exceptions and does not need a build tool; those are not the reasons. Speed is irrelevant at this scale."
+    },
+    {
+      "stage": "check",
+      "question": "FakeClock.advanceTo(1_999) is called on a clock currently at 2_000. What happens, and why is the rule enforced on a fake?",
+      "options": [
+        "It is rejected, because code under test may compute now minus last and a rewind would test an impossible negative duration",
+        "The clock moves to 1_999 so that tests can simulate NTP step corrections and VM migrations realistically",
+        "It is silently ignored and the clock stays at 2_000, so that tests never fail because of clock setup mistakes",
+        "The clock resets to its construction value and discards every advance made since, so the test restarts cleanly"
+      ],
+      "correct": 0,
+      "explanation": "The invariant is monotonicity: a rejected move leaves the clock at 2_000 and raises. Allowing a rewind would let a test exercise impossible states such as negative elapsed time. Real clocks can step backwards, but that is modelled explicitly in Phase 5 with a monotonic clock, not by letting the ordinary fake drift. Silently ignoring the call would hide a test bug."
+    },
+    {
+      "stage": "check",
+      "question": "SeededRandom is implemented as SplitMix64 rather than wrapping java.util.Random, random.Random, and math/rand. What does this buy the course?",
+      "options": [
+        "Cryptographic strength, so the same type can be reused to generate idempotency keys and nonces in Phase 12",
+        "A much longer period than any of the three standard-library generators, so long simulations never repeat",
+        "The same sequence for the same seed in all three languages, so 'with seed 7 the third message is lost' holds everywhere",
+        "Faster generation than the Mersenne Twister, whose 2.5 KB state is expensive to keep in cache during simulation"
+      ],
+      "correct": 2,
+      "explanation": "The three standard-library generators are different algorithms and produce unrelated sequences from the same seed. Ten lines of 64-bit wrapping arithmetic give identical output everywhere, which the published test vector for seed 1234567 confirms. SplitMix64 is explicitly not cryptographic: its whole state is recoverable from one output, and its 2^64 period is shorter than Mersenne Twister's."
+    },
+    {
+      "stage": "post",
+      "question": "In the Go test file, mustEqual calls t.Helper() before comparing. What changes if that line is removed?",
+      "options": [
+        "The file stops compiling, because Go requires any function that takes *testing.T to call t.Helper() first",
+        "A failure is reported at the line inside mustEqual rather than at the caller, hiding which table row produced it",
+        "The helper can no longer be called from inside a t.Run subtest, because subtests get their own *testing.T",
+        "t.Errorf behaves like t.Fatalf, so the first mismatch aborts the whole test instead of recording and continuing"
+      ],
+      "correct": 1,
+      "explanation": "t.Helper() marks the function so the runner skips its frame when attributing a failure, so the report names the caller's line. Without it every failure from the table-driven test points at the same line in the helper. It has no effect on compilation, on subtests, or on whether the test continues after a mismatch."
+    },
+    {
+      "stage": "post",
+      "question": "The thread test advances a shared FakeClock from eight workers and asserts the total. Why is `go test -race` the better check than the assertion alone?",
+      "options": [
+        "The race detector proves the mutex is unnecessary by showing that the goroutines never access `now` at the same time",
+        "The assertion cannot execute under -race, because the detector refuses to run tests that share a variable between goroutines",
+        "The race detector forces goroutines to run strictly one after another, so the total is always exact and the test cannot flake",
+        "Without the mutex the total is often still correct by chance, but the detector reports the unsynchronised accesses every run"
+      ],
+      "correct": 3,
+      "explanation": "A lost update needs an unlucky interleaving, so the plain assertion can pass many times with the bug present. The detector instruments every access and reports two unsynchronised accesses to `now` deterministically, with both stack traces. It does not serialise goroutines and it does not forbid shared state; it watches how shared state is accessed."
+    }
+  ]
+}

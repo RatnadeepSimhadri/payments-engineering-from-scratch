@@ -1,0 +1,78 @@
+{
+  "lesson": "08-lru-and-lfu-caches",
+  "title": "LRU and LFU Caches from Scratch",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A cache holds at most 1,000 BIN records and must answer get and put in constant time. Which pair of structures makes it possible to find the least recently used entry in O(1) when the cache is full?",
+      "options": [
+        "A hash map plus a doubly linked list ordered by recency",
+        "A sorted array of entries plus binary search on the access time",
+        "A hash map plus a min-heap keyed on the last access time",
+        "A hash map alone, scanning all entries for the oldest timestamp"
+      ],
+      "correct": 0,
+      "explanation": "The hash map gives O(1) lookup by key and the doubly linked list gives O(1) move-to-front and O(1) removal of the tail, which is always the least recently used entry. A heap makes every hit O(log n) because the access time changes; a sorted array or a scan is O(n) per operation."
+    },
+    {
+      "stage": "check",
+      "question": "Capacity 3. put(m1), put(m2), put(m3), get(m1), put(m4). Which key does the LRU evict, and what does keys() (most recent first) return afterwards?",
+      "options": [
+        "Evicts m1; keys() is [m4, m3, m2]",
+        "Evicts m3; keys() is [m4, m1, m2]",
+        "Evicts m2; keys() is [m4, m1, m3]",
+        "Evicts m4; keys() is [m1, m3, m2]"
+      ],
+      "correct": 2,
+      "explanation": "After the three puts the list is [m3, m2, m1]; get(m1) moves it to the front, [m1, m3, m2]; put(m4) on a full cache evicts tail.prev, which is m2, and pushes m4 to the head: [m4, m1, m3]. Evicting m1 would be the answer if get did not update recency, which is exactly the bug the move-to-front prevents."
+    },
+    {
+      "stage": "check",
+      "question": "In the O(1) LFU, a hit on a node at frequency f empties bucket f, and f was minFreq. Why can the code set minFreq = f + 1 without searching?",
+      "options": [
+        "Because frequencies are only ever incremented by one, so no bucket can exist below f + 1",
+        "Because f was the minimum, so no bucket below f existed, and the node just moved into bucket f + 1",
+        "Because the buckets are stored in a sorted structure that exposes the minimum directly",
+        "Because minFreq is recomputed lazily on the next eviction anyway, so any value is acceptable"
+      ],
+      "correct": 1,
+      "explanation": "minFreq being the minimum means every non-empty bucket is at f or above; bucket f is now empty and the node that left it is now in f + 1, so f + 1 is guaranteed non-empty and is the new minimum. The buckets live in a hash map with no ordering, and an insert resets minFreq to 1 rather than relying on lazy recomputation."
+    },
+    {
+      "stage": "check",
+      "question": "On the shared trace, LRU and LFU both score 0.000 during the scan of 500 one-off BINs, but on the first 200 lookups afterwards LRU scores 0.570 and LFU 0.725. Why?",
+      "options": [
+        "LFU evicted the scan keys against each other at frequency 1 and kept the hot set; LRU pushed its whole hot set out",
+        "LFU has a larger effective capacity because frequency buckets store their entries more compactly than a single list",
+        "LRU counts each scan lookup as two misses, once on the probe and once on the insert, which depresses its rate afterwards",
+        "LFU prefetches the hot set after a scan because minFreq resets to 1 and the frequency-1 bucket is refilled first"
+      ],
+      "correct": 0,
+      "explanation": "With capacity 32 and 500 never-repeated keys, every scan key enters LRU at the head and pushes the hot set out of the tail. In LFU every scan key enters at frequency 1 and the next victim is always the least recent frequency-1 key, so the hot BINs at frequency 200+ are untouched. Capacity is identical and nothing is prefetched; this is scan resistance."
+    },
+    {
+      "stage": "post",
+      "question": "A teammate proposes caching account balances with a 2-second TTL to cut ledger reads during authorization. What does the lesson say about this?",
+      "options": [
+        "It is safe as long as evictions and expirations are both exported as metrics",
+        "It is safe if the TTL is shortened to the p99 latency of a posting, so staleness cannot exceed one write",
+        "It is unsafe because a stale balance can approve an overdraft or decline a good customer, and no TTL short enough to prevent that is worth having",
+        "It is unsafe only if the cache is LFU, because frequency inertia keeps old balances alive"
+      ],
+      "correct": 2,
+      "explanation": "A balance is derived state whose purpose is to change on every posting, and an authorization decision made on a stale value is wrong in both directions. The demo shows a 100.00 USD cached balance approving 50.00 USD against a real balance of 20.00 USD. Shortening the TTL narrows the window but never closes it, and the policy choice is irrelevant to the staleness."
+    },
+    {
+      "stage": "post",
+      "question": "The merchant configuration cache showed a fee plan eleven hours after finance changed it. Which combination does the lesson recommend?",
+      "options": [
+        "A larger capacity so the configuration entry is never evicted by other keys",
+        "A TTL as a backstop plus invalidation sent by the service that changed the configuration",
+        "Switching from LRU to LFU so frequently read configurations stay current",
+        "Removing the cache for merchant configuration, since reference data must always be read live"
+      ],
+      "correct": 1,
+      "explanation": "Staleness is a freshness problem, not a capacity problem: the entry was never evicted, it just never expired. Invalidation on change is exact but depends on every writer and every receiver; a TTL bounds the damage when an invalidation is missed. Policy choice does not affect freshness, and merchant configuration is slowly changing reference data that is appropriate to cache."
+    }
+  ]
+}

@@ -1,0 +1,1763 @@
+{
+  "_comment": "Single source of truth for the curriculum. scripts/build_catalog.py derives README Contents, ROADMAP.md, and catalog.json from this file plus the on-disk lesson directories. Status is computed: a lesson is Complete when its directory has docs/en.md, quiz.json, and code in every language listed in languages.json with ci=true; otherwise Planned.",
+  "title": "Payments Engineering from Scratch",
+  "tagline": "Data structures, distributed systems, and payments engineering, built from first principles in the language you choose.",
+  "tracks": [
+    {
+      "id": "foundations",
+      "title": "Track A: Data Structures & Algorithms",
+      "phases": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "id": "distributed",
+      "title": "Track B: Distributed Systems",
+      "phases": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ]
+    },
+    {
+      "id": "payments",
+      "title": "Track C: Payments Engineering",
+      "phases": [
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    }
+  ],
+  "phases": [
+    {
+      "number": 0,
+      "slug": "00-setup-and-tooling",
+      "title": "Setup & Tooling",
+      "motto": "Three toolchains, one repository, zero magic.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-dev-environment",
+          "title": "Dev Environment: Java 21, Python 3.12, Go 1.22",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "A preflight that tells you exactly which toolchain is missing and how to fix it."
+        },
+        {
+          "n": 2,
+          "slug": "02-choose-your-language",
+          "title": "Choose Your Language: How Every Lesson Maps to Java, Python, and Go",
+          "type": "Learn",
+          "minutes": 45,
+          "hook": "The same algorithm in three languages, and what each one hides from you."
+        },
+        {
+          "n": 3,
+          "slug": "03-testing-from-the-standard-library",
+          "title": "Testing from the Standard Library",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "JUnit-free Java, unittest, and go test: the three runners this course relies on."
+        },
+        {
+          "n": 4,
+          "slug": "04-git-for-engineers",
+          "title": "Git for Engineers: Atomic Commits and Evidence",
+          "type": "Learn",
+          "minutes": 45,
+          "hook": "One lesson, one commit, one piece of evidence you can show in a review."
+        },
+        {
+          "n": 5,
+          "slug": "05-benchmarking-and-profiling",
+          "title": "Benchmarking and Profiling Without Lying to Yourself",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "JIT warm-up, GC pauses, and the GIL make naive timing meaningless."
+        },
+        {
+          "n": 6,
+          "slug": "06-reading-a-spec",
+          "title": "Reading a Spec: RFCs, ISO Standards, and Network Rulebooks",
+          "type": "Learn",
+          "minutes": 45,
+          "hook": "Payments is a specification-driven field. Learn to read one before you implement one."
+        },
+        {
+          "n": 7,
+          "slug": "07-decimal-and-integer-arithmetic",
+          "title": "Decimal and Integer Arithmetic in Three Runtimes",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "0.1 + 0.2 is why every ledger stores integers."
+        },
+        {
+          "n": 8,
+          "slug": "08-the-learning-loop",
+          "title": "The Learning Loop: Read, Build, Run, Keep Evidence",
+          "type": "Learn",
+          "minutes": 30,
+          "hook": "How to use the tutor skills, LEARNING.md, and the project graders."
+        }
+      ]
+    },
+    {
+      "number": 1,
+      "slug": "01-complexity-and-core-structures",
+      "title": "Complexity & Core Data Structures",
+      "motto": "Every structure is a trade between time, space, and what you can promise.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-complexity-and-big-o",
+          "title": "Complexity Analysis: Big-O, Big-Theta, and What Hardware Does to Them",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "O(n) with cache misses loses to O(n log n) without them."
+        },
+        {
+          "n": 2,
+          "slug": "02-amortized-analysis",
+          "title": "Amortized Analysis: Why Dynamic Arrays Are O(1)",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "The accounting method, applied to the structure you use most."
+        },
+        {
+          "n": 3,
+          "slug": "03-dynamic-arrays",
+          "title": "Dynamic Arrays from Scratch",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Growth factors, memory layout, and why 1.5x beats 2x in some runtimes."
+        },
+        {
+          "n": 4,
+          "slug": "04-linked-lists",
+          "title": "Linked Lists: Singly, Doubly, and Intrusive",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Pointer chasing is slow; here is when linked lists still win."
+        },
+        {
+          "n": 5,
+          "slug": "05-stacks-queues-and-deques",
+          "title": "Stacks, Queues, and Ring Buffers",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "A ring buffer is the data structure inside every message broker."
+        },
+        {
+          "n": 6,
+          "slug": "06-hash-maps-from-scratch",
+          "title": "Hash Maps from Scratch: Chaining, Open Addressing, and Resizing",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "The structure behind every idempotency store, built with load factors you can measure."
+        },
+        {
+          "n": 7,
+          "slug": "07-hash-functions-and-collisions",
+          "title": "Hash Functions, Collisions, and HashDoS",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "An attacker who knows your hash function can turn O(1) into O(n)."
+        },
+        {
+          "n": 8,
+          "slug": "08-binary-search-trees",
+          "title": "Binary Search Trees and Ordered Maps",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Range queries over transactions by timestamp need order, not just hashing."
+        },
+        {
+          "n": 9,
+          "slug": "09-heaps-and-priority-queues",
+          "title": "Heaps and Priority Queues from Scratch",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "The structure behind every scheduler, timer wheel, and retry queue."
+        },
+        {
+          "n": 10,
+          "slug": "10-disjoint-sets",
+          "title": "Disjoint Sets (Union-Find) with Path Compression",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Linking accounts, merging entities, and detecting fraud rings."
+        },
+        {
+          "n": 11,
+          "slug": "11-bit-manipulation",
+          "title": "Bit Manipulation and Compact Encodings",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Flags, bitmaps, and the bit tricks in ISO 8583 and Snowflake IDs."
+        },
+        {
+          "n": 12,
+          "slug": "12-strings-and-encodings",
+          "title": "Strings, Unicode, and Byte Encodings",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Why a name on a card is bytes, not characters, and what that breaks."
+        },
+        {
+          "n": 13,
+          "slug": "13-tries",
+          "title": "Tries and Prefix Trees",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "BIN range lookup for card routing is a trie problem."
+        },
+        {
+          "n": 14,
+          "slug": "14-choosing-a-structure",
+          "title": "Choosing a Structure: A Decision Procedure",
+          "type": "Learn",
+          "minutes": 45,
+          "hook": "Access pattern first, then invariants, then constants."
+        }
+      ]
+    },
+    {
+      "number": 2,
+      "slug": "02-algorithms",
+      "title": "Algorithms",
+      "motto": "An algorithm is a proof you can run.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-sorting-algorithms",
+          "title": "Sorting: Merge, Quick, Heap, and Why Libraries Use Timsort",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Stability matters when you sort transactions by amount and need time order preserved."
+        },
+        {
+          "n": 2,
+          "slug": "02-binary-search-and-its-variants",
+          "title": "Binary Search and Its Variants",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Lower bound, upper bound, and search over answer spaces."
+        },
+        {
+          "n": 3,
+          "slug": "03-two-pointers-and-sliding-windows",
+          "title": "Two Pointers and Sliding Windows",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Velocity checks are sliding-window problems."
+        },
+        {
+          "n": 4,
+          "slug": "04-recursion-and-backtracking",
+          "title": "Recursion and Backtracking",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Enumerating settlement allocations is a constrained search."
+        },
+        {
+          "n": 5,
+          "slug": "05-divide-and-conquer",
+          "title": "Divide and Conquer and the Master Theorem",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Recurrences you can solve without memorizing."
+        },
+        {
+          "n": 6,
+          "slug": "06-dynamic-programming",
+          "title": "Dynamic Programming: From Recurrence to Table",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Coin change is literally change-making; knapsack is payout batching."
+        },
+        {
+          "n": 7,
+          "slug": "07-greedy-algorithms",
+          "title": "Greedy Algorithms and Exchange Arguments",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "When taking the best local step is provably optimal, and when it is a bug."
+        },
+        {
+          "n": 8,
+          "slug": "08-graph-traversal-bfs-dfs",
+          "title": "Graph Traversal: BFS, DFS, and Connected Components",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Money-flow graphs, dependency graphs, and fraud rings all start here."
+        },
+        {
+          "n": 9,
+          "slug": "09-shortest-paths",
+          "title": "Shortest Paths: Dijkstra, Bellman-Ford, and Negative Cycles",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Cheapest FX route across currency pairs is a shortest-path problem with a twist."
+        },
+        {
+          "n": 10,
+          "slug": "10-topological-sort-and-dags",
+          "title": "Topological Sort and DAG Scheduling",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Settlement dependencies and build graphs."
+        },
+        {
+          "n": 11,
+          "slug": "11-minimum-spanning-trees",
+          "title": "Minimum Spanning Trees: Kruskal and Prim",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Union-find meets greedy."
+        },
+        {
+          "n": 12,
+          "slug": "12-string-matching",
+          "title": "String Matching: KMP, Rabin-Karp, and Aho-Corasick",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Sanctions screening scans millions of names against thousands of patterns."
+        },
+        {
+          "n": 13,
+          "slug": "13-interval-problems",
+          "title": "Interval Problems: Merging, Scheduling, and Sweep Lines",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Holds, authorizations, and overlapping settlement windows."
+        },
+        {
+          "n": 14,
+          "slug": "14-randomized-algorithms",
+          "title": "Randomized Algorithms and Reservoir Sampling",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Sampling transactions for audit without storing them all."
+        },
+        {
+          "n": 15,
+          "slug": "15-numerical-algorithms",
+          "title": "Numerical Algorithms: GCD, Modular Arithmetic, and Check Digits",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Luhn, mod-97 IBAN checks, and why they catch the errors they catch."
+        },
+        {
+          "n": 16,
+          "slug": "16-algorithm-design-patterns",
+          "title": "Algorithm Design Patterns: A Field Guide",
+          "type": "Learn",
+          "minutes": 45,
+          "hook": "How to recognize which pattern a new problem belongs to."
+        }
+      ]
+    },
+    {
+      "number": 3,
+      "slug": "03-systems-data-structures",
+      "title": "Systems Data Structures",
+      "motto": "The structures that databases, caches, and routers are made of.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-bloom-filters",
+          "title": "Bloom Filters from Scratch",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "A few bits per key to say 'definitely not seen' before hitting the database."
+        },
+        {
+          "n": 2,
+          "slug": "02-count-min-sketch-and-hyperloglog",
+          "title": "Count-Min Sketch and HyperLogLog",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Counting distinct cards per merchant in constant memory."
+        },
+        {
+          "n": 3,
+          "slug": "03-balanced-trees",
+          "title": "Balanced Trees: AVL and Red-Black",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Rotations, invariants, and why Java's TreeMap is red-black."
+        },
+        {
+          "n": 4,
+          "slug": "04-b-trees",
+          "title": "B-Trees and Why Databases Love Them",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Pages, fan-out, and the disk access pattern behind every index."
+        },
+        {
+          "n": 5,
+          "slug": "05-lsm-trees",
+          "title": "LSM Trees: Memtables, SSTables, and Compaction",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Write-optimized storage, built with a sorted map and some files."
+        },
+        {
+          "n": 6,
+          "slug": "06-consistent-hashing",
+          "title": "Consistent Hashing and Virtual Nodes",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Add a shard and move 1/N of the keys instead of all of them."
+        },
+        {
+          "n": 7,
+          "slug": "07-skip-lists",
+          "title": "Skip Lists",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "The probabilistic ordered structure inside Redis sorted sets."
+        },
+        {
+          "n": 8,
+          "slug": "08-lru-and-lfu-caches",
+          "title": "LRU and LFU Caches from Scratch",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "O(1) eviction with a hash map and a doubly linked list."
+        },
+        {
+          "n": 9,
+          "slug": "09-merkle-trees",
+          "title": "Merkle Trees and Content-Addressed Verification",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Verify two ledgers agree by comparing one hash."
+        },
+        {
+          "n": 10,
+          "slug": "10-segment-trees-and-fenwick-trees",
+          "title": "Segment Trees and Fenwick Trees",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Range sums over balances with O(log n) updates."
+        },
+        {
+          "n": 11,
+          "slug": "11-rate-limiter-algorithms",
+          "title": "Rate Limiter Algorithms: Token Bucket, Leaky Bucket, Sliding Window",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Protect a payment API from a retry storm with forty lines of code."
+        },
+        {
+          "n": 12,
+          "slug": "12-time-wheels-and-timers",
+          "title": "Hierarchical Timing Wheels",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Millions of timeouts with O(1) insert and tick."
+        },
+        {
+          "n": 13,
+          "slug": "13-unique-id-generation",
+          "title": "Unique ID Generation: UUIDs, ULIDs, and Snowflake",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Sortable, collision-resistant IDs for a distributed ledger."
+        },
+        {
+          "n": 14,
+          "slug": "14-memory-layout-and-cache-lines",
+          "title": "Memory Layout, Cache Lines, and False Sharing",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Why an array of structs can be 10x faster than a struct of arrays, or the reverse."
+        },
+        {
+          "n": 15,
+          "slug": "15-serialization-formats",
+          "title": "Serialization: JSON, Protobuf-style Binary, and Schema Evolution",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Hand-encode a varint and never fear a wire format again."
+        }
+      ]
+    },
+    {
+      "number": 4,
+      "slug": "04-concurrency",
+      "title": "Concurrency & Runtime Internals",
+      "motto": "Shared mutable state is where money goes missing.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-threads-and-the-memory-model",
+          "title": "Threads and the Memory Model",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Happens-before in the JVM, Go, and Python, and why a race is not a bug you can test for."
+        },
+        {
+          "n": 2,
+          "slug": "02-locks-and-atomic-counters",
+          "title": "Locks, Atomics, and a Balance That Never Lies",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Lose money with a race, then fix it three ways and measure each."
+        },
+        {
+          "n": 3,
+          "slug": "03-compare-and-swap-and-lock-free-structures",
+          "title": "Compare-and-Swap and Lock-Free Structures",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "A lock-free stack and the ABA problem that breaks it."
+        },
+        {
+          "n": 4,
+          "slug": "04-concurrent-hash-maps",
+          "title": "Concurrent Hash Maps: Striping and Lock-Free Reads",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "How ConcurrentHashMap and sync.Map avoid a global lock."
+        },
+        {
+          "n": 5,
+          "slug": "05-producers-consumers-and-bounded-queues",
+          "title": "Producers, Consumers, and Bounded Queues",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Backpressure begins with a queue that refuses to grow."
+        },
+        {
+          "n": 6,
+          "slug": "06-executors-goroutines-and-async",
+          "title": "Executors, Goroutines, and asyncio",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Three concurrency models, one fan-out/fan-in problem."
+        },
+        {
+          "n": 7,
+          "slug": "07-deadlocks-and-lock-ordering",
+          "title": "Deadlocks, Lock Ordering, and Detection",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Transfer from A to B while B transfers to A."
+        },
+        {
+          "n": 8,
+          "slug": "08-the-actor-model",
+          "title": "The Actor Model",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "One account, one mailbox, no locks."
+        },
+        {
+          "n": 9,
+          "slug": "09-jvm-gc-and-go-runtime",
+          "title": "JVM Garbage Collection and the Go Runtime",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Pause times are latency SLOs in disguise."
+        },
+        {
+          "n": 10,
+          "slug": "10-the-python-gil",
+          "title": "The Python GIL and Free-Threaded Python",
+          "type": "Learn",
+          "minutes": 45,
+          "hook": "What the GIL protects you from, and what it does not."
+        },
+        {
+          "n": 11,
+          "slug": "11-structured-concurrency-and-cancellation",
+          "title": "Structured Concurrency and Cancellation",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Context in Go, virtual threads in Java, task groups in Python."
+        },
+        {
+          "n": 12,
+          "slug": "12-testing-concurrent-code",
+          "title": "Testing Concurrent Code: Stress, Model Checking, and Determinism",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Make the scheduler your test input."
+        }
+      ]
+    },
+    {
+      "number": 5,
+      "slug": "05-distributed-foundations",
+      "title": "Distributed Systems Foundations",
+      "motto": "The network is not reliable, and the clock is lying.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-the-fallacies-of-distributed-computing",
+          "title": "The Fallacies of Distributed Computing",
+          "type": "Learn",
+          "minutes": 45,
+          "hook": "Eight assumptions that have each caused a payments outage."
+        },
+        {
+          "n": 2,
+          "slug": "02-failure-models",
+          "title": "Failure Models: Crash-Stop, Omission, Byzantine",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Which failures you tolerate determines which protocol you need."
+        },
+        {
+          "n": 3,
+          "slug": "03-lamport-and-vector-clocks",
+          "title": "Time, Order, and Clocks: Lamport and Vector Clocks",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Two events, two machines, no shared clock: who went first?"
+        },
+        {
+          "n": 4,
+          "slug": "04-physical-clocks-ntp-and-hybrid-logical-clocks",
+          "title": "Physical Clocks, NTP, and Hybrid Logical Clocks",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Clock skew is why your timestamps cannot order transactions."
+        },
+        {
+          "n": 5,
+          "slug": "05-consistency-models",
+          "title": "Consistency Models: Linearizability to Eventual",
+          "type": "Learn",
+          "minutes": 90,
+          "hook": "The hierarchy, with a history checker you can run."
+        },
+        {
+          "n": 6,
+          "slug": "06-cap-and-pacelc",
+          "title": "CAP, PACELC, and What They Actually Constrain",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Partition tolerance is not optional, so the choice is simpler than the triangle."
+        },
+        {
+          "n": 7,
+          "slug": "07-rpc-and-serialization",
+          "title": "RPC, Framing, and Serialization Over Raw Sockets",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Length-prefixed frames, request IDs, and a client that survives a half-open connection."
+        },
+        {
+          "n": 8,
+          "slug": "08-timeouts-and-deadlines",
+          "title": "Timeouts and Deadline Propagation",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "The downstream call that outlives its caller."
+        },
+        {
+          "n": 9,
+          "slug": "09-idempotency-keys",
+          "title": "Idempotency Keys: Exactly-Once Effects on At-Least-Once Networks",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "The single most important pattern in payments, with a store that handles concurrent duplicates."
+        },
+        {
+          "n": 10,
+          "slug": "10-retries-backoff-and-jitter",
+          "title": "Retries, Exponential Backoff, and Jitter",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Retry storms are self-inflicted outages; simulate one and then prevent it."
+        },
+        {
+          "n": 11,
+          "slug": "11-circuit-breakers-and-bulkheads",
+          "title": "Circuit Breakers and Bulkheads",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Fail fast when the processor is down instead of queueing a million timeouts."
+        },
+        {
+          "n": 12,
+          "slug": "12-leases-and-fencing-tokens",
+          "title": "Leases, Fencing Tokens, and Distributed Locks",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Why a lock with a timeout needs a monotonic token to be safe."
+        },
+        {
+          "n": 13,
+          "slug": "13-gossip-and-failure-detection",
+          "title": "Gossip Protocols and Failure Detection",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "SWIM-style membership without a coordinator."
+        }
+      ]
+    },
+    {
+      "number": 6,
+      "slug": "06-replication-and-consensus",
+      "title": "Replication & Consensus",
+      "motto": "Agreement is expensive. Know exactly what you are paying for.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-replication-strategies",
+          "title": "Replication: Leader-Based, Multi-Leader, Leaderless",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Who accepts writes decides how conflicts happen."
+        },
+        {
+          "n": 2,
+          "slug": "02-replication-lag-and-read-your-writes",
+          "title": "Replication Lag and Read-Your-Writes",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "A customer pays, refreshes, and sees no payment."
+        },
+        {
+          "n": 3,
+          "slug": "03-quorums",
+          "title": "Quorums: R + W > N and Its Limits",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Sloppy quorums, hinted handoff, and read repair."
+        },
+        {
+          "n": 4,
+          "slug": "04-paxos",
+          "title": "Single-Decree Paxos from Scratch",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Proposers, acceptors, and the two promises that make it safe."
+        },
+        {
+          "n": 5,
+          "slug": "05-raft-leader-election",
+          "title": "Raft I: Terms, Leader Election, and a Simulated Network",
+          "type": "Build",
+          "minutes": 150,
+          "hook": "Build the election with a deterministic network so you can replay every bug."
+        },
+        {
+          "n": 6,
+          "slug": "06-raft-log-replication",
+          "title": "Raft II: Log Replication and Commit",
+          "type": "Build",
+          "minutes": 150,
+          "hook": "AppendEntries, matchIndex, and the Log Matching property."
+        },
+        {
+          "n": 7,
+          "slug": "07-raft-safety-and-membership",
+          "title": "Raft III: Safety Proofs, Membership Changes, Snapshots",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Joint consensus and why you cannot just swap the config."
+        },
+        {
+          "n": 8,
+          "slug": "08-crdts",
+          "title": "CRDTs: Counters, Sets, and Convergence",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "A PN-counter for balances that can be reconciled without coordination."
+        },
+        {
+          "n": 9,
+          "slug": "09-conflict-resolution",
+          "title": "Conflict Resolution: LWW, Version Vectors, Merge Functions",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Last-writer-wins loses data by design."
+        },
+        {
+          "n": 10,
+          "slug": "10-chain-and-primary-backup",
+          "title": "Chain Replication and Primary-Backup",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Strong consistency with high read throughput."
+        },
+        {
+          "n": 11,
+          "slug": "11-byzantine-fault-tolerance",
+          "title": "Byzantine Fault Tolerance: PBFT in Outline",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "3f + 1 and why most payment systems do not need it."
+        },
+        {
+          "n": 12,
+          "slug": "12-linearizability-checking",
+          "title": "Linearizability Checking with Recorded Histories",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Prove your replicated register wrong with a history checker."
+        }
+      ]
+    },
+    {
+      "number": 7,
+      "slug": "07-storage-and-transactions",
+      "title": "Partitioning, Storage & Transactions",
+      "motto": "Durability is a promise; isolation is a contract.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-partitioning-and-rebalancing",
+          "title": "Partitioning Strategies and Rebalancing",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Range vs hash, hot keys, and moving a shard without downtime."
+        },
+        {
+          "n": 2,
+          "slug": "02-write-ahead-logs",
+          "title": "Write-Ahead Logs and Crash Recovery",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "fsync, torn writes, and a log you can replay after kill -9."
+        },
+        {
+          "n": 3,
+          "slug": "03-storage-engines",
+          "title": "Storage Engines: B-Tree vs LSM in Practice",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Read amplification, write amplification, space amplification."
+        },
+        {
+          "n": 4,
+          "slug": "04-isolation-levels-and-anomalies",
+          "title": "Isolation Levels and Their Anomalies",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Dirty reads, lost updates, write skew: produce each one on purpose."
+        },
+        {
+          "n": 5,
+          "slug": "05-two-phase-locking",
+          "title": "Two-Phase Locking and Deadlock Detection",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Serializable the old way."
+        },
+        {
+          "n": 6,
+          "slug": "06-mvcc-and-snapshot-isolation",
+          "title": "MVCC and Snapshot Isolation",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Readers never block writers, and the write-skew they let through."
+        },
+        {
+          "n": 7,
+          "slug": "07-serializable-snapshot-isolation",
+          "title": "Serializable Snapshot Isolation",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Detect the dangerous structure instead of locking."
+        },
+        {
+          "n": 8,
+          "slug": "08-two-phase-commit",
+          "title": "Two-Phase Commit and Its Blocking Problem",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Atomic across two ledgers, until the coordinator dies."
+        },
+        {
+          "n": 9,
+          "slug": "09-percolator-and-spanner-style-transactions",
+          "title": "Percolator and Spanner-Style Transactions",
+          "type": "Learn",
+          "minutes": 90,
+          "hook": "Timestamps as the coordinator."
+        },
+        {
+          "n": 10,
+          "slug": "10-secondary-indexes",
+          "title": "Secondary Indexes: Local vs Global",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Find all payments for a customer across shards."
+        },
+        {
+          "n": 11,
+          "slug": "11-change-data-capture",
+          "title": "Change Data Capture",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Turn the database log into an event stream."
+        },
+        {
+          "n": 12,
+          "slug": "12-saga-pattern",
+          "title": "The Saga Pattern: Compensations Instead of Locks",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Reserve funds, capture, ship, and undo in the right order when step three fails."
+        },
+        {
+          "n": 13,
+          "slug": "13-transactional-outbox",
+          "title": "The Transactional Outbox and Dual-Write Problem",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Commit the row and the event in one transaction or lose one of them."
+        },
+        {
+          "n": 14,
+          "slug": "14-schema-migrations-at-scale",
+          "title": "Schema Migrations at Scale: Expand, Migrate, Contract",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Change a ledger table without stopping payments."
+        }
+      ]
+    },
+    {
+      "number": 8,
+      "slug": "08-messaging-and-streams",
+      "title": "Messaging, Streams & Event-Driven Systems",
+      "motto": "The log is the database turned inside out.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-the-append-only-log",
+          "title": "The Append-Only Log: Partitions, Offsets, and Segments",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Build a Kafka-shaped log with files and offsets."
+        },
+        {
+          "n": 2,
+          "slug": "02-consumer-groups-and-rebalancing",
+          "title": "Consumer Groups, Offsets, and Rebalancing",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Who owns partition 7 after a consumer dies?"
+        },
+        {
+          "n": 3,
+          "slug": "03-delivery-guarantees",
+          "title": "At-Most-Once, At-Least-Once, and Effectively-Once",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Exactly-once delivery is impossible; exactly-once effects are engineering."
+        },
+        {
+          "n": 4,
+          "slug": "04-message-ordering-and-keys",
+          "title": "Message Ordering, Keys, and Head-of-Line Blocking",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Order per account, parallelism across accounts."
+        },
+        {
+          "n": 5,
+          "slug": "05-event-sourcing",
+          "title": "Event Sourcing: State as a Fold Over Events",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "An account is the sum of its events; a balance is a cache."
+        },
+        {
+          "n": 6,
+          "slug": "06-cqrs-and-projections",
+          "title": "CQRS and Projections",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Rebuild a read model from the log in one command."
+        },
+        {
+          "n": 7,
+          "slug": "07-stream-processing-windows",
+          "title": "Stream Processing: Tumbling, Sliding, and Session Windows",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Transactions per card per minute, computed as they arrive."
+        },
+        {
+          "n": 8,
+          "slug": "08-watermarks-and-late-data",
+          "title": "Watermarks, Event Time, and Late Data",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "The event happened at 11:59; it arrived at 12:03. Which window?"
+        },
+        {
+          "n": 9,
+          "slug": "09-backpressure",
+          "title": "Backpressure and Flow Control",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "The fast producer, the slow consumer, and the queue in between."
+        },
+        {
+          "n": 10,
+          "slug": "10-dead-letter-queues-and-poison-messages",
+          "title": "Dead-Letter Queues and Poison Messages",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "One malformed event must not stall every account behind it."
+        },
+        {
+          "n": 11,
+          "slug": "11-schema-registry-and-evolution",
+          "title": "Schema Registries and Compatible Evolution",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Add a field without breaking last month's consumer."
+        }
+      ]
+    },
+    {
+      "number": 9,
+      "slug": "09-reliability-and-scale",
+      "title": "Reliability, Observability & Scale",
+      "motto": "You cannot operate what you cannot observe.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-slis-slos-and-error-budgets",
+          "title": "SLIs, SLOs, and Error Budgets",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Availability is a number you choose and then pay for."
+        },
+        {
+          "n": 2,
+          "slug": "02-load-balancing-algorithms",
+          "title": "Load Balancing: Round Robin, Least Connections, Power of Two Choices",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Two random choices beat one by an exponential margin."
+        },
+        {
+          "n": 3,
+          "slug": "03-caching-strategies",
+          "title": "Caching Strategies: Cache-Aside, Write-Through, Write-Behind",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Stale balances are worse than slow balances."
+        },
+        {
+          "n": 4,
+          "slug": "04-cache-invalidation-and-stampedes",
+          "title": "Cache Invalidation, Stampedes, and Request Coalescing",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "A hot key expires and ten thousand requests hit the database."
+        },
+        {
+          "n": 5,
+          "slug": "05-distributed-rate-limiting",
+          "title": "Distributed Rate Limiting",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Token buckets across nodes without a coordinator."
+        },
+        {
+          "n": 6,
+          "slug": "06-metrics-and-histograms",
+          "title": "Metrics: Counters, Gauges, and Histograms Without Averages",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "p99 latency from a histogram you built."
+        },
+        {
+          "n": 7,
+          "slug": "07-distributed-tracing",
+          "title": "Distributed Tracing and Context Propagation",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Follow one payment across six services."
+        },
+        {
+          "n": 8,
+          "slug": "08-structured-logging",
+          "title": "Structured Logging and Log Correlation",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Every log line carries the payment ID or it is noise."
+        },
+        {
+          "n": 9,
+          "slug": "09-chaos-engineering",
+          "title": "Chaos Engineering and Fault Injection",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Kill the processor connection on purpose, in test."
+        },
+        {
+          "n": 10,
+          "slug": "10-capacity-planning-and-queueing-theory",
+          "title": "Capacity Planning and Queueing Theory",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Little's Law predicts your queue depth before you build it."
+        },
+        {
+          "n": 11,
+          "slug": "11-multi-region-and-disaster-recovery",
+          "title": "Multi-Region Architecture and Disaster Recovery",
+          "type": "Learn",
+          "minutes": 90,
+          "hook": "RPO, RTO, and the active-active ledger problem."
+        },
+        {
+          "n": 12,
+          "slug": "12-incident-response",
+          "title": "Incident Response and Blameless Postmortems",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "The runbook you write before the pager goes off."
+        },
+        {
+          "n": 13,
+          "slug": "13-graceful-degradation",
+          "title": "Graceful Degradation and Load Shedding",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Keep accepting payments when fraud scoring is down."
+        }
+      ]
+    },
+    {
+      "number": 10,
+      "slug": "10-money-and-ledgers",
+      "title": "Money & Ledgers",
+      "motto": "A ledger is a data structure with a legal obligation.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-representing-money",
+          "title": "Representing Money: Minor Units, Currencies, and Rounding",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "A Money type that makes 0.1 + 0.2 impossible to get wrong."
+        },
+        {
+          "n": 2,
+          "slug": "02-currency-and-fx",
+          "title": "Currencies, Exchange Rates, and FX Conversion",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "ISO 4217, exponents, and where the rounding residue goes."
+        },
+        {
+          "n": 3,
+          "slug": "03-double-entry-ledger",
+          "title": "The Double-Entry Ledger from Scratch",
+          "type": "Build",
+          "minutes": 150,
+          "hook": "Debits equal credits or the entry does not exist."
+        },
+        {
+          "n": 4,
+          "slug": "04-chart-of-accounts",
+          "title": "Chart of Accounts and Account Types",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Assets, liabilities, revenue: which direction increases each."
+        },
+        {
+          "n": 5,
+          "slug": "05-balances-and-snapshots",
+          "title": "Balances, Running Totals, and Snapshots",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Sum a million postings in milliseconds without summing a million postings."
+        },
+        {
+          "n": 6,
+          "slug": "06-immutability-and-reversals",
+          "title": "Immutability, Reversals, and Corrections",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "You never update a posting; you post its opposite."
+        },
+        {
+          "n": 7,
+          "slug": "07-holds-and-available-balance",
+          "title": "Holds, Pending Transactions, and Available Balance",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Authorized is not settled; available is not ledger balance."
+        },
+        {
+          "n": 8,
+          "slug": "08-reconciliation",
+          "title": "Reconciliation: Matching Your Ledger Against Theirs",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "The processor says 10,000 transactions; you have 9,998. Find the two."
+        },
+        {
+          "n": 9,
+          "slug": "09-multi-currency-ledgers",
+          "title": "Multi-Currency Ledgers and Revaluation",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "One ledger, many currencies, no mixing."
+        },
+        {
+          "n": 10,
+          "slug": "10-fees-and-splits",
+          "title": "Fees, Splits, and Platform Payments",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Marketplace payouts with fee allocation that always sums."
+        },
+        {
+          "n": 11,
+          "slug": "11-ledger-concurrency",
+          "title": "Ledger Concurrency: Hot Accounts and Balance Checks",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Ten thousand payments into one merchant account per second."
+        },
+        {
+          "n": 12,
+          "slug": "12-audit-trails-and-financial-close",
+          "title": "Audit Trails, Trial Balance, and Financial Close",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "What the auditor asks for and how the ledger answers."
+        }
+      ]
+    },
+    {
+      "number": 11,
+      "slug": "11-payment-rails",
+      "title": "Payment Rails & Card Networks",
+      "motto": "Every rail is a protocol, a rulebook, and a settlement cycle.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-how-a-card-payment-works",
+          "title": "How a Card Payment Works: Issuer, Acquirer, Network, Processor",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Follow one tap through seven parties in two seconds."
+        },
+        {
+          "n": 2,
+          "slug": "02-card-authorization-lifecycle",
+          "title": "Authorization, Capture, Void, Refund: The Card Lifecycle State Machine",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Partial captures, incremental auths, and the states that make or lose money."
+        },
+        {
+          "n": 3,
+          "slug": "03-iso-8583",
+          "title": "ISO 8583: Parsing the Card Network Message",
+          "type": "Build",
+          "minutes": 150,
+          "hook": "MTI, bitmaps, and data elements, parsed from raw bytes."
+        },
+        {
+          "n": 4,
+          "slug": "04-pan-luhn-and-bin-ranges",
+          "title": "PANs, Luhn, and BIN Range Routing",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Validate a card number and route it to the right network."
+        },
+        {
+          "n": 5,
+          "slug": "05-tokenization-and-pci-scope",
+          "title": "Tokenization and PCI DSS Scope Reduction",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Never store the PAN; here is what you store instead."
+        },
+        {
+          "n": 6,
+          "slug": "06-3ds-and-strong-customer-authentication",
+          "title": "3-D Secure and Strong Customer Authentication",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Frictionless vs challenge flows and liability shift."
+        },
+        {
+          "n": 7,
+          "slug": "07-interchange-and-scheme-fees",
+          "title": "Interchange, Scheme Fees, and Merchant Pricing",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Who gets paid on a $100 transaction, to the cent."
+        },
+        {
+          "n": 8,
+          "slug": "08-ach-and-nacha",
+          "title": "ACH and the NACHA File Format",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Fixed-width records, batch headers, and returns that arrive days later."
+        },
+        {
+          "n": 9,
+          "slug": "09-sepa-and-iso-20022",
+          "title": "SEPA, Wires, and ISO 20022 (pain.001, pacs.008)",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "The XML message format the whole world is migrating to."
+        },
+        {
+          "n": 10,
+          "slug": "10-real-time-payments",
+          "title": "Real-Time Payments: RTP, FedNow, UPI, Faster Payments",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Irrevocable in seconds changes every fraud control."
+        },
+        {
+          "n": 11,
+          "slug": "11-iban-bic-and-account-validation",
+          "title": "IBAN, BIC, and Account Number Validation",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Mod-97 and country-specific BBAN rules."
+        },
+        {
+          "n": 12,
+          "slug": "12-wallets-and-stored-value",
+          "title": "Wallets, Stored Value, and E-Money Regulation",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "A wallet balance is a liability on your books."
+        },
+        {
+          "n": 13,
+          "slug": "13-open-banking-and-account-aggregation",
+          "title": "Open Banking: OAuth Consent, Account Aggregation, and Data Access",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Consent flows, token refresh, and the aggregator SDK pattern."
+        },
+        {
+          "n": 14,
+          "slug": "14-bank-statements-and-formats",
+          "title": "Bank Statement Formats: MT940, CAMT.053, BAI2, OFX",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Parse what the bank sends you before you can reconcile it."
+        },
+        {
+          "n": 15,
+          "slug": "15-settlement-and-clearing",
+          "title": "Settlement and Clearing: Gross, Net, and Deferred",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "When the money actually moves, and why T+1 exists."
+        }
+      ]
+    },
+    {
+      "number": 12,
+      "slug": "12-payment-systems-design",
+      "title": "Payment Systems Design",
+      "motto": "Correctness first, then availability, then everything else.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-idempotent-payment-api",
+          "title": "Designing an Idempotent Payment API",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Idempotency keys, request fingerprints, and concurrent duplicates."
+        },
+        {
+          "n": 2,
+          "slug": "02-payment-state-machine",
+          "title": "The Payment State Machine",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Every transition is explicit, persisted, and reversible or terminal."
+        },
+        {
+          "n": 3,
+          "slug": "03-payment-orchestration",
+          "title": "Payment Orchestration Across Processors",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "A saga with real compensations and a dead-letter path."
+        },
+        {
+          "n": 4,
+          "slug": "04-smart-routing-and-retries",
+          "title": "Smart Routing, Cascading, and Retry Policies",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Which processor, which retry, and when to stop."
+        },
+        {
+          "n": 5,
+          "slug": "05-webhooks-and-callbacks",
+          "title": "Webhooks: Signing, Delivery, Ordering, and Replay",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "HMAC signatures, at-least-once delivery, and consumers that dedupe."
+        },
+        {
+          "n": 6,
+          "slug": "06-refunds-and-partial-refunds",
+          "title": "Refunds, Partial Refunds, and Refund Windows",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Refund more than captured and the ledger must say no."
+        },
+        {
+          "n": 7,
+          "slug": "07-disputes-and-chargebacks",
+          "title": "Disputes and Chargebacks: The Lifecycle and the Evidence",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "A state machine that runs for 120 days."
+        },
+        {
+          "n": 8,
+          "slug": "08-payouts-and-balance-management",
+          "title": "Payouts, Balances, and Negative Balance Handling",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Pay the merchant out of funds that have actually settled."
+        },
+        {
+          "n": 9,
+          "slug": "09-limits-and-velocity-controls",
+          "title": "Limits, Velocity Controls, and Exposure",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Per-card, per-merchant, per-day, in a sliding window."
+        },
+        {
+          "n": 10,
+          "slug": "10-payment-method-abstraction",
+          "title": "Payment Method Abstraction and Processor Adapters",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "One interface, nine rails, no leaking of processor quirks."
+        },
+        {
+          "n": 11,
+          "slug": "11-recurring-and-subscriptions",
+          "title": "Recurring Payments, Subscriptions, and Dunning",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Billing cycles, proration, and the retry schedule that recovers revenue."
+        },
+        {
+          "n": 12,
+          "slug": "12-currency-conversion-at-checkout",
+          "title": "Currency Conversion at Checkout and DCC",
+          "type": "Build",
+          "minutes": 60,
+          "hook": "Who bears FX risk and when the rate is locked."
+        },
+        {
+          "n": 13,
+          "slug": "13-api-design-for-money",
+          "title": "API Design for Money: Versioning, Pagination, and Error Semantics",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "A 500 on a payment is ambiguous; design so clients can recover."
+        },
+        {
+          "n": 14,
+          "slug": "14-testing-payment-systems",
+          "title": "Testing Payment Systems: Simulators, Property Tests, and Invariants",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Money is conserved; let the computer try to break that."
+        }
+      ]
+    },
+    {
+      "number": 13,
+      "slug": "13-risk-fraud-and-compliance",
+      "title": "Risk, Fraud & Compliance",
+      "motto": "Every control is a trade between fraud losses and good customers lost.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-fraud-patterns",
+          "title": "Fraud Patterns: Card Testing, Account Takeover, Friendly Fraud",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Know the attack before you build the defense."
+        },
+        {
+          "n": 2,
+          "slug": "02-rules-engine-and-velocity-checks",
+          "title": "A Rules Engine with Velocity Checks",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Declarative rules, sliding-window counters, and explainable decisions."
+        },
+        {
+          "n": 3,
+          "slug": "03-risk-scoring-and-thresholds",
+          "title": "Risk Scoring, Thresholds, and Precision-Recall Trade-offs",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "A score is useless without the threshold decision."
+        },
+        {
+          "n": 4,
+          "slug": "04-sanctions-screening",
+          "title": "Sanctions Screening: Name Matching Under Uncertainty",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Jaro-Winkler, phonetic keys, and the false-positive flood."
+        },
+        {
+          "n": 5,
+          "slug": "05-kyc-and-identity-verification",
+          "title": "KYC, CIP, and Identity Verification Flows",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "Who you are allowed to pay."
+        },
+        {
+          "n": 6,
+          "slug": "06-aml-transaction-monitoring",
+          "title": "AML Transaction Monitoring and Structuring Detection",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Ten deposits of $9,900."
+        },
+        {
+          "n": 7,
+          "slug": "07-device-fingerprinting-and-signals",
+          "title": "Device Fingerprinting and Behavioral Signals",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "What the browser tells you and what it lies about."
+        },
+        {
+          "n": 8,
+          "slug": "08-pci-dss-for-engineers",
+          "title": "PCI DSS for Engineers",
+          "type": "Learn",
+          "minutes": 75,
+          "hook": "The twelve requirements, translated into architecture."
+        },
+        {
+          "n": 9,
+          "slug": "09-psd2-sca-and-regional-regulation",
+          "title": "PSD2, SCA, and Regional Regulation",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Exemptions, TRA, and when a challenge is mandatory."
+        },
+        {
+          "n": 10,
+          "slug": "10-data-privacy-and-retention",
+          "title": "Data Privacy, Retention, and Right to Erasure in Financial Systems",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Delete the customer but keep the audit trail."
+        },
+        {
+          "n": 11,
+          "slug": "11-auditability-and-evidence",
+          "title": "Auditability: Immutable Logs and Evidence Bundles",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Hash-chained decision logs a regulator can verify."
+        }
+      ]
+    },
+    {
+      "number": 14,
+      "slug": "14-payments-at-scale",
+      "title": "Payments at Scale",
+      "motto": "At scale, every rare bug is a daily event.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-high-availability-payment-gateway",
+          "title": "Architecture of a High-Availability Payment Gateway",
+          "type": "Learn",
+          "minutes": 90,
+          "hook": "Stateless edges, durable cores, and where the idempotency store lives."
+        },
+        {
+          "n": 2,
+          "slug": "02-multi-region-ledgers",
+          "title": "Multi-Region Ledgers and Home-Region Routing",
+          "type": "Learn",
+          "minutes": 90,
+          "hook": "An account lives somewhere; route to it."
+        },
+        {
+          "n": 3,
+          "slug": "03-exactly-once-money-movement",
+          "title": "Exactly-Once Money Movement End to End",
+          "type": "Build",
+          "minutes": 150,
+          "hook": "Idempotency, outbox, consumer dedupe, and a ledger that cannot double-post."
+        },
+        {
+          "n": 4,
+          "slug": "04-reconciliation-at-scale",
+          "title": "Reconciliation at Scale: Streams, Buckets, and Breaks",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Match a billion records a day and surface the breaks."
+        },
+        {
+          "n": 5,
+          "slug": "05-batch-vs-real-time-settlement",
+          "title": "Batch vs Real-Time Settlement Pipelines",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "The nightly job that moves the actual money."
+        },
+        {
+          "n": 6,
+          "slug": "06-observability-for-money-movement",
+          "title": "Observability for Money Movement",
+          "type": "Build",
+          "minutes": 90,
+          "hook": "Metrics that detect a stuck payment before a customer does."
+        },
+        {
+          "n": 7,
+          "slug": "07-payment-incident-management",
+          "title": "Incident Management for Payments",
+          "type": "Learn",
+          "minutes": 60,
+          "hook": "Stop the bleeding, then reconcile."
+        },
+        {
+          "n": 8,
+          "slug": "08-cost-and-authorization-optimization",
+          "title": "Cost and Authorization-Rate Optimization",
+          "type": "Build",
+          "minutes": 75,
+          "hook": "Network tokens, retries, and routing that lifts approvals."
+        },
+        {
+          "n": 9,
+          "slug": "09-ledger-migrations",
+          "title": "Migrating a Live Ledger",
+          "type": "Learn",
+          "minutes": 90,
+          "hook": "Dual-write, shadow-read, cut over, and prove the balances match."
+        },
+        {
+          "n": 10,
+          "slug": "10-simulation-testing-of-payment-systems",
+          "title": "Deterministic Simulation Testing of Payment Systems",
+          "type": "Build",
+          "minutes": 120,
+          "hook": "Run a year of payments in a minute with a seeded network."
+        },
+        {
+          "n": 11,
+          "slug": "11-payments-system-design-interviews",
+          "title": "Payments System Design: Interview Patterns",
+          "type": "Learn",
+          "minutes": 90,
+          "hook": "Design a payment system in 45 minutes, with the questions interviewers actually ask."
+        }
+      ]
+    },
+    {
+      "number": 15,
+      "slug": "15-capstone-projects",
+      "title": "Capstone Projects",
+      "motto": "Build the platform, keep the evidence.",
+      "lessons": [
+        {
+          "n": 1,
+          "slug": "01-capstone-ledger-service",
+          "title": "Capstone: A Durable Double-Entry Ledger Service",
+          "type": "Capstone",
+          "minutes": 480,
+          "hook": "WAL, snapshots, multi-currency, reconciliation, and an API."
+        },
+        {
+          "n": 2,
+          "slug": "02-capstone-payment-gateway",
+          "title": "Capstone: An Idempotent Multi-Processor Payment Gateway",
+          "type": "Capstone",
+          "minutes": 480,
+          "hook": "Idempotency, state machine, routing, webhooks, and simulators."
+        },
+        {
+          "n": 3,
+          "slug": "03-capstone-replicated-kv-store",
+          "title": "Capstone: A Raft-Replicated Key-Value Store",
+          "type": "Capstone",
+          "minutes": 480,
+          "hook": "Election, replication, snapshots, and a linearizability checker."
+        },
+        {
+          "n": 4,
+          "slug": "04-capstone-event-sourced-wallet",
+          "title": "Capstone: An Event-Sourced Wallet with CQRS",
+          "type": "Capstone",
+          "minutes": 360,
+          "hook": "Commands, events, projections, and replay."
+        },
+        {
+          "n": 5,
+          "slug": "05-capstone-fraud-decisioning",
+          "title": "Capstone: Real-Time Fraud Decisioning",
+          "type": "Capstone",
+          "minutes": 360,
+          "hook": "Streams, windows, rules, scores, and explainable decisions."
+        },
+        {
+          "n": 6,
+          "slug": "06-capstone-reconciliation-engine",
+          "title": "Capstone: A Reconciliation Engine",
+          "type": "Capstone",
+          "minutes": 360,
+          "hook": "Parse statements, match, surface breaks, and report."
+        },
+        {
+          "n": 7,
+          "slug": "07-capstone-settlement-pipeline",
+          "title": "Capstone: A Settlement and Payout Pipeline",
+          "type": "Capstone",
+          "minutes": 360,
+          "hook": "Net, batch, file, and pay out, with a ledger that balances."
+        },
+        {
+          "n": 8,
+          "slug": "08-capstone-end-to-end-payments-platform",
+          "title": "Capstone: End-to-End Payments Platform",
+          "type": "Capstone",
+          "minutes": 720,
+          "hook": "Compose everything you built into one system you can demo."
+        }
+      ]
+    }
+  ]
+}

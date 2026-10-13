@@ -1,0 +1,78 @@
+{
+  "lesson": "06-capstone-reconciliation-engine",
+  "title": "Capstone: A Reconciliation Engine",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A finance analyst reconciles the acquirer's settlement file against the ledger with a spreadsheet VLOOKUP on amount. Which failure is guaranteed to appear on a busy day, independent of her care?",
+      "options": [
+        "Refunds and sales of the same amount are paired with each other because amount is not a unique key",
+        "The spreadsheet rounds every amount to two decimals and loses sub-cent fee precision",
+        "The acquirer's file is rejected because its control totals do not match",
+        "Lines are matched to the wrong day because VLOOKUP ignores the date column"
+      ],
+      "correct": 0,
+      "explanation": "Amounts cluster (9.99, 19.99, 49.00), so matching on amount alone pairs unrelated movements as soon as volume rises; this is the 97 mis-matched refunds in the Problem section. The date problem is real too but is a consequence of the same single-key lookup, and control totals are a parser concern that a spreadsheet never checks at all."
+    },
+    {
+      "stage": "check",
+      "question": "The MT940 line `:61:2603030303RD125,00NTRF...` is parsed. What sign does the normalized amount carry and why?",
+      "options": [
+        "Negative, because D means debit",
+        "Positive, because RD is a reversal of a debit, which credits the account",
+        "Negative, because reversals keep the sign of the original movement",
+        "Zero, because a reversal nets against the original line in the same file"
+      ],
+      "correct": 1,
+      "explanation": "Requirement 1 normalizes signs so that a credit to the statement account is positive, and the RC and RD marks flip the original type: a reversed debit puts money back, so it is positive. The parser never nets lines against each other; netting is the matcher's job in pass 3."
+    },
+    {
+      "stage": "check",
+      "question": "In pass 2, a reference-less statement line of 49.99 on 2026-03-03 has two candidate postings of 49.99: p-0001 dated 2026-03-04 and p-0002 dated 2026-03-03. Which is matched, and what happens to the other?",
+      "options": [
+        "p-0001, because lower ids win ties, and p-0002 goes to pass 3",
+        "Both are matched as an aggregate because their sum is within tolerance",
+        "p-0002, because date distance is compared before id, and p-0001 stays unmatched",
+        "Neither, because two candidates make the match ambiguous and both become breaks"
+      ],
+      "correct": 2,
+      "explanation": "Requirement 6 fixes the tie-break order: smallest date distance first, then posting id. p-0002 is zero days away and wins; p-0001 remains an unmatched posting for pass 3 or the classifier. Aggregation only applies when a group's sum equals the line, and 99.98 does not."
+    },
+    {
+      "stage": "check",
+      "question": "The acquirer settles 1,000 sales of 10.00 net of 129.70 in fees as one statement line of 9,870.30. Which pass matches it, and what is the invariant the match must preserve?",
+      "options": [
+        "Pass 1, by the batch reference the acquirer prints in the :86: field, consuming one posting",
+        "Pass 2, because 9,870.30 equals the sum of the ledger's sales postings within tolerance",
+        "No pass; the line is an IN_STATEMENT_NOT_LEDGER break until finance posts a fee entry",
+        "Pass 3, grouping 2,000 postings by batch tag whose sum equals the line, consuming all of them"
+      ],
+      "correct": 3,
+      "explanation": "No single posting equals 9,870.30, so passes 1 and 2 find nothing. Pass 3 groups the 1,000 sales and 1,000 fee postings by their batch tag, sums to exactly 9,870.30, and consumes the whole group, so Requirement 7's every-item-in-one-bucket identity still holds. Pass 2 compares single postings, not sums."
+    },
+    {
+      "stage": "post",
+      "question": "On day 1 the engine opens an IN_STATEMENT_NOT_LEDGER break for a line with no counterpart. On day 3 the ledger contains the posting. The engine crashes after writing day 3's result but before updating the carry-forward store, and is re-run. What must the second run produce?",
+      "options": [
+        "A second resolution record, so the break appears resolved twice in the history and the report double counts it",
+        "The identical result, with the break resolved once on day 3, because the store write is keyed on (breakId, resolvedOn)",
+        "A new IN_LEDGER_NOT_STATEMENT break, because the posting is now matched against both day 1 and day 3 lines",
+        "A TIE_OUT_FAILED error, because the first run's result already consumed the line and nothing is left to match"
+      ],
+      "correct": 1,
+      "explanation": "M3 step 3 tests exactly this crash. Keying resolution on (breakId, resolvedOn) makes the store write idempotent, so a re-run converges on one resolution. The input files are unchanged, so matching is deterministic and the tie-out holds; nothing in the result of run one is an input to run two except the open-break set loaded from the store."
+    },
+    {
+      "stage": "post",
+      "question": "Which identity catches an engine bug where pass 3 consumes a statement line but forgets to consume its postings?",
+      "options": [
+        "opening + matched lines + unmatched lines == closing, which fails because the aggregate line is counted on both sides",
+        "The control-total check in the NACHA parser, which rejects the file because the entry hash no longer agrees",
+        "ledger movement plus ledger-only breaks minus statement-only breaks plus mismatches == statement movement, off by the aggregate",
+        "matched lines + break lines == statement lines, which fails because the aggregate line sits in two buckets at once"
+      ],
+      "correct": 2,
+      "explanation": "The first identity partitions only the statement side and still holds, because the line is in exactly one bucket. The bug leaves 2,000 postings unconsumed, so they surface as IN_LEDGER_NOT_STATEMENT and the ledger-versus-statement movement identity is off by 9,870.30; that is the discrepancy M6 step 2 asserts. The parser never sees matcher state."
+    }
+  ]
+}

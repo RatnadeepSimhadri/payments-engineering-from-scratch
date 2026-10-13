@@ -1,0 +1,78 @@
+{
+  "lesson": "11-rate-limiter-algorithms",
+  "title": "Rate Limiter Algorithms: Token Bucket, Leaky Bucket, Sliding Window",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A payment gateway's downstream acquirer starts timing out 8% of requests, and within ninety seconds the gateway's inbound traffic is six times normal. What is the most likely mechanism?",
+      "options": [
+        "Customers notice the slowness and submit more payments to compensate for the ones they believe were lost",
+        "The gateway's own health checks increase in frequency during degradation and count as inbound traffic",
+        "Merchant integrations retry timed-out requests, many immediately and some in a loop, multiplying load on the failing component",
+        "The acquirer sends duplicate responses for every slow request and the gateway counts each one as a new inbound request"
+      ],
+      "correct": 2,
+      "explanation": "This is a retry storm: each timed-out request is retried by the client, often several times and without backoff, so the component that is already degraded receives a multiple of its normal load, mostly duplicates of requests still in flight. Customers and health checks do not scale traffic sixfold in ninety seconds, and acquirer responses are not inbound requests."
+    },
+    {
+      "stage": "check",
+      "question": "A token bucket has capacity 5 and refills at 2 tokens per second. After five requests drain it at t=0, a sixth request arrives. What does the limiter return?",
+      "options": [
+        "Denied, with Retry-After 500 ms, the time until one whole token has accumulated",
+        "Denied, with Retry-After 2500 ms, the time until the bucket is full again",
+        "Allowed, because the refill of the next 500 ms is credited in advance",
+        "Denied, with Retry-After 1000 ms, because Retry-After is always at least one second"
+      ],
+      "correct": 0,
+      "explanation": "The deficit is one token and the rate is 2 per second, so one token arrives in 500 ms; Retry-After is the time to the next admission, not to a full bucket. Nothing is credited in advance. The header is rounded up to whole seconds (so the client sees Retry-After: 1), but the limiter's own value is the exact 500 ms."
+    },
+    {
+      "stage": "check",
+      "question": "Limit 10 per second. Ten requests arrive between t=950 and t=995 ms and ten more between t=1000 and t=1045 ms. How many does a fixed window admit, and how many does a sliding window log admit?",
+      "options": [
+        "Fixed window 10, sliding log 10",
+        "Fixed window 20, sliding log 10",
+        "Fixed window 10, sliding log 20",
+        "Fixed window 20, sliding log 20"
+      ],
+      "correct": 1,
+      "explanation": "The fixed window's counter resets at t=1000, so both batches of ten are admitted: twenty requests in 100 ms against a limit of ten per second. The sliding log still holds the ten timestamps from 950 to 995 at t=1000, none of them older than one second, so every request in the second batch is denied. This is the boundary problem, and it is why the fixed window is only acceptable where a 2x overshoot does not matter."
+    },
+    {
+      "stage": "check",
+      "question": "In the retry-storm replay, the leaky bucket shaper admitted 11 of the 40 burst requests yet never exceeded 10 admissions in any one-second window, while the token bucket admitted 10 of the burst and reached 19 in one second. Why?",
+      "options": [
+        "The leaky bucket counts admissions by processing time and releases queued requests one per interval, so output is spaced",
+        "The leaky bucket has a smaller effective capacity than the token bucket at the same nominal rate, so it admits fewer per second",
+        "The token bucket's refill was misconfigured to 19 tokens per second in the demo, which inflated its one-second count",
+        "The leaky bucket silently drops queued requests that would exceed the per-second ceiling instead of counting them as admitted"
+      ],
+      "correct": 0,
+      "explanation": "A shaper bounds the output rate: admitted requests leave one every 100 ms, so the replay's measurement of processing times never finds more than 10 in a second, at the cost of a 995 ms queueing delay. A token bucket bounds admissions, and its one-second ceiling is capacity plus refill, 10 + 9 steady requests here. Both were configured for 10 per second; nothing was dropped silently and nothing was misconfigured."
+    },
+    {
+      "stage": "post",
+      "question": "You are choosing a limiter for an inbound POST /payments endpoint serving 50,000 merchants whose traffic is legitimately bursty. Which choice does the lesson's analysis support?",
+      "options": [
+        "A sliding window log per merchant, because exactness is worth the O(limit) timestamps per merchant even at 50,000 merchants",
+        "A leaky bucket shaper per merchant, because a smooth output rate protects the acquirer best and queueing delay is acceptable",
+        "A fixed window per merchant, because the 2x boundary overshoot is bounded, the state is two numbers, and it distributes trivially",
+        "A token bucket per merchant: bursts up to a known capacity are admitted, the overshoot is bounded, and state is two numbers"
+      ],
+      "correct": 3,
+      "explanation": "The token bucket admits legitimate bursts, bounds the one-second ceiling at capacity plus rate, costs two longs per merchant, distributes well, and reports an exact Retry-After. The shaper adds up to a queue's worth of latency to every request after a burst, which an authorization path cannot afford. The log is exact but O(limit) per merchant across 50,000 merchants, and the fixed window's overshoot is predictable by clients and therefore exploitable."
+    },
+    {
+      "stage": "post",
+      "question": "After deploying a rate limiter, a teammate says retries are now safe because duplicates are throttled. What does the lesson say is still missing?",
+      "options": [
+        "Nothing: a limiter with an honest Retry-After makes an admitted retry equivalent to the original request in every way that matters",
+        "Idempotency keys so an admitted retry replays the stored result instead of charging again, and jittered client backoff",
+        "A sliding window log instead of a token bucket, because only an exact limiter can guarantee that no duplicate charge is admitted",
+        "A shorter Retry-After, so clients retry before the original request can complete and the duplicate is rejected as in flight"
+      ],
+      "correct": 1,
+      "explanation": "A limiter makes retries rarer, not safe: an admitted retry still re-executes, and if the first attempt succeeded after the client timed out, the customer is charged twice unless an idempotency key turns the retry into a replay. And a Retry-After is a floor, not a schedule; without jitter, every client denied at the same instant retries at the same instant and produces the next burst. The choice of algorithm does not change either fact."
+    }
+  ]
+}

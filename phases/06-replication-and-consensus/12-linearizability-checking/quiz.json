@@ -1,0 +1,78 @@
+{
+  "lesson": "12-linearizability-checking",
+  "title": "Linearizability Checking with Recorded Histories",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Client A's write of x=5 returned at time 10. Client B's read of x was invoked at time 12 and returned 3, the previous value. Which statement is correct?",
+      "options": [
+        "The history is linearizable because the two clients never coordinated with each other",
+        "The history is linearizable if B's read happened to be served by a replica that was still correct",
+        "The history is not linearizable, because a read invoked after a write returned must observe it",
+        "The history is linearizable as long as B eventually reads 5 on a later attempt"
+      ],
+      "correct": 2,
+      "explanation": "Linearizability respects real time: A's write completed before B's read began, so any valid sequential order puts the write first and the read must return 5 or a later value. Which replica served the read is an implementation detail the definition does not see; eventual convergence is a weaker property."
+    },
+    {
+      "stage": "check",
+      "question": "Write(x=1) occupies [0,10] and a read of x returning 0 occupies [5,15]. The checker accepts the history. Why?",
+      "options": [
+        "Because the intervals overlap, the read may be linearized before the write at a point inside both intervals",
+        "Because reads of the initial value are always accepted regardless of concurrent writes",
+        "Because the read returned later than the write and so is ordered after it in real time",
+        "Because the checker only compares values and ignores timestamps when it finds a mismatch"
+      ],
+      "correct": 0,
+      "explanation": "Neither operation returned before the other was invoked, so real time imposes no order and the search may try the read first; from the initial state a read of 0 is legal. Returning later does not order an operation after another; only returning before the other's invocation does. If the read had been invoked at 11, after the write returned, the history would fail."
+    },
+    {
+      "stage": "check",
+      "question": "In the Wing-Gong search, which not-yet-linearized operation may be chosen next under the LINEARIZABLE rule?",
+      "options": [
+        "The one with the earliest invocation timestamp among those remaining",
+        "Any one that no remaining operation returned before it was invoked",
+        "Any one whose client has no other operation still remaining",
+        "The one whose result the specification accepts from the current state"
+      ],
+      "correct": 1,
+      "explanation": "An operation is minimal when nothing still unlinearized precedes it in real time; several overlapping operations can all be minimal, which is where the search branches. Earliest invocation is too strict (it would forbid valid reorderings of concurrent ops), the client rule is the SEQUENTIAL variant, and specification acceptance is checked after minimality, not instead of it."
+    },
+    {
+      "stage": "check",
+      "question": "What does the (linearized set, state) memo rely on to be correct?",
+      "options": [
+        "That every operation in the history has a distinct value, so states never repeat",
+        "That the history has at most 64 operations, so the bitmask comparison is exact",
+        "That the model is deterministic, so the same set reached in any order gives the same remaining problem",
+        "That operations of the same client are linearized in program order, so the set determines the order"
+      ],
+      "correct": 2,
+      "explanation": "Whether the remaining operations can be linearized depends only on which ones remain and the specification's current state, not on how that state was reached; if one order from a configuration failed, every order will. The 64-op cap is an implementation convenience for the bitmask, not what makes the memo sound, and repeated values are exactly the case where the memo helps most."
+    },
+    {
+      "stage": "post",
+      "question": "A history has one write and one read by different clients: write(x=7) [0,4] then read(x) returning 0 [6,8]. Which verdicts does the checker give?",
+      "options": [
+        "Linearizable yes, sequentially consistent yes: the read may be placed before the write",
+        "Linearizable no, sequentially consistent yes: real time forbids the order the client rule allows",
+        "Linearizable no, sequentially consistent no: a read of a stale value is always a violation",
+        "Linearizable yes, sequentially consistent no: different clients break program order"
+      ],
+      "correct": 1,
+      "explanation": "The write returned at 4 and the read was invoked at 6, so linearizability forces write-then-read, and a read of 0 after a write of 7 is rejected. Sequential consistency only constrains operations of the same client; these are different clients, so read-then-write is allowed and legal. This is the exact signature of a lagging replica serving reads."
+    },
+    {
+      "stage": "post",
+      "question": "The checker reports 'NO' on a 30-operation history recorded from a Raft cluster whose log replication passed every Lesson 06 test. What is the most likely explanation?",
+      "options": [
+        "The Raft log replication has a latent bug that the Lesson 06 invariant checks did not detect",
+        "The checker's 64-operation limit was exceeded and the result is meaningless",
+        "The read path returned state from a replica without confirming it had applied all committed entries",
+        "Two of the clients used different clocks and the history must be sequentially consistent instead"
+      ],
+      "correct": 2,
+      "explanation": "A correct Raft log makes the committed sequence linearizable, but a read that bypasses it (served from a follower's or a deposed leader's state machine) can return a value older than an acknowledged write; the fix is ReadIndex or lease reads. Thirty ops is under the limit, and clock skew would be a reason to widen intervals, not to change the consistency model being claimed."
+    }
+  ]
+}

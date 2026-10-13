@@ -1,0 +1,78 @@
+{
+  "lesson": "07-decimal-and-integer-arithmetic",
+  "title": "Decimal and Integer Arithmetic in Three Runtimes",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "In Java, Python, and Go, what does `(long)(19.99 * 100)` (or its int cast equivalent) evaluate to, and why?",
+      "options": [
+        "1999, because the multiplication is exact for any price with two decimal places",
+        "1998, because the nearest double to 19.99 times 100 is 1998.9999999999998 and the cast truncates",
+        "2000, because the runtime rounds the product up to the nearest representable integer",
+        "It depends on the language, because each runtime has its own floating-point format"
+      ],
+      "correct": 1,
+      "explanation": "19.99 is not representable in binary64; the nearest double is slightly below it, the product rounds to 1998.9999999999998, and the cast truncates toward zero. All three languages use the same IEEE 754 hardware, so all three give 1998. Not every price fails this way (10.10 * 100 happens to round to 1010.0), which is what makes the bug intermittent."
+    },
+    {
+      "stage": "check",
+      "question": "Adding 0.01 to a double a million times gives 10000.0000001719. Rounding the hundred ties 0.5, 1.5, ..., 99.5 with HALF_UP gives a sum 50 too high. How do these two errors differ?",
+      "options": [
+        "They are the same phenomenon: both come from the binary representation of decimal fractions in binary64",
+        "Both are artefacts of printing with limited precision, and both disappear when the values are shown with more significant digits",
+        "The first is bias from the rounding rule applied to each addition; the second is accumulation error from repeated inexact floating-point rounding",
+        "The first is accumulation error from the float format; the second is bias from the rounding rule and appears even with exact integers"
+      ],
+      "correct": 3,
+      "explanation": "The million-addition error exists because each binary64 addition rounds to 53 bits; it vanishes when the same sum is done in Fixed2. The tie drift exists because HALF_UP sends every exact tie upward; the demo computes it with integer arithmetic on tenths, with no float anywhere. Different causes, different fixes: change number system for the first, change rounding rule for the second."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the Python implementation include checked_add that raises OverflowError beyond 2^63 - 1, when Python integers cannot overflow?",
+      "options": [
+        "Because the service is one hop from a BIGINT column or a Java or Go peer with the int64 limit, and the arithmetic is where to find out",
+        "Because CPython's int is a 64-bit type under the hood and raises OverflowError on overflow exactly as Java's Math.addExact does",
+        "Because the unittest module cannot compare integers larger than 64 bits reliably, so the tests need results that fit in a machine word",
+        "Because Python's // operator floors toward negative infinity for very large values, which produces wrong quotients above 2^63"
+      ],
+      "correct": 0,
+      "explanation": "Python ints grow without bound, which the test INT64_MAX + 1 == 2**63 records. But the value will be stored or sent somewhere with a fixed width, and a range check at the arithmetic gives a stack trace naming the operands instead of a driver error at insert time. CPython ints are arbitrary precision; the // behaviour is a separate issue handled in divide_rounded."
+    },
+    {
+      "stage": "check",
+      "question": "Fixed2.fromDouble converts a double by formatting it with the shortest round-trip string and parsing that. What happens for fromDouble(0.1 + 0.2), and why is that the right outcome?",
+      "options": [
+        "It returns 0.30, because the shortest round-trip string for the sum is \"0.3\" and the parser pads that to two decimal places",
+        "It returns 0.31, because the parser rounds the third decimal digit half up to the nearest cent before storing the hundredths",
+        "It is rejected with 'more than two decimals', because the shortest string is \"0.30000000000000004\"; the error is surfaced, not hidden",
+        "It returns 0.29, because the conversion truncates the binary value toward zero and so drops the trailing representation error"
+      ],
+      "correct": 2,
+      "explanation": "The sum is a different double from 0.3, and its shortest round-trip string is \"0.30000000000000004\", which has seventeen decimals. The parser applies the same two-decimal rule to every input, so the conversion fails loudly. Silently returning 0.30 would hide a defect upstream; the tests in all three languages assert the rejection."
+    },
+    {
+      "stage": "post",
+      "question": "Checked.add(a, b) detects overflow with ((a ^ r) & (b ^ r)) < 0 where r = a + b. What does this expression test?",
+      "options": [
+        "Whether a and b have the same sign and r has the opposite sign, which is exactly when a two's-complement add has wrapped",
+        "Whether r is negative, since a sum of two valid longs that goes negative must have overflowed",
+        "Whether a or b equals Long.MIN_VALUE, the only operands that can cause an addition to overflow",
+        "Whether the carry out of the top bit was set, which the JVM exposes through the XOR operator"
+      ],
+      "correct": 0,
+      "explanation": "a ^ r has its sign bit set when a and r differ in sign; b ^ r likewise; the AND keeps the sign bit only if both differ, which can only happen when a and b agreed and r disagrees, the definition of wrap. A negative r is perfectly valid for negative operands, MIN_VALUE is not special for addition, and Java exposes no carry flag."
+    },
+    {
+      "stage": "post",
+      "question": "Fixed2 computes 100.00 divided by 3 as 33.33, and 33.33 times 3 as 99.99. What does Phase 10, Lesson 01 add to turn Fixed2 into Money, and which of these three gaps does that addition close?",
+      "options": [
+        "A BigDecimal backing field with arbitrary precision, closing the gap that Fixed2 cannot represent amounts above Long.MAX_VALUE hundredths",
+        "A Currency with an ISO 4217 exponent plus a largest-remainder allocate(), closing the missing-cent gap and the fixed-scale and cross-currency gaps",
+        "A HALF_EVEN default on every multiplying and dividing operation, closing the gap that Fixed2 forces every caller to name a rounding mode",
+        "A floating-point fast path for display and locale formatting, closing the gap that Fixed2 cannot render symbols or thousands separators"
+      ],
+      "correct": 1,
+      "explanation": "Fixed2 has no currency, a hard-coded scale of two, and no conserving split. Money pairs the integer with a Currency whose exponent sets the scale (so yen and dinar work), refuses to mix currencies, and allocates by the largest-remainder method so parts sum exactly to the whole, which is what recovers the missing cent. It keeps long storage and explicit rounding; those are features, not gaps."
+    }
+  ]
+}

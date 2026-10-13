@@ -1,0 +1,78 @@
+{
+  "lesson": "02-capstone-payment-gateway",
+  "title": "Capstone: An Idempotent Multi-Processor Payment Gateway",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A checkout service calls one card processor with a 10-second timeout and retries once. On a day when the processor is slow, what is the most likely money-moving consequence?",
+      "options": [
+        "The processor rejects the retry because its API is naturally idempotent",
+        "Some cardholders end up with two live authorizations for one order",
+        "Every slow request is eventually declined by the issuer for latency",
+        "The retry is approved only when the first request was declined"
+      ],
+      "correct": 1,
+      "explanation": "A timeout means the gateway does not know whether the first authorization succeeded; retrying blindly can approve both. Processors are only idempotent when the client sends a reference they can dedupe on, which a naive retry wrapper does not do."
+    },
+    {
+      "stage": "check",
+      "question": "In Milestone 4, why does the cascade policy move to the next processor on `SOFT_DECLINE` but stop on `HARD_DECLINE`?",
+      "options": [
+        "Hard declines are more expensive to retry because processors charge for them",
+        "Soft declines are only returned by processors that support cascading",
+        "A hard decline is the issuer's answer about the card and another acquirer would get the same answer",
+        "Hard declines open the circuit breaker, so no other processor is available"
+      ],
+      "correct": 2,
+      "explanation": "Insufficient funds or a stolen card is a decision about the cardholder, not about the processor path, so trying another processor only adds cost and risk. Soft declines and processor errors are about the path and may succeed elsewhere. Declines do not count toward the breaker in the reference design."
+    },
+    {
+      "stage": "check",
+      "question": "The orchestrator receives `TIMEOUT` from processor A on an authorization. Which action does Requirement 11 demand before processor B is tried?",
+      "options": [
+        "Confirm via inquire or void that A holds no live authorization for this reference",
+        "Wait for A's circuit breaker to open so the router skips it automatically",
+        "Write a `TIMED_OUT` state to the transition log and emit a webhook",
+        "Send the authorization to B with the same reference so A can dedupe it later"
+      ],
+      "correct": 0,
+      "explanation": "A timeout is an unknown outcome, and cascading without resolving it is how one payment becomes two holds. There is deliberately no `TIMED_OUT` state, and the same reference at a different processor does nothing to A's ledger."
+    },
+    {
+      "stage": "check",
+      "question": "Why must the outbox event be written in the same atomic append as the state transition rather than sent from the request handler after the write?",
+      "options": [
+        "Because webhook consumers require events to arrive before the API response is returned",
+        "Because a crash between the write and the send would leave a committed transition that is never announced",
+        "Because the HMAC signature can only be computed over data that is already on disk",
+        "Because the dispatcher needs the transition record to compute the per-payment sequence"
+      ],
+      "correct": 1,
+      "explanation": "The dual-write problem: two separate writes can succeed independently. Putting the event in the same append makes announcing the transition a consequence of committing it. The signature is computed at delivery time and the sequence is assigned at write time regardless."
+    },
+    {
+      "stage": "post",
+      "question": "The webhook dispatcher holds sequence 3 for payment X while sequence 2 is being retried, but keeps delivering events for payment Y. What property is this preserving, and what does it cost?",
+      "options": [
+        "Global ordering across all payments, at the cost of one slow consumer stalling everyone",
+        "Exactly-once delivery, at the cost of needing a durable acknowledgement log",
+        "Per-payment ordering with parallelism across payments, at the cost of head-of-line blocking within one payment",
+        "At-most-once delivery, at the cost of occasionally dropping an event when the consumer is down"
+      ],
+      "correct": 2,
+      "explanation": "Requirement 14 orders events per payment only, which is the key-based ordering from Phase 8 Lesson 04: payment Y's events are independent of X's. Delivery remains at-least-once; the consumer dedupes by `eventId`. Global ordering would stall unrelated payments behind one failing consumer."
+    },
+    {
+      "stage": "post",
+      "question": "Milestone 8 step 4 plants a bug that skips the inquire step on timeout and requires the checker to report at least one payment with two live authorizations. What is this step testing?",
+      "options": [
+        "That the checker can detect the incident the capstone was designed to prevent",
+        "That the processor simulators correctly reject duplicate references",
+        "That the circuit breaker opens faster when inquiries are skipped",
+        "That skipping inquire improves throughput enough to be worth the risk"
+      ],
+      "correct": 0,
+      "explanation": "A checker that never fails proves nothing. Planting a known violation shows the invariant check has the power to see the double-authorization problem. The simulators dedupe by reference within one processor, which is exactly why two processors can both hold an authorization."
+    }
+  ]
+}

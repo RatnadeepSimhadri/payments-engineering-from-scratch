@@ -1,0 +1,48 @@
+{
+  "lesson": "07-holds-and-available-balance",
+  "title": "Holds, Pending Transactions, and Available Balance",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A debit card customer has 500.00 settled and a hotel has authorized 300.00 that has not yet been captured. Which number should the issuer compare the next authorization request against?",
+      "options": ["500.00, because nothing has settled yet", "300.00, because that is the largest pending item", "200.00, the settled balance minus active holds", "800.00, the settled balance plus the authorization"],
+      "correct": 2,
+      "explanation": "The authorization decision is made against available balance: ledger minus the sum of active holds, here 500.00 - 300.00 = 200.00. Comparing against the 500.00 ledger balance is the failure in The Problem: every authorization is approved against money that has already been promised to someone else."
+    },
+    {
+      "stage": "check",
+      "question": "A 300.00 hold is captured for 287.40. Immediately after the capture, how have the ledger balance and the available balance changed?",
+      "options": ["Ledger down 300.00; available unchanged until the hold expires", "Ledger down 287.40; available up 12.60 because the remainder is released", "Ledger down 287.40; available down 287.40 as the capture is a new debit", "Ledger unchanged; available down 287.40 until settlement arrives"],
+      "correct": 1,
+      "explanation": "Capture moves the ledger by exactly the captured amount and consumes the hold, so the 12.60 that was held but not captured returns to available in the same step. Waiting for the original expiry to release it is the 'pending charge never dropped off' complaint; charging available again would double-count money that was already reserved."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the lesson's Account expire holds lazily inside every public method instead of relying on a background job?",
+      "options": ["Because a background job cannot see the account's private hold map", "Because lazy expiry is faster than a job for accounts with many holds", "Because it makes correctness a pure function of the injected clock, testable to the second", "Because card networks require issuers to release holds only when the customer transacts"],
+      "correct": 2,
+      "explanation": "Sweeping stale holds on every access means the result depends only on (status, now), so a test can advance a ManualClock to expiresAt - 1 and then to expiresAt and observe the boundary exactly, with no sleeping and no scheduler. A production system still runs a sweep job for freshness, but the lazy sweep is the correctness backstop. The networks set expiry windows; they do not dictate the issuer's implementation."
+    },
+    {
+      "stage": "check",
+      "question": "Fifty threads each try to authorize 20.00 against an account with 500.00 available at the same instant. Without the per-account lock, what goes wrong?",
+      "options": ["Some threads see a stale ledger balance and are wrongly rejected", "More than 25 holds can be inserted because several threads pass the check on the same snapshot", "The hold map throws a concurrent modification error and no holds are placed", "Expiry sweeps run concurrently and release holds that are still active"],
+      "correct": 1,
+      "explanation": "The check 'amount <= available' and the insertion of the hold are separate steps. Two threads can both read available = 20.00, both pass, and both insert, leaving available negative. The lock makes check-then-reserve one atomic step so exactly 25 succeed. Wrongly rejecting a thread would be safe (if annoying); over-admitting breaks the invariant and cannot be undone without voiding an approved authorization."
+    },
+    {
+      "stage": "post",
+      "question": "A hold for 300.00 expired yesterday and the merchant now presents a capture for 300.00. What does the lesson's Account do, and what has actually been lost?",
+      "options": ["Captures it, because the merchant holds a valid authorization code from the network", "Rejects it with HoldNotActive; the guarantee that reserved funds covered this capture is gone", "Captures it against available if funds remain, otherwise rejects for insufficient funds", "Converts the expired hold into a new active hold and then captures it"],
+      "correct": 1,
+      "explanation": "requireActive sweeps expiries and finds the hold EXPIRED, so capture throws HoldNotActive and changes nothing. In a real card system the issuer usually honours a late presentment anyway (Exercise 3's forcePost), but at that point the capture is settling against funds that were never reserved for it, which is exactly the exposure holds exist to prevent. Silently re-activating the hold would hide that the guarantee lapsed."
+    },
+    {
+      "stage": "post",
+      "question": "In Go, Authorize holds the account mutex and needs the available balance. Why does it call availableLocked() instead of the exported AvailableBalance()?",
+      "options": ["Because exported methods cannot be called from inside the same package", "Because sync.Mutex is not reentrant, so AvailableBalance would try to lock again and deadlock", "Because availableLocked skips the expiry sweep and is therefore faster", "Because the race detector flags any exported method called while a lock is held"],
+      "correct": 1,
+      "explanation": "Go's sync.Mutex has no owner and cannot be acquired twice by the same goroutine; a second Lock() blocks forever. Java's synchronized and Python's RLock are reentrant, so the same nested call pattern works there without the *Locked helpers. availableLocked does the same work as the exported method, including the sweep; it simply assumes the lock is already held."
+    }
+  ]
+}

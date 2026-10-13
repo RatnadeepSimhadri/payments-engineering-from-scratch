@@ -1,0 +1,78 @@
+{
+  "lesson": "03-capstone-replicated-kv-store",
+  "title": "Capstone: A Raft-Replicated Key-Value Store",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "An idempotency store runs on one Redis node with an asynchronous standby 400 ms behind. The primary loses power and the standby is promoted. What is the consequence for writes acknowledged in the last 400 ms?",
+      "options": [
+        "They are replayed from the client's retry and land safely on the standby",
+        "They are lost, and retried requests that depended on them will be treated as new",
+        "They are held in the primary's write buffer and flushed when it reboots",
+        "They are visible on the standby but marked as unconfirmed until the primary returns"
+      ],
+      "correct": 1,
+      "explanation": "Asynchronous replication acknowledges before the standby has the data, so a promotion loses the window. The client retry does not replay the key; it finds no key and the gateway performs the operation again, which is the double authorization in the Problem section. Nothing marks data unconfirmed in asynchronous replication."
+    },
+    {
+      "stage": "check",
+      "question": "A node restarts from a WAL that records `term=7, votedFor=2`. It then receives `RequestVote(term=7, candidate=5)` from a candidate with a longer log. What does the node do?",
+      "options": [
+        "Grants the vote, because candidate 5's log is more up to date than node 2's",
+        "Grants the vote, because a restart clears the vote for the current term",
+        "Refuses, because it has already voted for node 2 in term 7 and the vote is persisted",
+        "Refuses, because a node never votes in a term equal to its own current term"
+      ],
+      "correct": 2,
+      "explanation": "Requirement 2 and the vote rule in Milestone 2 grant at most one vote per term, and Requirement 4 persists that vote before the reply, precisely so a restart cannot produce a second vote. The up-to-date check runs only if `votedFor` is null or already equals the candidate. Nodes do vote in their current term; that is the normal case."
+    },
+    {
+      "stage": "check",
+      "question": "The leader has `matchIndex = {1: 18, 2: 18, 3: 18, 4: 17, 5: 17}` in a five-node cluster and entry 18 was written in the current term. Why does `commitIndex` advance to 18 now rather than waiting for all five?",
+      "options": [
+        "Three of five is a majority, so any future leader must have entry 18 under the election restriction",
+        "Entries from the current term are committed as soon as the leader writes them locally",
+        "Followers 4 and 5 are considered failed after two missed replies and are excluded from the count",
+        "The leader waits for all five only when the entry changes cluster membership"
+      ],
+      "correct": 0,
+      "explanation": "Requirement 6 commits at a majority because the election restriction guarantees any candidate that can win has every majority-committed entry. The leader's own write is not a commit; a minority-replicated entry can be overwritten, which is what M3 step 2 demonstrates. Followers are not excluded from counting, and membership entries use the joint-consensus majorities, not unanimity."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the spec put the session table inside the replicated state machine rather than in a map on the leader?",
+      "options": [
+        "A map on the leader would need a lock and slow down the single-threaded apply loop",
+        "The state machine already has a hash map and reusing it avoids a second allocation",
+        "Session ids must be sequential across the cluster and only the state machine assigns indexes",
+        "After a leader change the new leader must know which `(session, seq)` pairs were applied, and only replicated state survives"
+      ],
+      "correct": 3,
+      "explanation": "Requirement 9 and M4 step 3 retry a command at a new leader; if the dedupe table lived on the old leader, the new leader would apply the command a second time. Putting it in the state machine makes it part of the log and the snapshot. Locking and allocation are not the constraint, and session ids need only be unique, not sequential."
+    },
+    {
+      "stage": "post",
+      "question": "In Milestone 5 a leader is partitioned alone while the majority elects a new leader and writes `x=2`. A client sends `get(x)` to the old leader. Under the ReadIndex design, what prevents it from answering `x=1`?",
+      "options": [
+        "The old leader checks its election timer and steps down as soon as it expires",
+        "The read requires a heartbeat round with majority replies in the current term, which the old leader cannot obtain",
+        "The client includes the latest commit index it has seen and the old leader detects it is behind",
+        "The old leader's state machine is frozen at the moment the partition begins"
+      ],
+      "correct": 1,
+      "explanation": "Requirement 10 makes a leader confirm leadership with a majority before serving a read; partitioned alone, it never gets the replies and either times out or learns the higher term. A leader does not step down on an election timer (it has none running), the client does not carry a commit index in this design, and the state machine is not frozen; the leader simply must not answer from it."
+    },
+    {
+      "stage": "post",
+      "question": "The Milestone 8 checker processes a history where a `put(k, v)` timed out and no later `get(k)` ever returned `v`. How must the checker treat the timed-out `put`?",
+      "options": [
+        "As an operation that may or may not have happened, so a linearization may include or omit it",
+        "As a completed operation, because the leader may have appended it before the client gave up",
+        "As a failed operation that must be excluded from every candidate linearization",
+        "As a violation, because a write that was never observed means the cluster lost data"
+      ],
+      "correct": 0,
+      "explanation": "Requirement 13 says a timed-out operation may or may not have taken effect; the checker must succeed if either choice yields a valid order, and here omitting it does. Treating it as definitely completed would wrongly reject histories where the command was dropped; treating it as definitely absent would wrongly reject histories where a later `get` saw it. An unobserved write is not data loss."
+    }
+  ]
+}

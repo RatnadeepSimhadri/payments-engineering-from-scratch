@@ -1,0 +1,48 @@
+{
+  "lesson": "12-saga-pattern",
+  "title": "The Saga Pattern: Compensations Instead of Locks",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "An order flow debits a wallet service, then calls a separate fulfilment service, which fails. Why can the debit not simply be rolled back?",
+      "options": ["The wallet database does not support rollback once a row has been written", "The debit is already committed in its own database and only a new transaction can reverse it", "Rollback requires the fulfilment service to vote first and it is currently unavailable", "Rollbacks are forbidden for monetary rows under most audit regulations"],
+      "correct": 1,
+      "explanation": "Each service commits its own local transaction before the next call. A committed transaction is final; the only way to undo its effect is a second, compensating transaction such as a refund. Rollback is a feature of an open transaction, and there is no transaction open across two services' databases."
+    },
+    {
+      "stage": "check",
+      "question": "A three-step saga (reserve, capture, ship) fails at ship. In what order do the compensations run, and is ship compensated?",
+      "options": ["release then refund; ship is compensated last", "refund then release; ship is not compensated", "release then refund; ship is not compensated", "refund then release; ship is compensated first"],
+      "correct": 1,
+      "explanation": "Compensations run in reverse order of execution: capture's compensation (refund) first, then reserve's (release). The failed step never committed, so there is nothing to undo and it is not compensated. Running release before refund would undo steps in the wrong dependency order."
+    },
+    {
+      "stage": "check",
+      "question": "The saga log shows STEP_STARTED capture-funds with no STEP_COMPLETED. The orchestrator restarts. What does recovery do and what makes it safe?",
+      "options": ["Skips capture, because a started step is assumed to have succeeded", "Marks the saga failed and compensates, because the outcome is unknown", "Re-invokes capture; the wallet's idempotency key makes a repeat a no-op", "Asks the wallet whether it captured, then decides whether to re-invoke"],
+      "correct": 2,
+      "explanation": "A started-but-not-completed step may or may not have executed, so recovery re-invokes it. The participant stores the saga id with its outcome and replays that outcome on a repeat, so the balance moves at most once. Querying the wallet first is an extra round trip that still needs the same idempotency guarantee to be correct."
+    },
+    {
+      "stage": "check",
+      "question": "Why must a compensation such as release(key) succeed even when no hold exists for that key?",
+      "options": ["Because recovery may run it after a crash in which the forward step never actually reached the service", "Because holds are deleted by a background job and may already be gone when release is called", "Because the orchestrator cannot read the wallet's state and so cannot know the hold's amount", "Because compensations are logged before they run and a logged action must not raise an error"],
+      "correct": 0,
+      "explanation": "After a crash, the log may show STEP_STARTED reserve with no completion. Recovery cannot tell whether the hold was placed, so it may compensate a step that never executed. A compensation must therefore be legal in any state: if there is nothing to undo, record that it ran and return success."
+    },
+    {
+      "stage": "post",
+      "question": "Saga A has placed an 80.00 hold on a 100.00 balance and stalled. Saga B requests 50.00. What happens, and what is the trade-off?",
+      "options": ["B succeeds because the ledger balance is still 100.00; the risk is a later overdraft", "B is refused because available is 20.00; the cost is a false decline if A later compensates", "B waits until A completes or compensates; the cost is a blocked request", "B succeeds and A's capture fails later; the cost falls on the first saga to finish"],
+      "correct": 1,
+      "explanation": "The hold is a semantic lock: available balance is balance minus live holds, so B sees 20.00 and fails cleanly at its first step. If A later fails and releases, B was declined for money that became available again. That false decline is the accepted price; letting B through risks an overdraft and making B wait reintroduces blocking."
+    },
+    {
+      "stage": "post",
+      "question": "A design document writes the saga status to 'capturing' after the processor call returns, then calls the processor. What does the two-write rule require instead, and why?",
+      "options": ["Write 'capturing' only after success, so the log never records an action that did not complete", "Write 'capturing' before the call and 'captured' after, so a crash between them is detectable and re-run", "Write both records in one transaction with the processor call so that they cannot diverge", "Write 'captured' before the call so that recovery never re-invokes a processor operation"],
+      "correct": 1,
+      "explanation": "Appending STARTED before the call and COMPLETED after means a crash leaves a visible STARTED-only record that recovery re-executes under an idempotency key. Writing only after success loses the intent on a crash: the processor captured, your log says nothing, and reconciliation finds it days later. A single transaction across your database and a remote processor does not exist."
+    }
+  ]
+}

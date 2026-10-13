@@ -1,0 +1,78 @@
+{
+  "lesson": "10-simulation-testing-of-payment-systems",
+  "title": "Deterministic Simulation Testing of Payment Systems",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "An integration test against a processor sandbox passes 400 times in a row, then production double-charges 212 customers during a processor slowdown. Which property of the test most directly explains why it could not find the bug?",
+      "options": [
+        "The sandbox used test card numbers whose BIN ranges differ from production cards",
+        "The test could not control how long the processor took to answer or the order in which two responses returned",
+        "The test ran against a single processor region instead of the two regions used in production",
+        "The test suite was not executed at the same time of day as the production incident"
+      ],
+      "correct": 1,
+      "explanation": "The bug needed a slow processor, a timeout, a retry, and two approvals racing back; the sandbox decides its own latency and the OS decides the interleaving, so the test could not produce that ordering. BIN ranges and time of day are irrelevant to the interleaving, and a second region would only add more uncontrolled timing."
+    },
+    {
+      "stage": "check",
+      "question": "The Simulator orders events by (time, seq) where seq is the scheduling sequence number. What goes wrong if events are ordered by time alone?",
+      "options": [
+        "Events scheduled with a zero delay would run before the event that scheduled them",
+        "The virtual clock would advance past timers that have not fired yet and skip them",
+        "Two events at the same virtual millisecond could run in either order, so the trace is no longer a function of the seed",
+        "The priority queue would reject duplicate keys and silently drop one of the two events"
+      ],
+      "correct": 2,
+      "explanation": "PriorityQueue makes no promise about the relative order of equal keys, so without the tiebreak the same seed could produce different traces across runs or JDK versions. A zero-delay event has a later seq than its scheduler so it cannot run first; the queue neither skips timers nor rejects equal keys."
+    },
+    {
+      "stage": "check",
+      "question": "Harness.run derives netRng, processorRng, faultRng, and workloadRng by calling split() on one master Rng in a fixed order. What does this buy that a single shared Rng would not?",
+      "options": [
+        "Adding a random draw in the network code does not change which payments the workload generates or which faults occur",
+        "Each component gets a cryptographically independent stream so the processor cannot predict the network's drops",
+        "The four streams can be advanced in parallel on four threads without any synchronization between them",
+        "A seed produces four times as many distinct values before the generator's period is exhausted"
+      ],
+      "correct": 0,
+      "explanation": "With one shared stream, an extra draw anywhere shifts every later draw and a failing seed stops reproducing after an unrelated change. Splitting isolates each component's sequence. The streams are statistically independent, not cryptographic; the simulator is single-threaded; and period length is not the concern."
+    },
+    {
+      "stage": "check",
+      "question": "Why is no-stuck-payments (no payment still PENDING) checked only after runUntilIdle drains the queue, while trial-balance is checked once per virtual day during the run?",
+      "options": [
+        "Because checking for PENDING payments is O(n^2) and would make a long run too slow to finish",
+        "Because the trial balance can only change during the run while PENDING counts can only change after it",
+        "Because the ledger is durable and survives crashes while the PENDING status is volatile and is lost on each crash",
+        "Because a payment whose response is still on the wire is legitimately PENDING, so the check is only meaningful once nothing is in flight"
+      ],
+      "correct": 3,
+      "explanation": "no-stuck-payments is a quiescence (liveness) property: during the run a PENDING payment may simply be waiting 150 ms for a reply, so checking it mid-run would be a false positive. The trial balance is a safety property that must hold at every instant. Both checks are O(payments); status is durable in this gateway."
+    },
+    {
+      "stage": "post",
+      "question": "The auth-timeout callback checks armedEpoch != epoch and returns without retrying if the gateway has crashed since the timer was armed. What would be wrong with letting the timer fire anyway?",
+      "options": [
+        "The retry would use a fresh authKey on the second attempt and the processor would approve the same payment a second time",
+        "The timer would fire before the recovery sweep had run and the payment would be marked DECLINED without a processor response",
+        "The simulated gateway would be more reliable than a real one, whose in-memory timers do not survive a restart, so the test would miss recovery bugs",
+        "The epoch counter would overflow after enough crashes in a long run and timers armed afterwards would never fire at all"
+      ],
+      "correct": 2,
+      "explanation": "A real process loses its armed timers when it dies; a simulator that keeps them is kinder than reality and would hide a recovery sweep that fails to re-drive in-flight payments (the RECOVERY_SKIPS_PENDING defect would go unnoticed). The authKey is unchanged on retry in the correct gateway, timers never mark a payment DECLINED, and an int epoch does not overflow in any realistic run."
+    },
+    {
+      "stage": "post",
+      "question": "A colleague's pull request fixes an interleaving bug and adds a test that runs seeds 1 to 40 with no violation. The bug report said seed 1,183 failed. Which review comment is the most important one?",
+      "options": [
+        "Ask for the test to run 400 seeds instead of 40 so the coverage is ten times higher",
+        "Ask for the test to assert that seed 1,183 passes now and that the correct invariant name appears when the fix is reverted",
+        "Ask for the fingerprint of seed 1 to be checked into the repository so later refactors are detected",
+        "Ask for the 40 seeds to be chosen at random on each run so the suite does not become stale"
+      ],
+      "correct": 1,
+      "explanation": "The seed that found the bug is the regression test: it must pass with the fix and fail with the named invariant without it, otherwise the test proves nothing about this bug. More seeds add coverage but not proof; a pinned fingerprint is useful but secondary; random seeds per run destroy reproducibility, which is the whole point."
+    }
+  ]
+}

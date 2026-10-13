@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "id": "ledger-engineering",
+  "title": "Ledger Engineering",
+  "summary": "Money, double-entry, balances, holds, reconciliation, then build the ledger-engine project.",
+  "estimatedMinutes": 1125,
+  "stateFile": "LEDGER-LEARNING.md",
+  "invocation": {
+    "claudeCode": "/learn-ledgers",
+    "codex": "learn-ledgers, or choose it from /skills",
+    "portableFallback": "Use learn-ledgers to start or resume the Ledger Engineering path."
+  },
+  "languages": [
+    "Java"
+  ],
+  "conceptualFallback": "Read each lesson's docs/en.md and trace the worked example by hand; mark run evidence pending until a toolchain is available.",
+  "project": "ledger-engine",
+  "lessons": [
+    {
+      "phase": 0,
+      "lesson": 7,
+      "title": "Decimal and Integer Arithmetic in Three Runtimes",
+      "path": "phases/00-setup-and-tooling/07-decimal-and-integer-arithmetic",
+      "minutes": 60,
+      "required": true,
+      "order": 1
+    },
+    {
+      "phase": 10,
+      "lesson": 1,
+      "title": "Representing Money: Minor Units, Currencies, and Rounding",
+      "path": "phases/10-money-and-ledgers/01-representing-money",
+      "minutes": 90,
+      "required": true,
+      "order": 2
+    },
+    {
+      "phase": 10,
+      "lesson": 3,
+      "title": "The Double-Entry Ledger from Scratch",
+      "path": "phases/10-money-and-ledgers/03-double-entry-ledger",
+      "minutes": 150,
+      "required": true,
+      "order": 3
+    },
+    {
+      "phase": 10,
+      "lesson": 4,
+      "title": "Chart of Accounts and Account Types",
+      "path": "phases/10-money-and-ledgers/04-chart-of-accounts",
+      "minutes": 60,
+      "required": true,
+      "order": 4
+    },
+    {
+      "phase": 10,
+      "lesson": 7,
+      "title": "Holds, Pending Transactions, and Available Balance",
+      "path": "phases/10-money-and-ledgers/07-holds-and-available-balance",
+      "minutes": 90,
+      "required": true,
+      "order": 5
+    },
+    {
+      "phase": 10,
+      "lesson": 8,
+      "title": "Reconciliation: Matching Your Ledger Against Theirs",
+      "path": "phases/10-money-and-ledgers/08-reconciliation",
+      "minutes": 120,
+      "required": true,
+      "order": 6
+    },
+    {
+      "phase": 11,
+      "lesson": 15,
+      "title": "Settlement and Clearing: Gross, Net, and Deferred",
+      "path": "phases/11-payment-rails/15-settlement-and-clearing",
+      "minutes": 75,
+      "required": true,
+      "order": 7
+    },
+    {
+      "phase": 15,
+      "lesson": 1,
+      "title": "Capstone: A Durable Double-Entry Ledger Service",
+      "path": "phases/15-capstone-projects/01-capstone-ledger-service",
+      "minutes": 480,
+      "required": true,
+      "order": 8
+    }
+  ],
+  "checkpoints": {
+    "phases/10-money-and-ledgers/03-double-entry-ledger": "Post a three-posting entry and show the trial balance is zero.",
+    "phases/10-money-and-ledgers/08-reconciliation": "Produce a reconciliation report whose totals tie out on the lesson's sample statement."
+  }
+}

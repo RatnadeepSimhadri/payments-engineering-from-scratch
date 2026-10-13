@@ -1,0 +1,78 @@
+{
+  "lesson": "02-payment-state-machine",
+  "title": "The Payment State Machine",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A payments table has a free-text status column that each handler overwrites. The processor redelivers a 'succeeded' webhook after the merchant has refunded the payment. What happens?",
+      "options": [
+        "The handler overwrites 'refunded' with 'succeeded' and the refund vanishes from the payment's view",
+        "The database rejects the second write because 'refunded' is a terminal status in the column",
+        "The webhook is dropped because the handler notices its event id was already processed earlier",
+        "The payment moves to a 'partially_refunded' status automatically and the refund stays visible"
+      ],
+      "correct": 0,
+      "explanation": "A plain UPDATE has no memory of what happened before, so the late webhook wins and the payment reports 'succeeded' again. Nothing rejects it: there is no terminal set and no event id record. A state machine with a deduplication set is what makes the third option true, and it is what this lesson builds."
+    },
+    {
+      "stage": "check",
+      "question": "The table has eleven rules over eight states and nine event kinds. How does the test suite prove that a spoofed PROCESSOR_APPROVED on a CREATED payment cannot move it?",
+      "options": [
+        "It asserts that the Rule record for that pair is marked with the ALWAYS guard",
+        "It checks that resolve returns null for pairs that are not in the table",
+        "It enumerates every (state, kind) pair without a row and asserts each is refused untouched",
+        "It replays a history containing that transition and expects a chaining error"
+      ],
+      "correct": 2,
+      "explanation": "The exhaustive negative test drives a payment into each of the eight states, applies every event kind that has no row, and asserts an IllegalTransition plus unchanged state, version, and uncommitted list: sixty-two cases. resolve throws rather than returning null, and replay checks structure, not legality."
+    },
+    {
+      "stage": "check",
+      "question": "A payment is REFUNDING with amount 49.99, refunded 15.00, and pendingRefund 34.99. REFUND_SUCCEEDED arrives. Which rule fires and why?",
+      "options": [
+        "REFUND_LEAVES_BALANCE, because 15.00 is less than 49.99",
+        "REFUND_CLEARS_BALANCE, because 15.00 + 34.99 equals 49.99",
+        "Neither; the event is refused because two rules match the same pair",
+        "REFUND_LEAVES_BALANCE, because it appears first in the table"
+      ],
+      "correct": 1,
+      "explanation": "Both balance guards evaluate refunded + pendingRefund, the balance after the in-flight refund settles. 15.00 + 34.99 is exactly 49.99, so REFUND_CLEARS_BALANCE holds and the payment becomes REFUNDED. Table order only matters when more than one guard holds, and these two are mutually exclusive."
+    },
+    {
+      "stage": "check",
+      "question": "Two handlers load the same payment at version 0. A applies CONFIRM, B applies CANCEL, and A saves first. What does B's save do?",
+      "options": [
+        "Appends CANCEL as version 2 because the log is append-only and both writes are preserved",
+        "Overwrites A's transition because B's handler started later and last writer wins",
+        "Fails with ConcurrencyConflict because B's transition claims version 1 and the store holds 1",
+        "Succeeds silently and the payment becomes CANCELED while the processor authorizes it"
+      ],
+      "correct": 2,
+      "explanation": "B's uncommitted transition was built against version 0, so it claims version 1. The store already holds version 1 from A and expects 2, so save refuses. B must reload, see PROCESSING, and find that CANCEL has no row from that state. Appending as version 2 would record a cancel against a state the payment was never in."
+    },
+    {
+      "stage": "post",
+      "question": "Why does apply check the applied-event-id set before consulting the transition table rather than after?",
+      "options": [
+        "Because set lookup is faster than the table scan and the common case is a duplicate",
+        "Because a redelivered callback would otherwise be reported as an illegal transition, which is the wrong signal",
+        "Because the table cannot express rules for events that carry an amount",
+        "Because the guard predicates need the event id to compute the refundable balance"
+      ],
+      "correct": 1,
+      "explanation": "A redelivered PROCESSOR_APPROVED on a payment that has since moved to REFUNDING is normal at-least-once behaviour and must be a DUPLICATE no-op that is acknowledged. Checked after the table, it would throw IllegalTransition, which operators treat as a bug or a forged callback. Speed is not the reason; both checks are constant time."
+    },
+    {
+      "stage": "post",
+      "question": "Replay rebuilds a payment from its history. Which check does replay deliberately NOT perform, and why?",
+      "options": [
+        "Version contiguity, because gaps are expected after log compaction",
+        "That fromState matches the current state, because the stored state is authoritative",
+        "That each transition's guard still holds, because the rules may have changed since it was written",
+        "That the event ids are unique, because the processor guarantees that already"
+      ],
+      "correct": 2,
+      "explanation": "Guards were evaluated when the transition was accepted. Re-evaluating them on load would make old histories unloadable after a rule change. Replay checks structure instead: contiguous versions and a fromState chain, both of which indicate corruption if broken. Event ids are recorded by replay so later duplicates are still recognised."
+    }
+  ]
+}

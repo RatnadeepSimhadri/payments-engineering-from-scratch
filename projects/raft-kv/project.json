@@ -1,0 +1,60 @@
+{
+  "id": "raft-kv",
+  "title": "Raft Key-Value Store",
+  "level": 3,
+  "levelName": "Advanced",
+  "tagline": "Build a Raft-replicated key-value store on a deterministic simulated network, then prove its client history linearizable.",
+  "summary": "A five-node Raft cluster that elects leaders with randomized timeouts, replicates a log with the AppendEntries consistency check, commits by majority under the current-term rule, and applies committed commands to a key-value state machine. Clients PUT and GET through the leader; every run is a pure function of a seed, so partitions, crashes, and dropped messages replay exactly, and a Wing-Gong checker verifies the recorded history against a register model.",
+  "youWillBuild": "A replicated key-value store whose leader election, log replication, commit rule, and client reads survive partitions, crashes, and message loss on a seeded simulator, with a linearizability checker over the recorded history.",
+  "hours": 14,
+  "languages": ["Java"],
+  "languageWhy": {
+    "Java": "Records make messages and log entries immutable by construction, the switch over MessageKind is exhaustive, and the simulated network from the Raft lessons carries over unchanged; Python and Go ports follow later."
+  },
+  "status": "ready",
+  "skills": [
+    "Persist currentTerm, votedFor, and a 1-indexed log with the section 5.4.1 up-to-date comparison",
+    "Elect a leader with randomized timeouts drawn from a seeded RNG and prove at most one leader per term over many seeds",
+    "Replicate a log with the AppendEntries consistency check, nextIndex/matchIndex, and follower truncation while Log Matching holds",
+    "Commit by majority under the current-term rule, apply to a key-value state machine, and check the client history for linearizability"
+  ],
+  "prerequisites": [
+    {"title": "Raft I: Terms, Leader Election, and a Simulated Network", "path": "phases/06-replication-and-consensus/05-raft-leader-election"},
+    {"title": "Raft II: Log Replication and Commit", "path": "phases/06-replication-and-consensus/06-raft-log-replication"},
+    {"title": "Linearizability Checking with Recorded Histories", "path": "phases/06-replication-and-consensus/12-linearizability-checking"}
+  ],
+  "stages": [
+    {
+      "id": "01-term-and-log",
+      "title": "Term, Vote, and the Log",
+      "summary": "The persistent state every Raft server keeps: currentTerm, votedFor, and a 1-indexed log with append, truncate, lastIndex, lastTerm, and the up-to-date comparison, on top of the provided deterministic clock, RNG, and network.",
+      "hours": 2,
+      "difficulty": "starter",
+      "concepts": ["persistent vs volatile state", "1-indexed log with sentinel", "stable-storage writes", "up-to-date rule", "seeded simulation"]
+    },
+    {
+      "id": "02-leader-election",
+      "title": "Leader Election",
+      "summary": "RequestVote and its receiver rules, randomized election timeouts from the node's seeded RNG, majority counting, heartbeats, and stepping down on a higher term, with a many-seed test that asserts at most one leader per term.",
+      "hours": 4,
+      "difficulty": "core",
+      "concepts": ["terms as logical clocks", "randomized timeouts", "one vote per term", "majority quorum", "Election Safety"]
+    },
+    {
+      "id": "03-log-replication",
+      "title": "Log Replication",
+      "summary": "AppendEntries with the (prevLogIndex, prevLogTerm) consistency check, nextIndex and matchIndex per follower, back-off on refusal, follower truncation of conflicting suffixes, and the Log Matching property checked after every delivery.",
+      "hours": 4,
+      "difficulty": "core",
+      "concepts": ["consistency check", "nextIndex/matchIndex", "conflict truncation", "idempotent delivery", "Log Matching"]
+    },
+    {
+      "id": "04-commit-and-apply",
+      "title": "Commit, Apply, and Linearizable Reads",
+      "summary": "commitIndex advanced by a majority of matchIndex under the current-term rule, followers committing up to leaderCommit, a key-value state machine applied in log order, client PUT/GET through the leader, and a linearizability checker over the recorded history.",
+      "hours": 4,
+      "difficulty": "stretch",
+      "concepts": ["commit by majority", "current-term rule (Figure 8)", "State Machine Safety", "replicated state machine", "linearizability"]
+    }
+  ]
+}

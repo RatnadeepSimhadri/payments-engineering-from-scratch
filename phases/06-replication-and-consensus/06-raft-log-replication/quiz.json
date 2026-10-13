@@ -1,0 +1,78 @@
+{
+  "lesson": "06-raft-log-replication",
+  "title": "Raft II: Log Replication and Commit",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A leader has appended a client's write to its own log and sent it to four followers. When may it tell the client the write is durable?",
+      "options": [
+        "As soon as its own append to local storage has completed",
+        "Once the entry is stored on a majority of the cluster, itself included",
+        "Only after all four followers have acknowledged the entry",
+        "After the next heartbeat round confirms the followers are alive"
+      ],
+      "correct": 1,
+      "explanation": "Durability in Raft means the entry is on a majority, so any future leader (which needs a majority of votes) must have it. Waiting for all followers would let one slow or dead node stall the cluster; the leader's own append alone is lost if the leader crashes."
+    },
+    {
+      "stage": "check",
+      "question": "A follower holds entries with terms [1, 1, 2] at indexes 1-3 and receives AppendEntries with prevLogIndex=3, prevLogTerm=1 and no entries. What does it do?",
+      "options": [
+        "Accepts it, because the message carries no entries and so cannot conflict with anything",
+        "Truncates index 3 and replies success, since the leader's view of index 3 is authoritative",
+        "Rejects it, because its entry at index 3 has term 2, not the term 1 the leader named",
+        "Accepts it and sets commitIndex to 3, because prevLogIndex is within its log"
+      ],
+      "correct": 2,
+      "explanation": "Rule 2 is the consistency check: the follower must hold exactly the entry the leader names as predecessor, by index and term. Term 2 at index 3 does not match term 1, so it replies false and the leader will retry with prevLogIndex=2. Truncation (rule 3) only happens for entries the message carries that conflict, never on a prevLog mismatch."
+    },
+    {
+      "stage": "check",
+      "question": "What does the Log Matching property let a leader conclude from a follower's reply 'success, matchIndex = 7'?",
+      "options": [
+        "The follower holds the leader's entries 1 through 7 exactly, not merely entry 7",
+        "The follower has committed and applied every entry up to index 7",
+        "The follower's log is exactly seven entries long and holds nothing beyond",
+        "Entry 7 is now on a majority and the leader may advance commitIndex to 7"
+      ],
+      "correct": 0,
+      "explanation": "Because the consistency check only extends a log at a point where it already matches the leader's predecessor, agreement at (7, term) implies agreement on everything below it. That is what makes counting matchIndex sound. The follower may hold more than seven entries (an uncommitted tail), commit is the leader's decision not the follower's, and one reply is not a majority."
+    },
+    {
+      "stage": "check",
+      "question": "A leader of term 5 has two term-2 entries at indexes 1-2 replicated on three of five nodes, and nothing else in its log. Why is commitIndex still 0?",
+      "options": [
+        "Because followers must explicitly acknowledge commit before the leader counts them",
+        "Because the leader only counts replicas for entries from its own term; older entries commit indirectly",
+        "Because a leader cannot commit anything until it has received a client write in its term",
+        "Because index 2 is not yet on all five nodes and old-term entries need unanimity"
+      ],
+      "correct": 1,
+      "explanation": "Figure 2's commit rule requires log[N].term == currentTerm. Counting replicas of an older-term entry is the Figure 8 bug: a later leader with a newer last term could still win and overwrite it. The term-2 entries commit the moment a term-5 entry after them (the election no-op) reaches a majority, which does not need a client write or unanimity."
+    },
+    {
+      "stage": "post",
+      "question": "A node crashes and restarts. Which of these does it still have, and which must it rebuild?",
+      "options": [
+        "It keeps the log and commitIndex; it rebuilds only the state machine",
+        "It keeps the state machine; it rebuilds the log from the leader's snapshot",
+        "It keeps nothing and must be re-added as a fresh follower by the leader",
+        "It keeps the log, term, and vote; it rebuilds commitIndex, lastApplied, and the state machine"
+      ],
+      "correct": 3,
+      "explanation": "Figure 2 marks currentTerm, votedFor, and log[] as persistent and everything else volatile. commitIndex is a cached conclusion the leader will resend in its next AppendEntries, and the state machine is rebuilt by re-applying the persisted log up to it. Keeping commitIndex without the state machine would be inconsistent; a restarted node is behind, not new."
+    },
+    {
+      "stage": "post",
+      "question": "During a partition a minority-side leader appended two entries at indexes 5-6; the majority elected a new leader that committed a different entry at index 5. After the partition heals, what happens to the minority's entries?",
+      "options": [
+        "The new leader's AppendEntries hits a term conflict at index 5; the follower truncates both and appends the leader's",
+        "The new leader adopts the longer log, because a log with more client writes is treated as more up to date",
+        "Both versions of index 5 are kept, and each state machine applies them in ascending term order",
+        "The cluster halts writes until an operator inspects both logs and chooses which one is correct"
+      ],
+      "correct": 0,
+      "explanation": "The minority's entries were never on a majority, so they were never committed and may be discarded. Rule 3 does it as a side effect of ordinary replication: the first conflicting index is truncated along with everything after it. Longest-log-wins would roll back a committed write, which is exactly the failure Raft is designed to make impossible."
+    }
+  ]
+}

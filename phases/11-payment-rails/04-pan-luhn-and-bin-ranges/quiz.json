@@ -1,0 +1,48 @@
+{
+  "lesson": "04-pan-luhn-and-bin-ranges",
+  "title": "PANs, Luhn, and BIN Range Routing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A customer types one digit of their card number wrong at checkout. Where is the cheapest place to catch it?",
+      "options": ["At the issuer, which knows every account number it has issued", "At the card network, which validates the number before routing it", "Locally, before any request is sent, using the check digit", "At the acquirer, whose response code 14 means invalid card number"],
+      "correct": 2,
+      "explanation": "The last digit of a PAN is a Luhn check digit computed from the others, so a single-digit error is detectable with a few lines of arithmetic before any request is made. Every downstream option costs an authorization fee and a round trip and returns a message the customer cannot act on."
+    },
+    {
+      "stage": "check",
+      "question": "Which error does the Luhn algorithm fail to detect?",
+      "options": ["Any single digit replaced by a different digit", "Two adjacent digits 0 and 9 swapped with each other", "Two adjacent digits 4 and 2 swapped with each other", "The check digit itself replaced by a different digit"],
+      "correct": 1,
+      "explanation": "Under the doubling rule 0 maps to 0 and 9 maps to 18 - 9 = 9, so swapping which of them is doubled leaves the sum unchanged; 091 and 901 are both valid. Every single-digit change (including the check digit) alters the sum, and swapping 4 and 2 changes it because 8 + 2 differs from 4 + 4."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the lesson store BIN data as sorted intervals searched with binary search rather than as a set of prefixes?",
+      "options": ["Because binary search is faster than a hash lookup for 8-digit keys", "Because the networks define account ranges like 2221-2720 that are not prefixes", "Because Java has no efficient hash set for strings of digits", "Because a prefix set cannot distinguish Visa from Mastercard"],
+      "correct": 1,
+      "explanation": "A range such as 2221 through 2720 would need hundreds of enumerated prefixes, and 8-digit BINs nested inside 6-digit ones make that worse. An interval list stores each range as two numbers and answers any lookup in O(log n). A hash lookup is faster per operation, which is exactly why the trade-off is about representing the data, not speed."
+    },
+    {
+      "stage": "check",
+      "question": "The 6-digit BIN 411111 is normalized to an 8-digit key space. What interval does it become?",
+      "options": ["[41111100, 41111199]", "[41111100, 41111100]", "[00411111, 99411111]", "[41111111, 41111199]"],
+      "correct": 0,
+      "explanation": "The low bound pads the prefix with zeros and the high bound pads it with nines, so every 8-digit key that starts with 411111 falls inside. A single point would be an 8-digit BIN; left-padding would turn the prefix into a suffix and break ordering."
+    },
+    {
+      "stage": "post",
+      "question": "A key of 27210000 is looked up in the network table whose first row is [22210000, 27209999]. What happens inside lookup?",
+      "options": ["The binary search finds no candidate and returns empty without a range check", "The candidate is row 0, the high-bound check fails, and the result is empty", "The candidate is row 0 and MASTERCARD is returned because low is below the key", "The search throws because the key lies between two ranges"],
+      "correct": 1,
+      "explanation": "Binary search finds the rightmost row whose low is not above the key, which is row 0. The separate contains check then sees that 27209999 < 27210000 and returns empty, so the card is UNKNOWN. Omitting that high-bound check is the classic interval-search bug; a key between ranges is normal, not exceptional."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the Pan record override toString() to return the masked form?",
+      "options": ["Because PCI DSS requires that the Luhn check digit itself never be displayed anywhere", "Because Java records cannot otherwise be printed by SLF4J and other logging frameworks", "So that logging, concatenation, and debuggers show at most BIN plus last four by default", "So that two Pan values that share the same last four digits compare as equal to each other"],
+      "correct": 2,
+      "explanation": "Every implicit string conversion goes through toString, so the only way to make full-PAN logging an explicit act is to make the default rendering the mask and expose the digits only through a named accessor a reviewer can grep for. Equality still uses the full digits, and the check digit is among the last four that masking shows."
+    }
+  ]
+}

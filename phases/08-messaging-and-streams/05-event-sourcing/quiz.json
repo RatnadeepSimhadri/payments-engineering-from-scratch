@@ -1,0 +1,78 @@
+{
+  "lesson": "05-event-sourcing",
+  "title": "Event Sourcing: State as a Fold Over Events",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A wallet service stores one row per account with the current balance. Support asks what the balance was immediately before a specific debit three weeks ago. Why can the row not answer?",
+      "options": [
+        "The row holds only the present value; every earlier state was overwritten when the next update ran",
+        "The balance column is a float, so the historical value cannot be recovered without rounding error",
+        "The row was updated inside a transaction, and transaction logs are purged after seven days by default",
+        "Debits are stored in a different table, and the join on timestamp is too slow to run on demand"
+      ],
+      "correct": 0,
+      "explanation": "A current-state row is derived data with its history discarded; each update replaces the previous value. Storing the events and deriving the balance makes 'the state as of version k' a replay. The float distractor is a real problem from the Money lesson but is not why history is missing, and purging or slow joins are symptoms of the same missing record, not the cause."
+    },
+    {
+      "stage": "check",
+      "question": "In the lesson's design, where does the rule 'a withdrawal may not exceed available funds' live, and why there?",
+      "options": [
+        "In apply, so that a bad event in the stream is caught the moment it is replayed",
+        "In the event store's append, which inspects the payload before accepting it",
+        "In decide, because events are facts that already happened and apply must never refuse one",
+        "In the snapshot store, which validates the folded state before saving it"
+      ],
+      "correct": 2,
+      "explanation": "decide validates a command against the current state and either emits events or refuses; apply is a total function that folds a fact that is already true. If apply could reject, a stream could contain an event the system refuses to believe and no replay could finish. The store is deliberately ignorant of payloads; it only checks the version."
+    },
+    {
+      "stage": "check",
+      "question": "Two writers both load acct-42 at version 4. Writer A appends Released(auth-1), making version 5. Writer B then calls handle(Withdraw 40.00, expectedVersion 4). What happens?",
+      "options": [
+        "B's event is appended as version 6 because the store orders concurrent writers by arrival time",
+        "B receives a ConcurrencyException and must reload, re-decide against version 5, and retry",
+        "B's command is rejected for insufficient funds because the hold is still counted at version 4",
+        "The store merges both writes into version 5 since a release and a withdrawal do not conflict"
+      ],
+      "correct": 1,
+      "explanation": "The stream is at version 5 and B named version 4, so the conditional append (and the service's earlier check) fails; B's decision was made against stale facts and is discarded. B reloads, sees available 40.00, decides again, and appends at 5. Arrival-order appends are exactly the lost-update race the lesson is designed to prevent; a store never merges payloads."
+    },
+    {
+      "stage": "check",
+      "question": "Account state: balance 100.00 USD, one active hold of 25.00 USD. Which command does decide reject?",
+      "options": [
+        "Withdraw 75.00 USD",
+        "PlaceHold h2 for 70.00 USD",
+        "Withdraw 80.00 USD",
+        "ReleaseHold on the existing hold"
+      ],
+      "correct": 2,
+      "explanation": "Available funds are balance minus active holds: 100.00 - 25.00 = 75.00. Withdrawing 80.00 exceeds that and is refused. Withdrawing exactly 75.00 is allowed (the check is strictly greater-than), a 70.00 hold fits inside 75.00, and releasing an existing hold is always valid. Checking against balance instead of available is the bug that let the row in The Problem go negative."
+    },
+    {
+      "stage": "post",
+      "question": "A snapshot store is wiped by an operator by mistake. What is the consequence for an event-sourced account service?",
+      "options": [
+        "Every account's balance is lost until the last database backup is restored",
+        "Loads become slower because they replay from version 0 until new snapshots are taken; no state is lost",
+        "The expected-version check stops working because snapshot versions are the source of stream versions",
+        "Accounts whose last snapshot was after their last event can no longer accept commands"
+      ],
+      "correct": 1,
+      "explanation": "A snapshot is a cache of a fold prefix. The event stream is the system of record, so load falls back to replaying the whole stream and the result is identical; the demo and tests assert this equality. Versions come from the stream length, not from snapshots, so the concurrency check is unaffected."
+    },
+    {
+      "stage": "post",
+      "question": "The service snapshots every 4 events. A stream is at version 7 and a command appends two events at once. Is a snapshot written?",
+      "options": [
+        "No, because snapshots are taken only when a single append lands exactly on a multiple of 4",
+        "No, because the stream is at 9 after the append and 9 is not a multiple of 4",
+        "Yes, at version 8, because the snapshot is taken on the first of the two events",
+        "Yes, at version 9, because the append crossed a multiple of 4 and the snapshot records the folded state after it"
+      ],
+      "correct": 3,
+      "explanation": "The rule is newVersion / 4 > expectedVersion / 4, i.e. 9 / 4 = 2 > 7 / 4 = 1, so a snapshot is saved; it holds the state after all appended events, at version 9. Snapshotting mid-append at version 8 would require folding and saving between events the writer appended atomically, which the design does not do, and requiring an exact multiple would skip snapshots forever for a writer that always appends in pairs."
+    }
+  ]
+}

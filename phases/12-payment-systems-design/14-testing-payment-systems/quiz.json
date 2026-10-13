@@ -1,0 +1,78 @@
+{
+  "lesson": "14-testing-payment-systems",
+  "title": "Testing Payment Systems: Simulators, Property Tests, and Invariants",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A refund handler checks that each refund is no larger than the most recent capture. A payment was captured twice (20.00 then 30.00) and refunded twice (30.00 then 30.00). What went wrong, and why did the unit tests miss it?",
+      "options": [
+        "Nothing went wrong; each refund was within the last capture, so the handler behaved correctly",
+        "Refunds exceeded total captures by 10.00; no test ran two captures followed by two refunds",
+        "The second capture should have been rejected because partial captures are not allowed",
+        "The handler compared floats; the tests would have caught it with integer amounts"
+      ],
+      "correct": 1,
+      "explanation": "The bound must be against the total captured (50.00), not the last capture (30.00). Two refunds of 30.00 total 60.00. The example tests covered single refunds and single captures, which is exactly the blind spot a property test over random command sequences removes. Partial captures are legal; floats are a different bug."
+    },
+    {
+      "stage": "check",
+      "question": "The fake processor has TIMEOUT_AFTER_APPLY and TIMEOUT_BEFORE_APPLY behaviours that throw the same exception. Why does the service respond identically to both?",
+      "options": [
+        "Because the exception type tells the service which one happened, so one handler covers both",
+        "Because posting the ledger entry immediately is correct in both cases and reconcile fixes any drift",
+        "Because at the moment of the timeout the service cannot tell them apart; only a later query can",
+        "Because the processor always retries internally, so the operation is eventually applied either way"
+      ],
+      "correct": 2,
+      "explanation": "A lost response and a lost request look the same to the caller. The only safe reaction is to post nothing, mark the payment UNKNOWN, and reconcile against the processor's record later. Posting immediately is right half the time, which in a ledger means a reconciliation break every other incident."
+    },
+    {
+      "stage": "check",
+      "question": "The list shrinker tries removing the first half and second half before trying single elements. What does this buy?",
+      "options": [
+        "It guarantees the globally smallest counterexample rather than a local minimum",
+        "It reaches a short counterexample in tens of steps instead of thousands",
+        "It preserves the processor behaviours attached to each command during shrinking",
+        "It ensures the shrunk list is still a valid state-machine sequence"
+      ],
+      "correct": 1,
+      "explanation": "Large removals first mean most of a twelve-command list disappears in two or three successful steps; single-element removal alone would need a pass per element per round. Greedy shrinking still ends at a local minimum, not a guaranteed global one, and validity is not enforced by the shrinker at all; the runner simply skips illegal commands."
+    },
+    {
+      "stage": "check",
+      "question": "With the unbalancedFee bug switched on, the shrunk counterexample is [AUTHORIZE 18, CAPTURE 18] rather than [AUTHORIZE 1, CAPTURE 1]. Why?",
+      "options": [
+        "The amount generator's lower bound is 18 minor units",
+        "Captures below 18 cents are rejected by the state machine",
+        "The shrinker stopped early because it hit the step limit",
+        "2.9% of 17 cents rounds to zero, so no unbalanced fee is posted below 18"
+      ],
+      "correct": 3,
+      "explanation": "The bug credits the fee without a matching debit, so conservation breaks only when the fee is non-zero. 17 * 290 / 10000 = 0.493, which rounds to 0; 18 gives 0.522, which rounds to 1. The shrinker found the boundary without knowing why. The generator's lower bound is 1 and the step limit was not reached."
+    },
+    {
+      "stage": "post",
+      "question": "The postOnTimeout bug passes 500 trials and fails at trial 930. What is the lesson's recommended response?",
+      "options": [
+        "Raise the trial count in CI to 5,000 so rare sequences are reliably reached",
+        "Change the generator so it emits commands legal in the current state and reaches deep paths sooner",
+        "Add a hand-written example for the timeout path and drop the property test for it",
+        "Lower the fee rate so that the invariant check is more sensitive to small amounts"
+      ],
+      "correct": 1,
+      "explanation": "The bug needs an approved authorize, a capture with a specific one-in-five behaviour, and a later reconcile; uniform generation wastes most slots on commands the state machine rejects. A state-aware generator raises the odds of the deep path far more than any affordable trial count. Hand-written examples are kept as regression tests, but the property stays."
+    },
+    {
+      "stage": "post",
+      "question": "A property test over 2,000 random sequences passes. What has been demonstrated?",
+      "options": [
+        "That no command sequence can violate the invariants under any processor behaviour",
+        "That the invariants are correct and complete for the payment flow",
+        "That the generator produced no counterexample in 2,000 trials; untested paths may still fail",
+        "That the system is safe to deploy, since the sample size exceeds statistical significance"
+      ],
+      "correct": 2,
+      "explanation": "A passing property test is evidence bounded by what the generator can produce. It says nothing about paths the generator underweights or cannot reach, and nothing about invariants that were never written down. The right follow-up is to ask what the generator cannot generate, not to treat the pass as a proof."
+    }
+  ]
+}

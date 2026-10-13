@@ -1,0 +1,48 @@
+{
+  "lesson": "15-settlement-and-clearing",
+  "title": "Settlement and Clearing: Gross, Net, and Deferred",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A card authorization is approved in 300 ms and the customer leaves with the goods. What has happened to the money at that moment?",
+      "options": ["It has moved from the cardholder's account to the merchant's account", "It has moved to the acquirer and is awaiting payout to the merchant", "Nothing has moved; the issuer has made a promise that will be cleared and settled later", "It has moved to the card network's settlement account pending netting"],
+      "correct": 2,
+      "explanation": "Authorization is a claim on the issuer, not a transfer. Capture submits it for clearing that evening, the network computes net positions overnight, settlement between banks happens on T+1, and the acquirer pays the merchant on its own schedule. Until the last step the merchant holds a receivable, not money."
+    },
+    {
+      "stage": "check",
+      "question": "In the four-bank example, gross settlement moves 255, bilateral netting moves 125, and multilateral netting moves 35. Why do the multilateral net positions sum to zero?",
+      "options": ["Because the clearing house adds a balancing entry to absorb any residual", "Because every payment is simultaneously a debit to one bank and a credit to another", "Because the example was constructed with equal totals for each bank", "Because the central bank guarantees the difference out of reserves"],
+      "correct": 1,
+      "explanation": "Each obligation appears once as paid and once as received, so summing all positions counts every payment with a plus and a minus. It is the double-entry rule applied to the whole system; no construction or external guarantee is involved."
+    },
+    {
+      "stage": "check",
+      "question": "What risk does deferred net settlement carry that real-time gross settlement eliminates, and at what cost?",
+      "options": ["Operational risk of lost instructions, at the cost of slower processing", "Interbank credit exposure until the cycle settles, at the cost of much higher liquidity needs", "Foreign-exchange risk on cross-currency payments, at the cost of hedging fees", "Fraud risk on individual payments, at the cost of per-payment screening"],
+      "correct": 1,
+      "explanation": "Under DNS a bank that has accepted incoming payments is an unsecured creditor of the payers until settlement, and a failure can cascade through an unwind. RTGS settles each payment immediately in central bank money, so no credit is extended, but every outgoing payment must be covered as it is sent, which is why central banks provide intraday credit."
+    },
+    {
+      "stage": "check",
+      "question": "What was the precise structure of the 1974 Herstatt failure?",
+      "options": ["A fraud in which Herstatt reported FX trades that had never been executed", "A liquidity run in which depositors withdrew Deutsche Marks faster than the bank could borrow", "The Mark legs of FX trades had settled in Frankfurt when the bank was closed, before the dollar legs settled in New York", "A computer failure that lost a day of payment instructions at Herstatt's correspondent bank"],
+      "correct": 2,
+      "explanation": "Counterparties had paid Marks into Herstatt during the German business day; the dollar legs were due hours later in New York and were suspended when the licence was withdrawn at 16:30 Frankfurt time. One leg final, the other not, is settlement risk, and payment-versus-payment through CLS was the eventual fix."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the RTP network require participants to prefund a joint account at the Federal Reserve?",
+      "options": ["So that payments can settle gross and immediately with no credit extended between banks", "So that the network can earn interest on balances to cover its operating costs", "So that payments can be netted at end of day against a known balance", "So that the Federal Reserve can guarantee payments against fraud"],
+      "correct": 0,
+      "explanation": "Prefunding is how an instant-payment system gets RTGS-style finality without central bank intraday credit: a payment is debited from the sender's prefunded balance the moment it is accepted, so the receiver's bank can make funds available irrevocably. UPI, by contrast, settles net in cycles and the receiving bank extends credit until the cycle."
+    },
+    {
+      "stage": "post",
+      "question": "A marketplace charges a buyer's card and pays a seller by bank transfer as two separate operations. What is the settlement lesson that applies?",
+      "options": ["Use the same payment rail for both legs so that they settle in the same cycle", "Net the two legs against each other so that only the platform fee moves", "The failure mode is one leg completing without the other, so the legs must be atomic or compensable", "Delay the payout until T+2 so that card settlement has reached the platform first"],
+      "correct": 2,
+      "explanation": "Herstatt, PvP, DvP, and the saga pattern are all the same observation: with two legs the dangerous case is partial completion, which turns one party's payment into an unsecured loan. Settling both on one ledger entry, or compensating the completed leg when the other fails, is the fix; delaying payout reduces exposure but does not remove the two-leg structure."
+    }
+  ]
+}

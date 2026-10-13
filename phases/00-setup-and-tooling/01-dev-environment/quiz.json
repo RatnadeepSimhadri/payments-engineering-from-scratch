@@ -1,0 +1,78 @@
+{
+  "lesson": "01-dev-environment",
+  "title": "Dev Environment: Java 21, Python 3.12, Go 1.22",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "You run `java -version` and capture only standard output. What do you see on a correctly installed JDK 21?",
+      "options": [
+        "openjdk version \"21.0.2\" and two more lines",
+        "Nothing, because java -version writes to stderr",
+        "Only the line Picked up JAVA_TOOL_OPTIONS",
+        "A single line containing the number 21"
+      ],
+      "correct": 1,
+      "explanation": "The java launcher prints its version banner to standard error, not standard output, so a runner that captures only stdout sees an empty string. That is why the checker merges the two streams. The banner itself does appear, but on the other stream; JAVA_TOOL_OPTIONS is extra noise that only appears when that variable is set."
+    },
+    {
+      "stage": "check",
+      "question": "The checker compares `Python 3.9.18` against the minimum 3.11.0. Why must the comparison be on integers rather than on the version strings?",
+      "options": [
+        "String comparison is slower than integer comparison on long version strings",
+        "The version text may contain quotes that break lexical ordering in Java",
+        "Strings cannot be compared at all in Go, so the design has to use integers everywhere",
+        "As strings, \"3.9.18\" sorts after \"3.11.0\" because '9' > '1', so 3.9 would pass as newer"
+      ],
+      "correct": 3,
+      "explanation": "Lexical ordering compares character by character, and '9' is greater than '1', so \"3.9.18\" > \"3.11.0\" as strings. Parsing into (3, 9, 18) and (3, 11, 0) and comparing field by field gives the correct TOO_OLD result. Speed is irrelevant at this scale, and Go compares strings fine; it is the result, not the ability, that is wrong."
+    },
+    {
+      "stage": "check",
+      "question": "`java` is on PATH, but JAVA_TOOL_OPTIONS names a trust store that does not exist, so the JVM prints an error and exits 1. Which status should the checker report?",
+      "options": [
+        "MISSING, because no usable JVM is available",
+        "TOO_OLD, because no version could be compared",
+        "UNPARSEABLE, because the tool ran but printed no version",
+        "OK, because the executable exists on PATH"
+      ],
+      "correct": 2,
+      "explanation": "The process started, so the executable is not missing; it produced output the version pattern does not match, so nothing was compared. UNPARSEABLE is the only honest status, and its detail line tells the learner to run the command by hand to see the real error. Reporting MISSING would send them to reinstall a JDK they already have."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the Java toolchain's pattern strip an optional leading `1.` while the shared Version parser does not?",
+      "options": [
+        "Because the shared parser only accepts two numeric components and the third would be lost",
+        "Because Go's `1.22.3` is genuinely major 1, so the rule would turn it into 22.3.0",
+        "Because regular expressions in Python cannot express an optional prefix group",
+        "Because stripping in the parser would make javac and java report different versions"
+      ],
+      "correct": 1,
+      "explanation": "The legacy JDK scheme `1.8.0_292` means Java 8, so the Java pattern removes the `1.` before the shared parser sees the text. Go's version strings also begin with `1.`, and there the 1 is the real major version; a shared rule would misreport Go 1.22.3 as 22.3.0. The special case belongs to the tool whose format needs it."
+    },
+    {
+      "stage": "post",
+      "question": "The preflight finds Go missing on a machine where the learner chose Java in LEARNING.md. What should the program's exit code be, and why?",
+      "options": [
+        "1, so CI and the learner both see that the environment is incomplete",
+        "2, a distinct code that scripts can map to the number of missing toolchains",
+        "0, because a preflight reports and the learner needs only their chosen language",
+        "1 only when run by CI, detected through an environment variable"
+      ],
+      "correct": 2,
+      "explanation": "The checker's job is to report, with a fix, and let the human decide; a Java learner can start the course without Go. Exiting non-zero would block them for a toolchain they do not need. CI's stricter requirement that all three languages pass is enforced by run_lesson.py --strict, not by the preflight's exit code."
+    },
+    {
+      "stage": "post",
+      "question": "The tests pass a fake CommandRunner that returns canned strings instead of spawning processes. What does this buy, beyond speed?",
+      "options": [
+        "The tests pass on a machine with none of the toolchains installed, so they test the code, not the machine",
+        "The tests can verify that the real subprocess call merges stderr into stdout correctly",
+        "The fake lets the tests assert the exact column alignment of the formatted report",
+        "The fake guarantees that the real runner never times out on a hung JVM"
+      ],
+      "correct": 0,
+      "explanation": "Injecting the boundary separates deterministic logic (parse, compare, classify) from the environment, so the TOO_OLD and MISSING paths can be exercised on any machine, including one with every toolchain present. The fake deliberately does not exercise the real runner's stream merging or timeout; those are properties of REAL_RUNNER, which the tests avoid for the same reason."
+    }
+  ]
+}

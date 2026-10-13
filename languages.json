@@ -1,0 +1,77 @@
+{
+  "_comment": "Canonical implementation-language registry. Every Build lesson ships code in each language with ci=true; the learner picks one in start-learning and the tutor teaches in it. `dir` is the folder under code/, `run`/`test` are the canonical commands executed from inside that folder, `entry` names the file the tutor walks through first. Add a language by adding an entry and a code/<dir>/ folder to each lesson; scripts/run_lesson.py and scripts/project_test.py read this file. Python and Go are registered but ci=false for now: lessons ship Java first; Python and Go ports are added later and a lesson is Complete when every ci=true language is present.",
+  "languages": [
+    {
+      "id": "java",
+      "name": "Java",
+      "dir": "java",
+      "ci": true,
+      "minVersion": "21",
+      "versionCommand": [
+        "java",
+        "-version"
+      ],
+      "entry": "Main.java",
+      "testEntry": "MainTest.java",
+      "run": [
+        "sh",
+        "-c",
+        "javac -d .out *.java && java -cp .out Main"
+      ],
+      "test": [
+        "sh",
+        "-c",
+        "javac -d .out *.java && java -cp .out MainTest"
+      ],
+      "why": "Records, sealed interfaces, and pattern matching make state machines and money types explicit. The JVM memory model is the reference point for every concurrency lesson."
+    },
+    {
+      "id": "python",
+      "name": "Python",
+      "dir": "python",
+      "ci": false,
+      "minVersion": "3.11",
+      "versionCommand": [
+        "python3",
+        "--version"
+      ],
+      "entry": "main.py",
+      "testEntry": "test_main.py",
+      "run": [
+        "python3",
+        "main.py"
+      ],
+      "test": [
+        "python3",
+        "-m",
+        "unittest",
+        "-v"
+      ],
+      "why": "The shortest distance from an idea to running code. The GIL and Decimal module are teaching tools in their own right."
+    },
+    {
+      "id": "go",
+      "name": "Go",
+      "dir": "go",
+      "ci": false,
+      "minVersion": "1.22",
+      "versionCommand": [
+        "go",
+        "version"
+      ],
+      "entry": "main.go",
+      "testEntry": "main_test.go",
+      "run": [
+        "go",
+        "run",
+        "."
+      ],
+      "test": [
+        "go",
+        "test",
+        "./..."
+      ],
+      "why": "Goroutines, channels, and context make distributed-systems lessons concrete, and the toolchain ships its own test runner and race detector."
+    }
+  ]
+}

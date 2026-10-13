@@ -1,0 +1,48 @@
+{
+  "lesson": "11-iban-bic-and-account-validation",
+  "title": "IBAN, BIC, and Account Number Validation",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A payout service strips spaces from an IBAN, checks that it starts with two letters, and sends it to the bank. Which typing error does this catch?",
+      "options": ["A dropped trailing digit", "Two adjacent digits transposed", "A letter typed in place of a digit", "None of these three"],
+      "correct": 3,
+      "explanation": "Without a length table and a checksum, none of the common keying errors is detected: a short IBAN still starts with two letters, a transposition changes nothing structural, and a stray letter is still alphanumeric. Each of those is exactly what the length check, mod-97, and the BBAN structure check exist to catch."
+    },
+    {
+      "stage": "check",
+      "question": "In an IBAN such as GB82 WEST 1234 5698 7654 32, which part does the receiving bank actually route on?",
+      "options": ["The two check digits, which encode the bank", "The BBAN after position 4, in the domestic format", "The country code combined with the check digits", "The whole 22 characters as one opaque key"],
+      "correct": 1,
+      "explanation": "The IBAN is a wrapper: country code, two check digits, then the national BBAN unchanged. The bank identifier and branch identifier sit at country-specific offsets inside the BBAN (WEST and 123456 here), and the bank routes on those. The check digits only prove the string was transcribed correctly."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the mod97 function reduce the remainder after every single digit instead of converting the rearranged IBAN to an integer and dividing once?",
+      "options": ["Because the rearranged string is up to 68 digits and overflows a 64-bit integer", "Because ISO 13616 forbids computing the remainder in a single division step", "Because letters cannot be converted to digits before the division has started", "Because reducing per digit detects transpositions that one division misses"],
+      "correct": 0,
+      "explanation": "A 22-character IBAN becomes a 28-digit number after letters expand, and a 34-character one up to 68 digits; neither fits in a long or int64. Reducing per digit keeps the running value under 970 and makes the same code work in all three languages. The result is mathematically identical to a single division, so no detection power is gained or lost."
+    },
+    {
+      "stage": "check",
+      "question": "Iban.validate(\"GB82WEST1234569876543X\") returns two issues: BBAN_STRUCTURE and CHECKSUM_FAILED. Why is WRONG_LENGTH not among them?",
+      "options": ["Because the X is counted as two characters after letter expansion", "Because length is checked after the checksum and the checksum already failed", "Because the string is 22 characters, which is correct for GB", "Because the validator stops after the first two issues it finds"],
+      "correct": 2,
+      "explanation": "The input has the right length for a GB IBAN, so the length gate passes and the validator proceeds to the accumulated checks. The X violates the 8n group (reported with its positions) and consequently changes the mod-97 remainder, so both of those are reported together. Length is checked before, not after, the checksum."
+    },
+    {
+      "stage": "post",
+      "question": "A merchant submits IBAN DE89 3704 0044 0532 0130 00 with BIC NWBKGB2L. What should the validator return?",
+      "options": ["Reject with COUNTRY_MISMATCH, because a German account cannot have a UK BIC", "Valid, with a COUNTRY_MISMATCH warning for a human to review", "Reject with UNKNOWN_COUNTRY, because GB is not an IBAN country in the table", "Valid with no issues, because SEPA payments ignore the BIC entirely"],
+      "correct": 1,
+      "explanation": "Both identifiers are individually valid, and a foreign bank's branch can legitimately hold German IBANs under its parent's BIC, so the combination is unusual rather than impossible. The lesson models that as a WARNING that leaves valid() true. Rejecting outright would block legitimate payouts; ignoring it would hide a likely data-entry mix-up."
+    },
+    {
+      "stage": "post",
+      "question": "A US routing number passes the 3-7-1 check and its prefix is in a Federal Reserve range. What has the validator established?",
+      "options": ["The routing number was transcribed correctly and has a plausible prefix", "The institution exists and accepts ACH credits at that routing number", "The account number that accompanies it belongs to the named payee", "The payment will settle on the next business day via FedACH"],
+      "correct": 0,
+      "explanation": "A check digit detects transcription errors; it cannot confirm existence, reachability, or ownership. 021999996 passes every arithmetic check in the lesson and routes nowhere. Existence comes from the Federal Reserve routing directory, and account ownership from micro-deposits, prenotes, or an account-verification API."
+    }
+  ]
+}

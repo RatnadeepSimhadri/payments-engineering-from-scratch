@@ -1,0 +1,78 @@
+{
+  "lesson": "11-payments-system-design-interviews",
+  "title": "Payments System Design: Interview Patterns",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "In a 45-minute payments design interview, which phase carries most of the score?",
+      "options": [
+        "The architecture diagram, because it shows whether the candidate can structure a system",
+        "The clarifying questions, because they show whether the candidate listens",
+        "The probes, where the interviewer asks what happens when a specific component fails",
+        "The wrap-up, where the candidate summarises trade-offs and next steps"
+      ],
+      "correct": 2,
+      "explanation": "The probes are where the interviewer learns whether the candidate knows the mechanism, the invariant, and the failure prevented for each box; the diagram and the questions set them up. A candidate still drawing at minute 25 has spent the scoring window on the lowest-weight phase."
+    },
+    {
+      "stage": "check",
+      "question": "Which clarifying question most changes the design, and why?",
+      "options": [
+        "Whether to use SQL or NoSQL, because it determines the consistency model and therefore the whole transaction design",
+        "Who moves the money, because an external processor introduces an unknown-outcome state and a party to reconcile against",
+        "How many engineers are on the team, because it bounds the number of services the design can realistically contain",
+        "Whether the API needs authentication, because it decides whether a gateway layer sits in front of the payment service"
+      ],
+      "correct": 1,
+      "explanation": "An internal ledger has no timeout-versus-decline problem and nothing external to reconcile against; an external processor has both, which reshapes the state machine and adds the reconciliation component. SQL versus NoSQL is the candidate's decision to make, and team size and authentication do not change the architecture."
+    },
+    {
+      "stage": "check",
+      "question": "A candidate answers the balance-consistency probe with: 'balances are a column on the users table, updated inside a database transaction'. What is the strongest objection?",
+      "options": [
+        "A column has no history, so point-in-time balances and corrections require mutation rather than an appended reversing entry",
+        "Transactions are too slow for a wallet at two thousand transfers per second",
+        "The users table will become too wide once more currencies are added to the product",
+        "Database transactions cannot lock two rows at once, so transfers between users would race"
+      ],
+      "correct": 0,
+      "explanation": "A balance must be a fold over an immutable journal so that any balance can be recomputed to any point and corrected by a new entry; a mutable column cannot do either. Transactions at that rate are fine on one row, width is not the issue, and transactions can lock two rows in a fixed order."
+    },
+    {
+      "stage": "check",
+      "question": "The processor has no query endpoint and the duplicate-charge cost is high. A payment is in UNKNOWN after a timeout. What should the resolver do?",
+      "options": [
+        "Mark the payment FAILED after a fixed delay, since the processor cannot confirm it",
+        "Retry the authorization with a new processor key so the customer is not kept waiting",
+        "Send a void with the same processor key, which is a no-op if nothing was approved and a release if something was",
+        "Leave the payment in UNKNOWN until the settlement file arrives and reconciliation resolves it"
+      ],
+      "correct": 2,
+      "explanation": "Voiding by the same key is idempotent and safe in both worlds, and it matches the stated bias that duplicates cost more than lost sales. Marking FAILED risks a charged customer being told to pay again; a new key risks a double authorization; waiting days for the settlement file leaves the merchant and customer in limbo and the hold on the card."
+    },
+    {
+      "stage": "post",
+      "question": "In the P2P wallet prompt, a 500.00 ACH top-up is returned on day four after the user has sent 450.00 to a friend. Which answer would an interviewer grade as exemplary?",
+      "options": [
+        "Reverse the send so the friend's balance drops by 450.00 and the sender returns to zero, because the funds that paid for it were never good",
+        "Freeze both the sender's and the friend's accounts until the user tops up again and the bank confirms that the replacement funds have cleared",
+        "Absorb the 450.00 as a platform loss and write it off immediately, since the friend acted in good faith and the sender's balance cannot go negative",
+        "Post a new entry debiting the user for 500.00, leaving a negative balance treated as a receivable; completed transfers between users are final, and the risk hold policy is tuned to keep this rare"
+      ],
+      "correct": 3,
+      "explanation": "Completed transfers are final in a ledger; the return is a new entry and the shortfall is a credit decision the system models explicitly as a receivable. Clawing back from the recipient breaks finality and trust, freezing the recipient punishes an innocent party, and writing off without modelling the receivable hides the loss from the books."
+    },
+    {
+      "stage": "post",
+      "question": "A candidate says 'the queue guarantees exactly-once delivery, so the worker cannot double-post'. What is the accurate correction?",
+      "options": [
+        "Queues guarantee exactly-once only when consumers acknowledge within the visibility timeout, so the fix is a longer timeout",
+        "Delivery is at-least-once in every real queue; exactly-once is a property of the consumer's idempotent write, such as a unique index on the outbox id",
+        "Exactly-once requires a distributed transaction between the queue and the database, which the candidate should add to the design",
+        "Exactly-once holds if the queue is partitioned by payment id so that each payment has exactly one consumer at a time"
+      ],
+      "correct": 1,
+      "explanation": "No broker can prevent a redelivery after a consumer crashes between processing and acknowledging; the effect becomes once only because the consumer's write is idempotent. Visibility timeouts and partitioning reduce but do not eliminate redelivery, and a distributed transaction across the broker and the database is neither available in practice nor necessary."
+    }
+  ]
+}

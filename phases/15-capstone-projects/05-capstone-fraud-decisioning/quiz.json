@@ -1,0 +1,78 @@
+{
+  "lesson": "05-capstone-fraud-decisioning",
+  "title": "Capstone: Real-Time Fraud Decisioning",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A velocity check runs `SELECT COUNT(*) ... WHERE card = ? AND created_at > now() - interval '1 hour'` inside the payment handler, wrapped in a timeout that defaults to allow. What does a card-testing ring observe when it pushes 2,000 attempts per minute on one card?",
+      "options": [
+        "The count grows, the rule fires, and every attempt after the fifth is blocked",
+        "The query gets slower as the card gets hotter, the timeout trips, and every attempt is allowed",
+        "The database rejects the writes because the table lock is held by the counting query",
+        "The handler falls back to a cached count from the previous minute and blocks correctly"
+      ],
+      "correct": 1,
+      "explanation": "The scan grows with the card's history, so the hottest cards are exactly the ones whose check times out, and the fail-open default allows them. Nothing caches a count here; the first option assumes the query returns in budget, which is what the attack defeats."
+    },
+    {
+      "stage": "check",
+      "question": "The feature pipeline has a 30-second allowed lateness and the watermark is at 14:03:29 after seeing an event at 14:03:59. An event with event time 14:03:40 arrives. What happens?",
+      "options": [
+        "It is dropped and counted as late because it arrived after a later event",
+        "It is applied to the current processing-time window ending at 14:03:59",
+        "It is applied to the windows its event time belongs to, because 14:03:40 is after the watermark",
+        "It advances the watermark to 14:03:40 and is then applied"
+      ],
+      "correct": 2,
+      "explanation": "The watermark is max event time minus lateness, 14:03:59 minus 30 s. Any event with event time at or after the watermark is within lateness and updates the window its own timestamp falls into, not the newest one. It cannot advance the watermark because it is older than the maximum already seen."
+    },
+    {
+      "stage": "check",
+      "question": "The threshold table is review = 60, block = 120. A transaction fires `card_velocity_1m` (weight 35) and `sanctions_hit` (action HARD_BLOCK, weight 0). What is the decision and why?",
+      "options": [
+        "ALLOW, because the score of 35 is below the review threshold",
+        "REVIEW, because a hard-block rule only escalates by one level",
+        "BLOCK, because a fired HARD_BLOCK rule decides regardless of score",
+        "BLOCK, because the sanctions weight is added and exceeds 120"
+      ],
+      "correct": 2,
+      "explanation": "Requirement 8 makes HARD_BLOCK an action, not a weight: the decision is BLOCK whenever such a rule fires, and the score (35 here) is reported but does not decide. The last option describes the alternative design where sanctions carries a weight above the block threshold; the reference design deliberately keeps the legal obligation out of the arithmetic."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the design store a feature snapshot and the ruleset hash inside every decision record instead of only the decision?",
+      "options": [
+        "So the record can be re-scored months later without the feature store, proving why the decision was made",
+        "So the feature store can be rebuilt from the decision log after a crash",
+        "So the scorer can skip recomputation on a retried transaction with the same id",
+        "So the sanctions list can be updated without re-screening historical names"
+      ],
+      "correct": 0,
+      "explanation": "The compliance incident in the Problem section could not be investigated because nobody recorded what the engine knew at decision time. A self-contained record answers that in M6 step 3. The log is not a feature-store recovery mechanism; windows are rebuilt from the transaction stream, not from decisions."
+    },
+    {
+      "stage": "post",
+      "question": "In the M7 simulation you disable the watermark and treat every event as arriving on time, then delay 20% of events by 10 to 25 seconds. Card-testing recall drops. What does this demonstrate?",
+      "options": [
+        "That the sanctions screener depends on event ordering and silently skips names when events arrive out of sequence",
+        "That processing-time windows split a burst across windows and undercount it, so event time is load-bearing",
+        "That the hard-block rules fire less often when events arrive late because their velocity counters age out too fast",
+        "That the decision log cannot be verified when events are reordered, so the hash chain breaks and recall is miscounted"
+      ],
+      "correct": 1,
+      "explanation": "A card-testing burst is 300 cards hitting one device in 10 minutes. Delayed events land in later processing-time buckets, so `device.distinct_cards_1h` and `card.attempts_1m` at decision time read lower than reality and fewer rules fire. The screener and the log verification do not depend on arrival order at all."
+    },
+    {
+      "stage": "post",
+      "question": "The screener scores `Muhammad Alrashid` at 0.94 against list alias `Mohammad Al-Rashid` and `Mohammed Rashid` at 0.88. Under the two-band design, what happens to each?",
+      "options": [
+        "Both are blocked, because both exceed the 0.85 lower band and sanctions is a legal obligation",
+        "Both are allowed, because neither is an exact character-for-character match to a list entry",
+        "The first is blocked only if its velocity score also exceeds the block threshold of 120",
+        "The first fires the HARD_BLOCK rule; the second adds 50 to the score and is allowed on its own"
+      ],
+      "correct": 3,
+      "explanation": "Requirement 10 defines two bands: at or above 0.92 is a hard block, between 0.85 and 0.92 adds 50 to the score. Fifty alone is below the review threshold of 60, so a coffee purchase by the second customer passes unless another rule fires. Blocking both would be the false-positive flood Phase 13 warned about; allowing both ignores the legal obligation on the strong match."
+    }
+  ]
+}

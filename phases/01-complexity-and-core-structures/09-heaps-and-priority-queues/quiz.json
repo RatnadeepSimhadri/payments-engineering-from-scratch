@@ -1,0 +1,78 @@
+{
+  "lesson": "09-heaps-and-priority-queues",
+  "title": "Heaps and Priority Queues from Scratch",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service needs to repeatedly take the earliest-due item out of a changing set of 400,000 timers. Which data structure gives O(log n) for both insert and take-earliest?",
+      "options": [
+        "A sorted array with binary search for the insert position",
+        "A hash map keyed by due time with a scan for the minimum",
+        "A binary heap ordered by due time",
+        "A linked list kept in due-time order by inserting at the right place"
+      ],
+      "correct": 2,
+      "explanation": "A heap inserts and removes the minimum in O(log n) because only one root-to-leaf path is disturbed. The sorted array finds the position in O(log n) but must shift up to n elements to insert; the linked list walks O(n) to find the position; the hash map has no notion of minimum and must scan every entry."
+    },
+    {
+      "stage": "check",
+      "question": "In the array [1, 3, 2, 4, 8, 7, 6, 9, 5], which statement is true?",
+      "options": [
+        "It is not a valid min-heap because 3 appears before 2",
+        "It is a valid min-heap because every parent at index i is <= its children at 2i+1 and 2i+2",
+        "It is a valid min-heap only if the array is also sorted beyond the root",
+        "It is not a valid min-heap because 5 at index 8 is smaller than 9 at index 7"
+      ],
+      "correct": 1,
+      "explanation": "Check the pairs: 1 <= 3,2; 3 <= 4,8; 2 <= 7,6; 4 <= 9,5. All hold, so heap order is satisfied. Siblings such as 3 and 2, or 9 and 5, are unordered by design; the invariant only relates parents to children, which is what keeps insert and pop at O(log n)."
+    },
+    {
+      "stage": "check",
+      "question": "Why does Floyd's heapify, which sifts down every internal node from n/2 - 1 to 0, run in O(n) rather than O(n log n)?",
+      "options": [
+        "Because sift-down is O(1) when both children are already heaps",
+        "Because only the n/2 internal nodes are visited, which halves the work of n pushes",
+        "Because a node at height h sifts at most h levels, and sum of h * n / 2^(h+1) over all heights equals n",
+        "Because the array is already nearly sorted after the first half of the sifts"
+      ],
+      "correct": 2,
+      "explanation": "Most nodes sit near the leaves and can move only a few levels: half the nodes move zero levels, a quarter at most one, and only the root can move log n. The series 0/2 + 1/4 + 2/8 + 3/16 + ... sums to 1, so the total is at most n swaps. Visiting half the nodes alone would still be O(n log n) if each cost log n, and sift-down is not O(1)."
+    },
+    {
+      "stage": "check",
+      "question": "IndexedMinHeap keeps a map from key to array index. Where must that map be updated to stay consistent?",
+      "options": [
+        "Only in push and pop, since those are the operations that add and remove keys",
+        "Nowhere during normal operation; the map is rebuilt by a full scan before each decreaseKey",
+        "Only in decreaseKey, because that is the only operation that needs to look an index up",
+        "In every swap during sift-up and sift-down, plus when pop moves the last element to the root"
+      ],
+      "correct": 3,
+      "explanation": "The invariant index[entries[i].key] == i breaks every time an entry moves, and entries move on every swap of a sift as well as when pop relocates the last element to index 0. Routing all moves through one swap method is how the implementation keeps this to a single place. Rebuilding by scan would make decreaseKey O(n), defeating its purpose."
+    },
+    {
+      "stage": "post",
+      "question": "Three retries A, B, C are pushed with the same due time in that order, then D with an earlier due time. Using the Entry (priority, seq) comparison, what is the pop order?",
+      "options": [
+        "D, then A, B, C in insertion order because seq breaks the tie",
+        "D, then C, B, A because the most recent tie sits nearest the root",
+        "D, then A, B, C in whatever order the array layout happens to produce",
+        "A, B, C, D because the heap preserves push order unless priorities differ by more than one"
+      ],
+      "correct": 0,
+      "explanation": "D has the smallest priority so it pops first. A, B, and C share a priority, and the comparison falls back to the sequence number assigned at push time, so they leave in insertion order. Without the seq field the order would indeed depend on array layout, which is exactly the arbitrary tie-breaking that java.util.PriorityQueue documents."
+    },
+    {
+      "stage": "post",
+      "question": "An operator wants to pull 400,000 pending retries forward to 'now'. Why is java.util.PriorityQueue a poor fit, and what does the lesson's design change?",
+      "options": [
+        "PriorityQueue cannot hold that many elements; the lesson's heap uses a linked structure that grows without copying",
+        "PriorityQueue has no decrease-key and remove(Object) scans linearly, so the batch is O(n^2); the index map makes each change O(log n)",
+        "PriorityQueue compares with the system clock, so moving items requires re-sorting; the lesson stores absolute due times instead",
+        "PriorityQueue pops ties arbitrarily, so pulling items forward would reorder merchants; the sequence number prevents that"
+      ],
+      "correct": 1,
+      "explanation": "Changing a priority in PriorityQueue means remove(Object), an O(n) indexOf, then re-add; over 400,000 items that is O(n^2). The index map locates an entry in O(1) and sift-up restores order in O(log n). PriorityQueue grows fine and does not read the clock; the tie-break issue is real but is a separate property from re-prioritisation cost."
+    }
+  ]
+}

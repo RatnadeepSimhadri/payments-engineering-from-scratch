@@ -1,0 +1,48 @@
+{
+  "lesson": "08-two-phase-commit",
+  "title": "Two-Phase Commit and Its Blocking Problem",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service debits alice on database A, commits, then credits bob on database B, commits. The process is killed between the two commits. What is the state of the money?",
+      "options": ["Both updates are rolled back by the databases", "alice is debited and bob is not credited", "bob is credited and alice is not debited", "Both updates are applied when the process restarts"],
+      "correct": 1,
+      "explanation": "Each database committed its own statement independently; A's commit is durable and B's never ran. The money left alice and reached nobody. Neither database knows about the other, so nothing rolls back and a restarted process cannot tell which half ran without a log of its own."
+    },
+    {
+      "stage": "check",
+      "question": "In which order must a participant do these three things when it receives PREPARE and all checks pass?",
+      "options": ["Vote YES, take the lock, write PREPARED to the log", "Take the lock, vote YES, write PREPARED to the log", "Write PREPARED to the log, vote YES, take the lock", "Take the lock, write PREPARED to the log, vote YES"],
+      "correct": 3,
+      "explanation": "The YES vote is a promise that must survive a participant crash, so it cannot leave before the PREPARED record is durable. The lock is taken first so that the logged state is never more permissive than the in-memory state. Voting before logging is the strongest distractor: a crash between the two leaves the coordinator holding a promise the participant has forgotten."
+    },
+    {
+      "stage": "check",
+      "question": "The coordinator has received YES from both participants and is killed before appending the DECISION record. What does the recovered coordinator do with the transaction?",
+      "options": ["Re-sends PREPARE and collects fresh votes", "Decides ABORT, because no decision record exists", "Decides COMMIT, because both votes were YES", "Asks the participants which decision they received"],
+      "correct": 1,
+      "explanation": "Presumed abort: a BEGIN without a DECISION means no COMMIT message can have been sent, because the DECISION append precedes every phase-2 message, so ABORT is always a legal choice. Deciding COMMIT from the remembered votes is wrong because the votes were in memory and died with the process; the log is the only thing recovery can trust."
+    },
+    {
+      "stage": "check",
+      "question": "A participant has been PREPARED for ten minutes with no decision from the coordinator. A new transaction needs the same account. Which action is safe?",
+      "options": ["Abort the old transaction and release the lock", "Vote NO to the new transaction and keep waiting", "Commit the old transaction since the vote was YES", "Vote YES to the new one; the old one has expired"],
+      "correct": 1,
+      "explanation": "Once a participant has voted YES it does not know whether the coordinator logged COMMIT before dying, so neither unilateral commit nor unilateral abort is safe; either could violate agreement with the other participant. The only safe action is to refuse the new work and keep the lock. That is the blocking problem, and it is why the lesson says no timeout can release a prepared participant."
+    },
+    {
+      "stage": "post",
+      "question": "Why must a participant's commit(txId) be a no-op when the transaction is already COMMITTED, rather than throwing an error?",
+      "options": ["Because the coordinator sends COMMIT twice by design to improve durability", "Because acknowledgements can be lost and the coordinator redelivers the decision", "Because recovery replays the participant log and would otherwise double-apply", "Because two coordinators may legitimately own the same transaction identifier"],
+      "correct": 1,
+      "explanation": "Phase 2 retries delivery until every participant acknowledges, and an ack can be lost even though the participant applied the decision. The redelivered COMMIT must be absorbed without re-applying the posting. Log replay is handled separately in crashAndRecover and never calls commit(), so it is not the reason; and two coordinators sharing an id would be a bug, not a case to support."
+    },
+    {
+      "stage": "post",
+      "question": "A team proposes 2PC between the wallet service, the card-network gateway, and the fraud service. What is the strongest objection?",
+      "options": ["Two round trips make each payment too slow for a card authorization", "The three services use different programming languages and databases", "External participants will not hold a lock across your coordinator's decision", "Two-phase commit cannot handle more than two participants in one transaction"],
+      "correct": 2,
+      "explanation": "2PC requires every participant to expose prepare and to hold its resources locked until the coordinator decides; a card network or a third-party fraud service offers final messages with explicit reversals, not a prepare verb. Latency is a real cost but a secondary one, and the protocol handles any number of participants. Across service boundaries the answer is a saga or an outbox."
+    }
+  ]
+}

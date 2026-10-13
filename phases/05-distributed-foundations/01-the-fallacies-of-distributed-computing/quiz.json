@@ -1,0 +1,48 @@
+{
+  "lesson": "01-the-fallacies-of-distributed-computing",
+  "title": "The Fallacies of Distributed Computing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service calls a payment processor and the call times out after 5 seconds. Which of these can the calling process conclude from the timeout alone?",
+      "options": ["The charge was not executed and it is safe to retry", "The processor is down and the circuit should open", "Nothing about whether the charge executed; the outcome is unknown", "The request was dropped by the network before it arrived"],
+      "correct": 2,
+      "explanation": "A timeout is compatible with five worlds: request dropped, still executing, processor crashed mid-way, response dropped, response late. The caller cannot distinguish them, which is the ambiguous outcome at the root of fallacy 1. Concluding 'not executed and safe to retry' is exactly the assumption that produces duplicate charges."
+    },
+    {
+      "stage": "check",
+      "question": "A checkout service with 200 worker threads and an infinite HTTP read timeout handles 50 calls per second to a processor that hangs 0.5% of connections. Roughly how long until the pool is exhausted, and what is the fix?",
+      "options": ["About 11 minutes; add more threads to the pool so the hangs are absorbed", "About 13 minutes; a bounded read timeout so each hung socket releases its thread", "About 11 minutes; retry hung calls immediately so the thread can move on", "About 2 hours; move the health check off the shared worker pool"],
+      "correct": 1,
+      "explanation": "0.5% of 50/s is 0.25 hung sockets per second; 200 threads are consumed in about 800 seconds. More threads only delays the exhaustion (2,000 threads fail in 110 minutes), and retrying a hung call duplicates work. A bounded timeout caps the steady-state hung threads at roughly 0.25/s times 5 s, about one thread."
+    },
+    {
+      "stage": "check",
+      "question": "Why must an idempotency key be created and persisted by the caller before the first attempt rather than generated inside the HTTP client's retry loop?",
+      "options": ["Because the processor rejects keys that were not registered in advance through a separate call", "Because keys generated in the loop are not cryptographically random enough for the processor", "Because a key that is created per attempt or lost in a crash cannot tie the retry to the original request", "Because the key has to be stored in the database before the HTTP client library can be initialised"],
+      "correct": 2,
+      "explanation": "The key's only job is to let the receiver recognise a retry as the same request. If each attempt mints a new key, every retry is a new charge; if the key lives only in process memory and the caller crashes between attempts, the next attempt has no key to reuse. Registering keys in advance is not how any production API works."
+    },
+    {
+      "stage": "check",
+      "question": "A webhook endpoint accepts any JSON body that parses and marks the order paid if status is 'succeeded'. Which fallacy is this, and what is the counter-measure?",
+      "options": ["Fallacy 1, the network is reliable; add a retry with exponential backoff on the webhook receiver", "Fallacy 8, the network is homogeneous; add a per-processor adapter that canonicalises the body", "Fallacy 6, there is one administrator; add monitoring on the webhook success rate", "Fallacy 4, the network is secure; verify an HMAC signature over body plus timestamp with a replay window"],
+      "correct": 3,
+      "explanation": "Trusting a message because of the URL it arrived at assumes the network authenticates senders, which it does not. An HMAC with a shared secret proves who sent the body, and the timestamp plus a short window stops a captured message from being replayed. An adapter (fallacy 8) fixes format differences, not forgery."
+    },
+    {
+      "stage": "post",
+      "question": "During a database failover the old primary keeps accepting writes from clients that still hold connections to it, and the ledger ends up with two histories. Which fallacy is this, and why is a lock timeout alone not a fix?",
+      "options": ["Fallacy 5, topology changes; the old holder cannot be trusted to stop, so the resource must reject writes with a stale fencing token", "Fallacy 2, latency is zero; the failover took longer than the lock timeout so the lock should simply be made longer", "Fallacy 5, topology changes; the clients should be restarted after every failover so they reconnect to the new primary", "Fallacy 1, the network is reliable; the writes to the old primary should be retried against the new one"],
+      "correct": 0,
+      "explanation": "Split brain is a topology change the old primary did not observe. A timeout only tells the old holder when to stop; a partitioned or paused process may not act on it in time. Safety requires the protected resource to check a monotonically increasing token on every write and reject stale ones. Restarting clients is reactive and leaves a window; a longer timeout widens it."
+    },
+    {
+      "stage": "post",
+      "question": "A client integrates two card processors. One returns amount as an integer in minor units, the other as a decimal string such as \"19.99\". The client multiplies both by 100. Which pattern prevents this class of defect?",
+      "options": ["Round the decimal string with HALF_EVEN before multiplying so both paths agree", "Normalise both responses to a decimal string and parse that with a shared helper", "Ask the second processor to change its API so every partner uses minor units", "An adapter per processor that produces one canonical Money type at the boundary"],
+      "correct": 3,
+      "explanation": "Fallacy 8: participants do not share semantics, and a parse that succeeds with the wrong meaning is worse than one that fails. One adapter per participant converts each external format into the same strict internal Money (integer minor units plus currency) and rejects anything that does not canonicalise. A shared helper on a normalised string still leaves the per-processor interpretation implicit."
+    }
+  ]
+}

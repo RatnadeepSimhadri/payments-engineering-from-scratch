@@ -1,0 +1,78 @@
+{
+  "lesson": "08-pci-dss-for-engineers",
+  "title": "PCI DSS for Engineers",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A merchant's checkout form posts the card number to the merchant's own backend, which forwards it to a payment provider and keeps only the returned token. Which systems are in PCI DSS scope?",
+      "options": [
+        "None, because the merchant never stores the card number in its database",
+        "Only the payment provider, since it is the party that stores the card",
+        "The backend and everything it logs to, because it processes the PAN on every request",
+        "Only the database, since scope is defined by where data is persisted"
+      ],
+      "correct": 2,
+      "explanation": "Scope covers systems that store, process, or transmit cardholder data. A backend that receives the PAN in a request body processes it, so it is in the CDE along with its logs, error tracker, and backups. Storage is only one of the three verbs; the database being token-only does not help."
+    },
+    {
+      "stage": "check",
+      "question": "A team encrypts the card verification code (CVV) at rest using keys held in a hardware security module and argues this satisfies Requirement 3. Is it compliant?",
+      "options": [
+        "Yes, because strong cryptography is the required rendering method for stored account data",
+        "Yes, provided the HSM is FIPS 140-2 validated and the keys rotate annually",
+        "No, because sensitive authentication data must never be stored after authorization, however protected",
+        "No, because CVVs must be tokenized rather than encrypted under v4.0"
+      ],
+      "correct": 2,
+      "explanation": "The CVV is sensitive authentication data, which the standard forbids retaining after the authorization response regardless of encryption strength. Encryption is a permitted rendering for the PAN, which is cardholder data, not for SAD. The HSM's validation level and tokenization are irrelevant to a value that is not allowed to exist."
+    },
+    {
+      "stage": "check",
+      "question": "Two e-commerce integrations: in one, the provider's iframe captures the card number inside the merchant's page; in the other, the merchant's own JavaScript collects the number and posts it to the provider from the browser. Which SAQ applies to each?",
+      "options": [
+        "Both qualify for SAQ A, since the merchant's backend never receives the PAN in either case",
+        "SAQ A for the iframe; SAQ A-EP for the merchant-controlled JavaScript, because the merchant's code governs how the PAN is sent",
+        "SAQ A-EP for the iframe; SAQ A for the JavaScript, because the iframe runs inside the merchant's origin",
+        "SAQ D for both, because any browser-side handling of a PAN puts the merchant fully in scope"
+      ],
+      "correct": 1,
+      "explanation": "SAQ A requires all CHD functions to be outsourced, which the hosted iframe achieves. When the merchant's own script collects the PAN and decides where to send it, the merchant's code is part of the payment flow and SAQ A-EP applies, with roughly five times as many requirements. SAQ D is for merchants whose backend receives or stores the PAN."
+    },
+    {
+      "stage": "check",
+      "question": "Why does PCI DSS v4.0 require an inventory and integrity check of every script on a payment page (6.4.3), even when a hosted iframe means the merchant never sees the PAN?",
+      "options": [
+        "Because the iframe's contents are considered part of the merchant's DOM and therefore in scope",
+        "Because a malicious script in the merchant's page can overlay a fake card form or skim data, as in web-skimming attacks",
+        "Because scripts are the only way a PAN can reach the merchant's logs from the browser",
+        "Because the requirement replaces the need for TLS on the checkout page"
+      ],
+      "correct": 1,
+      "explanation": "The merchant's page hosts the iframe, and any script running in that page can draw a convincing fake form over it or alter the page. The Magecart family of attacks did exactly this through third-party scripts. The iframe's own contents are the provider's; the requirement is about what surrounds it, and it adds to TLS rather than replacing it."
+    },
+    {
+      "stage": "post",
+      "question": "A central log pipeline receives logs from the payment service. Under what condition is the log pipeline itself part of the cardholder data environment rather than merely connected-to?",
+      "options": [
+        "Whenever it is on the same network as the payment service",
+        "Only if engineers use it to administer payment hosts",
+        "If any log line has ever carried a PAN, because it then stores cardholder data",
+        "Never; log systems are explicitly excluded from the CDE definition"
+      ],
+      "correct": 2,
+      "explanation": "A system that stores cardholder data is in the CDE by definition, and a logged request body makes the log store exactly that. Otherwise the pipeline is connected-to and still in scope for the controls, but with a different risk profile. Same-network placement makes it connected-to, not CDE; nothing in the standard excludes logging systems."
+    },
+    {
+      "stage": "post",
+      "question": "The standard permits rendering a stored PAN unreadable with a one-way hash. Why is a plain SHA-256 of the PAN not acceptable under v4.0?",
+      "options": [
+        "Because SHA-256 has been removed from the PCI SSC's list of strong cryptography and must be replaced with SHA-3",
+        "Because the public BIN and the Luhn check digit leave so few candidates that the hash is reversed by brute force; a keyed hash is required",
+        "Because a hash cannot be rotated the way an encryption key can, so a compromised hash table cannot be re-protected",
+        "Because hashing makes the PAN unavailable for refunds and chargebacks, which the standard requires to keep working"
+      ],
+      "correct": 1,
+      "explanation": "A PAN has little entropy once the public BIN is known and the check digit is fixed, so an unsalted hash of every candidate in a BIN range is computed in minutes. Requirement 3.5.1.1 therefore requires a keyed cryptographic hash with managed keys. SHA-256 itself is fine as a primitive; the problem is the input space, and refunds use tokens, not hashes."
+    }
+  ]
+}

@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "id": "payments-interview-prep",
+  "title": "Payments System Design Interview Prep",
+  "summary": "The lessons interviewers probe: idempotency, ledgers, state machines, webhooks, reconciliation, HA design, then drills.",
+  "estimatedMinutes": 1455,
+  "stateFile": "INTERVIEW-PREP.md",
+  "invocation": {
+    "claudeCode": "/interview-prep",
+    "codex": "interview-prep, or choose it from /skills",
+    "portableFallback": "Use interview-prep to start or resume the Payments System Design Interview Prep path."
+  },
+  "languages": [
+    "Java"
+  ],
+  "conceptualFallback": "Read each lesson's docs/en.md and trace the worked example by hand; mark run evidence pending until a toolchain is available.",
+  "project": "idempotent-payment-gateway",
+  "lessons": [
+    {
+      "phase": 5,
+      "lesson": 9,
+      "title": "Idempotency Keys: Exactly-Once Effects on At-Least-Once Networks",
+      "path": "phases/05-distributed-foundations/09-idempotency-keys",
+      "minutes": 120,
+      "required": true,
+      "order": 1
+    },
+    {
+      "phase": 5,
+      "lesson": 10,
+      "title": "Retries, Exponential Backoff, and Jitter",
+      "path": "phases/05-distributed-foundations/10-retries-backoff-and-jitter",
+      "minutes": 90,
+      "required": true,
+      "order": 2
+    },
+    {
+      "phase": 10,
+      "lesson": 1,
+      "title": "Representing Money: Minor Units, Currencies, and Rounding",
+      "path": "phases/10-money-and-ledgers/01-representing-money",
+      "minutes": 90,
+      "required": true,
+      "order": 3
+    },
+    {
+      "phase": 10,
+      "lesson": 3,
+      "title": "The Double-Entry Ledger from Scratch",
+      "path": "phases/10-money-and-ledgers/03-double-entry-ledger",
+      "minutes": 150,
+      "required": true,
+      "order": 4
+    },
+    {
+      "phase": 11,
+      "lesson": 1,
+      "title": "How a Card Payment Works: Issuer, Acquirer, Network, Processor",
+      "path": "phases/11-payment-rails/01-how-a-card-payment-works",
+      "minutes": 75,
+      "required": true,
+      "order": 5
+    },
+    {
+      "phase": 11,
+      "lesson": 2,
+      "title": "Authorization, Capture, Void, Refund: The Card Lifecycle State Machine",
+      "path": "phases/11-payment-rails/02-card-authorization-lifecycle",
+      "minutes": 120,
+      "required": true,
+      "order": 6
+    },
+    {
+      "phase": 12,
+      "lesson": 1,
+      "title": "Designing an Idempotent Payment API",
+      "path": "phases/12-payment-systems-design/01-idempotent-payment-api",
+      "minutes": 120,
+      "required": true,
+      "order": 7
+    },
+    {
+      "phase": 12,
+      "lesson": 2,
+      "title": "The Payment State Machine",
+      "path": "phases/12-payment-systems-design/02-payment-state-machine",
+      "minutes": 120,
+      "required": true,
+      "order": 8
+    },
+    {
+      "phase": 12,
+      "lesson": 5,
+      "title": "Webhooks: Signing, Delivery, Ordering, and Replay",
+      "path": "phases/12-payment-systems-design/05-webhooks-and-callbacks",
+      "minutes": 120,
+      "required": true,
+      "order": 9
+    },
+    {
+      "phase": 10,
+      "lesson": 8,
+      "title": "Reconciliation: Matching Your Ledger Against Theirs",
+      "path": "phases/10-money-and-ledgers/08-reconciliation",
+      "minutes": 120,
+      "required": true,
+      "order": 10
+    },
+    {
+      "phase": 14,
+      "lesson": 1,
+      "title": "Architecture of a High-Availability Payment Gateway",
+      "path": "phases/14-payments-at-scale/01-high-availability-payment-gateway",
+      "minutes": 90,
+      "required": true,
+      "order": 11
+    },
+    {
+      "phase": 14,
+      "lesson": 3,
+      "title": "Exactly-Once Money Movement End to End",
+      "path": "phases/14-payments-at-scale/03-exactly-once-money-movement",
+      "minutes": 150,
+      "required": true,
+      "order": 12
+    },
+    {
+      "phase": 14,
+      "lesson": 11,
+      "title": "Payments System Design: Interview Patterns",
+      "path": "phases/14-payments-at-scale/11-payments-system-design-interviews",
+      "minutes": 90,
+      "required": true,
+      "order": 13
+    }
+  ],
+  "checkpoints": {
+    "phases/14-payments-at-scale/11-payments-system-design-interviews": "Deliver one 45-minute mock answer graded against the rubric."
+  }
+}

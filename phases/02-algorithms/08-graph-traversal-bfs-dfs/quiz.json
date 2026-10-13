@@ -1,0 +1,48 @@
+{
+  "lesson": "08-graph-traversal-bfs-dfs",
+  "title": "Graph Traversal: BFS, DFS, and Connected Components",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A transaction graph has 50 million accounts and 2 billion transfers. Which representation lets a traversal run in time proportional to accounts plus transfers?",
+      "options": ["An adjacency matrix of booleans, because edge lookup is O(1)", "An adjacency list mapping each account to its counterparties", "A sorted array of all transfers, searched with binary search per hop", "A hash set of (from, to) pairs, queried for every candidate pair"],
+      "correct": 1,
+      "explanation": "The adjacency list stores each edge once and enumerates a node's neighbours in time proportional to its degree, giving O(V + E) traversals. The matrix would need 2.5 x 10^15 cells and makes neighbour enumeration O(V) per node; a pair set answers existence queries but cannot enumerate neighbours without trying every account."
+    },
+    {
+      "stage": "check",
+      "question": "In BFS, why must a node be marked as discovered when it is enqueued rather than when it is dequeued?",
+      "options": ["Marking on dequeue would let a node enter the queue several times and record a later, non-shortest parent", "Marking on dequeue would make the algorithm visit nodes in depth-first order instead", "Marking on enqueue is required so that the source node receives distance zero", "Marking on dequeue would cause the traversal to skip nodes with no outgoing edges"],
+      "correct": 0,
+      "explanation": "Between its first enqueue and its dequeue a node can be reached again from a later frontier node; without a mark it is enqueued again and its parent is overwritten by the later discovery, breaking the shortest-hop guarantee and growing the queue to O(E). The visit order stays breadth-first either way; it is the distances and parents that go wrong."
+    },
+    {
+      "stage": "check",
+      "question": "The iterative DFS pushes a node's neighbours onto the stack in reverse order. What does this achieve?",
+      "options": ["It guarantees each node is pushed onto the stack at most once per traversal", "It makes the visit order match the recursive DFS, which takes the first neighbour first", "It converts the depth-first traversal into breadth-first, level-by-level order", "It bounds the stack depth by the number of nodes rather than the number of edges"],
+      "correct": 1,
+      "explanation": "A stack is last-in first-out, so pushing the last neighbour first makes the first neighbour pop first, reproducing recursive preorder. Nodes may still be pushed several times (once per incoming edge seen before the visit), which is why the visited check happens after the pop and the stack is bounded by O(E)."
+    },
+    {
+      "stage": "check",
+      "question": "payroll -> acct-X -> landlord and payroll -> landlord. A two-colour (visited / not visited) cycle detector reports a cycle here. What does the three-colour version see when it examines payroll -> landlord?",
+      "options": ["landlord is GRAY, so this is a back edge and a cycle", "landlord is WHITE, so it descends and finds no cycle", "landlord is BLACK, so this is a cross edge and not a cycle", "payroll is BLACK, so the edge is skipped as already processed"],
+      "correct": 2,
+      "explanation": "DFS from payroll goes to acct-X, then landlord, finishes landlord (BLACK) and acct-X, then examines the direct edge. landlord is finished and not on the current path, so the edge is a cross edge. Only an edge into a GRAY node, one still on the path, closes a cycle; the two-colour detector cannot tell GRAY from BLACK and misreports every diamond."
+    },
+    {
+      "stage": "post",
+      "question": "Connected components of the demo graph put the laundering ring and the household payroll fan-out into separate components of 5 and 4 accounts. Why is 'component of 3 or more' still not a usable fraud rule?",
+      "options": ["Components ignore direction, so any linked group qualifies, including a salary paid out to a landlord and a grocer", "Components are computed on the directed graph, so a fan-out always splits into singletons", "Components require a cycle, so the ring is found but the tail accounts D and E are missed", "Components are nondeterministic, so the same graph gives different groups on each run"],
+      "correct": 0,
+      "explanation": "Weak connectivity says only that accounts are linked by some chain of transfers in either direction, which describes every normal household as well as every ring. What separates the ring is that money returns to its origin, a directed cycle (or, more precisely, a non-trivial strongly connected component). The lesson's components are deterministic because node and neighbour order are preserved."
+    },
+    {
+      "stage": "post",
+      "question": "A risk job must report how many hops each account is from a flagged account, reproducibly, on a graph containing a 100,000-account forwarding chain. Which combination is correct?",
+      "options": ["Recursive DFS with a distance counter, over a hash-map adjacency list", "Iterative BFS with a distance map, over an insertion-ordered adjacency list", "Iterative DFS with a distance counter, over an insertion-ordered adjacency list", "Recursive BFS with a parent map, over a sorted adjacency matrix"],
+      "correct": 1,
+      "explanation": "Hop counts are shortest-path distances, which only BFS computes; DFS reports the depth of whichever path it happened to take. The chain rules out recursion in Java and Python. Insertion order makes the parent chosen among equal-distance routes, and hence the report, reproducible; a hash map's order can change between runs."
+    }
+  ]
+}

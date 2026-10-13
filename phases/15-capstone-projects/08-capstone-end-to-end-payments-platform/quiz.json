@@ -1,0 +1,78 @@
+{
+  "lesson": "08-capstone-end-to-end-payments-platform",
+  "title": "Capstone: End-to-End Payments Platform",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Seven components each pass their own test suites. Which kind of failure can still appear only when they run together?",
+      "options": [
+        "A floating-point rounding error inside one component's fee calculation that only shows up on amounts ending in .99",
+        "Two components holding the same fact with no rule for which one is authoritative, such as a wallet balance and a ledger balance",
+        "A unit test that passes only because its random seed was never changed and would fail on any other seed value",
+        "A component whose write-ahead log fails to truncate a torn tail on recovery and replays a partial record"
+      ],
+      "correct": 1,
+      "explanation": "Each component's own invariant can hold while the platform is wrong, because no component test sees the other's state; the fix is a contract naming one source of truth and bounding the other's lag. Rounding, seed fragility, and WAL recovery are all single-component defects that the earlier capstones' tests already cover."
+    },
+    {
+      "stage": "check",
+      "question": "Under Contract 1, which statement about a customer's wallet balance is correct?",
+      "options": [
+        "The ledger's posted balance minus active holds is the truth, and the wallet's available balance is a projection that never exceeds it",
+        "The wallet's event store is the source of truth and the ledger is posted from it with a measured lag",
+        "Both stores are sources of truth and a nightly job reconciles the difference between them",
+        "The gateway's payment records are the truth, since every balance change starts as a payment"
+      ],
+      "correct": 0,
+      "explanation": "Money lives in the ledger; the wallet's available is derived and bounded above by the ledger, which is what the M2 checkpoint assertion proves. Making the wallet the truth reintroduces the window where a customer can spend money the books do not show; two truths is the composition failure the contract exists to prevent."
+    },
+    {
+      "stage": "check",
+      "question": "The relay is configured to deliver every outbox record twice. Which outcome does Requirement 3 demand?",
+      "options": [
+        "The ledger shows two postings per event and the trial balance is still zero, since both are balanced",
+        "The second delivery is rejected by the relay before it reaches any consumer",
+        "The consumers log a warning for each duplicate and continue, with totals doubled but flagged",
+        "The final state (trial balance, payment states, payout states) is identical to a run with single delivery"
+      ],
+      "correct": 3,
+      "explanation": "Consumers dedupe on the (sourceComponent, sourceRecordId, kind) key with a unique index, so duplicates have no effect and the state hash matches the single-delivery run. Two balanced postings would still double the merchant's payable; the relay cannot know what was delivered if it crashed between deliver and mark, so dedupe must live in the consumer."
+    },
+    {
+      "stage": "check",
+      "question": "A capture lands at 23:30 platform time. The processor's settlement file uses a 23:00 cut-off and lists it under the next day. What does the reference design do?",
+      "options": [
+        "Reports an IN_LEDGER_NOT_STATEMENT break and assigns it to the processor-relations owner",
+        "Moves the capture's settlement date to the next day so the ledger agrees with the processor",
+        "Normalizes the processor's date to the platform calendar at parse time and records a WINDOW_SHIFT annotation, not a break",
+        "Holds the capture out of both windows until the reconciler confirms which day the processor used"
+      ],
+      "correct": 2,
+      "explanation": "Contract 3 gives the platform one calendar; the stamp assigned at capture is authoritative, and other parties' dates are normalized on parse with the original retained for the report. Classifying a known cut-off difference as a break is the on-call hour from The Problem; changing the ledger's stamp would make the platform's own windows inconsistent."
+    },
+    {
+      "stage": "post",
+      "question": "The planted defect WALLET_CREDITS_BEFORE_LEDGER makes the wallet's available balance rise when the top-up command is accepted rather than when the ledger posting is applied. Which invariant is expected to catch it first, and why?",
+      "options": [
+        "trial-balance, because the ledger receives a posting with no matching debit",
+        "wallet-available-bounded, because available exceeds posted minus holds during the lag between the event and the posting",
+        "one-payment-per-key, because the duplicate credit creates a second payment record",
+        "every-capture-posted-once, because the top-up is posted twice when the relay catches up"
+      ],
+      "correct": 1,
+      "explanation": "The defect breaks Contract 1 directly: for the duration of the relay lag the wallet shows money the ledger has not posted, which is exactly the inequality the invariant checks. The ledger itself remains balanced, no payment record is involved in a top-up, and the posting happens once."
+    },
+    {
+      "stage": "post",
+      "question": "An invariant violation fires in the running platform. The runbook says to freeze the affected outbox and page, rather than post a correcting ledger entry. Why?",
+      "options": [
+        "Because a correcting entry before the root cause is known can hide the defect and may itself be wrong, while freezing stops further damage and preserves the state for diagnosis",
+        "Because correcting entries require a second approver under the platform's segregation-of-duties rules, and nobody is available at night",
+        "Because the ledger rejects any entry posted while an invariant violation is active, so the correction would fail anyway",
+        "Because the relay cannot be restarted until the violation count returns to zero, and the correcting entry would sit unpublished"
+      ],
+      "correct": 0,
+      "explanation": "An invariant violation means the platform's model of money is wrong somewhere; writing more entries on top of an unknown defect compounds it and destroys evidence. Freezing the flow bounds the blast radius and keeps the state hash for the postmortem. The other options describe mechanisms the capstone does not specify."
+    }
+  ]
+}

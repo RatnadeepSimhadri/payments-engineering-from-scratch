@@ -1,0 +1,78 @@
+{
+  "lesson": "04-sanctions-screening",
+  "title": "Sanctions Screening: Name Matching Under Uncertainty",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A screener lowercases names, splits on whitespace, and flags any payment whose surname token appears on the sanctions list. What is the most likely outcome in production?",
+      "options": [
+        "It misses most listed persons because surnames alone are rarely on the list",
+        "It produces so many alerts on common surnames that real hits are not reviewed in time",
+        "It performs well, since surname plus first initial is how the lists are keyed",
+        "It fails on diacritics only; otherwise the hit rate is acceptable"
+      ],
+      "correct": 1,
+      "explanation": "Common surnames (Khan, Garcia, Kim, Ali, Smith) are on every sanctions list, so a surname-only match fires on a large fraction of ordinary customers. The regulatory failure is not missed hits but a queue so long the true hits settle before an analyst reaches them. Recall is actually high; precision is the problem."
+    },
+    {
+      "stage": "check",
+      "question": "For martha and marhta, Jaro counts 6 matches and 2 out-of-order matched characters. What is the Jaro score, and what does the Winkler adjustment change it to?",
+      "options": [
+        "0.8889, then 0.9333 after a prefix bonus of 4",
+        "0.9444, then 0.9611 after a prefix bonus of 3",
+        "0.9444, unchanged because the transposition cancels the prefix bonus",
+        "1.0000, because a transposition is not counted as a difference"
+      ],
+      "correct": 1,
+      "explanation": "Two out-of-order characters are one transposition (half of 2), so jaro = (6/6 + 6/6 + 5/6) / 3 = 0.9444. The common prefix is 'mar', three characters, so Winkler adds 3 * 0.1 * (1 - 0.9444) = 0.0167, giving 0.9611. Transpositions do cost something, just less than in Levenshtein."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the Soundex implementation skip h and w without resetting the 'last code' variable, while a vowel does reset it?",
+      "options": [
+        "Because h and w are always silent in English surnames, whereas vowels are always pronounced",
+        "Because the official rules collapse consonants separated by h or w but code those separated by a vowel twice",
+        "Because h and w have no digit class, so the algorithm has no way to represent them in the key",
+        "Because resetting the last code on h or w would make most keys longer than four characters"
+      ],
+      "correct": 1,
+      "explanation": "The official rule treats h and w as transparent: 'Ashcraft' codes s and c as a single 2, giving A261. A vowel is a separator: in 'Tymczak' the a between z and k means k emits a second 2, giving T522. Getting either case wrong produces a different key from every other correct implementation, which breaks cross-system matching."
+    },
+    {
+      "stage": "check",
+      "question": "Hameed Qasrani is compared with Hamid al-Qasrani. How is the unmatched token 'al' treated, and why?",
+      "options": [
+        "It counts as a missing token and the score is divided by three",
+        "It is removed from the denominator because particles are attached inconsistently across documents",
+        "It is matched to 'hameed' as a fuzzy pair because both begin with a vowel sound",
+        "It causes the comparison to be rejected since the token counts differ"
+      ],
+      "correct": 1,
+      "explanation": "Particles like al, bin, van, and de are dropped, kept, or hyphenated depending on the document, so their absence on one side is not evidence against a match. The score is (1.0 + jw(hameed, hamid)) / 2, not / 3. A matched particle on both sides still counts, so it is not simply deleted."
+    },
+    {
+      "stage": "post",
+      "question": "The threshold table shows recall 1.000 with 4 false positives at 0.90, and recall 0.750 with 1 false positive at 0.95. A fully automated block with no analyst review is being configured. Which threshold does the lesson's reasoning favour, and with what caveat?",
+      "options": [
+        "0.90, because recall must be perfect and customers whose payments are blocked can complain afterwards",
+        "0.95 with a second-stage check on the misses, because an unreviewed block that is wrong one time in three harms real customers",
+        "0.85, because lower thresholds are always the safer choice in a compliance system facing regulatory review",
+        "1.00, because an automated system with no human in the loop should act only on exact string matches"
+      ],
+      "correct": 1,
+      "explanation": "The right threshold depends on who is downstream. Blocking a legitimate payment with no human in the loop is a real harm, so the automated stage runs tighter and the names it clears flow to a second stage (analyst queue or secondary identifiers). An analyst queue would favour 0.90. 1.00 misses two thirds of real variants and is not defensible."
+    },
+    {
+      "stage": "post",
+      "question": "Theodora Grimblewood hits entry FIC-0001 at threshold 0.85 with the explanation \"exact 'grimblewood'~'grimblewood' (+1.00); initial 'theodora'~'t' (+0.85)\". What should an analyst conclude from the explanation alone?",
+      "options": [
+        "The hit is strong because both tokens contributed positive evidence",
+        "The hit rests on a one-letter alias and can be resolved quickly against secondary identifiers",
+        "The hit is a phonetic match and needs a native speaker to review",
+        "The hit should be escalated because the surname matched exactly"
+      ],
+      "correct": 1,
+      "explanation": "The second reason says the given name matched only an initial, which is the weakest evidence kind the matcher emits. An exact surname plus an initial describes thousands of people, so the next step is a date of birth or nationality check, not escalation. Explanations exist precisely so the analyst does not need to recompute the score to know this."
+    }
+  ]
+}

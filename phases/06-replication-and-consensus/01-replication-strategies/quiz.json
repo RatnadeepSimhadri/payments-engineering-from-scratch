@@ -1,0 +1,78 @@
+{
+  "lesson": "01-replication-strategies",
+  "title": "Replication: Leader-Based, Multi-Leader, Leaderless",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A database primary acknowledges a write to the client and then loses power. Its replica is promoted. Under which configuration is the acknowledged write guaranteed to survive?",
+      "options": [
+        "Asynchronous replication, as long as the replica was less than one second behind the primary",
+        "Semi-synchronous replication, where the primary waited for that replica's acknowledgement before acking the client",
+        "Any configuration, because an acknowledged write is by definition durable on the primary's disk",
+        "Statement-based replication, because the SQL text is small enough to be shipped before the ack"
+      ],
+      "correct": 1,
+      "explanation": "Only a mode in which the client's acknowledgement waits for the replica to have the write makes the promoted replica guaranteed to hold it. Asynchronous replication loses whatever the replica lacked, however small the lag. Durability on the dead primary's disk does not help a client talking to the new leader, and the log format is irrelevant to timing."
+    },
+    {
+      "stage": "check",
+      "question": "What single property of leader-based replication makes write conflicts impossible?",
+      "options": [
+        "Followers verify each write against the leader's checksum before applying it to their own storage",
+        "The replication log is shipped synchronously so that every follower is always at the same position",
+        "All writes pass through one node, which assigns them a single total order that followers replay as a prefix",
+        "Clients attach idempotency keys so that a retried write is recognised and discarded by the leader"
+      ],
+      "correct": 2,
+      "explanation": "Concurrent writes to the same record are serialised by the one node that accepts writes, so there is never a second, independent history to conflict with. Synchronous shipping affects durability, not ordering; idempotency keys prevent duplicates, not conflicts; and followers apply the log in order without needing to validate it."
+    },
+    {
+      "stage": "check",
+      "question": "In the worked example, the primary dies at LSN 1,000,250 with replica A at 1,000,180 and replica B at 1,000,120 under asynchronous replication. What happens when the old primary comes back after A is promoted?",
+      "options": [
+        "It rejoins as a follower and ships its 70 extra records to A, which applies them to close the gap",
+        "Its history diverges from A's at 1,000,180; it must be rebuilt from A and its 70 orphaned records reconciled by hand",
+        "It resumes as primary because it holds the highest LSN, and A is demoted back to a follower",
+        "Its 70 records are discarded automatically because A's promotion advanced the cluster epoch"
+      ],
+      "correct": 1,
+      "explanation": "A has written new records past 1,000,180 of its own, so neither history is a prefix of the other. The old primary cannot ship its records as if nothing happened, and no tool can automatically decide which divergent branch is right for a ledger. A higher LSN does not confer leadership once another node has been promoted."
+    },
+    {
+      "stage": "check",
+      "question": "Why is multi-leader replication a poor fit for a ledger even when its latency advantage across regions is large?",
+      "options": [
+        "Because the leaders replicate to each other synchronously, which makes every posting wait on a cross-region round trip",
+        "Because an invariant such as 'a balance never goes below its limit' cannot be enforced by a leader that does not know what the other leader just accepted",
+        "Because multi-leader systems cannot ship write-ahead-log records and must fall back to statement-based replication",
+        "Because postings use auto-increment identifiers, and the leaders would have to coordinate every id assignment"
+      ],
+      "correct": 1,
+      "explanation": "Multi-leader replication accepts writes independently and reconciles later, so two regions can each approve a debit that together overdraw the balance; an invariant across records needs a single serialisation point. Leaders replicate to each other asynchronously, log format is unrelated, and id collisions are solvable with per-node ranges or UUIDs."
+    },
+    {
+      "stage": "post",
+      "question": "A leaderless store with N = 3 uses W = 2 and R = 2. A client writes to replicas 1 and 2 during a partition that hides replica 3. After the partition heals, a read reaches replicas 2 and 3. What does the read see, and why?",
+      "options": [
+        "Only the old value from replica 3, because reads take the first response and replica 3 is now reachable",
+        "Both versions, and it returns the newer one, because R + W > N guarantees the read quorum overlaps the write quorum at replica 2",
+        "An error, because replica 3 missed the write and a quorum read requires every replica to agree",
+        "Only the new value, because hinted handoff has already delivered the write to replica 3 before any read can occur"
+      ],
+      "correct": 1,
+      "explanation": "With R + W = 4 > 3, any two replicas include at least one of the two that accepted the write, here replica 2, so the read receives the new version and returns it (and may read-repair replica 3). Quorum reads do not require all replicas to agree, and handoff is a background repair that offers no timing guarantee."
+    },
+    {
+      "stage": "post",
+      "question": "Applying the decision procedure, which combination correctly matches each data set to a strategy?",
+      "options": [
+        "Ledger: multi-leader per region for write availability; catalogue: single leader with synchronous replication for exact prices",
+        "Ledger: single leader with semi-synchronous or consensus replication and fencing; catalogue: multi-leader or leaderless with per-field last-writer-wins",
+        "Ledger: leaderless with R + W > N so that no failover is ever needed; catalogue: single leader because product edits are rare",
+        "Both: single leader with asynchronous replication, since asynchronous is the default in every major database"
+      ],
+      "correct": 1,
+      "explanation": "The ledger has cross-record invariants and cannot merge concurrent writes, which rules out multi-leader and leaderless; its lost-write cost demands semi-synchronous or consensus replication with fencing. The catalogue has independent records whose concurrent edits can be merged per field, so it can take the availability of multi-leader or leaderless replication. Asynchronous single-leader is exactly the configuration that lost postings in the worked example."
+    }
+  ]
+}

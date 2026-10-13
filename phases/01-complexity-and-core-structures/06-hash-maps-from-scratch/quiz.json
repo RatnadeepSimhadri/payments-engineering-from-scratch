@@ -1,0 +1,78 @@
+{
+  "lesson": "06-hash-maps-from-scratch",
+  "title": "Hash Maps from Scratch: Chaining, Open Addressing, and Resizing",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A hash map is said to offer O(1) lookups. Which statement about that claim is accurate?",
+      "options": [
+        "It is a worst-case bound that holds for any hash function and any table size",
+        "It is an expected bound that assumes a well-spread hash and a table that grows with the key count",
+        "It holds only when there are no collisions, which a good hash function guarantees",
+        "It is amortised: individual lookups may take O(n) but the average over a run is constant"
+      ],
+      "correct": 1,
+      "explanation": "O(1) is an expected cost under two assumptions: the hash distributes keys uniformly and the load factor is kept bounded by resizing. Collisions are the normal case and a good hash does not prevent them; it only keeps chains and probe runs short. Amortisation describes inserts across resizes, not individual lookups."
+    },
+    {
+      "stage": "check",
+      "question": "In an open-addressing table with linear probing, why does remove() mark the slot as a TOMBSTONE instead of EMPTY?",
+      "options": [
+        "A tombstone keeps the key's hash cached so a later re-insert of the same key is faster",
+        "Marking EMPTY would let later inserts reuse the slot, which breaks the load-factor accounting",
+        "A lookup stops at EMPTY, so an EMPTY in the middle of a probe run would hide every key stored beyond it",
+        "Tombstones are needed so that resize() can tell which slots were ever used and copy them in order"
+      ],
+      "correct": 2,
+      "explanation": "The soundness of 'stop at EMPTY' depends on every slot between a key's home and its actual slot being non-EMPTY. Writing EMPTY into the middle of a run makes keys past that point unreachable, so a retried request would look new. Tombstones do not cache hashes, and resize drops them entirely rather than relying on them."
+    },
+    {
+      "stage": "check",
+      "question": "ChainedHashMap has capacity 8 and MAX_LOAD 0.75. After inserting the seventh distinct key, what has happened?",
+      "options": [
+        "Nothing yet; the table resizes when the eighth key is inserted and size equals capacity",
+        "The table resized to 16 because size 7 exceeds 0.75 * 8 = 6",
+        "The table resized to 12, the smallest capacity that brings the load back under 0.75",
+        "The table resized to 16 before the seventh key was inserted, because 6 + 1 would exceed the limit"
+      ],
+      "correct": 1,
+      "explanation": "The chaining put() inserts first and then checks size > capacity * MAX_LOAD; 7 > 6 triggers a doubling to 16. Capacities must stay powers of two for the & (capacity - 1) index to work, so 12 is impossible. Checking before the insert is what the open-addressing table does, because it also counts tombstones."
+    },
+    {
+      "stage": "check",
+      "question": "Every key is inserted with a hasher that returns 0. After 64 inserts, what does each table report?",
+      "options": [
+        "Chaining: collisions 64 and max chain 64; probing: displacement 64 and max probe run 64",
+        "Chaining: collisions 63 and max chain 1 after resizing; probing: displacement 0 after resizing",
+        "Both tables throw an exception once the longest chain or probe run exceeds the capacity",
+        "Chaining: collisions 63 and max chain 64; probing: displacement 2016 and max probe run 64"
+      ],
+      "correct": 3,
+      "explanation": "With one bucket in use, every insert after the first collides (63) and the chain holds all 64 keys. For probing, the k-th key is displaced k slots from home, and 0 + 1 + ... + 63 = 2016. Resizing cannot help because the hash, not the capacity, puts every key in slot 0; both tables stay correct but become O(n)."
+    },
+    {
+      "stage": "post",
+      "question": "Why does this lesson's OpenAddressingHashMap resize at load 0.5 while ChainedHashMap waits until 0.75?",
+      "options": [
+        "Open addressing allocates three arrays, so growing earlier spreads the allocation cost more evenly",
+        "A chaining table cannot exceed load 1.0, so it needs the extra headroom before a forced doubling",
+        "Linear probing suffers primary clustering: the expected miss cost grows like 1/(1 - alpha)^2, so it must stay sparse",
+        "Tombstones are counted as live entries in chaining, which makes its load figure overstate real occupancy"
+      ],
+      "correct": 2,
+      "explanation": "Knuth's analysis gives an unsuccessful probing search about (1 + 1/(1 - alpha)^2) / 2 probes: 2.5 at alpha 0.5 but 8.5 at 0.75 and 50 at 0.9, because occupied runs grow faster the longer they get. Chaining degrades only linearly with alpha and works even above 1.0. Chaining has no tombstones at all."
+    },
+    {
+      "stage": "post",
+      "question": "An idempotency store built on the hash map receives the same key three times. Which observable proves the store is correct?",
+      "options": [
+        "The response body of the third call is a byte-for-byte copy of the first and handlerRuns() equals 1",
+        "The third call completes faster than the first because the key is now cached in the table",
+        "The map's size() equals 3, one entry per request, so every attempt has been accounted for",
+        "The second and third calls return status 409 Conflict so the client knows it already sent the request"
+      ],
+      "correct": 0,
+      "explanation": "Correctness means the side effect happened once and every retry sees the identical stored response, which is exactly what replayed=true with handlerRuns() == 1 shows. Faster is a side benefit, not proof. size() must be 1, not 3. Stripe-style stores return the original status (here 201), not a 409, so a retrying client can proceed."
+    }
+  ]
+}

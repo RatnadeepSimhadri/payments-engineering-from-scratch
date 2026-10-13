@@ -1,0 +1,78 @@
+{
+  "lesson": "05-webhooks-and-callbacks",
+  "title": "Webhooks: Signing, Delivery, Ordering, and Replay",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A webhook endpoint is reachable from the public internet and marks orders as paid when it receives a payment.captured body. Without any further mechanism, what can an attacker who knows the URL do?",
+      "options": [
+        "Nothing, because the processor's TLS certificate proves the request origin",
+        "Post their own payment.captured bodies and have orders marked paid",
+        "Only read events in transit; they cannot inject new ones",
+        "Only delay delivery, since HTTP bodies cannot be forged"
+      ],
+      "correct": 1,
+      "explanation": "An HTTP POST carries no proof of who sent it. TLS authenticates the server the client connects to, not the client that connects to the consumer, so the processor's certificate does nothing here. A shared-secret HMAC over the body is what lets the consumer tell the processor's POST from anyone else's."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the signer compute the HMAC over \"timestamp.payload\" instead of over the payload alone?",
+      "options": [
+        "The dot separator is required by RFC 2104 for multi-part messages",
+        "It makes the MAC shorter, since the timestamp replaces part of the payload",
+        "It lets the verifier reject a captured request replayed after the tolerance window",
+        "It allows the consumer to skip parsing the JSON body entirely"
+      ],
+      "correct": 2,
+      "explanation": "A MAC over the payload alone is valid forever, so a captured request can be replayed indefinitely. Binding the timestamp into the MAC means an attacker cannot refresh it without the secret, and an unmodified one becomes stale after the window. RFC 2104 says nothing about separators; the dot is a convention."
+    },
+    {
+      "stage": "check",
+      "question": "The verifier compares the expected tag and the received tag with a loop that ORs together every byte's XOR before returning. What attack does this close?",
+      "options": [
+        "A timing attack that learns the tag one byte at a time from response latency",
+        "A length-extension attack against the underlying SHA-256 hash",
+        "A replay attack that reuses a tag with a newer timestamp",
+        "A collision attack that finds two payloads with the same tag"
+      ],
+      "correct": 0,
+      "explanation": "A short-circuiting comparison returns sooner when fewer leading bytes match, and the latency difference lets an attacker confirm the tag prefix by prefix, roughly 256 guesses per byte instead of 2^256 overall. Length extension is closed by HMAC's nested construction, not by the compare; replays are closed by the timestamp."
+    },
+    {
+      "stage": "check",
+      "question": "With backoff waits of [30s, 2m, 10m, 1h, 6h] and an endpoint that fails every attempt, when is the delivery dead-lettered?",
+      "options": [
+        "After the fifth attempt, because there are five backoff entries",
+        "After the sixth attempt, about 7.2 hours after the first",
+        "After exactly 24 hours regardless of how many attempts were made",
+        "Never; the dispatcher keeps retrying at the 6h interval"
+      ],
+      "correct": 1,
+      "explanation": "The array holds the waits between attempts, so five waits allow six attempts: at 0, 30s, 150s, 750s, 4350s, and 25950s (about 7.2h). When the sixth fails there is no further wait to apply, so the delivery moves to the dead-letter list. Retrying forever would be a memory leak; a fixed 24h cutoff is not how the schedule is defined."
+    },
+    {
+      "stage": "post",
+      "question": "A consumer receives an event whose id it has already processed. What should it return, and why?",
+      "options": [
+        "500, so the producer knows something went wrong and investigates",
+        "409 Conflict, because the resource already exists on the consumer side",
+        "200, because the producer is retrying only because it missed the earlier success",
+        "400, because a repeated event id indicates a replay attack in progress"
+      ],
+      "correct": 2,
+      "explanation": "A duplicate almost always means the consumer's earlier 200 was lost to a timeout, so the producer is doing exactly what at-least-once requires. Answering 200 stops the retries; a 5xx would turn a harmless redelivery into a retry storm. A replay attack is caught by the signature and timestamp checks before the id is even looked at, and a 409 would be treated as a failure by most producers."
+    },
+    {
+      "stage": "post",
+      "question": "Events for payment pay_77 arrive as sequence 2 (captured) and then sequence 1 (authorized). After both are handled, what is the consumer's recorded status and what did it do with the second event?",
+      "options": [
+        "authorized; it applied the second event because events are applied in arrival order",
+        "captured; it returned OUT_OF_ORDER with a 200 and did not apply the older event",
+        "captured; it returned 500 so the producer would resend sequence 1 later",
+        "authorized; it rolled back to the lower sequence because it is the earlier state"
+      ],
+      "correct": 1,
+      "explanation": "The consumer keeps the highest applied sequence per object. Sequence 1 is less than the recorded 2, so the event is real but stale: it is acknowledged with 200 and not applied, leaving the status at captured. Returning 500 would cause pointless redelivery of an event the consumer will never need; applying it would roll a payment back from captured to authorized."
+    }
+  ]
+}

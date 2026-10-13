@@ -1,0 +1,48 @@
+{
+  "lesson": "01-representing-money",
+  "title": "Representing Money: Minor Units, Currencies, and Rounding",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "In IEEE 754 binary floating point, which of these decimal values is stored exactly?",
+      "options": ["0.10", "0.25", "0.30", "19.99"],
+      "correct": 1,
+      "explanation": "0.25 is 1/4, a finite sum of powers of two, so it is exact. 0.10, 0.30, and 19.99 all need a factor of five in the denominator and have infinitely repeating binary expansions, so the nearest double is slightly off."
+    },
+    {
+      "stage": "check",
+      "question": "A Money value stores the integer 1250. What is needed to know whether that means 12.50 USD, 1.250 KWD, or 1250 JPY?",
+      "options": ["The amount's own scale field", "The currency's ISO 4217 exponent", "The locale of the user viewing it", "The database column type it came from"],
+      "correct": 1,
+      "explanation": "The exponent belongs to the currency (USD 2, KWD 3, JPY 0), which is why Money pairs the integer with a Currency. A per-amount scale would let two USD values disagree about where the decimal point is; locale and column type are presentation and storage concerns."
+    },
+    {
+      "stage": "check",
+      "question": "Using HALF_EVEN rounding, what are 12.5 and 13.5 rounded to the nearest integer?",
+      "options": ["13 and 14", "12 and 13", "12 and 14", "13 and 13"],
+      "correct": 2,
+      "explanation": "HALF_EVEN sends an exact tie to the even neighbour: 12.5 goes down to 12 and 13.5 goes up to 14. HALF_UP would give 13 and 14. Over many ties the two directions cancel, which is why it is the default for fee and tax math."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the Python divide_rounded work on absolute values and reapply the sign instead of using // directly?",
+      "options": ["Because // is measurably slower than divmod when either operand is a negative number", "Because // floors toward negative infinity while Java and Go truncate toward zero", "Because Python's divmod raises an exception when it is handed a negative dividend", "Because the sign of an amount must be kept in a separate field for formatting and display"],
+      "correct": 1,
+      "explanation": "-125 // 10 is -13 in Python but -125 / 10 is -12 in Java and Go. Working on magnitudes gives all three languages identical results on every input, which prevents one-cent discrepancies between services written in different languages."
+    },
+    {
+      "stage": "post",
+      "question": "100.00 USD is allocated in ratios 1:1:1 with the largest-remainder method. What does the result look like?",
+      "options": ["[33.33, 33.33, 33.33] and one cent is reported as a rounding loss", "[33.34, 33.33, 33.33] and the parts sum to exactly 100.00", "[33.33, 33.33, 33.34] because the last share absorbs remainders", "[33.34, 33.34, 33.33] because ties round half up"],
+      "correct": 1,
+      "explanation": "Each share floors to 3333 cents, one cent is left over, and the ties on remainder are broken by index order, so the first share receives it. The parts always sum to the whole; nothing is lost or invented. Giving the leftover to the last share would also conserve money but is not what the stable-sort-by-index rule produces."
+    },
+    {
+      "stage": "post",
+      "question": "An upstream service sends the USD amount \"1.005\". What does Money.parse do, and why is that the right behaviour?",
+      "options": ["Rounds it to 1.01 with HALF_UP so the request can proceed and the caller is not blocked", "Truncates it to 1.00 on the grounds that digits beyond the exponent are serialization noise", "Rejects it, because excess precision is almost always an upstream bug that rounding would hide", "Stores 1005 with a per-amount exponent of 3 so that no information from the sender is lost"],
+      "correct": 2,
+      "explanation": "USD has exponent 2, so a third decimal is not a legal amount. Silently rounding or truncating would hide the upstream defect and create a value the sender never intended. If three-decimal input is genuinely expected, round at the boundary with an explicit, reviewable rounding mode instead."
+    }
+  ]
+}

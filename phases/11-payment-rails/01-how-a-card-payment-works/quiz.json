@@ -1,0 +1,78 @@
+{
+  "lesson": "01-how-a-card-payment-works",
+  "title": "How a Card Payment Works: Issuer, Acquirer, Network, Processor",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A terminal displays \"Approved\" 1.2 seconds after a card tap. Which statement about the money is true at that moment?",
+      "options": [
+        "The merchant's bank account has been credited with the purchase amount",
+        "The network has moved the funds from the issuer to the acquirer",
+        "The issuer has placed a hold on the cardholder's funds; nothing has moved",
+        "The cardholder's account has been debited and the merchant is paid at midnight"
+      ],
+      "correct": 2,
+      "explanation": "Authorization is a real-time promise backed by a hold on the cardholder's open-to-buy or available balance. Money moves only at settlement, after the merchant clears the transaction, typically a day or more later. The last option describes a single-message PIN debit posting, which is not what a credit tap does, and even there the merchant is funded by the acquirer later, not at midnight."
+    },
+    {
+      "stage": "check",
+      "question": "Which party pays interchange, and to whom?",
+      "options": [
+        "The acquirer pays it to the issuer, out of the merchant discount it collects",
+        "The merchant pays it directly to the network as a scheme assessment",
+        "The issuer pays it to the acquirer as a reward for bringing volume",
+        "The cardholder pays it to the issuer as part of the annual card fee"
+      ],
+      "correct": 0,
+      "explanation": "Interchange flows from acquirer to issuer on every cleared transaction and is netted at settlement; the acquirer recovers it from the merchant through the merchant discount rate. The network's own fee is the assessment, a separate and much smaller line, so the second option confuses two different fees."
+    },
+    {
+      "stage": "check",
+      "question": "An acquirer sends a 0100 authorization request and receives no response before its timeout. What must it do?",
+      "options": [
+        "Resend the identical 0100 until a 0110 arrives, since duplicates are harmless",
+        "Treat the transaction as approved under stand-in rules and clear it that night",
+        "Return response code 51 to the merchant so the customer tries another card",
+        "Send a 0400 reversal with the same STAN so any hold the issuer placed is released"
+      ],
+      "correct": 3,
+      "explanation": "After a timeout the acquirer cannot know whether the issuer approved and placed a hold, so it sends a reversal, retrying from a store-and-forward queue until acknowledged. Resending the 0100 could create a second hold; only the network, not the acquirer, may approve under stand-in; and 51 is an issuer decision about funds, not a connectivity signal."
+    },
+    {
+      "stage": "check",
+      "question": "In a dual-message system, why can the cleared amount legitimately differ from the authorized amount?",
+      "options": [
+        "Because the network recalculates every amount in the issuer's billing currency during the clearing cycle",
+        "Because clearing is a separate later message carrying the final amount, and scheme rules allow tips, estimates, and partial captures",
+        "Because the issuer rounds authorization amounts to whole dollars and the clearing record restores the exact cents",
+        "Because the 0110 response only confirms that the card is valid and never carries any amount field at all"
+      ],
+      "correct": 1,
+      "explanation": "Authorization and clearing are separate flows at separate times; the clearing record carries the final amount, and scheme rules permit differences such as a 20% tip tolerance, hotel estimates, and partial or multiple captures. FX conversion does happen at clearing, but it produces a billing-currency amount, not a different transaction amount, and single-message systems have no such gap at all."
+    },
+    {
+      "stage": "post",
+      "question": "A 100.00 USD purchase has interchange of 1.80% + 0.10 USD, a network assessment of 0.13%, and a merchant discount rate of 2.50%. In cents, what do the issuer, network, and acquirer keep, and what does the merchant receive?",
+      "options": [
+        "Issuer 190, network 13, acquirer 47, merchant 9750",
+        "Issuer 250, network 13, acquirer 0, merchant 9737",
+        "Issuer 180, network 10, acquirer 60, merchant 9750",
+        "Issuer 190, network 13, acquirer 250, merchant 9547"
+      ],
+      "correct": 0,
+      "explanation": "Interchange is 180 + 10 = 190 cents to the issuer, the assessment is 13 cents to the network, the merchant pays 250 cents of discount and receives 9750, and the acquirer keeps the spread 250 - 190 - 13 = 47. The parties sum to 10000. The last option double-counts the discount as acquirer income on top of interchange and assessment."
+    },
+    {
+      "stage": "post",
+      "question": "A PIN debit transaction on a single-message network is approved with a 0210. Which capability from the dual-message world does NOT exist here?",
+      "options": [
+        "Sending a 0400 reversal if the terminal never printed a receipt",
+        "Routing the request to the issuer by the card's BIN range",
+        "Capturing a smaller amount than was approved when an item is out of stock",
+        "Receiving a response code that distinguishes insufficient funds from an invalid card"
+      ],
+      "correct": 2,
+      "explanation": "In a single-message system the 0200/0210 both authorizes and clears, so the amount is final on approval; there is no later capture, partial or otherwise, and a change requires a reversal and a new transaction. Reversals, BIN routing, and detailed response codes exist on both kinds of rail."
+    }
+  ]
+}

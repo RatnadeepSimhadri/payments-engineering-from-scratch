@@ -1,0 +1,78 @@
+{
+  "lesson": "02-rules-engine-and-velocity-checks",
+  "title": "A Rules Engine with Velocity Checks",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A merchant sees 300 authorization attempts of 1.00 USD from the same card in ten minutes, every one of them declined by the issuer. Looking at any single one of those transactions, what is suspicious about it?",
+      "options": [
+        "Nothing; the signal is the rate of attempts per card, which no single transaction carries",
+        "The amount, because fraud is always tested with amounts under 5.00 USD",
+        "The decline code, because issuers only decline cards that are already flagged",
+        "The merchant category, because card testing happens only at digital-goods merchants"
+      ],
+      "correct": 0,
+      "explanation": "Each attempt is an ordinary small purchase; the fraud is visible only as a count per key over a window, which is why a rules engine needs velocity counters as facts. Small amounts are common in card testing but are not a rule: plenty of legitimate purchases are under 5.00 USD and attackers vary amounts precisely to avoid such a filter."
+    },
+    {
+      "stage": "check",
+      "question": "A sliding-window counter uses a ring of 10 buckets over a 10-minute window. An attempt is recorded at T0 + 59 s. At T0 + 10 min exactly, is that attempt counted, and why?",
+      "options": [
+        "Yes, because the bucket started at T0 + 59 s, which is inside the window",
+        "No, because its bucket started at T0, which is not strictly greater than now minus the window",
+        "Yes, because a ring never drops an event until the slot is overwritten by a new lap",
+        "No, because the ring resets every bucket when the clock crosses a minute boundary"
+      ],
+      "correct": 1,
+      "explanation": "The ring tracks bucket starts, not event times: the event lands in the bucket starting at T0, and the query keeps buckets with start > now - W, so a start of exactly T0 is excluded even though the event is only 9 min 1 s old. That is the one-bucket undercount the design trades for O(n) memory. The slot-reuse answer confuses how slots are recycled with how queries filter them."
+    },
+    {
+      "stage": "check",
+      "question": "The engine uses record-then-read: enrich records the current attempt, then reads the counter into the fact. A rule says attempts_per_card_10m GT 5 with action DECLINE. Which attempt is the first one declined?",
+      "options": [
+        "The fifth, because GT 5 is read as 'at or above the fifth attempt'",
+        "The seventh, because the current attempt is not yet visible to its own rule",
+        "The sixth, because the sixth attempt sees a count of six and six is greater than five",
+        "The first that is declined by the issuer, because only declines are counted"
+      ],
+      "correct": 2,
+      "explanation": "Record-then-read means the attempt counts itself, so the sixth attempt observes 6 and 6 GT 5 fires; this is the boundary the tests pin down. Read-then-record would make the seventh attempt the first decline, which is why the convention must be written into the rule's explanation. Declines and approvals are both recorded; counting only declines would reset an attacker's budget whenever a rule fired."
+    },
+    {
+      "stage": "check",
+      "question": "A rule reads the fact attempts_per_card_10m, but the velocity service is down and the fact is missing from the context. Under this lesson's design, what happens?",
+      "options": [
+        "The rule treats the missing counter as zero and the transaction passes the velocity check silently",
+        "The engine throws, because a missing fact is the same kind of error as a type mismatch",
+        "The rule fires conservatively, declining because the engine cannot prove the attempt is safe",
+        "The rule does not fire and the trace line prints <absent>, so the outage is visible in every decision"
+      ],
+      "correct": 3,
+      "explanation": "Absence is not zero and not an error: the rule passes, but the decision record shows <absent> for the observed value so a monitor can alarm on absent-fact rates. Treating absence as zero would make a counter outage indistinguishable from clean traffic. Throwing is reserved for a type mismatch between fact and rule value, which is a configuration bug that no amount of traffic can fix."
+    },
+    {
+      "stage": "post",
+      "question": "Under the SCORE strategy with reviewAt = 50 and declineAt = 80, three live rules each scoring 30 fire, and one shadow rule scoring 60 also holds. What is the decision and the reported score?",
+      "options": [
+        "DECLINE with score 90, because the three live rules sum past the decline threshold",
+        "DECLINE with score 150, because every rule that holds contributes its score",
+        "REVIEW with score 60, because the shadow rule alone is the strongest signal",
+        "ALLOW with score 30, because only the first fired rule contributes under any strategy"
+      ],
+      "correct": 0,
+      "explanation": "Live scores sum to 90, which is at or above declineAt, so the action is DECLINE; the shadow rule is traced with [shadow] and reported by shadowFired() but adds nothing to the total. Counting the shadow rule's 60 would defeat the purpose of shadow mode, which is to measure a candidate without letting it change a single decision."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the engine evaluate every rule and write a trace line for each, even under FIRST_MATCH where the first fired rule has already settled the action?",
+      "options": [
+        "Because stopping early would leave the velocity counters for later rules un-incremented",
+        "Because later rules can override the first match if they carry a higher score",
+        "Because the full trace is the evidence an analyst needs and the measurement every shadow rule depends on",
+        "Because Java records cannot represent a partially evaluated list of rules"
+      ],
+      "correct": 2,
+      "explanation": "The trace answers 'why was this declined', 'what else was wrong with it', and 'what did the engine see', and it is the only place a shadow rule's would-have-fired result is recorded; evaluation costs a few dozen comparisons against a network call to the issuer. Later rules never override the first match under FIRST_MATCH, and velocity counters are updated during enrichment, before any rule runs."
+    }
+  ]
+}

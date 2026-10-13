@@ -1,0 +1,78 @@
+{
+  "lesson": "15-numerical-algorithms",
+  "title": "Numerical Algorithms: GCD, Modular Arithmetic, and Check Digits",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "An agent types a beneficiary account number and swaps two adjacent digits. Which property of the identifier would let the form reject it before submission?",
+      "options": [
+        "The account number is stored as a 64-bit integer rather than a string",
+        "The identifier carries a check digit computed so that transpositions break an equation",
+        "The bank publishes a list of all valid account numbers for lookup",
+        "The number is long enough that a random typo is unlikely to collide"
+      ],
+      "correct": 1,
+      "explanation": "A check digit makes the whole identifier satisfy an equation (a weighted sum mod 10, the number mod 97, a table fold ending at 0) that most keying errors violate. Length alone does not help: a transposition of a valid number is another plausible number. Lookups are not available at form time and are what the check digit avoids."
+    },
+    {
+      "stage": "check",
+      "question": "Why does Luhn catch every single-digit substitution but not the adjacent transposition 09 <-> 90?",
+      "options": [
+        "Because the doubled-position map is a permutation of the digits, but 0 and 9 are the two digits it leaves unchanged",
+        "Because 0 and 9 are both treated as zero by the digit-sum step, so they are indistinguishable everywhere",
+        "Because Luhn only examines the odd positions and 0 and 9 happen to fall on even ones",
+        "Because the check digit is computed modulo 10 and 0 + 9 is congruent to 9 modulo 10"
+      ],
+      "correct": 0,
+      "explanation": "The doubled map sends 0..9 to 0,2,4,6,8,1,3,5,7,9, a permutation, so any single change alters the sum. A transposition swaps which digit is doubled, changing the sum by (f(a) - a) - (f(b) - b); f(d) - d is zero only for d = 0 and d = 9, so only that pair is invisible. 0 and 9 are perfectly distinguishable as single digits."
+    },
+    {
+      "stage": "check",
+      "question": "The IBAN DE89 3704 0044 0532 0130 00 is checked by computing a 24-digit number modulo 97. The Java and Go versions do this in a long without overflow. How?",
+      "options": [
+        "They parse the number with BigInteger-style arbitrary precision and then reduce once",
+        "They reduce modulo 97 after every digit, so the running value never exceeds 10 * 97 + 9",
+        "They split the IBAN into two 12-digit halves and combine the remainders",
+        "They use floating point, which has enough precision for 24 significant digits"
+      ],
+      "correct": 1,
+      "explanation": "Horner's rule evaluates r = (r * 10 + digit) mod 97 left to right; r stays below 97 so the intermediate is at most 979. The 24-digit number is never formed. Splitting into halves also works but needs the weight 10^12 mod 97; a double has only about 16 significant digits and would be wrong."
+    },
+    {
+      "stage": "check",
+      "question": "Damm's check digit folds digits through a 10 x 10 table. Which property of the table guarantees that every adjacent transposition is detected?",
+      "options": [
+        "Every row and every column of the table is a permutation of the digits 0 through 9",
+        "The main diagonal of the table is all zeros, so appending the state returns to zero",
+        "Total anti-symmetry: T[T[c][x]][y] differs from T[T[c][y]][x] whenever x differs from y",
+        "The table is symmetric about its main diagonal, so T[x][y] always equals T[y][x]"
+      ],
+      "correct": 2,
+      "explanation": "Total anti-symmetry says exactly that feeding x then y from any state c reaches a different state than feeding y then x, which is what makes a swap of neighbours visible. The Latin-square property (rows and columns are permutations) is what guarantees single-digit errors; the zero diagonal is what lets the check digit drive the final state to 0. The table is not symmetric."
+    },
+    {
+      "stage": "post",
+      "question": "A team tests its Luhn implementation by flipping one random digit a thousand times and reports 100% detection. Which real keying error class is their test blind to, and what does Luhn actually do with it?",
+      "options": [
+        "Twin errors (aa -> bb); Luhn detects all of them because doubled and undoubled digits sum differently",
+        "Jump transpositions (digits two apart swapped); Luhn detects none of them because the two positions carry the same weight",
+        "Adjacent transpositions; Luhn detects none of them because its weights alternate between the two positions",
+        "Single-digit errors in the check position itself; Luhn ignores the check digit when it validates a number"
+      ],
+      "correct": 1,
+      "explanation": "Positions two apart are both doubled or both undoubled, so swapping them leaves the sum unchanged: the aggregate run shows 0 of 2,531 jump transpositions caught. Luhn catches most adjacent transpositions (all but 09/90) and most twin errors (all but three pairs). A single-random-flip test can never surface a weakness in transpositions, which is why the lesson enumerates each class exhaustively."
+    },
+    {
+      "stage": "post",
+      "question": "A new internal reference number is digits only and has room for exactly one check digit. It must catch every single-digit error and every adjacent transposition. Which choice meets the requirement?",
+      "options": [
+        "Luhn, because it is the card-industry standard and catches every single-digit error",
+        "ISO 7064 MOD 97-10, truncated to its first check digit to fit the field",
+        "Damm or Verhoeff, whose table-based folds guarantee both classes with a single digit",
+        "A CRC-8 over the digit string, which detects all single-bit and burst errors"
+      ],
+      "correct": 2,
+      "explanation": "Damm and Verhoeff are designed for precisely these two guarantees in one digit; Luhn misses the 09/90 transposition and cannot be fixed within one digit. Truncating MOD 97-10 destroys its arithmetic guarantees. A CRC models bit errors on a wire, not a human swapping two digits, and gives no proven coverage of transpositions."
+    }
+  ]
+}

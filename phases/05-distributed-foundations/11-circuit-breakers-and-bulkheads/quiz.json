@@ -1,0 +1,78 @@
+{
+  "lesson": "11-circuit-breakers-and-bulkheads",
+  "title": "Circuit Breakers and Bulkheads",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A checkout service has 200 worker threads and calls a card processor with a 2-second timeout at 20 calls per second. The processor stops responding. Which resource runs out first, and roughly how fast?",
+      "options": [
+        "Network bandwidth, within a few seconds, because timed-out requests are retransmitted",
+        "Worker threads, within about a minute, because each waiting call holds one for 2 seconds",
+        "Database connections, within an hour, because failed orders are written to a retry table",
+        "Memory, within a few minutes, because each timed-out response body is buffered"
+      ],
+      "correct": 1,
+      "explanation": "Each call holds a thread for the full 2-second timeout, so 20 calls per second occupy 40 threads steadily, and retries plus ordinary traffic exhaust 200 threads in well under two minutes. Bandwidth is barely touched because the processor returns nothing; the failure is capacity, not data volume."
+    },
+    {
+      "stage": "check",
+      "question": "The breaker is configured with minimumCalls = 10 and a 50% threshold. The window holds 4 failures and 5 successes. What happens on the next failure?",
+      "options": [
+        "The breaker stays CLOSED because 5 of 10 is exactly 50%, and the trip needs strictly more than the threshold",
+        "The breaker trips to OPEN because the window now holds 10 calls at a 50% failure rate",
+        "The breaker trips to HALF_OPEN so that it can verify the failure rate with a probe before opening",
+        "The breaker stays CLOSED because the rate is computed only when the window is completely full"
+      ],
+      "correct": 1,
+      "explanation": "After the failure the window holds 10 calls and 5 failures, so both guards are met: total >= minimumCalls and rate >= threshold (the comparison is at-or-above). HALF_OPEN is only ever entered from OPEN after the open duration, never directly from CLOSED."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the bulkhead run before the breaker in GuardedCall.begin(), and why is a bulkhead rejection not recorded in the breaker's window?",
+      "options": [
+        "Because the bulkhead check is cheaper, and recording rejections would make the window overflow its buckets",
+        "Because a full bulkhead means the caller is saturated, not that the dependency failed, so counting it would trip the breaker on a healthy dependency",
+        "Because the breaker only accepts results from calls that completed, and a rejected call has no completion time to record",
+        "Because the bulkhead owns the clock, and the breaker cannot compute the failure rate until a permit has been granted"
+      ],
+      "correct": 1,
+      "explanation": "A bulkhead rejection is evidence about our own capacity. If it entered the window, a traffic spike against a perfectly healthy processor would open the breaker and then reject good traffic for openDurationMs. The cost of the check is irrelevant; the ordering is about what each rejection means."
+    },
+    {
+      "stage": "check",
+      "question": "A 5-second window has 1-second buckets. 8 successes are recorded at t = 0 and 12 failures at t = 1500. What does failureRatePercent(5000) return?",
+      "options": [
+        "60, because both buckets are still within the window at t = 5000",
+        "0, because the window is cleared whenever the clock crosses a bucket boundary",
+        "100, because the bucket labelled 0 is now 5000 ms old and no longer counted",
+        "50, because the window averages the rate of each live bucket equally"
+      ],
+      "correct": 2,
+      "explanation": "A bucket is live only while now - bucketStart < windowMs. At t = 5000 the bucket labelled 0 is exactly 5000 ms old and drops out, leaving 12 failures out of 12 calls. The rate is a ratio over all live outcomes, not an average of per-bucket rates."
+    },
+    {
+      "stage": "post",
+      "question": "The breaker is HALF_OPEN with 3 permits. Two probes have succeeded and the third fails at t = 14000. What is the state, and when can the next probe be admitted (openDurationMs = 3000)?",
+      "options": [
+        "CLOSED, because two of three probes succeeded, which is above the 50% threshold",
+        "OPEN, and the next probe is admitted at t = 17000 because the timer restarts from the failure",
+        "OPEN, and the next probe is admitted at t = 15000 because the timer runs from the original trip",
+        "HALF_OPEN, and one more probe is admitted immediately to break the tie"
+      ],
+      "correct": 1,
+      "explanation": "Any probe failure in HALF_OPEN re-opens the breaker and sets openedAtMs to the failure time, so the next transition to HALF_OPEN is at 14000 + 3000 = 17000. The failure-rate threshold applies only in CLOSED; in HALF_OPEN the rule is all probes succeed or the breaker re-opens."
+    },
+    {
+      "stage": "post",
+      "question": "A team sets openDurationMs to 500 ms for a card processor whose outages typically last 2 to 5 minutes. What is the most likely consequence?",
+      "options": [
+        "The breaker never opens, because 500 ms is shorter than one bucket of the sliding window",
+        "Recovery is detected quickly and rejected traffic is minimised, which is the intended trade-off",
+        "The dead processor receives a batch of probes every half second for the whole outage, each waiting out the full timeout",
+        "The bulkhead fills with probes and starts rejecting calls that the breaker would otherwise have admitted"
+      ],
+      "correct": 2,
+      "explanation": "openDurationMs is a bet on outage length. At 500 ms the breaker re-probes 120 times a minute, each probe hanging for the timeout against a dead host and re-opening the breaker, so the processor is still hammered and the caller still burns threads. The open duration does not interact with the window's bucket size, and three probes cannot fill a bulkhead of ten."
+    }
+  ]
+}

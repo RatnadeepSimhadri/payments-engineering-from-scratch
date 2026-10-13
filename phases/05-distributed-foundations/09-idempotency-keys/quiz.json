@@ -1,0 +1,78 @@
+{
+  "lesson": "09-idempotency-keys",
+  "title": "Idempotency Keys: Exactly-Once Effects on At-Least-Once Networks",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A client sends POST /v1/charges, gets no response within its timeout, and retries. In which situation does the retry create a duplicate charge?",
+      "options": [
+        "Only when the first request was dropped by the network before reaching the server",
+        "When the server executed the first request but its response was lost on the way back",
+        "Never, because HTTP guarantees that a POST is delivered to the server at most once",
+        "Only when the two requests are routed to different server instances"
+      ],
+      "correct": 1,
+      "explanation": "If the server executed the first request and the response was lost (or is still in flight), the retry is a second execution. A request dropped before arrival is the one case where a retry is safe. HTTP makes no delivery guarantee at all, and routing is irrelevant to whether the first attempt ran."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the request fingerprint exclude the idempotency key itself?",
+      "options": [
+        "Because the key is a client secret and must never be hashed together with the request data it protects",
+        "Because then every key would have a unique fingerprint, and a reused key with a different body could never be detected",
+        "Because the key travels in an HTTP header and headers are deliberately kept out of the request body hash",
+        "Because SHA-256 input is limited in length and a 255-character key would push the canonical form over it"
+      ],
+      "correct": 1,
+      "explanation": "The fingerprint exists to check whether two requests under the same key are the same operation. If the key were hashed in, two requests with the same key would always share it, and the 422 conflict could never fire. The key is not a secret and SHA-256 accepts input of any length."
+    },
+    {
+      "stage": "check",
+      "question": "Two retries with the same key arrive at the same moment while the first attempt is still executing. What must be true of the store for only one to execute?",
+      "options": [
+        "The lookup and the insertion of the in-progress entry happen as one atomic step under a lock or a unique constraint",
+        "The store checks the fingerprint before the lookup so that identical bodies are merged into one request",
+        "The second request is delayed by the TTL so that the first request has time to complete",
+        "Each server instance keeps its own store and the load balancer routes by key"
+      ],
+      "correct": 0,
+      "explanation": "With a separate check and insert, both requests see no entry and both execute. Only an atomic check-and-reserve (a monitor, a lock, INSERT ... ON CONFLICT, or SET NX) makes the second request see the first's reservation and receive IN_PROGRESS. Routing by key is fragile and the TTL has nothing to do with concurrency."
+    },
+    {
+      "stage": "check",
+      "question": "The processor returns a 502 to the first keyed request. The client retries with the same key. Following the lesson's (and Stripe's) rule, what happens?",
+      "options": [
+        "The processor is called again, because errors are never stored and the client deserves a fresh attempt",
+        "The stored 502 is replayed, because once the handler began executing its result is the honest answer",
+        "The store returns 409 because a failed request leaves the key permanently in progress",
+        "The store returns 422 because the fingerprint of an error response never matches"
+      ],
+      "correct": 1,
+      "explanation": "A 502 is a response: the handler ran, and the store does not know what side effects it had, so the safe replay is to repeat what happened. A fresh attempt needs a fresh key. The entry is completed, not in progress, and the fingerprint is computed from the request, not the response."
+    },
+    {
+      "stage": "post",
+      "question": "An IN_PROGRESS entry is 31 seconds old, the in-progress lease is 30 seconds, and a request arrives with the same key but a different fingerprint. What does begin() return?",
+      "options": [
+        "CONFLICT, because a fingerprint mismatch is checked before anything else",
+        "IN_PROGRESS, because the entry has not been completed or abandoned",
+        "NEW, because the expired lease removes the entry before the fingerprint is compared",
+        "REPLAY of an empty response, because the lease converts the entry to completed"
+      ],
+      "correct": 2,
+      "explanation": "Expiry (TTL or lease) is evaluated first and removes the entry, so the key behaves as if it had never been seen; the fingerprint comparison then has nothing to compare against and the caller reserves the key as NEW. Had the entry been 29 seconds old, the mismatch would have produced CONFLICT."
+    },
+    {
+      "stage": "post",
+      "question": "The first attempt reserves the key, the processor charges the card, and then the connection drops before the response arrives at the API. The API abandons the reservation and the retry executes. What is the root cause, and what closes it?",
+      "options": [
+        "The lease was too short; lengthening it would let the first attempt finish before the retry was admitted to execute",
+        "The side effect and its record live in different systems; one transaction, or a derived downstream key, closes it",
+        "The fingerprint did not include the processor's charge id, so the retry could not be recognised as a replay of it",
+        "The TTL started at reservation rather than at completion, so the entry had already expired during the call"
+      ],
+      "correct": 1,
+      "explanation": "The store recorded a reservation, the processor recorded a charge, and nothing links them, so the API cannot tell that money moved. Closing the gap needs atomicity (charge row and idempotency row in one transaction), a derived key so the processor replays, or a recovery point. The lease and TTL were not involved, and the charge id does not exist until after execution."
+    }
+  ]
+}

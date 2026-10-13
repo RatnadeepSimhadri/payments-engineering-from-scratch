@@ -1,0 +1,78 @@
+{
+  "lesson": "06-aml-transaction-monitoring",
+  "title": "AML Transaction Monitoring and Structuring Detection",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A customer deposits 9,900.00 USD in cash on Monday, Tuesday, and Wednesday at three different branches. No single deposit reaches the 10,000.00 reporting threshold. What is the bank's exposure?",
+      "options": [
+        "None; each deposit is below the threshold and no report was required",
+        "A reporting failure only if the three deposits happened in one business day",
+        "A likely structuring pattern that its monitoring program is required to detect and assess",
+        "A currency transaction report was due on the aggregate and the bank is late"
+      ],
+      "correct": 2,
+      "explanation": "Splitting cash to stay under the threshold is structuring, and the bank must have a program that detects near-threshold patterns and files a suspicious activity report where warranted. The CTR aggregation rule applies within one business day, so no CTR was due here; that is exactly why the structurer spread the deposits out, and why the detector cannot rely on calendar days."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the structuring detector qualify deposits with a strict amount < threshold rather than amount <= threshold?",
+      "options": [
+        "Because deposits at exactly the threshold are reported by the CTR process and are not evasion",
+        "Because integer comparison on minor units cannot represent equality reliably",
+        "Because the floor parameter already excludes amounts at the threshold",
+        "Because deposits at the threshold belong to the velocity scenario instead"
+      ],
+      "correct": 0,
+      "explanation": "A 10,000.00 cash deposit triggers the routine report automatically; there is nothing to evade and nothing to detect. Using <= would turn every legitimate reported deposit into a structuring alert. Integer comparison is exact, the floor is a lower bound not an upper one, and velocity is unrelated."
+    },
+    {
+      "stage": "check",
+      "question": "Ten deposits of 9,900.00 every seven hours produce eight raw structuring alerts from the sliding window. What does the engine deliver to the analyst, and how?",
+      "options": [
+        "Eight separate alerts, one per window position, so that no evidence from any window is lost",
+        "One alert whose evidence is the union of all ten deposits, formed by merging alerts that share a transaction",
+        "Only the single highest-scoring alert, with the other seven discarded along with their evidence",
+        "One alert per calendar day, three in total, each carrying only that day's qualifying deposits"
+      ],
+      "correct": 1,
+      "explanation": "Consecutive alerts from the same scenario whose evidence overlaps describe one episode. mergeOverlapping unions their evidence, keeps the narrative of the highest-scoring window, and appends the merged total. Discarding the others would lose evidence; keeping all eight would make the analyst clear the same episode eight times."
+    },
+    {
+      "stage": "check",
+      "question": "The velocity score is 50 * count / baselineCount + 50 * counterparties / baselineCounterparties. With baselines 6 and 4, why does an account making nine rent payments to one landlord in six hours not alert at threshold 150?",
+      "options": [
+        "Because rent payments are ACH and the velocity scenario only counts wires",
+        "Because the count term alone gives 75 and the one-counterparty term adds only 12, totalling 87",
+        "Because the window is six hours and rent payments are spread across a month",
+        "Because the landlord is on an allow-list that the scenario consults"
+      ],
+      "correct": 1,
+      "explanation": "50 * 9 / 6 = 75 and 50 * 1 / 4 = 12, so the score is 87. The two terms are separate precisely so that repetition to one payee is distinguished from spraying funds to many. The scenario does not filter by channel or consult allow-lists, and the question states the nine payments are within six hours."
+    },
+    {
+      "stage": "post",
+      "question": "The synthetic run at an 80% floor alerts on the planted structurer and on a legitimate laundromat whose daily cash deposits are 8,400 to 9,300. Raising the floor to 93% keeps the structurer and drops the laundromat. What should the team conclude?",
+      "options": [
+        "93% is the correct floor for all banks and should be hard-coded",
+        "The floor is a tunable policy parameter whose setting must be justified with labelled data for this customer base",
+        "The laundromat should be reported anyway, since its deposits exceed the threshold weekly",
+        "The structuring scenario should be replaced by the velocity scenario, which has no floor"
+      ],
+      "correct": 1,
+      "explanation": "The right floor depends on the institution's customers; a bank with many cash businesses will tune differently from one with few. What matters to an examiner is that the setting is a reviewed parameter backed by a precision/recall analysis on labelled cases, not a constant in code. Reporting legitimate businesses floods the queue and is not what the law asks for."
+    },
+    {
+      "stage": "post",
+      "question": "Why does every Alert carry the list of transactions that triggered it rather than only a score and a scenario id?",
+      "options": [
+        "Because the score cannot be computed without re-reading the transactions",
+        "Because a suspicious activity report requires a narrative citing specific transactions, and the investigator has 30 days",
+        "Because the merge step needs transaction ids to detect overlap, so they must be stored anyway",
+        "Because regulators require that raw transaction data be transmitted with each filing"
+      ],
+      "correct": 1,
+      "explanation": "The filing's narrative must say who, what, when, and how with specific transactions, and the investigation clock is short. An alert without evidence forces the investigator to reconstruct the case from scratch. The merge step does use the ids, but that is a convenience, not the reason; raw data is not transmitted with a SAR."
+    }
+  ]
+}

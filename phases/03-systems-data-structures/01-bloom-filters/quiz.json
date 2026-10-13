@@ -1,0 +1,78 @@
+{
+  "lesson": "01-bloom-filters",
+  "title": "Bloom Filters from Scratch",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service checks a database table on every request to see whether an idempotency key was used before, and 99.6% of those lookups return no row. What property would a pre-check need to have so the service could safely skip the database when the pre-check says 'not seen'?",
+      "options": [
+        "It must never report 'seen' for a key that is actually new",
+        "It must never report 'not seen' for a key that was actually used",
+        "It must store the full key so the response can be served from it",
+        "It must be rebuilt after every write so it is always exactly current"
+      ],
+      "correct": 1,
+      "explanation": "Skipping the database on 'not seen' is only safe if 'not seen' is always true, so the pre-check must have no false negatives. False positives ('seen' for a new key) are harmless because they just trigger the lookup that would have happened anyway. Storing the key or rebuilding after every write would make it a cache, not a cheap filter."
+    },
+    {
+      "stage": "check",
+      "question": "You size a Bloom filter for 10,000 keys at a 1% false-positive rate. Which parameters does the lesson's formula produce?",
+      "options": [
+        "m = 95,851 bits and k = 7 hash functions",
+        "m = 10,000 bits and k = 1 hash function",
+        "m = 80,000 bits and k = 10 hash functions",
+        "m = 160,000 bits and k = 4 hash functions"
+      ],
+      "correct": 0,
+      "explanation": "m = -n ln p / (ln 2)^2 = 10000 * 4.605 / 0.4805 = 95,851 bits, about 9.6 bits per key, and k = (m/n) ln 2 = 6.64, rounded to 7. One bit per key with one hash would be a plain hash table of booleans with a false-positive rate near 63% after filling; the other options do not come from the formula."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the lesson compute k bit positions as (h1 + i * h2) mod m from two 64-bit hashes rather than running k different hash functions over the key bytes?",
+      "options": [
+        "Because k independent hashes would make the filter accept deletes",
+        "Because any two hashes produce a lower false-positive rate than k hashes",
+        "Because Kirsch and Mitzenmacher showed it gives the same rate at a fraction of the cost",
+        "Because FNV-1a cannot be seeded, so only one hash of the bytes is possible"
+      ],
+      "correct": 2,
+      "explanation": "Double hashing derives the k positions from two hashes and the 2006 result proves the asymptotic false-positive rate is unchanged, so the lookup costs two hashes instead of k. It does not lower the rate below the k-hash design, and it has nothing to do with deletes. FNV-1a can be seeded by changing the offset basis, which Exercise 1 asks you to do."
+    },
+    {
+      "stage": "check",
+      "question": "The Java implementation reduces the combined hash with Long.remainderUnsigned(h1 + i * h2, m) instead of the % operator. What goes wrong with %?",
+      "options": [
+        "The % operator is not defined for long operands in Java 21",
+        "A negative long gives a negative remainder, so about half of all keys would index outside the array",
+        "The % operator rounds toward negative infinity and shifts every index by one",
+        "The % operator silently truncates the long to 32 bits before dividing"
+      ],
+      "correct": 1,
+      "explanation": "Java's long is signed, and h1 + i*h2 has its top bit set for about half of all keys, so % returns a negative remainder and the bit-array index would be out of range. remainderUnsigned treats the long as the 64-bit unsigned value it holds, matching Go's uint64 and Python's masked integers. Java's % truncates toward zero, not negative infinity, and never narrows to 32 bits."
+    },
+    {
+      "stage": "post",
+      "question": "A filter sized for 10,000 keys at p = 0.01 has been running for a month and now holds 100,000 keys. What does the lesson say you should expect?",
+      "options": [
+        "Insertions start throwing an exception once the sized capacity is exceeded",
+        "The false-positive rate stays near 1% because k adapts to the fill ratio",
+        "Some added keys now return 'definitely absent' because their bits were overwritten",
+        "Nearly every absent key returns 'possibly seen', so the database load quietly returns to what it was"
+      ],
+      "correct": 3,
+      "explanation": "At ten times capacity the fill ratio is about 0.999 and p is about 0.995: the filter still never produces a false negative, raises no error, and simply stops saving lookups. That silent degradation is why the fill ratio must be exported and alarmed on. Bits are only ever set, never overwritten, so false negatives remain impossible."
+    },
+    {
+      "stage": "post",
+      "question": "A teammate proposes: 'When the filter says the idempotency key was possibly seen, return the cached response directly and skip the database read to save even more load.' What is wrong with this?",
+      "options": [
+        "Nothing: the filter's one-sided guarantee makes 'possibly seen' reliable enough",
+        "At p = 0.01 about one new request in a hundred would be treated as a retry and get another customer's response",
+        "The filter cannot be queried twice for the same key without resetting its bits",
+        "It only works if the filter is rebuilt from the table on every restart"
+      ],
+      "correct": 1,
+      "explanation": "'Possibly seen' includes every false positive, and at the configured 1% rate a new payment would be mistaken for a retry one time in a hundred. The one-sided guarantee covers only the 'definitely absent' answer; a positive is a hint to consult the authoritative store, never a result to act on. Rebuild-on-restart is a separate concern and does not fix this."
+    }
+  ]
+}

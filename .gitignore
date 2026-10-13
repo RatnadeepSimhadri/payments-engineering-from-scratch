@@ -1,0 +1,10 @@
+.out/
+catalog.json
+__pycache__/
+*.pyc
+*.class
+learning-artifacts/
+LEARNING.md
+PROJECTS-LEARNING.md
+*-LEARNING.md
+.DS_Store

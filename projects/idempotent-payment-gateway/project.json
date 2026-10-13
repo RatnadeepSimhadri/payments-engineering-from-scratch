@@ -1,0 +1,103 @@
+{
+  "id": "idempotent-payment-gateway",
+  "title": "Idempotent Payment Gateway",
+  "level": 2,
+  "levelName": "Builder",
+  "tagline": "A charge API that survives client retries, flaky processors, and duplicate webhooks without ever charging twice.",
+  "summary": "You build the core of a card-payment gateway: an idempotency store that detects replays and conflicts by fingerprint, a payment state machine with partial refunds and versioned history, a retrying processor client with full-jitter backoff, a retry budget and a circuit breaker, and a signed webhook dispatcher with at-least-once delivery and consumer-side dedupe. Everything runs on an injected clock and a seeded random source, so every schedule and every signature is reproducible.",
+  "youWillBuild": "An in-memory payment gateway where the same request can be sent any number of times and money moves exactly once.",
+  "hours": 10,
+  "languages": [
+    "Java"
+  ],
+  "languageWhy": {
+    "Java": "Records, sealed-style enums and EnumMap give the state machine and the transition table a compact, type-checked shape; javax.crypto.Mac and MessageDigest.isEqual are the production HMAC tools."
+  },
+  "status": "ready",
+  "skills": [
+    "Scope idempotency keys per account, fingerprint the request body with SHA-256, and classify every call as NEW, REPLAY, CONFLICT or IN_PROGRESS with a TTL",
+    "Drive a payment through an explicit transition table with versioned history and partial refunds in integer minor units",
+    "Retry only retryable failures with exponential backoff, full jitter from a seeded source, a retry budget and a CLOSED/OPEN/HALF_OPEN circuit breaker",
+    "Sign webhook events with HMAC-SHA256 and a timestamp, verify them inside a tolerance window, deliver at-least-once with dead-lettering, and dedupe on the consumer"
+  ],
+  "prerequisites": [
+    {
+      "title": "Idempotency Keys: Exactly-Once Effects on At-Least-Once Networks",
+      "path": "phases/05-distributed-foundations/09-idempotency-keys"
+    },
+    {
+      "title": "Retries, Exponential Backoff, and Jitter",
+      "path": "phases/05-distributed-foundations/10-retries-backoff-and-jitter"
+    },
+    {
+      "title": "Circuit Breakers and Bulkheads",
+      "path": "phases/05-distributed-foundations/11-circuit-breakers-and-bulkheads"
+    },
+    {
+      "title": "Designing an Idempotent Payment API",
+      "path": "phases/12-payment-systems-design/01-idempotent-payment-api"
+    }
+  ],
+  "stages": [
+    {
+      "id": "01-idempotency-store",
+      "title": "Idempotency Store",
+      "summary": "A store keyed by (merchant, idempotency key) that fingerprints the canonical request with SHA-256 and answers NEW, REPLAY, CONFLICT or IN_PROGRESS, with records that expire on an injected clock.",
+      "hours": 2,
+      "difficulty": "starter",
+      "concepts": [
+        "idempotency key",
+        "request fingerprint",
+        "canonical form",
+        "replay vs conflict",
+        "TTL",
+        "injected clock"
+      ]
+    },
+    {
+      "id": "02-payment-state-machine",
+      "title": "Payment State Machine",
+      "summary": "A Payment that moves created -> processing -> succeeded | failed (or canceled) through one transition table, keeps a versioned transition log, and refunds in parts until it is fully refunded.",
+      "hours": 2,
+      "difficulty": "core",
+      "concepts": [
+        "finite state machine",
+        "transition table",
+        "terminal states",
+        "optimistic version",
+        "partial refunds",
+        "integer minor units"
+      ]
+    },
+    {
+      "id": "03-retries-and-circuit-breaker",
+      "title": "Retries, Backoff and a Circuit Breaker",
+      "summary": "A processor client that retries only UNAVAILABLE with capped exponential backoff and full jitter from a seeded source, stops when a retry budget drains, and sits behind a CLOSED/OPEN/HALF_OPEN breaker; then the Gateway that ties the store, the state machine and the client together.",
+      "hours": 3,
+      "difficulty": "core",
+      "concepts": [
+        "retryable classification",
+        "exponential backoff",
+        "full jitter",
+        "retry budget",
+        "circuit breaker",
+        "release vs complete"
+      ]
+    },
+    {
+      "id": "04-webhook-dispatch",
+      "title": "Signed Webhooks, At-Least-Once",
+      "summary": "Lifecycle events signed with HMAC-SHA256 over a timestamp and the body, verified inside a tolerance window with a constant-time compare, delivered at-least-once on a retry schedule with a dead-letter list, and deduped by event id on the consumer.",
+      "hours": 3,
+      "difficulty": "stretch",
+      "concepts": [
+        "HMAC-SHA256",
+        "timestamped signature",
+        "replay window",
+        "at-least-once delivery",
+        "dead letter",
+        "consumer dedupe"
+      ]
+    }
+  ]
+}

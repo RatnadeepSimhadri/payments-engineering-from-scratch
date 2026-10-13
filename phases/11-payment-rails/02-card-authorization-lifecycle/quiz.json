@@ -1,0 +1,78 @@
+{
+  "lesson": "02-card-authorization-lifecycle",
+  "title": "Authorization, Capture, Void, Refund: The Card Lifecycle State Machine",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A cardholder taps for 80.00 USD at a restaurant and the terminal shows APPROVED. What has happened to the money at that moment?",
+      "options": [
+        "80.00 USD has been transferred from the issuer to the merchant's acquirer",
+        "The issuer has reduced the available balance by 80.00 but no funds have moved",
+        "The merchant's bank account has been credited pending the end-of-day batch",
+        "Nothing changes on either account until the cardholder's statement is produced"
+      ],
+      "correct": 1,
+      "explanation": "An approval is an authorization: the issuer places a hold that lowers the available balance and promises to pay if the merchant later presents a capture. No funds move until clearing and settlement. The first option describes settlement, which happens days later; the third confuses the hold with a credit."
+    },
+    {
+      "stage": "check",
+      "question": "A 100.00 USD authorization has had 40.00 captured. The merchant now calls closeCapture. What does the event log record and what is the new state?",
+      "options": [
+        "A CLOSE_CAPTURE event for 60.00 and the state CAPTURED, with captured still 40.00",
+        "A CAPTURE event for 60.00 and the state CAPTURED, because the remainder is taken",
+        "A VOID event for 60.00 and the state VOIDED, because the hold is released",
+        "A CLOSE_CAPTURE event for 40.00 and the state PARTIALLY_CAPTURED, awaiting more"
+      ],
+      "correct": 0,
+      "explanation": "Closing a partial capture releases the uncaptured 60.00 back to the cardholder; the event records the released amount, the captured total stays at 40.00, and the transaction is CAPTURED because no further captures are possible. VOID is only legal from AUTHORIZED, before any money has been captured, which is why the third option is wrong."
+    },
+    {
+      "stage": "check",
+      "question": "Why does every merchant-initiated method call expireIfDue before checking the legal-move table?",
+      "options": [
+        "So the clock is read exactly once per call, which keeps the event timestamps monotonic",
+        "So an authorization past its validity window fails with EXPIRED as the recorded reason, not a silent success",
+        "So the policy's validity period can be shortened retroactively when the network changes its rules",
+        "So the expiry event can carry the merchant's reason string, which the audit trail requires"
+      ],
+      "correct": 1,
+      "explanation": "Expiry is driven by the injected clock, not by a background job, so the transition is applied lazily at the moment the next action arrives. The capture then fails as an illegal transition from EXPIRED, with the expiry persisted as its own event. The last option is a side effect, not the purpose; the first is not something the ordering achieves."
+    },
+    {
+      "stage": "check",
+      "question": "A restaurant (MCC 5812, 15% tolerance) authorized 0.33 USD. What is the capture ceiling and why?",
+      "options": [
+        "0.38 USD, because 37.95 cents rounds HALF_UP to protect the merchant's tip",
+        "0.33 USD, because tolerances apply only above a one-dollar minimum authorization",
+        "0.34 USD, because the tolerance is applied as a flat one-cent allowance on small tickets",
+        "0.37 USD, because 37.95 cents is rounded DOWN so the tolerance never favours the merchant"
+      ],
+      "correct": 3,
+      "explanation": "The ceiling is authorized times 11500/10000 with Rounding.DOWN: 33 * 11500 / 10000 = 37.95 cents, truncated to 37. Rounding toward the merchant's disadvantage means the ceiling can never be a fraction of a cent above what the rule allows. HALF_UP would give 38 cents and let the merchant capture more than 15% over the authorization."
+    },
+    {
+      "stage": "post",
+      "question": "Which pair of transitions is legal in this state machine?",
+      "options": [
+        "AUTHORIZED -> INCREMENT -> AUTHORIZED, and PARTIALLY_CAPTURED -> INCREMENT -> AUTHORIZED",
+        "CAPTURED -> VOID -> VOIDED, and PARTIALLY_REFUNDED -> REFUND -> REFUNDED",
+        "PARTIALLY_CAPTURED -> EXPIRE -> EXPIRED, and PARTIALLY_REFUNDED -> REFUND -> REFUNDED",
+        "AUTHORIZED -> REFUND -> PARTIALLY_REFUNDED, and VOIDED -> CAPTURE -> CAPTURED"
+      ],
+      "correct": 2,
+      "explanation": "A partially captured authorization still has an open hold, so it can expire; a partially refunded transaction can keep refunding until refunded equals captured. INCREMENT is only legal from AUTHORIZED (the first option's second edge is forbidden), VOID is illegal once anything is captured, REFUND needs captured funds, and VOIDED is terminal."
+    },
+    {
+      "stage": "post",
+      "question": "A transaction captured 60.00 USD and refunded 25.00. The merchant now requests a 36.00 refund. What happens and what does the ledger show afterwards?",
+      "options": [
+        "The refund is rejected with LimitExceeded; refunded stays 25.00 and net settled stays 35.00",
+        "The refund succeeds; net settled is -1.00 and the merchant owes the difference at settlement",
+        "The refund succeeds for 35.00 only, the system trims it to captured minus refunded automatically",
+        "The refund is rejected as an illegal transition because PARTIALLY_REFUNDED accepts no refunds"
+      ],
+      "correct": 0,
+      "explanation": "Cumulative refunds may never exceed captured: 25.00 + 36.00 = 61.00 > 60.00, so the refund is rejected before any event is written, and the state and totals are untouched. The state table does allow REFUND from PARTIALLY_REFUNDED, so this is an amount-rule failure, not a state failure. Silently trimming the amount would hide the caller's bug."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "01-capstone-ledger-service",
+  "title": "Capstone: A Durable Double-Entry Ledger Service",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A wallet service stores balances in a `balance_cents` column updated in place. Which question can it not answer without additional data?",
+      "options": [
+        "What is the current balance of wallet 42?",
+        "Which wallets currently have a negative balance?",
+        "What was the balance of wallet 42 at the end of last quarter?",
+        "How many wallets exist in the MXN currency?"
+      ],
+      "correct": 2,
+      "explanation": "A balance column is a number with no history, so a point-in-time balance requires an immutable journal to fold over. Current balance and negative-balance scans are exactly what a column answers well, and currency counts are a metadata query."
+    },
+    {
+      "stage": "check",
+      "question": "In the capstone's WAL record, why does the service compute `fsync` before applying postings to in-memory balances rather than after?",
+      "options": [
+        "Because applying first would make the in-memory state visible to readers before the entry is durable",
+        "Because the CRC32 can only be computed over bytes that have already been flushed to disk",
+        "Because the operating system requires the file to be synced before any more writes are buffered",
+        "Because in-memory updates are slower than disk flushes and should be deferred as long as possible"
+      ],
+      "correct": 0,
+      "explanation": "The invariant is that any state a client can observe is recoverable. If memory were updated first and the process died before fsync, a reader could have seen a balance that recovery cannot reproduce. The CRC is computed over the payload bytes in memory, not after the flush."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the spec require the idempotency key and request hash to be fields of the WAL entry record instead of a separate in-memory map?",
+      "options": [
+        "A separate map would need its own lock and slow down the single writer",
+        "Recovery rebuilds the map from the log, so a replayed key after a restart still returns the original entry",
+        "The request hash is needed to verify the CRC32 of each record during recovery",
+        "The WAL record format has spare bytes that would otherwise be wasted padding"
+      ],
+      "correct": 1,
+      "explanation": "Requirement 9 says the idempotency guarantee must survive restart. Only state derived from the log survives, so the key and hash must be in the log. The CRC covers the payload independently of the hash, and locking is not the constraint."
+    },
+    {
+      "stage": "check",
+      "question": "A USD to EUR conversion is modelled as two entries through `FX_CLEARING:USD` and `FX_CLEARING:EUR`. What does this buy over a single entry with a USD debit and a EUR credit?",
+      "options": [
+        "It halves the number of postings the reconciler has to match each night",
+        "It lets the service skip the rounding step because the clearing accounts absorb fractions",
+        "It avoids writing the exchange rate into the journal, keeping records smaller",
+        "Each entry balances within one currency, so the per-currency trial balance stays zero and the open FX position is visible"
+      ],
+      "correct": 3,
+      "explanation": "Requirement 13 keeps the trial balance zero per currency, which a mixed-currency entry cannot satisfy. The clearing accounts also expose treasury's open position. Rounding is still explicit and the rate is recorded on both entries, not omitted."
+    },
+    {
+      "stage": "post",
+      "question": "During recovery the service finds a record whose CRC fails at LSN 30 of 50. The spec's reference choice is to stop at LSN 29 and report it. What is the strongest argument for the alternative, refusing to start?",
+      "options": [
+        "Truncating to LSN 29 and rewriting the file tail would take longer on a large log than scanning the whole file once",
+        "A mid-log corruption is not a torn tail: entries 31 to 50 were acknowledged to clients, and silently dropping them violates durability",
+        "The most recent snapshot, taken at an earlier LSN, will always already contain entries 31 to 50 so nothing is lost",
+        "Clients that posted entries 31 to 50 will retry with the same idempotency keys and the entries will be recreated"
+      ],
+      "correct": 1,
+      "explanation": "A torn tail only loses records that were never acknowledged. A corrupt record in the middle means acknowledged entries after it would be lost, which breaks the durability promise; refusing to start forces a human to restore from a replica or backup. Snapshots are taken at or before the WAL head, so they cannot contain later entries, and clients will not retry acknowledged requests."
+    },
+    {
+      "stage": "post",
+      "question": "In the Milestone 9 concurrency test, why must the WAL entry-record count equal `accepted + 10` rather than `8000 + 10`?",
+      "options": [
+        "Rejected transfers must leave no record, so the count proves validation happens before the append",
+        "The 10 funding entries are written to a separate segment and counted differently",
+        "Group commit merges several transfers into one record, so the count is always lower",
+        "Each worker's first transfer is written twice because of the idempotency map warm-up"
+      ],
+      "correct": 0,
+      "explanation": "Requirement 5 appends only accepted entries; an `INSUFFICIENT_AVAILABLE` rejection happens in validation and writes nothing. The count ties the log to the accepted set exactly. Group commit batches fsyncs, not records, and funding entries are ordinary records."
+    }
+  ]
+}

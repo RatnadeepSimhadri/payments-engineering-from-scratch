@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "id": "consensus-from-scratch",
+  "title": "Consensus from Scratch",
+  "summary": "Clocks, consistency, Paxos, Raft I-II, linearizability checking, then build raft-kv.",
+  "estimatedMinutes": 1275,
+  "stateFile": "CONSENSUS-LEARNING.md",
+  "invocation": {
+    "claudeCode": "/learn-consensus",
+    "codex": "learn-consensus, or choose it from /skills",
+    "portableFallback": "Use learn-consensus to start or resume the Consensus from Scratch path."
+  },
+  "languages": [
+    "Java"
+  ],
+  "conceptualFallback": "Read each lesson's docs/en.md and trace the worked example by hand; mark run evidence pending until a toolchain is available.",
+  "project": "raft-kv",
+  "lessons": [
+    {
+      "phase": 5,
+      "lesson": 3,
+      "title": "Time, Order, and Clocks: Lamport and Vector Clocks",
+      "path": "phases/05-distributed-foundations/03-lamport-and-vector-clocks",
+      "minutes": 120,
+      "required": true,
+      "order": 1
+    },
+    {
+      "phase": 5,
+      "lesson": 5,
+      "title": "Consistency Models: Linearizability to Eventual",
+      "path": "phases/05-distributed-foundations/05-consistency-models",
+      "minutes": 90,
+      "required": true,
+      "order": 2
+    },
+    {
+      "phase": 6,
+      "lesson": 1,
+      "title": "Replication: Leader-Based, Multi-Leader, Leaderless",
+      "path": "phases/06-replication-and-consensus/01-replication-strategies",
+      "minutes": 75,
+      "required": true,
+      "order": 3
+    },
+    {
+      "phase": 6,
+      "lesson": 4,
+      "title": "Single-Decree Paxos from Scratch",
+      "path": "phases/06-replication-and-consensus/04-paxos",
+      "minutes": 120,
+      "required": true,
+      "order": 4
+    },
+    {
+      "phase": 6,
+      "lesson": 5,
+      "title": "Raft I: Terms, Leader Election, and a Simulated Network",
+      "path": "phases/06-replication-and-consensus/05-raft-leader-election",
+      "minutes": 150,
+      "required": true,
+      "order": 5
+    },
+    {
+      "phase": 6,
+      "lesson": 6,
+      "title": "Raft II: Log Replication and Commit",
+      "path": "phases/06-replication-and-consensus/06-raft-log-replication",
+      "minutes": 150,
+      "required": true,
+      "order": 6
+    },
+    {
+      "phase": 6,
+      "lesson": 12,
+      "title": "Linearizability Checking with Recorded Histories",
+      "path": "phases/06-replication-and-consensus/12-linearizability-checking",
+      "minutes": 90,
+      "required": true,
+      "order": 7
+    },
+    {
+      "phase": 15,
+      "lesson": 3,
+      "title": "Capstone: A Raft-Replicated Key-Value Store",
+      "path": "phases/15-capstone-projects/03-capstone-replicated-kv-store",
+      "minutes": 480,
+      "required": true,
+      "order": 8
+    }
+  ],
+  "checkpoints": {
+    "phases/06-replication-and-consensus/05-raft-leader-election": "Run 40 seeds and show at most one leader per term.",
+    "phases/06-replication-and-consensus/06-raft-log-replication": "Show a follower's conflicting entries being overwritten and state machines converging."
+  }
+}

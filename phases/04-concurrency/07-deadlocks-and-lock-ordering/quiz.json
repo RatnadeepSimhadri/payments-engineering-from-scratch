@@ -1,0 +1,48 @@
+{
+  "lesson": "07-deadlocks-and-lock-ordering",
+  "title": "Deadlocks, Lock Ordering, and Detection",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Thread 1 holds the lock on account A and is waiting for the lock on account B. Thread 2 holds B and is waiting for A. What happens if nothing intervenes?",
+      "options": ["Both threads wait forever; neither consumes CPU and neither ever runs again", "The JVM or runtime times out one lock after a default interval and the other thread proceeds", "Both threads spin at full CPU until the scheduler reorders them", "The thread that asked first is granted its lock because locks are FIFO"],
+      "correct": 0,
+      "explanation": "This is a circular wait: each thread needs a lock only the other can release, and plain mutexes have no timeout and no preemption, so both park permanently. Mutexes do not spin, and lock fairness orders waiters for one lock; it cannot resolve a cycle across two locks."
+    },
+    {
+      "stage": "check",
+      "question": "The deadlock test passes a two-party Barrier as the TransferService's betweenLocks hook. What does the barrier accomplish?",
+      "options": ["It makes both transfers run strictly one after the other, so the test is effectively single-threaded and cannot hang", "It forces both threads to hold their first lock before either requests its second, reproducing the interleaving every run", "It gives the slower thread a head start of one scheduling quantum, so the detector always aborts the same thread", "It replaces the second lock acquisition with a non-blocking try, so the test cannot block on a lock held by the other thread"],
+      "correct": 1,
+      "explanation": "The window in which both threads hold one lock and want the other is nanoseconds wide; a barrier between the first and second lock widens it to certainty. The detector then refuses whichever request arrives second, which is scheduler-dependent, so the test asserts one abort and one commit rather than naming the victim."
+    },
+    {
+      "stage": "check",
+      "question": "In the wait-for graph T4 -> T1, T1 -> T2, T2 -> T1, what does findCycle return, and why is T4 excluded?",
+      "options": ["[T1, T2, T4], because T4 is also permanently stuck", "[T4, T1, T2], because the search starts from the smallest node", "[T1, T2], because T4 waits behind the cycle but no one waits for T4", "[], because a node with no incoming edge means the graph is acyclic"],
+      "correct": 2,
+      "explanation": "A cycle requires every member to be waited on by another member; nothing waits for T4, so aborting it would free no one. The DFS finds the back edge T2 -> T1 and recovers the path between them. T4 is stuck too, but it will proceed once the cycle is broken, which is exactly why the detector must report only the cycle."
+    },
+    {
+      "stage": "check",
+      "question": "In tryLockTransfer, why must the first lock be released before backoff.pause() rather than after it?",
+      "options": ["Because pause() is slow and holding a lock for that long would reduce throughput", "Because holding a lock while pausing is hold-and-wait, which is the Coffman condition try-lock exists to remove", "Because the backoff's random generator is itself guarded by that lock", "Because ReentrantLock forbids calling yield while a lock is held"],
+      "correct": 1,
+      "explanation": "The point of try-lock is that a thread never waits while holding anything; if it paused with the first lock held, another thread could park waiting for that lock while this one waits for the other, and the deadlock is back in slow motion. Throughput would also suffer, but the correctness argument is the reason."
+    },
+    {
+      "stage": "post",
+      "question": "A service updates many rows per transaction and cannot know up front which rows a transaction will touch. Which strategy fits, and what must the application then be prepared to do?",
+      "options": ["Lock ordering by primary key, and nothing further is needed", "Try-lock on every row with no backoff, and retry until success", "Detection, and the application retries any transaction aborted with 'deadlock detected'", "A single global lock per transaction, and accept the serialization"],
+      "correct": 2,
+      "explanation": "Ordering needs the full lock set in advance, and a global lock throws away concurrency. Databases therefore run a wait-for-graph detector and abort one transaction when a cycle forms; the application's part of the contract is to retry the victim, ideally with backoff. Try-lock without backoff would livelock under contention."
+    },
+    {
+      "stage": "post",
+      "question": "orderedTransfer locks the smaller account id first regardless of transfer direction. Why does that make a deadlock impossible rather than merely unlikely?",
+      "options": ["Because any cycle would require some thread to hold a higher-ordered lock while waiting for a lower one, which the rule forbids", "Because the comparison takes so little time that the window for interleaving closes", "Because the detector is still running underneath and will abort the second thread", "Because threads that lock the same account first are queued, so only one can proceed at a time"],
+      "correct": 0,
+      "explanation": "Follow a hypothetical cycle: each thread holds a lock of lower order than the one it waits for, so around the cycle the order strictly increases and returns to its start, a contradiction. The argument does not depend on timing or on the detector; the ordered benchmarks run with no tracker at all."
+    }
+  ]
+}

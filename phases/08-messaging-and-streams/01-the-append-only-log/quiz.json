@@ -1,0 +1,78 @@
+{
+  "lesson": "01-the-append-only-log",
+  "title": "The Append-Only Log: Partitions, Offsets, and Segments",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "Three services each need every authorization event, and one of them must be able to re-read last week's events after a bug fix. Which broker model supports this directly?",
+      "options": [
+        "A queue with competing consumers, since each consumer acknowledges what it processed",
+        "A queue per service, with the producer publishing each event three times",
+        "An append-only log where each reader keeps its own offset and records stay until retention",
+        "A request-reply RPC from each service to the authorization service's database"
+      ],
+      "correct": 2,
+      "explanation": "A log keeps records until a retention rule deletes them and lets every reader hold its own position, so three readers and a rewind are both natural. Three queues with triple publishing is the workaround the lesson's failure story shows breaking: one publish fails, the queues disagree, and nothing can be replayed because consumed messages are gone."
+    },
+    {
+      "stage": "check",
+      "question": "A topic has 3 partitions. Records with key m-coffee hash to partition 1. What does the log guarantee about ordering?",
+      "options": [
+        "All m-coffee records are in production order relative to each other, and nothing is promised across partitions",
+        "All records in the topic are totally ordered by offset regardless of which partition holds them",
+        "m-coffee records are ordered only within one segment; order can change at a segment roll",
+        "Ordering is preserved as long as there is at most one consumer reading the whole topic"
+      ],
+      "correct": 0,
+      "explanation": "Order is a per-partition property: offsets are dense and monotonic within one partition, and the partitioner sends the same key to the same partition, so one key's records are totally ordered. Offsets in different partitions are unrelated. Segments are a storage detail and never reorder records; a roll only starts a new file at the next offset."
+    },
+    {
+      "stage": "check",
+      "question": "indexIntervalBytes is 40 and frames are 39 bytes. After appending offsets 0, 1, 2 to an empty segment, which index entries exist?",
+      "options": [
+        "(0, 0), (1, 39), (2, 78), because every record gets an index entry of its own",
+        "(0, 0) and (2, 78), because an entry is written once 40 bytes have accumulated",
+        "(1, 39) only, because the first record in a segment never needs an index entry",
+        "(0, 0) only, because 3 records times 39 bytes is still under the 160-byte limit"
+      ],
+      "correct": 1,
+      "explanation": "The first record always gets (0, 0). After it, 39 bytes have accumulated, which is under 40, so offset 1 gets no entry. After offset 1, 78 bytes have accumulated, so offset 2 is indexed at byte position 78 and the counter resets. One entry per record is exactly what the sparse index avoids, and skipping the first entry would leave positionOf with nothing to search."
+    },
+    {
+      "stage": "check",
+      "question": "A partition has segments with base offsets 0, 3, 6, 9 and the active segment holds offset 9 only. Retention drops the two oldest segments. What is true afterwards?",
+      "options": [
+        "logStartOffset is 6, read(2, 1) throws OffsetOutOfRange, and read(6, 1) returns offset 6",
+        "logStartOffset stays 0 but read(2, 1) returns an empty list because the data is gone",
+        "Offsets are renumbered so the surviving records become 0 through 3",
+        "The active segment is dropped first because it is the smallest"
+      ],
+      "correct": 0,
+      "explanation": "Retention removes whole closed segments from the oldest end, so the surviving segments are 6 and 9 and logStartOffset becomes 6. Offsets are never renumbered; that would break every committed consumer position. A read below the log start is an error, not an empty result, which is how a consumer learns its committed offset was retired. The active segment is never dropped."
+    },
+    {
+      "stage": "post",
+      "question": "A consumer polls offsets 0 and 1, commits, polls offsets 2 and 3, then crashes before committing. A new consumer in the same group starts. What happens?",
+      "options": [
+        "It starts at offset 4 because the broker tracked that 2 and 3 were delivered",
+        "It starts at offset 1 because the committed value is the last processed offset",
+        "It starts at offset 2 and redelivers 2 and 3, which is at-least-once delivery",
+        "It starts at offset 0 because a crash always resets the group to the log start"
+      ],
+      "correct": 2,
+      "explanation": "The committed value is the next offset to read, so after processing 0 and 1 the commit stores 2. Polling 2 and 3 advanced the in-memory position only; the crash discarded it. The restart resumes at 2 and delivers 2 and 3 again, which is why consumers of a payments log must be idempotent. Committing the last processed offset (1) is the off-by-one the lesson warns about."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the partitioner compute (fnv1a32(key) & 0x7FFFFFFF) % partitionCount rather than fnv1a32(key) % partitionCount in Java?",
+      "options": [
+        "The mask spreads keys more evenly because it removes correlation in the top bit",
+        "A Java int hash can be negative and % of a negative number is negative, giving an invalid partition index",
+        "The mask makes the Java hash match Python, which has no 32-bit integers",
+        "Kafka requires 31-bit hashes so that partition counts up to 2^31 are supported"
+      ],
+      "correct": 1,
+      "explanation": "Java's % keeps the sign of the dividend, so a negative hash yields a negative partition and an ArrayIndexOutOfBoundsException. Masking the sign bit makes the value non-negative first. Python matches because it masks to 32 bits after each multiply, not because of this mask; Go returns uint32 and has no negative case. The mask has no effect on distribution quality."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "lesson": "03-double-entry-ledger",
+  "title": "The Double-Entry Ledger from Scratch",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service keeps one balance column per account and updates it in place. A merchant's balance disagrees with the sum of their payment events by 14.16. What is the structural reason the system cannot say which update caused it?",
+      "options": [
+        "The events table was written by a different service than the balance table",
+        "In-place updates destroy the prior value and no second record must agree with it",
+        "Floating-point rounding accumulated across eleven months of fee calculations",
+        "The database isolation level allowed two updates to read the same stale balance"
+      ],
+      "correct": 1,
+      "explanation": "A single-entry balance has no counterpart it is required to equal, so any error is internally consistent and the history is overwritten. Isolation and rounding can cause drift, but even with both fixed a lone balance column still cannot be checked against anything; double-entry supplies the counterpart."
+    },
+    {
+      "stage": "check",
+      "question": "An entry debits Processor Receivable 100.00 USD and credits Merchant Payable 100.00 EUR. What does the JournalEntry constructor do?",
+      "options": [
+        "Accepts it, because the two amounts are equal and the sides are opposite",
+        "Accepts it and records an implied FX conversion at a rate of 1.0",
+        "Rejects it, because USD nets to +100.00 and EUR nets to -100.00, neither zero",
+        "Rejects it only if the ledger has no EUR account to receive the credit"
+      ],
+      "correct": 2,
+      "explanation": "Balance is checked per currency. Each currency in the entry must net to zero on its own; a 100 USD debit against a 100 EUR credit leaves both currencies unbalanced. Equality of the two numbers is irrelevant because 100 USD is not 100 EUR. Account existence is checked later by the ledger, not by the entry."
+    },
+    {
+      "stage": "check",
+      "question": "Merchant Payable is a LIABILITY account with debits of 97.10 and credits of 97.10. Fee Revenue is a REVENUE account with debits of 0 and credits of 2.90. What does balance() return for each?",
+      "options": [
+        "0.00 for the payable and 2.90 for revenue, both read on the credit side",
+        "0.00 for the payable and -2.90 for revenue, because credits are negative",
+        "-97.10 for the payable and 2.90 for revenue, because debits reduce liabilities",
+        "97.10 for the payable and -2.90 for revenue, since balance is debits minus credits"
+      ],
+      "correct": 0,
+      "explanation": "balance() reports in the account's normal direction: credits minus debits for credit-normal types. The payable is 97.10 - 97.10 = 0.00 (settled by the payout) and revenue is 2.90 - 0 = 2.90. The raw debits-minus-credits view that would give -2.90 is netDebit(), used by the trial balance, not balance()."
+    },
+    {
+      "stage": "check",
+      "question": "post() receives an entry whose id was posted before but whose postings differ. Why does the ledger throw IdempotencyConflictException rather than ignore it or append it?",
+      "options": [
+        "Appending would unbalance the trial balance because the second entry nets to a different total",
+        "Ignoring it would be slower than throwing because equality must still be computed first",
+        "Ignoring hides a caller bug in id generation and appending corrupts the journal; rejecting is the only safe outcome",
+        "The index map cannot hold two entries under one key, so a Java exception is unavoidable"
+      ],
+      "correct": 2,
+      "explanation": "Both alternatives are wrong for different reasons: a silent no-op hides that the caller reused an id for a different business event, and appending would put two different entries under one id, breaking replay detection forever. The second entry is itself balanced, so the trial balance would not catch it; that is exactly why the conflict must be rejected at post time."
+    },
+    {
+      "stage": "post",
+      "question": "After posting pay-001 (Dr 1200 100.00, Cr 2100 97.10, Cr 4100 2.90), stl-001 (Dr 1010 100.00, Cr 1200 100.00) and out-001 (Dr 2100 97.10, Cr 1010 97.10), what does the USD trial balance show?",
+      "options": [
+        "Debit column 100.00, credit column 100.00, from the receivable and the bank",
+        "Debit column 2.90 from the bank, credit column 2.90 from fee revenue",
+        "Debit column 197.10, credit column 197.10, summing every posting on each side",
+        "Debit column 0.00, credit column 0.00, because every account was settled"
+      ],
+      "correct": 1,
+      "explanation": "The trial balance lists each account's net, not the sum of its postings. Receivable and payable both net to zero after settlement and payout. The bank holds 100.00 - 97.10 = 2.90 (debit column) and revenue holds 2.90 (credit column). Summing all postings per side would give 197.10 each but that is not what a trial balance reports."
+    },
+    {
+      "stage": "post",
+      "question": "A posting method appends the entry to the journal, then validates each posting's account, and throws on the first unknown account. What is the defect?",
+      "options": [
+        "A rejected entry leaves a partial write: it is in the journal but its totals were never applied",
+        "The exception type is wrong; an unknown account should be an UnbalancedEntryException",
+        "Validation after append is slower because the journal list must be scanned twice",
+        "Nothing, because the exception propagates to the caller who can remove the entry"
+      ],
+      "correct": 0,
+      "explanation": "Atomicity without a database comes from ordering: every check that can fail runs before the first mutation, so a rejection changes nothing. Appending first means a rejected entry is visible in the journal with no matching balance update, which breaks the invariant that balances derive from the journal. Expecting the caller to clean up is not a design."
+    }
+  ]
+}

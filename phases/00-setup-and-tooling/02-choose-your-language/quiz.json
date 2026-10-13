@@ -1,0 +1,78 @@
+{
+  "lesson": "02-choose-your-language",
+  "title": "Choose Your Language: How Every Lesson Maps to Java, Python, and Go",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A Java service computes -57971 / 1000 and a Python service computes -57971 // 1000. What do they get?",
+      "options": [
+        "Both get -57, because integer division discards the fractional part in every language",
+        "Both get -58, because both languages round negative quotients toward negative infinity",
+        "Java gets -57 (truncation toward zero) and Python gets -58 (floor toward negative infinity)",
+        "Java gets -58 and Python gets -57, because Python's // rounds toward zero and Java's / floors"
+      ],
+      "correct": 2,
+      "explanation": "The JLS defines integer division as rounding toward zero; the Python reference defines // as floor division. The exact quotient is -57.971, so truncation gives -57 and floor gives -58. Go agrees with Java. This one-cent disagreement on negative amounts is why every divide_rounded in the course works on magnitudes and reapplies the sign."
+    },
+    {
+      "stage": "check",
+      "question": "The course's three implementations of each lesson share type names, method names, and test cases. What is the stated reason for keeping them this parallel rather than writing each idiomatically?",
+      "options": [
+        "Parallel code is faster to compile and run in all three toolchains, which keeps CI under its time budget",
+        "A learner who later switches languages, or reads a colleague's service, should recognise every mechanism immediately",
+        "Idiomatic Go and Python would need third-party libraries, which the standard-library-only rule forbids",
+        "The audit script compares the three files line by line and fails any lesson whose implementations diverge"
+      ],
+      "correct": 1,
+      "explanation": "The design is one design: the Money record a Python learner builds is the dataclass a Java colleague recognises. The cost, acknowledged in the lesson, is slightly less idiomatic code in each language. Speed is not the reason, idiomatic code does not require libraries, and the audit checks structure and headers, not line-by-line equivalence."
+    },
+    {
+      "stage": "check",
+      "question": "Go's Plus returns (Money, error) while Java's plus throws CurrencyMismatchException. According to the lesson, what does the course consider the main advantage of the error-value style for payments code?",
+      "options": [
+        "Every failure path is visible at the call site: the caller must handle the error or explicitly discard it with _",
+        "Error values are cheaper than exceptions at run time, which matters on the authorization hot path",
+        "Error values can carry a currency and an amount, while exceptions can only carry a message string",
+        "Go's compiler verifies that every returned error is checked, so unhandled failures cannot compile"
+      ],
+      "correct": 0,
+      "explanation": "The lesson's position is that visibility wins: an exception can be ignored by omission, while an ignored Go error is a visible `_` a reviewer can see. Exceptions can carry any fields, and the Go compiler does not enforce error checking (only unused variables); performance is not the argument made."
+    },
+    {
+      "stage": "check",
+      "question": "Which statement about Python's global interpreter lock is correct as the lesson presents it?",
+      "options": [
+        "The GIL makes `self._now += millis` atomic, so a FakeClock shared between threads needs no lock in Python",
+        "The GIL prevents threads from sharing memory at all, which is why Python uses multiprocessing for concurrency",
+        "The GIL serialises bytecode execution, but compound statements span several bytecodes, so a lock is still needed for correctness",
+        "The GIL is released only when a thread finishes, so Python threads run strictly one after another to completion"
+      ],
+      "correct": 2,
+      "explanation": "One thread runs bytecode at a time, but the interpreter can switch between bytecodes, and `x += 1` is a load, an add, and a store. Two threads can interleave inside it and lose an update, which is why the Python FakeClock in Lesson 03 holds a lock. Threads do share memory; the GIL is released during I/O and periodically, not only at thread exit."
+    },
+    {
+      "stage": "post",
+      "question": "A Go struct represents an optional authorization code as a plain string field. What problem does the lesson identify, and what is the recommended shape?",
+      "options": [
+        "Strings are immutable in Go, so the field cannot be updated after the network replies; use a byte slice instead",
+        "Exported string fields are serialised even when empty; use a lowercase field name so JSON encoding skips it",
+        "Go strings are not UTF-8 safe for network payloads; use a fixed-size byte array sized to the network's code length",
+        "The zero value \"\" is indistinguishable from a deliberately empty code; use a pointer or a (value, ok) pair to represent absence"
+      ],
+      "correct": 3,
+      "explanation": "Go has no null for value types; a string field that was never set is \"\", the same as one set to the empty string. Java's Optional and Python's None make absence explicit; the Go equivalents are a *string or a (string, bool) return. The other options describe behaviours Go does not have."
+    },
+    {
+      "stage": "post",
+      "question": "You chose Go in LEARNING.md in week one and want to switch to Java in week six. What does the lesson say about doing that?",
+      "options": [
+        "Edit the language line in LEARNING.md or re-run start-learning; nothing else depends on it, since every lesson already ships all three languages",
+        "Switching requires re-running scaffold_lesson.py for every completed lesson so the Java stubs are generated",
+        "Switching is discouraged because the tutor skills cache the first choice and later lessons assume the earlier code exists",
+        "Switching is only possible between Java and Python, because Go lessons use a different directory layout under code/"
+      ],
+      "correct": 0,
+      "explanation": "LEARNING.md is the single place the choice lives; the tutor skills read it and teach in that language. Every Build lesson has java/, python/, and go/ folders regardless of the choice, so changing the line is the whole migration. No scaffolding, caching, or layout differences are involved."
+    }
+  ]
+}

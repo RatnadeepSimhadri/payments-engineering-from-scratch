@@ -1,0 +1,78 @@
+{
+  "lesson": "02-write-ahead-logs",
+  "title": "Write-Ahead Logs and Crash Recovery",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A service calls write() on a file and the call returns successfully. The host then loses power. What happened to those bytes?",
+      "options": [
+        "They are on disk, because write() does not return until the device acknowledges",
+        "They may be lost, because write() only copies them into the kernel's page cache",
+        "They are on disk if the file was opened in append mode, otherwise they are lost",
+        "They are lost only if the process also crashed before the operating system did"
+      ],
+      "correct": 1,
+      "explanation": "write(2) hands bytes to the kernel and returns; they reach the device later, when the kernel flushes or when fsync(2) forces it. Power loss before that flush discards them. Append mode changes where bytes land, not when they become durable, and a process crash is irrelevant once the kernel has the bytes."
+    },
+    {
+      "stage": "check",
+      "question": "Replay finds a frame whose CRC does not match. How does it decide between 'torn write' and 'corruption'?",
+      "options": [
+        "Torn if the stored CRC is zero, corrupt if it is any other wrong value",
+        "Torn if the sequence number is one higher than expected, corrupt otherwise",
+        "Torn if this is the last frame in the file, corrupt if there are bytes after it",
+        "Torn if the payload is shorter than 16 bytes, corrupt if it is longer than that"
+      ],
+      "correct": 2,
+      "explanation": "The log is append-only and synced after every append, so only the final frame can be half-written. A damaged frame with data after it was fully written and synced at some point, so something other than a crash damaged it, and recovery must stop rather than truncate acknowledged records. The CRC value itself carries no information about which case applies."
+    },
+    {
+      "stage": "check",
+      "question": "The ledger's commit does append, then sync, then apply to memory. What goes wrong if sync and apply are swapped?",
+      "options": [
+        "Nothing changes, because sync is a no-op on in-memory storage and only matters on a real disk",
+        "Memory can reflect a change the caller was told about, which a crash then erases from the recovered state",
+        "The sequence numbers become non-contiguous because apply increments them before the frame is written",
+        "Replay becomes slower because the in-memory map must be rebuilt before the log is read"
+      ],
+      "correct": 1,
+      "explanation": "With apply before sync, the process can return success to a caller while the record is still only in the page cache. A crash then loses the record, and recovery produces a state that contradicts what the caller was told. Sequence numbers are assigned in append, not apply, so they are unaffected either way."
+    },
+    {
+      "stage": "check",
+      "question": "Why does the CRC cover the sequence number as well as the payload?",
+      "options": [
+        "So that a frame copied or spliced into the wrong position fails its checksum",
+        "So that the length field can be omitted from the header to save space",
+        "So that the CRC can be computed before the payload bytes are available",
+        "So that replay can skip frames whose sequence is below the snapshot's"
+      ],
+      "correct": 0,
+      "explanation": "A frame with a valid payload CRC but the wrong sequence would look fine if only the payload were covered; including the sequence ties the bytes to their position in the log. The length is still needed to find the next frame, and the snapshot skip uses the sequence number directly, not the CRC."
+    },
+    {
+      "stage": "post",
+      "question": "A checkpoint syncs the snapshot (covering seq 1..40) and then the process crashes before truncating the WAL. On restart, what does open() do with WAL records 1..40?",
+      "options": [
+        "Applies them on top of the snapshot, which is safe because every ledger operation is idempotent",
+        "Discards the snapshot and replays the full WAL, since the WAL is always the more recent source",
+        "Raises a corruption error because a WAL and a snapshot that overlap indicate a torn checkpoint",
+        "Skips them because their seq is not greater than the snapshot's covered seq, then finishes the truncate"
+      ],
+      "correct": 3,
+      "explanation": "The snapshot is tagged with the sequence it covers, and replay skips any record with seq <= that tag, so nothing is double-applied; open() then completes the interrupted truncate. Credits and debits are not idempotent (applying a credit twice doubles it), so the first option would corrupt balances."
+    },
+    {
+      "stage": "post",
+      "question": "A log holds three complete records and then 15 bytes of a fourth. After replay, what are recordsReplayed, truncatedBytes, and the next sequence number?",
+      "options": [
+        "3, 15, and 4, because the partial header is a torn tail that is cut off and its seq is reused",
+        "3, 0, and 5, because the torn frame still consumes a sequence number even though it is dropped",
+        "4, 15, and 5, because the reader applies what it can of the fourth record before truncating",
+        "3, 15, and 5, because recovery must never hand out a sequence number that appeared on disk"
+      ],
+      "correct": 0,
+      "explanation": "Fewer than 16 bytes remain, so the header is torn; replay stops at offset 3 frames in, truncates the 15 bytes, and sets nextSeq to lastSeq + 1 = 4. The torn record was never acknowledged, so reusing its sequence is correct. A record is never partially applied; it is all or nothing by frame."
+    }
+  ]
+}

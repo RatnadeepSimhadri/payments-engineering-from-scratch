@@ -1,0 +1,78 @@
+{
+  "lesson": "05-consistency-models",
+  "title": "Consistency Models: Linearizability to Eventual",
+  "questions": [
+    {
+      "stage": "pre",
+      "question": "A wallet has one leader and two asynchronously replicated read replicas. A customer tops up, then immediately makes a purchase whose balance check reads from a replica. What can go wrong, and why?",
+      "options": [
+        "The purchase can be declined because the replica may not yet hold the top-up; asynchronous replication promises convergence, not freshness",
+        "The top-up can be lost because asynchronous replicas acknowledge writes before the leader has durably stored them",
+        "Nothing, because a replica always redirects a read to the leader when it detects that it is behind",
+        "The balance check can see the top-up twice because the two replicas each apply it independently"
+      ],
+      "correct": 0,
+      "explanation": "Asynchronous replication means a replica may lag behind the leader by any amount, so a read there can return a balance that predates an acknowledged write. Replicas do not acknowledge writes (the leader does), a replica cannot know it is behind without coordination, and applying a write on each replica does not double it."
+    },
+    {
+      "stage": "check",
+      "question": "Which single clause separates linearizability from sequential consistency?",
+      "options": [
+        "Linearizability requires every client to see the same total order; sequential consistency allows different orders",
+        "Linearizability requires the order to respect real time: an operation that completed before another began must come first",
+        "Linearizability applies to multi-object transactions; sequential consistency applies to single registers only",
+        "Linearizability requires each client's program order to be respected; sequential consistency does not"
+      ],
+      "correct": 1,
+      "explanation": "Both models require one total order that respects every client's program order. Linearizability adds the real-time clause, which is what forbids a client from reading a value another client has already overwritten. Neither model is about multi-object transactions; that is serializability."
+    },
+    {
+      "stage": "check",
+      "question": "History: P writes 100 then 70; client C reads 70 and then reads 100. Which is the strongest model in the hierarchy that accepts this history?",
+      "options": [
+        "Sequential consistency, because each client's program order is still respected",
+        "Causal consistency, because the two writes come from one client and are therefore causally ordered",
+        "Eventual consistency, because C has observed a write and then a state from before it, which every stronger model forbids",
+        "Linearizability, because both writes completed before C's reads began"
+      ],
+      "correct": 2,
+      "explanation": "W(70) causally follows W(100) from the same writer, and C has seen W(70). Reading 100 afterwards shows C a state before a write it already observed, which violates monotonic reads, causal, sequential, and linearizable consistency. Only eventual consistency, which promises nothing about reads in progress, accepts it."
+    },
+    {
+      "stage": "check",
+      "question": "Two clients P and Q concurrently write a and b to the same register without reading each other. Client C observes a then b; client D observes b then a. Under which models is this history acceptable?",
+      "options": [
+        "Only linearizability, because both writes overlapped in real time and so either order is a valid linearization",
+        "Sequential consistency and below, because no client's program order is violated",
+        "Causal consistency and below, because the writes are concurrent and may be seen in different orders",
+        "None, because two clients disagreeing about the final value is a split-brain failure"
+      ],
+      "correct": 2,
+      "explanation": "Causal consistency only constrains causally related writes; a and b are concurrent, so different clients may see them in different orders. Sequential consistency and linearizability both require a single total order with one last write, which C and D contradict. Divergence on concurrent writes is expected and is resolved by a conflict rule, not a failure."
+    },
+    {
+      "stage": "post",
+      "question": "Which guarantee, and which mechanism, is the cheapest fix for a customer who tops up and then sees the old balance on the next screen?",
+      "options": [
+        "Linearizable reads, by routing every balance read to the leader",
+        "Read-your-writes, by having the client carry a version token that a replica must have reached before answering",
+        "Causal consistency, by attaching vector clocks to every write and buffering out-of-order writes on replicas",
+        "Monotonic writes, by applying each client's writes on every replica in issue order"
+      ],
+      "correct": 1,
+      "explanation": "The incident is a client not seeing its own write: read-your-writes, a per-session guarantee that costs a version token or a sticky session and no leader round trip. Linearizable reads would also fix it but pay coordination on every read; causal consistency is stronger than needed; monotonic writes is about write order, not visibility."
+    },
+    {
+      "stage": "post",
+      "question": "A purchase service reads the balance with a linearizable read from the leader and then issues a debit if the balance is sufficient. Two purchases arrive at the same moment. Is the double-spend prevented?",
+      "options": [
+        "Yes, because a linearizable read guarantees that both services observe the most recent acknowledged debit before deciding",
+        "Yes, provided the debit is also written to the leader, since the leader serialises all writes and applies them in order",
+        "No, because both reads can return the same balance before either debit lands; the check and the debit must be one atomic step",
+        "No, because linearizability constrains only the order of writes and says nothing at all about the value a read returns"
+      ],
+      "correct": 2,
+      "explanation": "Linearizability says what each read means, not that a read and a later write form one step. Both reads can legitimately return 150 if they both precede both debits, and each debit then succeeds. Preventing the double-spend needs a conditional write or a transaction that makes check-then-debit atomic; the leader serialising writes does not make the preceding reads part of them."
+    }
+  ]
+}

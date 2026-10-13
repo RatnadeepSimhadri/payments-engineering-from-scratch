@@ -1,0 +1,97 @@
+{
+  "id": "ledger-engine",
+  "title": "Ledger Engine",
+  "level": 2,
+  "levelName": "Builder",
+  "tagline": "Build a double-entry ledger that refuses to go out of balance, then reconcile it against a bank statement.",
+  "summary": "An in-memory double-entry ledger: exact integer money, a chart of accounts with normal balance sides, an append-only journal that rejects unbalanced or mixed-currency entries, balances and a trial balance derived from the journal, reversals, and a two-pass reconciliation that reports every break with totals that tie out.",
+  "youWillBuild": "A ledger engine that posts balanced journal entries, derives balances and a zero-sum trial balance, reverses mistakes, and reconciles a bank account against an external statement.",
+  "hours": 8,
+  "languages": [
+    "Java"
+  ],
+  "languageWhy": {
+    "Java": "Records and sealed-ish exception hierarchies make the value types and the 'ledger said no' contract explicit; Math.addExact shows what overflow-safe money looks like."
+  },
+  "status": "ready",
+  "skills": [
+    "Represent money as integer minor units with explicit rounding and lossless allocation",
+    "Model a chart of accounts with account types and normal balance direction",
+    "Post immutable journal entries that balance per currency and carry ids and sequence numbers",
+    "Derive signed balances, point-in-time balances, and a trial balance that sums to zero",
+    "Reverse entries without editing history",
+    "Reconcile ledger postings against an external statement and report breaks that tie out"
+  ],
+  "prerequisites": [
+    {
+      "title": "Representing Money: Minor Units, Currencies, and Rounding",
+      "path": "phases/10-money-and-ledgers/01-representing-money"
+    },
+    {
+      "title": "The Double-Entry Ledger from Scratch",
+      "path": "phases/10-money-and-ledgers/03-double-entry-ledger"
+    },
+    {
+      "title": "Reconciliation: Matching Your Ledger Against Theirs",
+      "path": "phases/10-money-and-ledgers/08-reconciliation"
+    }
+  ],
+  "stages": [
+    {
+      "id": "01-money-and-accounts",
+      "title": "Money and the Chart of Accounts",
+      "summary": "Exact Money arithmetic (parse, plus, minus, times with rounding, allocate) and an account registry where every account type knows which side it grows on.",
+      "hours": 2,
+      "difficulty": "starter",
+      "concepts": [
+        "integer minor units",
+        "rounding modes",
+        "largest-remainder allocation",
+        "account types",
+        "normal balance side"
+      ]
+    },
+    {
+      "id": "02-balanced-journal-entries",
+      "title": "Balanced Journal Entries",
+      "summary": "An append-only journal that accepts an entry only if its debits equal its credits in one currency, assigns sequence numbers, and de-duplicates on entry id.",
+      "hours": 2,
+      "difficulty": "core",
+      "concepts": [
+        "posting",
+        "journal entry",
+        "balance invariant",
+        "append-only log",
+        "idempotent post"
+      ]
+    },
+    {
+      "id": "03-balances-and-trial-balance",
+      "title": "Balances, Trial Balance, and Reversals",
+      "summary": "Derive signed balances from the journal (with periodic snapshots), read a balance as of any sequence number, produce a trial balance whose columns agree, and reverse entries by mirroring them.",
+      "hours": 2,
+      "difficulty": "core",
+      "concepts": [
+        "derived state",
+        "balance snapshots",
+        "trial balance",
+        "reversal entries",
+        "immutability"
+      ]
+    },
+    {
+      "id": "04-reconcile-against-statement",
+      "title": "Reconcile Against a Statement",
+      "summary": "Match a bank or processor account's ledger lines against an external statement by reference, then by amount within a date window, and report every break by category with totals that tie out.",
+      "hours": 2,
+      "difficulty": "stretch",
+      "concepts": [
+        "reconciliation",
+        "two-pass matching",
+        "break categories",
+        "tie-out",
+        "date tolerance"
+      ]
+    }
+  ]
+}
