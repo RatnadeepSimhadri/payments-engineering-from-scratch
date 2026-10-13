@@ -31,8 +31,8 @@ Never present a slash command as universal syntax.
 
 Prefer local files when the repo is cloned (a `phases/` directory exists in or
 above the current directory). Otherwise fetch from
-`https://raw.githubusercontent.com/<owner>/payments-engineering-from-scratch/main/<path>`
-(owner from `README.md`).
+`https://raw.githubusercontent.com/RatnadeepSimhadri/payments-engineering-from-scratch/main/<path>`.
+The repository is private: the raw fallback works only for collaborators with a token, so prefer a local clone.
 
 - Lesson text: `phases/<phase-dir>/<lesson-dir>/docs/en.md`
 - Lesson quiz: `phases/<phase-dir>/<lesson-dir>/quiz.json`

@@ -42,8 +42,8 @@ use the natural-language form.
 
 Prefer local files when the repository is cloned (a `curriculum/curriculum.json`
 exists in or above the current directory). Otherwise fetch from
-`https://raw.githubusercontent.com/<owner>/payments-engineering-from-scratch/main/<path>`
-where `<owner>` is the GitHub owner recorded in `README.md`.
+`https://raw.githubusercontent.com/RatnadeepSimhadri/payments-engineering-from-scratch/main/<path>`.
+The repository is private: the raw fallback works only for collaborators with a token, so prefer a local clone.
 
 - Phase and lesson list, hooks, minutes: `curriculum/curriculum.json`
 - Which lessons are complete and in which languages: `ROADMAP.md` (✅ rows) or `catalog.json` if present

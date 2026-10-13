@@ -28,7 +28,7 @@ Never present one host's syntax as universal.
 
 ## Sources of truth
 
-Local first (repo cloned), raw GitHub fallback (`https://raw.githubusercontent.com/<owner>/payments-engineering-from-scratch/main/<path>`, owner from README.md):
+Local first (repo cloned), raw GitHub fallback (`https://raw.githubusercontent.com/RatnadeepSimhadri/payments-engineering-from-scratch/main/<path>`):
 
 - `curriculum/curriculum.json`: every phase and lesson with slug, title, hook, type, minutes. The hook is a one-sentence thesis and is the fastest way to match a topic.
 - `ROADMAP.md`: which lessons are ✅ complete, 🚧 in progress, ⬚ planned.

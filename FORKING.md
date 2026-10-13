@@ -25,7 +25,7 @@ This course is MIT licensed. Fork it and adapt it.
 ## Keeping your fork updated
 
 ```bash
-git remote add upstream https://github.com/<owner>/payments-engineering-from-scratch.git
+git remote add upstream https://github.com/RatnadeepSimhadri/payments-engineering-from-scratch.git
 git fetch upstream
 git merge upstream/main
 python3 scripts/build_catalog.py
@@ -37,5 +37,5 @@ Not required by MIT, but appreciated:
 
 ```text
 Based on Payments Engineering from Scratch
-https://github.com/<owner>/payments-engineering-from-scratch
+https://github.com/RatnadeepSimhadri/payments-engineering-from-scratch
 ```

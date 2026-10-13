@@ -42,7 +42,7 @@ Not sure? The `start-learning` skill runs a placement quiz, asks which language 
 If you use **Claude Code**, **Codex**, or any agent that reads `SKILL.md` files, the course can teach itself to you, one lesson per session, in your chosen language.
 
 ```bash
-git clone https://github.com/ratnadeep-ms/payments-engineering-from-scratch.git
+git clone https://github.com/RatnadeepSimhadri/payments-engineering-from-scratch.git
 cd payments-engineering-from-scratch
 claude            # Claude Code discovers .claude/skills/ automatically
 ```
@@ -77,7 +77,7 @@ Then, inside your agent:
 ### Run the code locally
 
 ```bash
-git clone https://github.com/ratnadeep-ms/payments-engineering-from-scratch.git
+git clone https://github.com/RatnadeepSimhadri/payments-engineering-from-scratch.git
 cd payments-engineering-from-scratch
 python3 scripts/run_lesson.py phases/10-money-and-ledgers/01-representing-money            # all three languages
 python3 scripts/run_lesson.py phases/10-money-and-ledgers/01-representing-money --lang java
