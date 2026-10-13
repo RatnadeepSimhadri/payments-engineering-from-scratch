@@ -48,6 +48,39 @@ For an authorization service, three SLIs cover most of what matters:
 
 Two principles. First, measure as close to the user as you can afford: a load-balancer log sees failures the application never logged (it crashed). Second, the SLI must be computable from data you already keep, with no judgement call per event, or it will not be computed.
 
+### Authorization success: classifying every outcome
+
+The availability SLI lives or dies on the classification table. "Declined" is not one outcome; it is a dozen, and only some of them are the service's fault. Write the table down, check it into the repository next to the SLI query, and review it whenever a new reason code appears.
+
+| Outcome | HTTP | Valid? | Good? | Why |
+|---------|------|--------|-------|-----|
+| Approved by issuer | 200 | yes | yes | the service did its job |
+| Declined: insufficient funds, do not honor, expired card | 200 | yes | yes | a definitive answer from the issuer is success for the service |
+| Declined by our fraud engine (rule or model) | 200 | yes | yes | a deliberate decision, measured by a separate fraud-quality SLI |
+| Declined: `processor_timeout`, `issuer_unavailable`, `internal_error` | 200 | yes | **no** | the merchant got a decline because our path failed |
+| Stand-in approval (STIP) after issuer timeout | 200 | yes | yes, but count it | approved, but track the rate: STIP shifts risk onto us |
+| 5xx, connection reset, load balancer timeout | 5xx | yes | no | the classic failure |
+| Response after the client's timeout (we answered in 9 s, client gave up at 8 s) | 200 | yes | no | the merchant saw a timeout; the latency SLI also counts it |
+| 400 malformed body, unknown currency, bad card number format | 4xx | no | — | client bug; tracked on a per-merchant integration dashboard |
+| 401/403 bad API key | 4xx | no | — | client configuration, unless our key store is down (watch the rate) |
+| 409 idempotency conflict (Phase 12) | 409 | no | — | the protocol working as designed |
+| 429 rate limited | 429 | yes | depends | good if the merchant exceeded its contracted rate; bad if our global limiter shed load |
+
+Two rows deserve a second look. A spike in 401s is usually a merchant rotating keys badly, but if every merchant gets 401 at once your credential cache is broken; exclusions need their own volume alarm, or a failure can hide inside the "not valid" bucket. And 429 is ambiguous on purpose: the classification must look at *why* the limiter fired, which means the limiter has to log the reason.
+
+### Money-movement correctness
+
+Availability asks "did we answer?" Correctness asks "did the money end up where we said it would?" For a payments system the second question matters more, and it has different mechanics:
+
+- **Unit.** One event per money movement (an authorization, a capture, a refund, a payout), not per HTTP request. Retries collapse into one event through the idempotency key.
+- **Valid.** Movements that have reached a terminal state and whose external record has arrived (the processor settlement file, the bank statement line). Movements still inside the settlement window are not yet valid; they are *pending*, and they are reported separately so a stuck file does not look like perfect correctness.
+- **Good.** Ledger amount, currency, direction, and counterparty all equal the external record, matched by reconciliation within the agreed window (T+1 for card settlement files, T+2 for some ACH returns).
+- **Two measures.** Count the fraction of movements that matched, and also the fraction of *value* that matched. One unmatched 50,000.00 USD payout and 10,000 matched 200.00 USD captures is 99.99% by count and 97.6% by value; both numbers belong on the dashboard.
+
+Correctness targets are tighter than availability targets, typically 99.999% by count, with any single unmatched movement above a value threshold paged regardless of budget. A failed request can be retried by the merchant; a misbooked payout is a debt someone has to chase. The budget is still useful: it tells the team whether reconciliation breaks are a background rate to grind down or a regression that started with last Tuesday's deploy.
+
+The latency of the correctness SLI changes how it is alerted. It is known a day late, so a fast-burn page is impossible; the alert is a daily check of breaks against budget, plus an immediate page from the reconciliation job when the day's break count exceeds, say, ten times the trailing median.
+
 ### Choosing the SLO
 
 The target is a product decision disguised as an engineering one. Three constraints bound it:
@@ -77,6 +110,40 @@ budget in events = 0.0005 * 5,184,000,000 = 2,592,000 failed authorizations
 ```
 
 The two forms are the same budget. The time form is intuitive; the event form is what the SLI actually measures, and it is what makes partial outages legible: a 10% failure rate for 216 minutes spends exactly the budget.
+
+Each extra nine divides the budget by ten. Over a 30-day window, for a large merchant path at 2,000 TPS (5.184 billion requests) and a regional service at 50 TPS (129.6 million requests):
+
+| SLO | Budget | Full-outage minutes per 30 d | Failed requests at 2,000 TPS | Failed requests at 50 TPS |
+|-----|--------|------------------------------|------------------------------|---------------------------|
+| 99% | 1% | 432 | 51,840,000 | 1,296,000 |
+| 99.5% | 0.5% | 216 | 25,920,000 | 648,000 |
+| 99.9% | 0.1% | 43.2 | 5,184,000 | 129,600 |
+| 99.95% | 0.05% | 21.6 | 2,592,000 | 64,800 |
+| 99.99% | 0.01% | 4.32 | 518,400 | 12,960 |
+| 99.999% | 0.001% | 0.432 (26 s) | 51,840 | 1,296 |
+
+Read the 99.99% row against your incident history. If the median time from page to mitigation is 20 minutes, a single total outage spends nearly five months of budget. A 99.99% target is achievable only if most failures are partial (one shard, one region, one issuer) or are mitigated automatically.
+
+Budgets are spent by many small incidents, not one big one. A month for the 99.95% service, in events:
+
+| Day | Incident | Error ratio | Duration | Failed requests | Budget spent | Cumulative |
+|-----|----------|-------------|----------|-----------------|--------------|------------|
+| 3 | one issuer gateway node flapping | 0.5% | 90 min | 54,000 | 2.1% | 2.1% |
+| 8 | bad deploy, rolled back | 30% | 6 min | 216,000 | 8.3% | 10.4% |
+| 15 | regional database failover | 100% | 4 min | 480,000 | 18.5% | 28.9% |
+| 22 | certificate expiry on one tokenization endpoint | 12% | 25 min | 360,000 | 13.9% | 42.8% |
+| all | background (0.01% every hour of the month) | 0.01% | 30 d | 518,400 | 20.0% | 62.8% |
+
+The arithmetic is `ratio × duration_s × 2,000` failed requests, divided by 2,592,000. Note the last row: a 0.01% background rate that nobody would ever page for is a fifth of the budget. That is the argument for the 3-day ticket alert, and for keeping a running "top budget consumers" report.
+
+### A decision procedure for the target
+
+1. List the hard dependencies on the request path and their measured (not advertised) availability over the last 90 days. Multiply them: `0.9995 × 0.9999 × 0.9998 = 0.9992`. That is your ceiling without redundancy.
+2. Take the last 90 days of your own SLI. The first SLO should be achievable on that history with some budget left: if you ran at 99.97%, start at 99.95%, not 99.99%.
+3. Check the SLA. The SLO must be strictly tighter than any customer contract, with room for at least one more incident of typical size.
+4. Check the human loop. Budget minutes per window must exceed your page-to-mitigation time for a typical incident; otherwise every page is a breach.
+5. Write the policy (what happens at 0% remaining) before publishing the number. If nobody will agree to freeze launches at that target, the target is too tight or the policy is fiction.
+6. Revisit quarterly. Tighten when you have consistently spent less than half the budget and users still complain; loosen when you spend it every month and users do not notice.
 
 ### Burn rate
 
@@ -124,9 +191,52 @@ The SRE workbook's answer is to combine windows and burn rates:
 
 Read the first row as: page when **both** the 1-hour burn rate and the 5-minute burn rate exceed 14.4. The long window says the problem is big enough to matter (2% of a month's budget in an hour). The short window says it is still happening right now, which stops the alert re-firing for the rest of the hour after a fix. The short window is conventionally one twelfth of the long one.
 
-Where does 14.4 come from? It is the burn rate at which a one-hour incident consumes 2% of a 30-day budget: `(2% × 30 days) / 1 hour = 0.6 days / (1/24 day) = 14.4`. The three tiers then cover a total outage (detected in about 5 minutes by the first row), a moderate degradation (6 hours at 6x spends 5%), and a slow leak like the 0.4% defect (burn rate 8 trips the 6-hour row within 30 minutes of starting, and the 3-day row shortly after).
+Where does 14.4 come from? It is the burn rate at which a one-hour incident consumes 2% of a 30-day budget: `(2% × 30 days) / 1 hour = 0.6 days / (1/24 day) = 14.4`. The three tiers then cover a total outage (detected in about 5 minutes by the first row), a moderate degradation (6 hours at 6x spends 5%), and a slow leak like the 0.4% defect (burn rate 8 is below the first row's 14.4, so it trips the 6-hour row after 4.5 hours, when that window holds 5% of the budget, and the 3-day row after 9 hours).
 
 Detection time for a total outage under the first row: the 5-minute window reaches burn rate 14.4 after `14.4 × 0.0005 × 5 min ≈ 2.2 seconds` of 100% errors, and the 1-hour window after `14.4 × 0.0005 × 60 min ≈ 26 seconds`. In practice the scrape interval dominates, and you page in two to three minutes.
+
+### Detection time for any error ratio
+
+The general formula, for an error ratio `e` that starts abruptly against a clean background: a window of length `W` with threshold burn rate `B` fires once its average reaches `B × (1 − SLO)`, which takes
+
+```text
+t_detect = B × (1 − SLO) × W / e        (only if e > B × (1 − SLO); otherwise never)
+```
+
+The alert needs both windows, and the long one is always slower, so the long window sets detection time. For the 99.95% SLO (thresholds: row 1 fires above 0.72% errors, row 2 above 0.3%, row 3 above 0.05%):
+
+| Error ratio (burn) | Row 1: 1 h / 5 m, B 14.4 | Row 2: 6 h / 30 m, B 6 | Row 3: 3 d / 6 h, B 1 | Budget spent before first alert |
+|--------------------|--------------------------|------------------------|------------------------|---------------------------------|
+| 100% (2,000) | 26 s | 65 s | 2.2 min | 2% |
+| 10% (200) | 4.3 min | 10.8 min | 21.6 min | 2% |
+| 2.5% (50) | 17.3 min | 43.2 min | 1.4 h | 2% |
+| 1% (20) | 43.2 min | 1.8 h | 3.6 h | 2% |
+| 0.4% (8) | never | 4.5 h | 9 h | 5% |
+| 0.1% (2) | never | never | 36 h | 10% |
+| 0.04% (0.8) | never | never | never | none: on track to meet the SLO |
+
+The last column is the design property worth remembering. When the background is clean, the first alert fires once the long window has accumulated exactly that row's budget share: `B × W / 30 days`, so 2%, 5%, or 10%. The alerts are not tuned in error-ratio units at all; they are tuned in "how much of the month are we willing to lose before a human looks."
+
+Resetting matters as much as firing. After the fix, the short window drains below its threshold within its own length (at most 5 minutes, 30 minutes, 6 hours), and the alert resolves even though the long window is still elevated. Without the short window, row 1 would keep paging for up to an hour after the rollback.
+
+In Prometheus-style rules the first two rows look like this, with recording rules `slo:auth_errors:ratio_rate<window>` computing bad / valid over each window:
+
+```yaml
+- alert: AuthAvailabilityFastBurn
+  expr: |
+    slo:auth_errors:ratio_rate1h > (14.4 * 0.0005)
+    and
+    slo:auth_errors:ratio_rate5m > (14.4 * 0.0005)
+  labels: {severity: page}
+- alert: AuthAvailabilitySlowBurn
+  expr: |
+    slo:auth_errors:ratio_rate6h > (6 * 0.0005)
+    and
+    slo:auth_errors:ratio_rate30m > (6 * 0.0005)
+  labels: {severity: page}
+```
+
+**Low traffic breaks ratios.** At 02:00 the service sees 50 requests per second, so the 5-minute window holds 15,000 requests and row 1's threshold is 108 failures. One merchant retrying a dead endpoint 200 times in a minute fires it. Three standard fixes: require a minimum event count in the short window before the alert can fire (for example 1,000 valid events); generate synthetic authorizations against a test issuer so the denominator never collapses; or, for genuinely tiny services, alert on the absolute count of failures in a longer window rather than on a ratio.
 
 ### The error budget policy
 
@@ -137,6 +247,59 @@ The budget is only useful if something happens when it runs out. The policy is w
 - Budget consumed by a dependency: the dependency's team is pulled into the postmortem; the SLO is not relaxed.
 
 The freeze is what makes the number real. Without it, the SLO is the slide again.
+
+### A payments SLO document
+
+The SLO lives in a short document in the service's repository, reviewed like code. A complete one for the authorization service:
+
+```yaml
+service: card-authorization
+owners: {engineering: payments-auth-team, product: acceptance-pm}
+window: rolling 30 days
+slis:
+  availability:
+    valid: "POST /v1/authorizations with a well-formed body; excludes 4xx validation, 401/403, 409, health checks"
+    good: "definitive issuer or fraud-engine decision; NOT declines with reason in {processor_timeout, issuer_unavailable, internal_error}"
+    source: "edge load-balancer logs joined to auth decision log on request_id"
+    slo: 99.95%
+  latency:
+    valid: "same as availability"
+    good: "response sent within 800 ms of request received at the edge"
+    slo: 99%
+  correctness:
+    unit: "one money movement (auth, capture, refund), retries collapsed by idempotency key"
+    valid: "terminal movements whose processor settlement record has arrived"
+    good: "amount, currency, direction, merchant equal the settlement record"
+    measured_by: "nightly reconciliation job (Phase 13)"
+    slo: "99.999% by count; any unmatched movement over 10,000.00 USD pages immediately"
+slices: [region, card_network, merchant_tier]
+alerts:
+  - {severity: page,   long: 1h, short: 5m,  burn: 14.4, min_events_short: 1000}
+  - {severity: page,   long: 6h, short: 30m, burn: 6,    min_events_short: 1000}
+  - {severity: ticket, long: 3d, short: 6h,  burn: 1}
+sla_backed: "99.9% monthly availability for enterprise merchants (service credits)"
+policy:
+  budget_remaining_below_50pct: "release requires an on-call sign-off"
+  budget_exhausted: "feature launches frozen; sprint is reliability work until back above SLO"
+  dependency_caused: "dependency team joins postmortem; SLO not relaxed"
+review: "quarterly, with the last quarter's budget consumers ranked"
+```
+
+Every field answers a question someone will ask during an incident: is this request counted, where does the number come from, who decides, what happens next.
+
+### Failure modes of an SLO program
+
+| Failure | Symptom | Fix |
+|---------|---------|-----|
+| SLI measured at the application, not the edge | the service crashes and the SLI shows 100% (no logs, no errors) | measure at the load balancer or a client-side probe; alert on missing data |
+| "Good" defined by HTTP status only | timeout declines returned as 200 burn nothing | classify by decline reason (the table above) |
+| Exclusions without volume alarms | a credential-cache outage turns every request into a 401 and disappears from "valid" | alert on the rate of each excluded class |
+| Average over all merchants | one small merchant's 100% outage is 0.01% of global traffic | slice by merchant tier or region, with a per-slice SLO |
+| Percentile SLO ("p99 under 800 ms") | cannot be summed across windows or replicas; budget arithmetic is wrong | state latency as a fraction of requests under a threshold |
+| SLO equals SLA | every internal miss is a contractual payout | keep the SLO strictly tighter |
+| Policy nobody enforces | budget exhausted in week two, launches continue | sign the policy before the quarter; make release tooling read the budget |
+| Correctness counted only by events | a single large misbooked payout looks like noise | report by value as well as by count; page on large single breaks |
+| Ratio alerts on low traffic | 02:00 pages from a handful of failures | minimum event counts, synthetic traffic, or count-based alerts |
 
 ### What SLOs do not do
 
@@ -159,7 +322,7 @@ A payments platform runs an authorization service at 2,000 TPS. The SLO is 99.95
 
 **Day 10 after the incident.** Budget spent: 9% + 4.6% = 13.6%. Remaining: 86.4%. No freeze.
 
-**Days 11 to 30.** Suppose the same 0.4% slow defect from The Problem appears on day 15 and runs undetected by humans. Burn rate 8. The 6-hour / 30-minute row fires at burn rate 6 within about 25 minutes of onset; the team finds it on day 15 instead of day 26. Had they not, 15 days at burn rate 8 would be 400% of the budget: the SLO would have been missed by a factor of four, and under the policy, feature work would be frozen for most of the following month.
+**Days 11 to 30.** Suppose the same 0.4% slow defect from The Problem appears on day 15 and runs undetected by humans. Burn rate 8. Burn rate 8 is below the fast-burn threshold, but the 6-hour / 30-minute row fires about 4.5 hours after onset, once 5% of the budget is gone; the team finds it on day 15 instead of day 26. Had they not, 15 days at burn rate 8 would be 400% of the budget: the SLO would have been missed by a factor of four, and under the policy, feature work would be frozen for most of the following month.
 
 The arithmetic a reviewer should be able to reproduce from this example: 21.6 minutes of budget, burn rate 50 for 40 minutes is 4.6% of it, and the difference between detection on day 15 and day 26 is the difference between a ticket and a frozen quarter.
 

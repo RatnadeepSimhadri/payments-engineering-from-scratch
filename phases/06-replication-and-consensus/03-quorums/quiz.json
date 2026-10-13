@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A store keeps 3 replicas per key with W=1 and R=1. Why can a read return a value older than the last acknowledged write?",
+      "options": ["Replicas apply writes in a random order, so versions can regress", "The read and the write each touch one node and need not be the same node", "One acknowledgement is not durable until it has been written to disk", "Reads are served from a cache that is refreshed every few seconds"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "With W=1 and R=1 the write set and the read set are each a single node chosen independently, so they overlap only by luck. That is the settlement-currency incident: every replica was healthy, the read simply asked the one that had not received the write yet. Durability is a separate concern; a perfectly durable write on node 1 is still invisible to a read of node 3."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "With N=3, R=2, W=2 under strict quorums, what is the minimum overlap between any read quorum and any write quorum?",
+      "options": ["Zero, because the two quorums are chosen by different coordinators", "Two nodes, because both quorums are majorities of three replicas", "Three nodes, because R + W = 4 exceeds the replica count of three", "One node, because two subsets of sizes R and W share R + W - N members"],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "Two subsets of an N-element set with sizes R and W intersect in at least R + W - N elements: 2 + 2 - 3 = 1. That one shared node holds the write, and the read returns the newest version among its responses. Two shared nodes is possible but not guaranteed: {n1, n2} and {n2, n3} share only n2."
     },
     {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "stage": "check",
+      "question": "A sloppy W=2 write is acked by n1, n4, and n0 while home replicas n2 and n3 are down. Later an R=2 read asks only n2 and n3. Why can it be stale?",
+      "options": ["The acks came from outside the home set, so the two quorums need not intersect", "R + W equals N in this configuration, so the overlap guarantee never applied", "Hinted handoff overwrote the value on n2 and n3 with an older version", "The read coordinator ignores versions and returns the first response it gets"],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The intersection proof assumes both quorums are drawn from the same fixed N home replicas. A sloppy quorum takes acks from fallback nodes, so the write set {n1, n4, n0} and read set {n2, n3} are disjoint even though R + W = 4 > 3. Hinted handoff fixes it later; it never writes an older value, because put is store-if-newer."
+    },
+    {
+      "stage": "check",
+      "question": "Two coordinators read a balance of 100.00 USD; one writes 70.00 after a debit, the other writes 150.00 after a credit one tick later. What does LWW do?",
+      "options": ["Keeps both versions as siblings for the application to merge later", "Rejects the second write because its read version is no longer current", "Converges every replica to 150.00 USD and silently drops the debit", "Sums the two deltas and converges every replica to 120.00 USD"],
+      "correct": 2,
+      "explanation": "Last-writer-wins compares (timestamp, writerId) and keeps the higher one, so every replica converges to 150.00 and the 30.00 debit vanishes with no error. Keeping siblings is what version vectors do (Lesson 09), and summing deltas is what a CRDT counter or a ledger does; LWW does neither, which is why a balance must never be a register."
     },
     {
       "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
+      "question": "Which repair mechanism is the only one that eventually converges a cold key that nobody reads and whose hint holder crashed?",
+      "options": ["Read repair, because it rewrites every stale replica of the key", "Hinted handoff, because hints are replicated to every other node", "Raising R to N so that every read contacts every home replica", "Anti-entropy, because it compares every key on every replica pair"],
+      "correct": 3,
+      "explanation": "Anti-entropy runs on a schedule over every key, so it fixes divergence no read ever observed and no surviving hint covers. Read repair only touches keys that are read, and only the replicas that responded. Hints live on the node that took the sloppy write; if that node dies, its hints die with it."
+    },
+    {
+      "stage": "post",
+      "question": "A settlement job reads each merchant's settlement currency from a Cassandra-style store. Which configuration should that read use?",
+      "options": ["A strict QUORUM read paired with QUORUM writes for that key family", "ONE, because the settlement currency rarely changes after onboarding", "ONE with read repair enabled, so stale replicas get fixed on the read", "QUORUM reads on a sloppy store with hinted handoff enabled for writes"],
+      "correct": 0,
+      "explanation": "This configuration value is an input to a money movement, so the read must see the latest acknowledged write: strict QUORUM reads and writes give R + W > N on the same home set. Read repair fixes replicas after a stale response; it cannot stop the stale response itself. A sloppy store breaks the intersection guarantee even when the counts satisfy R + W > N."
     }
   ]
 }

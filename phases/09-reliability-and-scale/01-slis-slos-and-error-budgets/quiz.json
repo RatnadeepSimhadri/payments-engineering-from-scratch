@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "An authorization service returns HTTP 200 with body {\"status\": \"declined\", \"reason\": \"processor_timeout\"}. From the merchant's point of view, what was this request?",
+      "options": ["A success, because the HTTP status code was 200", "A failure, because our own path failed to get an answer", "A client error, because the merchant should simply retry", "Neutral, because declines are the issuer's decision"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The merchant lost a sale because the service's own path timed out, so it is a failure regardless of the 200 status. Treating declines as the issuer's decision is the strongest distractor, but that only holds for issuer reasons such as insufficient funds; an internal reason means no issuer ever decided."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "An availability SLO is 99.95% over a rolling 30 days. How many minutes of total outage does the error budget allow?",
+      "options": ["4.32 minutes", "43.2 minutes", "21.6 minutes", "2.16 minutes"],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "30 days is 43,200 minutes and the budget is 1 - 0.9995 = 0.0005, so 0.0005 x 43,200 = 21.6 minutes. 43.2 minutes is the budget for 99.9% and 4.32 minutes is the budget for 99.99%; each extra nine divides the budget by ten."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Against a 99.95% SLO, a defect makes 0.4% of authorizations fail. What is the burn rate and how long until a 30-day budget is gone?",
+      "options": ["Burn rate 8; the budget is gone in 3.75 days", "Burn rate 0.4; the budget lasts the full 75 days", "Burn rate 80; the budget is gone in 9 hours", "Burn rate 4; the budget is gone in 7.5 days"],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Burn rate is the observed error ratio over the sustainable one: 0.004 / 0.0005 = 8, and 30 days / 8 = 3.75 days. Burn rate 4 comes from dividing by 0.001, which is the 99.9% budget, not this SLO's."
+    },
+    {
+      "stage": "check",
+      "question": "In a multi-window burn-rate alert, why must the 5-minute window also exceed 14.4 before the 1-hour rule pages?",
+      "options": ["It catches total outages faster than the 1-hour window can", "It lowers the cost of evaluating the alert rule each minute", "It is required so the alert works when traffic is very low", "It confirms the problem is still happening, so the alert resolves soon after a fix"],
+      "correct": 3,
+      "explanation": "The long window says the incident is big enough to matter; the short window says it is still happening, so the page clears within about five minutes of a rollback instead of staying high for the rest of the hour. It does not speed up detection: the long window is always the slower condition and sets the detection time."
     },
     {
       "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Ten thousand 200.00 USD captures reconcile, and one 50,000.00 USD payout does not match the bank record. What should the correctness SLI report?",
+      "options": ["99.99% only, because each money movement counts as one event", "Both 99.99% by count and about 97.6% by value, since both matter", "About 97.6% only, because value is the sole measure that matters", "Nothing yet, because the payout is still inside its settlement window"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Reporting by count alone makes one large misbooked payout look like noise; reporting by value alone hides a rising rate of small breaks. The lesson's SLO document pairs a count target with a page on any single large unmatched movement. The payout's bank record has arrived, so it is valid, not pending."
+    },
+    {
+      "stage": "post",
+      "question": "The 6 h / 30 m alert row uses burn rate 6 on a 99.95% SLO. When does it first fire for a 0.4% error ratio starting on a clean background?",
+      "options": ["After about 22 minutes, when the 30-minute window crosses", "Never, because 0.4% is below the 0.72% fast-burn threshold", "After about 9 hours, when the 3-day ticket row also fires", "After about 4.5 hours, once 5% of the budget is spent"],
+      "correct": 3,
+      "explanation": "The row fires when the 6-hour average reaches 6 x 0.0005 = 0.3%; at 0.4% that takes 0.3/0.4 x 6 h = 4.5 h, by which point 5% of the month's budget is gone. The 30-minute window crosses after about 22 minutes, but both windows must exceed the threshold, and the long one sets the detection time."
     }
   ]
 }

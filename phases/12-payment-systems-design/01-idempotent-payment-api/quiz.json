@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A client's 1.5-second timeout fires while the server is still authorizing a card, and the client retries. With no idempotency key, what does the processor see?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Two authorizations for the same card, one the merchant never learns about",
+        "One authorization, because the processor drops identical card requests",
+        "One authorization, because the timed-out request is rolled back on close",
+        "Two authorization attempts, the second of which the issuer always declines"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The first request keeps running after the client gives up, so both requests reach the processor and both authorize. Closing the client connection does not roll back a call already in flight, which is why the server, not the client, has to recognize the retry as the same request."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Merchant A and merchant B both send Idempotency-Key order-1001 with different bodies. What should the server do?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Return 422 to merchant B, because the key was already used with a different body",
+        "Treat them as two independent payments, because keys are scoped per merchant",
+        "Replay merchant A's stored response to merchant B, because the key matches",
+        "Reject both with 409 until one merchant switches to a new unique key"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The store key is (merchant, key), so the two requests never meet. Returning 422 is the tempting answer, but it would treat a global collision between unrelated callers as a client bug; replaying A's response to B would also leak one merchant's payment to another."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Two requests with the same merchant and key arrive 5 ms apart while the first is still charging the processor. What does the second one receive?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "201 with the first payment, since the result will be identical anyway",
+        "422, because a key may not be reused before its first response is stored",
+        "409 Conflict with Retry-After, because the key is IN_PROGRESS and leased",
+        "A second charge, since no stored response exists for the key to replay"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Reserve is atomic: the first caller moved the key to IN_PROGRESS, so the duplicate sees a live lease and is told to retry shortly. 422 is reserved for a different fingerprint; here the bodies match, and the client should wait, not surface an error."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "The first request was declined by the issuer with 402. The client retries with the same key and the same body. What does the server return?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A fresh attempt at the card, because a decline is not a final result",
+        "409, because declined requests must wait for the lease before a retry",
+        "201 if the second attempt is approved, since the customer added funds",
+        "The stored 402 body, byte-identical, with Idempotent-Replayed: true"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "A retry repeats the request, not the attempt at the card, so the stored 402 is replayed. Re-running the decline is the strongest distractor; it would hammer the issuer from every client retry loop and trip velocity limits. Trying the card again is a new request with a new key."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "The process charges the processor and dies before storing the response. Thirty seconds later the lease has expired and a retry arrives. What does the recovering caller do first?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Look up the deterministic processor reference to see if the charge happened",
+        "Charge the card again, because the stored record has no response to replay",
+        "Return 409 forever, because a dead owner cannot be distinguished from a slow one",
+        "Delete the record and treat the retry as a brand-new request under the key"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The reference is a pure function of the scoped key, so the recovering caller can ask the processor whether the charge exists and complete the record from that answer. Charging immediately is the bug the lease alone cannot prevent: the first charge already went through, and only the stored response was lost."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "A teammate proposes routing GET /payments/{id} through the idempotency layer to cut database load. What is wrong with that?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "GET requests cannot carry headers, so the client has no key to send",
+        "Reads would return a stale cached state while the store grows on every poll",
+        "SHA-256 fingerprints cannot be computed over a request with an empty body",
+        "Replaying a GET breaks the RFC 9110 rule that GET responses are uncacheable"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A replayed read would keep reporting authorized after the payment was captured or refunded, and every poll after a 409 would add a record. GET is already idempotent because it has no side effect; RFC 9110 actually allows GET responses to be cached, so the last option misstates the rule."
     }
   ]
 }

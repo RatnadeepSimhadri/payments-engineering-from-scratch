@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A log aggregator never processes payments but receives request bodies that sometimes contain a full card number. Is it inside the PCI cardholder data environment?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "No, because it has no business reason to use the card number",
+        "No, as long as the logs are rotated away within thirty days",
+        "Yes, because scope follows access to the PAN, not intent to use it",
+        "Yes, but only if the aggregator also stores the card expiry date"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Scope is defined by where cardholder data is stored, processed, or transmitted, so any system the PAN reaches is assessed. Lack of business need is the strongest distractor and is exactly the trap: it is a reason to remove the PAN from that system, not a reason the system is out of scope while the PAN is there."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "Why does the vault index PANs by HMAC-SHA256 under a vault key instead of plain SHA-256?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A PAN has so little entropy that an unkeyed hash can be brute-forced",
+        "SHA-256 output is 32 bytes, too long to fit an indexed database column",
+        "HMAC is reversible by the vault, so it can recover the PAN for a charge",
+        "Plain SHA-256 produces different digests for the same PAN on each run"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "With a public six-digit BIN and a check digit, about 10^9 candidates remain per BIN, which a GPU hashes in seconds, so an unkeyed hash table is a PAN lookup table. HMAC is not reversible either; it only becomes unguessable because the attacker lacks the key, which is what PCI DSS 3.5.1.1 requires."
+    },
+    {
+      "stage": "check",
+      "question": "A minted candidate token happens to pass the Luhn check. What does the vault do, and why does that always work?",
+      "options": [
+        "Discards it and redraws all random digits until one fails the check",
+        "Changes the last four digits so the token cannot match any real card",
+        "Accepts it, because a token with a random BIN never reaches a network",
+        "Bumps one random digit, since any single-digit change breaks the checksum"
+      ],
+      "correct": 3,
+      "explanation": "Luhn's doubling map is a permutation of the digits, so changing any one digit changes the sum modulo 10, and one bump always turns a valid number invalid. Redrawing would also work but is not guaranteed to terminate quickly; changing the last four would break the format-preservation promise that downstream systems depend on."
+    },
+    {
+      "stage": "check",
+      "question": "An attacker with database write access copies the nonce and ciphertext from token A's row into token B's row. What happens when B is detokenized?",
+      "options": [
+        "B returns A's PAN, because the data key and nonce are both still valid",
+        "GCM authentication fails, because the token is the associated data",
+        "B returns garbage digits, which the Pan constructor rejects on Luhn",
+        "Decryption succeeds but the audit log flags the mismatch afterwards"
+      ],
+      "correct": 1,
+      "explanation": "The vault passes the token as GCM additional authenticated data, so the tag computed under A no longer verifies under B and doFinal throws. Without AAD, the first option is what would happen: the key and nonce are valid, and the record would silently decrypt to the wrong card."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "A retailer tokenizes every stored card through a vault. Which systems must remain inside the cardholder data environment?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Only the vault, because every other system now holds tokens instead",
+        "The vault and the order database, since it stores token-to-order links",
+        "The payment page, the vault, and the gateway that sends the real PAN",
+        "Every system that reads tokens, since tokens are derived from PANs"
       ],
-      "correct": 1,
-      "explanation": "TODO"
+      "correct": 2,
+      "explanation": "The PAN is still typed into the payment page, stored in the vault, and sent by the gateway to the acquirer, so those three stay in scope. Saying only the vault is the strongest distractor: it forgets that the PAN must be captured and transmitted, and merchant tokens do not change what the acquirer receives."
+    },
+    {
+      "stage": "post",
+      "question": "Why does revoke overwrite the ciphertext with zeros and keep the record, rather than deleting the row?",
+      "options": [
+        "Deleting a row in a hash map is slower than overwriting its byte array",
+        "Zeroed ciphertext lets the vault restore the PAN if revocation is undone",
+        "PCI DSS forbids deleting any record that once held cardholder data",
+        "It crypto-shreds the PAN while the tombstone keeps the audit trail whole"
+      ],
+      "correct": 3,
+      "explanation": "Overwriting makes the PAN unrecoverable even if the data key later leaks, and the remaining record lets the audit log's references to that token still resolve to when it was created and who revoked it. Revocation is deliberately terminal: unlike suspend, nothing can restore the PAN, so the second option inverts the point."
     }
   ]
 }

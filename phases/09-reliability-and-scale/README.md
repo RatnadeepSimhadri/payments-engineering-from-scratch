@@ -2,19 +2,12 @@
 
 > You cannot operate what you cannot observe.
 
-13 lessons, 12 complete, ~16 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
+13 lessons, 13 complete, ~16 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
 
 ## Start this phase
 
-**First lesson:** [Load Balancing: Round Robin, Least Connections, Power of Two Choices](02-load-balancing-algorithms/)
+**First lesson:** [SLIs, SLOs, and Error Budgets](01-slis-slos-and-error-budgets/)
 
-Run the first complete lesson from the repository root:
-
-```bash
-python3 scripts/run_lesson.py phases/09-reliability-and-scale/02-load-balancing-algorithms --lang java
-```
-
-Keep the command, the exit code, and the test count as your first piece of evidence.
 
 With an agent tutor: `/learn` (Claude Code), `learn` (Codex), or `Use learn to teach the next lesson.` The tutor reads your language from `LEARNING.md`.
 
@@ -22,7 +15,7 @@ With an agent tutor: `/learn` (Claude Code), `learn` (Codex), or `Use learn to t
 
 | # | Lesson | Type | Time | Status | Hook |
 |:---:|--------|:----:|:----:|:------:|------|
-| 01 | [SLIs, SLOs, and Error Budgets](01-slis-slos-and-error-budgets/) | Learn | ~60 min | 🚧 | Availability is a number you choose and then pay for. |
+| 01 | [SLIs, SLOs, and Error Budgets](01-slis-slos-and-error-budgets/) | Learn | ~60 min | ✅ | Availability is a number you choose and then pay for. |
 | 02 | [Load Balancing: Round Robin, Least Connections, Power of Two Choices](02-load-balancing-algorithms/) | Build | ~90 min | ✅ | Two random choices beat one by an exponential margin. |
 | 03 | [Caching Strategies: Cache-Aside, Write-Through, Write-Behind](03-caching-strategies/) | Build | ~90 min | ✅ | Stale balances are worse than slow balances. |
 | 04 | [Cache Invalidation, Stampedes, and Request Coalescing](04-cache-invalidation-and-stampedes/) | Build | ~75 min | ✅ | A hot key expires and ten thousand requests hit the database. |

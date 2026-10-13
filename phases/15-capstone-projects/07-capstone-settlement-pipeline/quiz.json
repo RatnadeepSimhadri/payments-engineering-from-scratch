@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A payout script selects unsettled captures, calls the bank once per seller, then marks everything settled at the end. The bank fails mid-run and the script is restarted. What happens?",
+      "options": ["Only the sellers after the failure are paid, since the bank rejected the rest", "Sellers paid before the failure are paid again, because nothing records their payout", "No seller is paid twice, because the bank deduplicates repeated payment instructions", "The restart fails immediately, because the settled flag is locked by the first run"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The settled flag is written only after the loop, so on restart the SELECT finds every capture still unsettled and pays the early sellers a second time. This is the Problem section's 9,200 double payouts. A bank API call per seller carries no idempotency key here, so the bank has nothing to deduplicate on; the capstone fixes this with step keys and an outbox."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Merchant m_2210 has captures 10,000.00, refunds 200.00, chargebacks 150.00, fees 620.00, a new reserve hold of 500.00 and a reserve release of 480.00. What is the net payable?",
+      "options": ["9,030.00 USD", "8,050.00 USD", "9,490.00 USD", "9,010.00 USD"],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "net = gross - refunds - chargebacks - fees - reserveHeld + reserveReleased = 10,000.00 - 200.00 - 150.00 - 620.00 - 500.00 + 480.00 = 9,010.00. 8,050.00 subtracts the release instead of adding it; 9,490.00 ignores the reserve hold. The settlement entry balances at 10,480.00 on each side."
     },
     {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "stage": "check",
+      "question": "The fee is 2.9% + 0.30 per capture on 1,000 captures of 10.00. Why must the netting engine sum per-transaction fee postings rather than compute the fee on the 10,000.00 total?",
+      "options": ["Per capture gives 590.00 as contracted; on the total gives 290.30 and loses the fixed part", "Per capture avoids HALF_UP rounding, which is not permitted on fee calculations", "Computing on the total would overflow a 64-bit minor-unit amount for large merchants", "The processor's fee report is issued per batch, so totals cannot be compared to it"],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The fixed 0.30 applies once per capture, so 1,000 x (0.29 + 0.30) = 590.00, while 2.9% of 10,000.00 plus one 0.30 is 290.30. Summing the per-capture postings also makes FEE_REVENUE equal the sum of individual fee postings, which reconciliation against the processor needs. HALF_UP is the documented rounding mode, and overflow is not the issue."
+    },
+    {
+      "stage": "check",
+      "question": "In window 1 a merchant has captures 100.00 and refunds 400.00. What does Requirement 5 expect the pipeline to do?",
+      "options": ["Create a payout of 0.00 and write off the shortfall to a platform loss account", "Pull the shortfall from the merchant's bank account in the same ACH batch", "Leave MERCHANT_PAYABLE with a debit balance and net it against the next window", "Reject the window's netting until enough new captures arrive to cover refunds"],
+      "correct": 2,
+      "explanation": "A negative net produces no payout; MERCHANT_PAYABLE carries a debit balance (the merchant owes the platform), the merchant is flagged NEGATIVE_BALANCE, and the next window consumes the carried shortfall first. Writing it off loses money the platform is owed, and refusing to net breaks the one-entry-per-window rule; a debit pull is a different product decision the spec does not make."
     },
     {
       "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "The release step crashes after posting MERCHANT_PAYABLE to SETTLEMENT_CLEARING and writing the outbox record, but before marking payouts RELEASED. What does re-running release produce?",
+      "options": ["A second set of release entries, which a nightly reconciliation must then reverse", "One set of entries and one file, because the step key and the bank's file-hash check dedupe", "No file at all, because the outbox record is discarded when the step does not finish", "Two files at the bank, one per run, each with its own control total and file hash"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Entries are posted with StepKey(windowId, batchId, RELEASE) as the idempotency key, so the re-run posts nothing new; the outbox holds one FILE_READY record, and SimBank deduplicates by file hash. M5 tests this at all four crash points. Re-posting the entries is exactly the double payout this capstone exists to prevent."
+    },
+    {
+      "stage": "post",
+      "question": "Six days after acknowledgement the bank returns m_2210's 9,010.00 payout with R03. How does the reference design account for it?",
+      "options": ["It deletes the original release entry so the payable balance comes back automatically", "It retries the same payout to the same account in the next batch with a new trace number", "It moves the payout to SETTLED and records the return as a note on the merchant's account", "It posts BANK_OPERATING to MERCHANT_PAYABLE with reverses set and marks the payout RETURNED"],
+      "correct": 3,
+      "explanation": "Returns post a new compensating entry, debit BANK_OPERATING and credit MERCHANT_PAYABLE:m_2210, whose reverses field points at the release entry, and the payout moves to RETURNED(R03). Ledger entries are never deleted. R03 means no such account, so retrying the same destination will fail again; the merchant is asked for new bank details."
     }
   ]
 }

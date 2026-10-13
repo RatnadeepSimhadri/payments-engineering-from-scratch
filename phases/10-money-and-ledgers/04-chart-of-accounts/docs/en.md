@@ -140,6 +140,114 @@ For the chart of accounts this means two things that engineers can enforce:
 
 A chart without these two accounts cannot produce the regulator's number without reconstruction. The failure in The Problem is a chart-of-accounts failure first and a reporting failure second.
 
+### A full chart for a two-sided marketplace
+
+The wallet-and-merchant chart above is the minimum. A marketplace (buyers pay the platform, the platform pays sellers and couriers, keeps a commission, collects sales tax as a marketplace facilitator, and runs promotions) needs more accounts, and every one of them exists because a question needs a balance to answer it.
+
+| Number | Account | Type | Normal side | What the balance means |
+|--------|---------|------|-------------|------------------------|
+| 1010 | Operating Bank | ASSET | Debit | The platform's own cash |
+| 1020 | FBO / Safeguarding Bank | ASSET | Debit | Segregated account holding funds owed to sellers, couriers, and buyers |
+| 1200 | Processor Receivable | ASSET | Debit | Captured buyer payments not yet settled by the processor |
+| 1250 | Seller Receivable | ASSET | Debit | Amounts sellers owe the platform (refunds or chargebacks after payout) |
+| 2100 | Seller Payable | LIABILITY | Credit | Net order proceeds owed to sellers, control account for the seller sub-ledger |
+| 2150 | Courier Payable | LIABILITY | Credit | Delivery earnings owed to couriers, control account for the courier sub-ledger |
+| 2200 | Buyer Credit Balance | LIABILITY | Credit | Store credit and gift-card balances owed to buyers |
+| 2300 | Seller Reserve | LIABILITY | Credit | Seller proceeds withheld against disputes; still owed to the seller |
+| 2400 | Sales Tax Payable | LIABILITY | Credit | Tax collected from buyers and owed to tax authorities |
+| 2900 | Suspense: Unidentified Receipts | LIABILITY | Credit | Cash received that cannot yet be matched; must be zero at month end |
+| 3100 | Paid-in Capital | EQUITY | Credit | What the owners put in |
+| 3200 | Retained Earnings | EQUITY | Credit | Accumulated net income, posted only at period close |
+| 4100 | Commission Revenue | REVENUE | Credit | The platform's take rate on item value |
+| 4150 | Delivery Fee Revenue | REVENUE | Credit | The platform's share of delivery fees after courier pay |
+| 4190 | Promotions (contra-revenue) | REVENUE | Debit (contra) | Platform-funded discounts; a debit balance that reduces reported revenue |
+| 4900 | FX Gain/(Loss) | REVENUE | Credit | Net difference between booked and settled rates |
+| 5100 | Chargeback Losses | EXPENSE | Debit | Dispute fees and principal the platform could not recover |
+| 5200 | Processor Fees | EXPENSE | Debit | Card processing costs charged to the platform |
+| 5300 | Bad Debt: Seller Balances | EXPENSE | Debit | Seller receivables written off as uncollectable |
+
+`4190` is a **contra account**: typed REVENUE so that it rolls up under the 4000 range, but its normal balance is a debit, the opposite of its type. Accounting standards generally treat consideration paid to a customer (a platform-funded coupon) as a reduction of revenue rather than a marketing expense, and the contra account keeps both numbers visible: gross commission in 4100, discounts in 4190, net revenue as their sum. A ledger engine that infers normal side from type alone needs an explicit `contra` flag for these.
+
+### Which side moves each account
+
+The type table at the top of the lesson is the rule. In practice engineers think in events, so here is the same rule for the marketplace chart, stated per account:
+
+| Account | Increased by | Typical increasing event | Decreased by | Typical decreasing event |
+|---------|--------------|--------------------------|--------------|--------------------------|
+| 1020 FBO Bank | Debit | processor settlement lands | Credit | seller or courier payout, sweep of platform share |
+| 1200 Processor Receivable | Debit | buyer payment captured | Credit | processor settles the batch |
+| 1250 Seller Receivable | Debit | refund issued after the seller was paid | Credit | netted from the next payout, or written off |
+| 2100 Seller Payable | Credit | order paid | Debit | payout, refund before payout, netting a receivable |
+| 2200 Buyer Credit Balance | Credit | refund issued as store credit, gift card sold | Debit | buyer spends the credit |
+| 2300 Seller Reserve | Credit | holdback taken at order time | Debit | reserve released, or applied to a chargeback |
+| 2400 Sales Tax Payable | Credit | order paid | Debit | monthly remittance, refund |
+| 4100 Commission Revenue | Credit | order paid | Debit | refund reverses the commission |
+| 4190 Promotions | Debit | coupon applied | Credit | order with coupon refunded |
+| 5200 Processor Fees | Debit | settlement net of fees | Credit | rare: processor fee rebate |
+
+Two patterns fall out. Every liability is decreased by a debit, and the debit is almost always paired with a credit to a bank account (money leaves) or to another liability (money is reassigned). And the only entries that touch revenue are the ones that change what the platform *earned*; moving money between buyers, sellers, and couriers never does.
+
+### Journal entries per marketplace event
+
+One order traced through its life. A buyer orders items worth 45.00, delivery 5.00, and sales tax of 8% on the items (3.60), total 53.60. A platform-funded coupon takes 5.00 off, so the card is charged 48.60. Commission is 15% of items (6.75); the courier is paid 4.00 of the 5.00 delivery fee. The processor charges 2.9% + 0.30 on 48.60, which is 1.7094, rounded HALF_EVEN to 1.71.
+
+```text
+E1  Order paid (capture)
+  Dr 1200 Processor Receivable          48.60
+  Dr 4190 Promotions                     5.00
+      Cr 2100 Seller Payable                       38.25   (45.00 - 6.75)
+      Cr 4100 Commission Revenue                    6.75
+      Cr 2150 Courier Payable                       4.00
+      Cr 4150 Delivery Fee Revenue                  1.00
+      Cr 2400 Sales Tax Payable                     3.60
+
+E2  Processor settles into the FBO account, net of its fee
+  Dr 1020 FBO / Safeguarding Bank       46.89
+  Dr 5200 Processor Fees                 1.71
+      Cr 1200 Processor Receivable                 48.60
+
+E3  Sweep the platform's own share out of safeguarding (46.89 - 38.25 - 4.00)
+  Dr 1010 Operating Bank                 4.64
+      Cr 1020 FBO / Safeguarding Bank               4.64
+
+E4  Payouts to seller and courier
+  Dr 2100 Seller Payable                38.25
+  Dr 2150 Courier Payable                4.00
+      Cr 1020 FBO / Safeguarding Bank              42.25
+
+E5  Monthly tax remittance
+  Dr 2400 Sales Tax Payable              3.60
+      Cr 1010 Operating Bank                        3.60
+
+E6  Items returned after payout; buyer refunded 43.60 to card (items + tax - coupon)
+  Dr 1250 Seller Receivable             38.25
+  Dr 4100 Commission Revenue             6.75
+  Dr 2400 Sales Tax Payable              3.60
+      Cr 4190 Promotions                            5.00
+      Cr 1010 Operating Bank                       43.60
+
+E7  Seller's next order pays 60.00 net; the receivable is netted before payout
+  Dr 2100 Seller Payable                38.25
+      Cr 1250 Seller Receivable                    38.25
+```
+
+Check E1: debits 48.60 + 5.00 = 53.60; credits 38.25 + 6.75 + 4.00 + 1.00 + 3.60 = 53.60. Check E6: debits 38.25 + 6.75 + 3.60 = 48.60; credits 5.00 + 43.60 = 48.60. After E6 the platform's earnings from this order are the delivery margin 1.00 less the processor fee 1.71: a loss of 0.71, visible because fees and revenue were never netted. In E5 the tax was remitted before the refund, so 2400 now carries a 3.60 debit balance: a claim to net against next month's remittance, which is exactly what the tax return will do.
+
+Had the buyer accepted store credit instead of a card refund, E6's `Cr 1010 Operating Bank 43.60` becomes `Cr 2200 Buyer Credit Balance 43.60`: no cash moves, a new liability appears, and because it is owed to a payment service user, 1020 must now be topped up by 43.60 from 1010 to stay covered.
+
+### Common mapping mistakes
+
+| Event | Wrong mapping | Right mapping | What breaks |
+|-------|---------------|---------------|-------------|
+| Buyer pays 53.60 | Cr Revenue 53.60 | Cr Seller Payable, Courier Payable, Tax Payable; Cr Revenue only for commission and fee | Revenue of 53.60 instead of 7.75 gross; the platform reports GMV as income |
+| Platform coupon 5.00 | Seller Payable reduced by 5.00 | Dr 4190 Promotions | The seller is underpaid for a discount the platform chose to fund |
+| Sales tax collected | Cr Commission Revenue | Cr 2400 Sales Tax Payable | Tax owed to the state appears as earnings; the remittance then looks like an expense |
+| Refund after payout | Dr Seller Payable, driving it negative | Dr 1250 Seller Receivable | A negative liability hides credit risk; the payout job may try to pay a negative amount |
+| Store credit issued | Cr Promotions or Revenue | Cr 2200 Buyer Credit Balance | A liability owed to buyers vanishes from the safeguarding calculation |
+| Processor fee | Netted into Commission Revenue | Dr 5200 Processor Fees | Gross revenue and cost are both lost; a processor price rise is invisible |
+| Chargeback | Dr Commission Revenue | Dr 2300 Reserve or 1250 Receivable, Dr 5100 for what is unrecoverable | Revenue falls for a reason that is not pricing; the dispute loss rate cannot be reported |
+| Courier pay | Cr Seller Payable | Cr 2150 Courier Payable | Two counterparties with different payout schedules share one control account; the sub-ledger check cannot tell which side broke |
+
 ### Failure modes
 
 - **Suspense accounts that never clear.** `9999 Suspense` or `adjustments` receives anything nobody could classify. It is legitimate as a parking place for an unidentified receipt for a day; it is a defect when its balance is non-zero at month end. Rule: every suspense balance has an owner and a clearing deadline.

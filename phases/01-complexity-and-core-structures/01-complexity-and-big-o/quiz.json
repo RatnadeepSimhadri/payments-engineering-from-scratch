@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A reconciliation job compares every processor record with every ledger record. It takes 0.1 s on 10,000 records. Roughly how long should you expect at 2.1 million records?",
+      "options": ["About 21 seconds, because the input grew 210 times", "About 1 minute, because sorting adds a log factor", "About an hour or more, because the cost grows with n squared", "About 0.1 s, because each comparison is constant time"],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "A nested loop is Theta(n^2): growing n by 210x grows the work by about 44,000x, so 0.1 s becomes over an hour even at an idealised billion operations per second. 21 seconds is the linear extrapolation, which is exactly the mistake that let the staging test pass."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A reviewer says \"binary search is O(n)\". What is the precise status of that statement?",
+      "options": ["True but uninformative, since O is only an upper bound", "False, because binary search is O(log n) and not O(n)", "True only for the worst case, not the average case", "False, because O(n) describes linear search only"],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "O(g) means at most c * g(n) for large n, and log n <= n, so the statement is true. It is imprecise: the tight bound is Theta(log n). Calling it false confuses an upper bound with an exact growth rate, which is what Theta is for."
+    },
+    {
+      "stage": "check",
+      "question": "Which statement about \"ArrayList.add runs in amortized constant time\" is correct?",
+      "options": ["Each add is Theta(1) expected under a random input distribution", "Each add is Theta(1) because the JVM pre-allocates unlimited capacity", "Any sequence of m adds costs O(m), but a single add can cost Theta(n)", "Adds are O(log n) each because the backing array grows by doubling"],
+      "correct": 2,
+      "explanation": "Amortised cost is a worst-case bound over a sequence with no probability involved: m appends cost O(m) in total, yet the append that triggers a resize copies n elements. That spike is why amortised O(1) is a throughput promise, not a latency one. \"Expected\" describes a probabilistic average, which is a different claim."
+    },
+    {
+      "stage": "check",
+      "question": "You time an algorithm at n = 1,000, 2,000, 4,000, 8,000 after warm-up and see 3 ms, 12 ms, 48 ms, 192 ms. What class is it?",
+      "options": ["Theta(n log n), because the ratios grow slowly", "Theta(n), with cache misses adding a constant", "Theta(n^3), because the times are growing quickly", "Theta(n^2), because each doubling multiplies time by 4"],
+      "correct": 3,
+      "explanation": "In the doubling test, a stable ratio of 4 means quadratic (2^2), 2 means linear, about 2.1-2.3 means n log n, and 8 means cubic. Here every ratio is exactly 4. Cubic would show ratios of 8, so fast growth alone is not enough to call it cubic."
     },
     {
       "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Eight sorted BIN range starts are stored in an int array. Why does a linear scan beat binary search on it?",
+      "options": ["Binary search is O(n) when the array length is not a power of two", "The scan touches one cache line with predictable branches; search mispredicts", "The JIT converts binary search into a linear scan for any small array", "Linear scan is O(1) when n is a constant known at compile time"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Eight ints are 32 bytes, one cache line; the scan's loop branch is near-perfectly predicted and its compare often becomes a conditional move, about 20-30 cycles. Binary search does 3 dependent iterations with data-dependent branches that mispredict about half the time, about 40-60 cycles. The asymptotic analysis is right about the direction; the hardware sets the crossover, around 32-64 elements here."
+    },
+    {
+      "stage": "post",
+      "question": "In `for (Record p : processor) { if (ledgerList.contains(p.id())) match(p); }` with n processor and m ledger records, what is the cost and the fix?",
+      "options": ["Theta(n * m), since contains scans the list; build a hash set of IDs once", "Theta(n), since contains is one call per record; no fix is needed", "Theta(n log m), since contains uses binary search; sort the list first", "Theta(n + m), since the JIT caches contains; replace with a TreeMap"],
+      "correct": 0,
+      "explanation": "This is shape F: the body looks like one line, but List.contains is a linear scan, so the loop is Theta(n * m), quadratic when n ~ m. Building a HashSet of ledger IDs once costs Theta(m) and each probe Theta(1) expected, giving Theta(n + m). List.contains never binary searches, even on a sorted list, so the n log m answer prices the wrong call."
     }
   ]
 }

@@ -76,6 +76,21 @@ Between `String.hashCode` and SHA-256 sits a family of general-purpose hashes wi
 
 The jump that matters is from "no key" to "keyed": only a keyed function hides its colliding set from an attacker. The jump from SipHash to HMAC-SHA-256 is a different axis entirely, from "unpredictable collisions" to "cryptographically secure", and you pay for it only when the key is itself a secret.
 
+### How each family behaves on the key shapes payments systems actually use
+
+Speed and avalanche in the abstract do not tell you what happens to *your* keys. The table rates each function against four key shapes that recur in payment services: sequential integers (ledger entry IDs, auto-increment merchant IDs), prefix-sharing strings (`merch_000123_order_...`, idempotency keys built from a merchant prefix), random identifiers (UUIDv4, tokens), and keys an adversary chooses.
+
+| Function | Sequential integers | Shared-prefix strings | Random IDs | Adversary-chosen keys |
+|----------|---------------------|-----------------------|------------|-----------------------|
+| Identity / `(int) id` | perfect spread with power-of-two masking, until IDs stride by a multiple of the table size | n/a | fine | trivially floods: the attacker picks IDs that differ only in masked-off bits |
+| Java `String.hashCode` + `HashMap.hash()` spread | n/a | acceptable; the spread step rescues most clustering | fine | floods; colliding blocks compose, so the set is cheap to grow |
+| FNV-1a (unseeded) | good | good | fine | floods; the function is public, so the colliding set is precomputable |
+| MurmurHash3 / xxHash with a random seed | good | good | fine | weaker than it looks: published seed-independent collisions exist for some of these designs, so the seed does not hide the set |
+| SipHash with a per-process random key | good | good | fine | resists: the colliding set depends on a 128-bit secret |
+| HMAC-SHA-256 with a vaulted key | good | good | fine | resists, at roughly 100x the cost; justified only when the key is itself sensitive |
+
+The fourth row is the subtle one and the reason the 2012 follow-up research mattered: "has a seed parameter" is not the same as "is a keyed PRF". A function whose internal structure lets collisions be found *without* knowing the seed gives an attacker the same advantage as no seed at all. The only rows that resist an adversary are the ones designed as pseudorandom functions of a secret key.
+
 ### What good avalanche looks like
 
 Avalanche is testable. Flip one bit of the input, hash both, and count how many output bits changed; over many inputs the average should be half the output width, with low variance. `String.hashCode` fails this immediately: flipping the low bit of the last character flips exactly one output bit, every time. SipHash and MurmurHash pass it: one input bit flips about half the 64 output bits, unpredictably. This is why `HashMap.hash()` bothers to XOR the high 16 bits into the low 16 before masking: it is a cheap partial avalanche step that rescues `String.hashCode`'s distribution on benign keys, spreading the entropy that lives in the high bits down into the bits the bucket mask actually reads. It cannot rescue it against an adversary, because the attacker simply chooses keys whose collision survives the spread.
@@ -138,6 +153,30 @@ A different startup picks a different `a` and sends the same two keys to differe
 
 Lesson 06's bound is worth restating in attack terms. With `n` keys in `m` buckets the expected chain length under a good hash is the load factor `alpha = n / m`, kept near 0.75 by resizing, so a lookup touches about 1.75 entries on average: the "O(1)" everyone quotes. The variance matters too. Under a uniform hash, the longest chain among `m` buckets with `n = m` keys is about `ln m / ln ln m`, roughly 5 to 7 for a million buckets: even the worst bucket is short. The attack does not nudge the average; it destroys the distribution, forcing one chain to length `n` while the rest stay empty. That is why an averaged metric (mean insert time, overall throughput) shows nothing until the service is already stalled: the damage is entirely in the tail, exactly the measurement lesson from Lesson 02.
 
+The standard expected-probe formulas (Knuth, Vol. 3, Section 6.4) put numbers on the benign case, for both collision strategies Lesson 06 discussed. Chaining counts entries examined; linear probing counts slots examined:
+
+| Load factor `alpha` | Chaining, hit (`1 + alpha/2`) | Chaining, miss (`1 + alpha`) | Linear probing, hit (`(1 + 1/(1-alpha))/2`) | Linear probing, miss (`(1 + 1/(1-alpha)^2)/2`) |
+|---------------------|-------------------------------|------------------------------|---------------------------------------------|------------------------------------------------|
+| 0.25 | 1.13 | 1.25 | 1.17 | 1.39 |
+| 0.50 | 1.25 | 1.50 | 1.50 | 2.50 |
+| 0.75 | 1.38 | 1.75 | 2.50 | 8.50 |
+| 0.90 | 1.45 | 1.90 | 5.50 | 50.5 |
+| flooded (all `n` keys in one bucket) | `~n/2` | `n` | `~n/2`, and the cluster also slows every neighbouring key | `~n` |
+
+Two readings matter for a defender. First, the benign numbers are all small constants, which is why load-factor tuning is a performance knob and not a security control: no choice of `alpha` changes the flooded row. Second, open addressing is *worse* under attack than chaining, because a flooded run of slots is a primary cluster that innocent keys hashing nearby must also walk, so one tenant's keys slow lookups for unrelated keys that merely land in the same region.
+
+### Flooding cost per request: the number to put in a design doc
+
+The attacker's budget is request bytes; the defender's cost is comparisons. Converting one into the other tells you what limit to set. Assume about 20 bytes per key on the wire (a 16-character key plus separators) and 20 ns per string comparison:
+
+| Request body | Colliding keys | Chaining comparisons (`~n^2/2`) | CPU, chaining | Treeified `HashMap` (`~n log2 n`) | Same body, capped at 1,000 keys |
+|--------------|----------------|---------------------------------|---------------|-----------------------------------|---------------------------------|
+| 100 KB | 5,000 | 12,500,000 | 0.25 s | ~61,000 (1.2 ms) | 500,000 (10 ms) |
+| 1 MB | 50,000 | 1,250,000,000 | 25 s | ~780,000 (16 ms) | 500,000 (10 ms) |
+| 2 MB | 100,000 | 5,000,000,000 | 100 s | ~1,700,000 (34 ms) | 500,000 (10 ms) |
+
+The last column is why the 2011 fixes started with parameter caps: a cap bounds the worst case per request regardless of the hash, at the cost of rejecting legitimate requests above it. It does not bound the worst case across requests: a long-lived shared store (the idempotency store) accumulates keys from many requests, so a cap per request only slows an attacker who is willing to send many small requests. Long-lived stores need the keyed hash; per-request parsers can live with a cap.
+
 ### Non-string keys and custom hashCode
 
 The exposure is not limited to strings. Any key type whose hash an attacker can influence is a candidate, and the moment you write a custom `hashCode` (or `__hash__`, or implement `hash.Hash`) you have opted out of whatever the runtime's string hash does and taken responsibility yourself. Two common mistakes:
@@ -151,8 +190,24 @@ The rule: a key type's hash should depend on all the fields that `equals` depend
 
 - **2003, Crosby and Wallach**, *Denial of Service via Algorithmic Complexity Attacks* (USENIX Security): named the class, showed it against the Perl hash, the Squid cache, and an intrusion-detection system, and proposed universal hashing as the fix. This is the paper to cite.
 - **2011, 28C3, Klink and Walde**, *Efficient Denial of Service Attacks on Web Application Platforms*: demonstrated it against the POST-parameter parsers of most web platforms at once. PHP and others added a `max_input_vars` cap; several runtimes began randomizing their hash seed.
-- **2012, SipHash**, Aumasson and Bernstein: a fast keyed PRF designed precisely for hash-table keys. Python adopted hash randomization (PEP 456, SipHash) and enabled it by default in 3.3; Ruby, Rust (`SipHash` is the default `HashMap` hasher), Perl, and others followed.
+- **2012, SipHash**, Aumasson and Bernstein: a fast keyed PRF designed precisely for hash-table keys. Python enabled hash randomization by default in 3.3 and switched the string hash to SipHash in 3.4 (PEP 456); Ruby, Rust (`SipHash` is the default `HashMap` hasher), Perl, and others followed.
 - **Java's path**: Java 7u6 added an experimental seeded `String.hashCode` alternative (`jdk.map.althashing.threshold`) but it was fragile and was removed; Java 8's answer was treeification instead, which is why Java mitigates the symptom (long chains) rather than the cause (predictable buckets). A Java service exposed to adversarial keys should still prefer a keyed hash at the application layer.
+
+The same history as an incident timeline. Read the "response" column as a catalogue of defences, and notice that the first round of fixes was partly undone a year later because a seed alone was not enough:
+
+| When | Event | Response | Defence class |
+|------|-------|----------|---------------|
+| Aug 2003 | Crosby and Wallach publish algorithmic-complexity attacks (Perl, Squid, Bro IDS) | Perl 5.8.1 randomizes its hash seed | seed |
+| Dec 2011 | Klink and Walde at 28C3; coordinated advisory oCERT-2011-003 covers PHP, Java containers, ASP.NET, Python, Ruby, V8 | Microsoft ships out-of-band bulletin MS11-100 days later | patch |
+| Dec 2011 - Jan 2012 | Platform patches | PHP 5.3.9 adds `max_input_vars`; Tomcat adds `maxParameterCount`; Ruby randomizes its string hash | cap and seed |
+| Mar - Apr 2012 | Python 2.6.8, 2.7.3, 3.2.3 | hash randomization added behind an opt-in flag (`-R`), off by default for compatibility | seed (opt-in) |
+| Sep 2012 | Python 3.3 | hash randomization on by default | seed |
+| Dec 2012 | Aumasson, Bernstein, and Bosslet at 29C3, "Hash-flooding DoS reloaded" | show seed-independent collisions in seeded MurmurHash2/3 and CityHash; propose SipHash. Ruby moves to SipHash (CVE-2012-5371) | keyed PRF |
+| Mar 2014 | Java 8 | `HashMap` treeifies overfull bins; the Java 7u6 alternative string hashing is removed | bound the worst case |
+| Mar 2014 | Python 3.4 (PEP 456) | string and bytes hash become SipHash-2-4 | keyed PRF |
+| 2015 onward | Rust 1.0 ships SipHash as the default `HashMap` hasher; later Python and Rust move to the faster SipHash-1-3 | keyed PRF by default | keyed PRF |
+
+Two lessons fall out of the timeline. First, every platform reached for the cheapest defence first (a cap), then a seed, and only after the 29C3 work for a real keyed PRF: the same order a team under incident pressure tends to follow, and the reason to design the end state up front. Second, the defences are layered, not alternatives: PHP still has `max_input_vars`, Java still treeifies, and Python web frameworks add their own field limits on top of a SipHash-keyed `dict`. A payments service should layer the same way.
 
 ### Why payments amplifies the attack
 
@@ -210,6 +265,45 @@ A keyed hash is only as unpredictable as its key. The key must be drawn once at 
 
 Rotation is rarely needed: because the key never leaves the process and a restart draws a fresh one, ordinary deploys rotate it for free. The only question worth asking is whether a long-lived process handling adversarial input should periodically rehash under a new key, which trades a rare O(n) rehash for defence-in-depth against a key that might have leaked; most services decide the restart cadence already covers it.
 
+### Designing the defence for a Java idempotency store
+
+Put the pieces together for the store in The Problem. Each layer catches something the others miss, and the cost column is what you defend in review:
+
+| Layer | What it stops | What it misses | Cost |
+|-------|---------------|----------------|------|
+| Key format validation (length 1-255, printable ASCII) | oversized keys that make each comparison expensive | equal-hash keys of normal length | negligible |
+| Per-tenant key quota and rate limit | one tenant growing the shared store without bound | a slow, patient flood under the quota | one counter per tenant |
+| Keyed hash on the key wrapper | precomputed colliding sets, for every map that uses the wrapper | an attacker who learns the process key | one HMAC per key, about 1 microsecond |
+| `Comparable` key so `HashMap` can treeify | the residual worst case if the hash ever degrades | non-`HashMap` structures | none |
+| Request timeout and a max-chain-length metric | silent tail damage; turns an attack into an alert | nothing on its own; it detects, it does not prevent | one histogram |
+
+The JDK has no SipHash, so an application-layer keyed hash in Java usually wraps the key and computes HMAC-SHA-256 from `javax.crypto` once, at construction, caching the result. The `Mac` instance is created per call here for clarity; production code keeps one per thread.
+
+```java
+final class IdemKey implements Comparable<IdemKey> {
+    private static final byte[] PROCESS_KEY = new byte[32];
+    static { new SecureRandom().nextBytes(PROCESS_KEY); }   // per process, never logged
+
+    private final String raw;
+    private final int hash;
+
+    IdemKey(String raw) { this.raw = raw; this.hash = keyedHash(raw); }
+
+    private static int keyedHash(String s) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(PROCESS_KEY, "HmacSHA256"));
+            return ByteBuffer.wrap(mac.doFinal(s.getBytes(StandardCharsets.UTF_8))).getInt();
+        } catch (GeneralSecurityException e) { throw new IllegalStateException(e); }
+    }
+    @Override public int hashCode() { return hash; }
+    @Override public boolean equals(Object o) { return o instanceof IdemKey k && k.raw.equals(raw); }
+    @Override public int compareTo(IdemKey o) { return raw.compareTo(o.raw); }
+}
+```
+
+Three design choices are worth defending. The hash is cached, so a key that is looked up many times pays for HMAC once. `equals` still compares the raw string, so a hash collision (which remains possible, just unpredictable) never merges two different keys. And the type is `Comparable`, so if the keyed hash were ever misconfigured, for instance by a test-only fixed key leaking into production, `HashMap` treeification still caps the damage at `O(log n)`. In Python and Go the wrapper is unnecessary: `dict` already uses keyed SipHash, and Go's runtime map hash is seeded per map with a hardware-assisted function (AES-based on supported CPUs), though Go's seeding is an implementation detail rather than a language promise.
+
 ### Measuring your own exposure
 
 You do not need the attacker's input to find the exposure; you need to know which maps are reachable with influenced keys. A quick audit:
@@ -231,6 +325,8 @@ The output of this audit is the `outputs/` checklist below, filled in for your s
 1. **Reinforce.** Compute `"Aa".hashCode()` and `"BB".hashCode()` by hand with the `h = 31 * h + c` rule and confirm they are equal. Then explain in two sentences why `HashMap.hash()` spreading the high bits into the low bits does **not** help against these keys, even though it improves distribution on benign keys.
 2. **Apply.** You own an idempotency store keyed by a client-supplied header on a shared hot path, running on Java 17. Write the threat model (who the adversary is, what they control, what they gain) and choose a defence from this lesson's list. Justify why you did or did not rely on Java 8 treeification, and state one input-validation control you would add regardless of the hash.
 3. **Extend.** Combine with Lesson 06 and Lesson 02: Lesson 06's hand-rolled chaining map has no treeification. Describe the minimal change that restores an expected-O(1) bound under adversarial keys (seed the hash with a per-process random value fed through a mixing function), and explain, using the amortized-analysis vocabulary from Lesson 02, why "expected O(1) with a random seed" is a different guarantee from "amortized O(1)" and which adversary each one does and does not defend against.
+4. **Apply (numbers).** A rate-limiter map uses linear probing and resizes at load factor 0.9 to save memory. Using the expected-probe table, compute the expected probes for a miss at 0.9 and at 0.75, and the extra probes per second at 50,000 checks per second. Then explain why lowering the load factor would not help at all if the map's keys were attacker-chosen and its hash unseeded.
+5. **Design.** Your service accepts webhook payloads whose JSON object keys are merchant-defined and parsed into a `HashMap`. Using the incident timeline, write the three-layer defence you would ship (one cap, one hash change, one detection signal), state the request size at which your cap bounds parsing to under 10 ms using the flooding-cost table, and name the one platform event in the timeline that shows why a seed alone is insufficient.
 
 ## Key Terms
 
@@ -242,6 +338,7 @@ The output of this audit is the `outputs/` checklist below, filled in for your s
 | HashDoS | "hash flooding" | An algorithmic-complexity denial of service that forces a hash table into its O(n) worst case by sending keys that share a bucket |
 | Seeded hash | "salted hash" | A hash keyed by a per-process random value so the colliding set is unknown to an attacker; only defeats the attack if the function mixes the seed, not merely adds it |
 | Keyed PRF (SipHash) | "a fast secure hash" | A pseudorandom function over byte strings with a secret key; unpredictable without the key but not collision-resistant, which is exactly what a table needs |
+| Load factor | "how full the table is" | `alpha = n / m`; sets the expected probe count on benign keys, and has no effect on the flooded worst case |
 | Treeification | "Java's hash fix" | Converting an overfull `HashMap` bucket to a red-black tree so its worst case is O(log n) not O(n); caps damage, does not hide the bucket |
 
 ## Further Reading

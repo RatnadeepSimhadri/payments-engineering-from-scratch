@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Two inputs are both sorted by the same key. What is the least memory a join over them needs, and which algorithm gives it?",
+      "options": ["O(n) memory, by building a hash table of the smaller input", "O(log n) memory, by binary searching one input for each key", "O(1) memory per key group, by advancing two cursors in lockstep", "O(n log n) memory, by re-sorting both inputs on the join key"],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "Sorted inputs allow a merge join: compare the two heads, emit or advance the smaller, advance both on equality. This is the merge step of merge sort and needs only the current group in memory. A hash join is the right choice when inputs are unsorted, but it holds a whole side in memory, which is exactly what fails at a few hundred million records."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Why does the bucket key use the transaction date rather than the acquirer's settlement date?",
+      "options": ["Settlement date is not in the ledger, so T+1 records would land in different buckets", "Settlement date is in local time, while transaction date is always in UTC", "Transaction date sorts faster because it has fewer distinct values per day", "Scheme rules require that every reconciliation report is keyed by transaction date"],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The bucket key must contain only fields both sides share. Our capture carries the transaction date; the acquirer's settlement date is a day or more later. Bucketing by settlement date would separate every T+1 record from its capture and push nearly every bucket onto the slow path. Time zones and scheme rules are real concerns but are not why the key is chosen."
+    },
+    {
+      "stage": "check",
+      "question": "The bucket digest is the sum of mix(ref), the count, and the total. Why a sum rather than a hash of the concatenated references?",
+      "options": ["A sum is cryptographically stronger than a concatenated hash for short strings", "A sum is order-independent, so the feeds need not agree on order inside a bucket", "A sum avoids overflow, while hashing a long concatenation would overflow 64 bits", "A sum lets the reconciler recover which reference is missing from a bad bucket"],
+      "correct": 1,
+      "explanation": "Addition modulo 2^64 is commutative, so {A1, A2} and {A2, A1} produce the same digest and neither feed must sort within a bucket. A concatenated hash would require sorting references per bucket first. The sum is not cryptographically strong (an adversary could engineer collisions) and it cannot identify the missing reference; that is the slow path's job."
+    },
+    {
+      "stage": "check",
+      "question": "A processor record settles 6 days after its transaction with a 2-day tolerance. Why is it deferred out of its bucket's digest?",
+      "options": ["So the fast path can still match the bucket and the late record is never reported", "So the record is discarded, because late settlements are always the acquirer's mistake", "So the record's amount is excluded from the processor total that feeds the tie-out", "So the bucket cannot fast-match and the record reaches the cross-bucket pass as TIMING"],
+      "correct": 3,
+      "explanation": "Deferred late records are added to the processor total and parked as leftovers; a non-empty late list also forces the bucket onto the slow path. In the cross-bucket pass the pair has equal amounts and a lag beyond tolerance, so it becomes a TIMING break. If late records were folded into the digest, an otherwise identical bucket would fast-match and TIMING would never be reported."
     },
     {
       "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A run reports 510 breaks, but internalTotal differs from matchedTotal plus the internal-side break amounts by 7.00 USD. What should happen?",
+      "options": ["Treat the report as wrong and stop: a record was lost or double-counted", "Publish it with a note, because every one of the 510 breaks is individually correct", "Add a 7.00 USD adjustment break so that the summary totals balance again", "Rerun with a larger timing tolerance until the 7.00 USD difference disappears"],
+      "correct": 0,
+      "explanation": "The tie-out is the reconciliation of the reconciliation: every record must be matched or in exactly one break. A failed equation means the reconciler itself lost or double-counted a record, so the count of 510 cannot be trusted. Adding a plug break hides the defect, and widening the tolerance changes classification, not whether records are accounted for."
+    },
+    {
+      "stage": "post",
+      "question": "The same reference appears on the processor side in two different buckets (two amounts) and once internally. How does this reconciler report it?",
+      "options": ["One match plus one DUPLICATE, found through the set of matched references", "One AMOUNT_MISMATCH or match, and the extra copy shows up as MISSING_INTERNAL", "Two AMOUNT_MISMATCH breaks, one for each processor copy of the reference", "The run fails because a reference may not appear in more than one bucket"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Detecting a cross-bucket duplicate exactly needs a set of every matched reference, which is the O(n) memory the design avoids. The leftovers are paired positionally, and whatever is unpaired on the processor side surfaces as MISSING_INTERNAL. The lesson documents this limit and Exercise 3 adds a Bloom filter to flag it as a probable duplicate."
     }
   ]
 }

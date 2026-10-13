@@ -91,6 +91,45 @@ The ledger has no single posting of 9,870.30. It has 1,000 postings of 10.00 to 
 
 Your parsers' job is to make this table disappear: after parsing, nothing downstream knows which format a line came from except the `source` pointer kept for the evidence bundle.
 
+### A full run by hand: five lines, five postings
+
+Before the million-line run, work a whole account through every pass and both tie-out identities. USD operating account, statement opening balance 5,000.00, date tolerance 1 day.
+
+| Statement line | Date | Amount | Reference | Ledger posting | Date | Amount | `externalRef` |
+|----------------|------|--------|-----------|----------------|------|--------|---------------|
+| L1 | 03-03 | +250.00 | S-1 | P1 | 03-03 | +250.00 | S-1 |
+| L2 | 03-03 | +49.00 | none | P2 | 03-03 | +49.00 | sale-881 |
+| L3 | 03-04 | +49.00 | none | P3 | 03-04 | +49.00 | sale-907 |
+| L4 | 03-04 | -1,200.00 | PO-77 | P4 | 03-04 | -1,200.00 | PO-77 |
+| L5 | 03-04 | +19.99 | none | P5 | 03-04 | +75.00 | S-9 |
+
+The statement's closing balance is 5,000.00 + 250.00 + 49.00 + 49.00 - 1,200.00 + 19.99 = 4,167.99.
+
+1. **Pass 1 (reference).** L1 pairs with P1 on `S-1`; L4 pairs with P4 on `PO-77`. `S-9` appears on no line, so P5 falls through.
+2. **Pass 2 (amount and date).** L2 and L3 are both 49.00 and both P2 and P3 are within tolerance of each. Lines are walked in `(date, id)` order: L2 (03-03) picks P2 at distance 0 over P3 at distance 1; L3 then picks P3 at distance 0. A spreadsheet `VLOOKUP` on amount returns the first 49.00 for both lines and matches P2 twice, which is the Problem section's refund-to-sale mistake in miniature.
+3. **Pass 3 (aggregation).** No `batch` tag is present, so nothing groups.
+4. **Breaks.** L5 becomes `IN_STATEMENT_NOT_LEDGER` (+19.99). P5 becomes `IN_LEDGER_NOT_STATEMENT` (+75.00). Counts: 4 + 1 = 5 lines, 4 + 1 = 5 postings.
+
+Identity 1, over the statement alone: opening 5,000.00 + matched lines (250.00 + 49.00 + 49.00 - 1,200.00 = -852.00) + unmatched lines (19.99) = 4,167.99, which equals the closing balance. It holds by construction whenever every line lands in exactly one bucket, so it catches parser bugs, not matcher bugs.
+
+Identity 2, ledger against statement: the ledger's movement is 250.00 + 49.00 + 49.00 - 1,200.00 + 75.00 = -777.00. Removing what only the ledger has and adding what only the statement has gives -777.00 - 75.00 + 19.99 = -832.01, which equals the statement movement of 4,167.99 - 5,000.00. Now plant the M6 bug on a run with an aggregate group of 9,870.30: pass 3 marks the line matched but leaves its postings unconsumed, so they also appear as `IN_LEDGER_NOT_STATEMENT`. The ledger side subtracts 9,870.30 that the statement side still contains, and identity 2 is off by exactly 9,870.30. That is why the second identity is the one that catches engine bugs.
+
+### How each failure surfaces
+
+| Failure in the inputs or the engine | What the engine reports | Where it is caught |
+|-------------------------------------|-------------------------|--------------------|
+| Two lines share an amount and only one has a counterpart | one pass 2 match by date distance, one `IN_STATEMENT_NOT_LEDGER` | M2 step 5 |
+| Acquirer nets fees and rounding drifts by 0.01 | `AMOUNT_MISMATCH` of 0.01 on the aggregate group | M3 step 1 |
+| Bank sends the same line twice | `DUPLICATE_IN_STATEMENT`; the first copy still matches | M2 step 2 |
+| NACHA file truncated in transit | `FILE_CONTROL_MISMATCH`; no lines enter the matcher | M1 step 4 |
+| Matcher consumes one side of a pair but not the other | `TIE_OUT_FAILED` with the discrepancy | M6 step 2 |
+| Re-run after a crash between result and store write | identical result; no break opened twice | M3 step 3 |
+| Input file edited after the run | `verify` names the file whose hash changed | M6 step 3 |
+
+### Deciding where a new break type belongs
+
+When a real file produces a difference the taxonomy does not name, resist adding an enum value first. Ask in order: does one side lack the item entirely (`IN_*_NOT_*`)? Do both sides have it with a different amount or date (`*_MISMATCH`)? Does one side have it twice (`DUPLICATE_*`)? Did money come back (`RETURNED`)? Only if all four answers are no is it a new type, and then it needs an owner, an action, and a classifier-table row before it ships.
+
 ## Requirements
 
 Each requirement is a sentence you can turn into a test. The milestone that first satisfies it is in brackets.
@@ -219,7 +258,7 @@ func TestM5ScalesLinearithmically(t *testing.T) {
 
 ### Milestone 6: Tie-out, report, and evidence
 
-Implement `TieOut.compute(statement, result)`: `opening + sum(matched line amounts) + sum(unmatched line amounts) == closing` must hold trivially because every line is in one bucket; the second identity `ledgerMovement + sum(IN_LEDGER_NOT_STATEMENT) - sum(IN_STATEMENT_NOT_LEDGER) + mismatches == statementMovement` is the one that catches engine bugs. Print both as arithmetic. Generate `reports/recon-<account>-<date>.md` with the sections in Requirement 14. Build `EvidenceBundle.write(dir)` with `manifest.json` listing every input hash, the result hash, config, and engine version, and `EvidenceBundle.verify(dir)`.
+Implement `TieOut.compute(statement, result)`: `opening + sum(matched line amounts) + sum(unmatched line amounts) == closing` must hold trivially because every line is in one bucket; the second identity `ledgerMovement - sum(IN_LEDGER_NOT_STATEMENT) + sum(IN_STATEMENT_NOT_LEDGER) + sum(mismatch differences, statement minus ledger) == statementMovement` is the one that catches engine bugs. Print both as arithmetic. Generate `reports/recon-<account>-<date>.md` with the sections in Requirement 14. Build `EvidenceBundle.write(dir)` with `manifest.json` listing every input hash, the result hash, config, and engine version, and `EvidenceBundle.verify(dir)`.
 
 Acceptance test `m6_report_ties_out_and_evidence_verifies`:
 

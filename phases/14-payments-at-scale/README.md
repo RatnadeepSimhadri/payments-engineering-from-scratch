@@ -2,7 +2,7 @@
 
 > At scale, every rare bug is a daily event.
 
-11 lessons, 10 complete, ~17 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
+11 lessons, 11 complete, ~17 hours. Generated from `curriculum/curriculum.json` by `scripts/build_catalog.py`.
 
 ## Start this phase
 
@@ -18,7 +18,7 @@ With an agent tutor: `/learn` (Claude Code), `learn` (Codex), or `Use learn to t
 | 01 | [Architecture of a High-Availability Payment Gateway](01-high-availability-payment-gateway/) | Learn | ~90 min | ✅ | Stateless edges, durable cores, and where the idempotency store lives. |
 | 02 | [Multi-Region Ledgers and Home-Region Routing](02-multi-region-ledgers/) | Learn | ~90 min | ✅ | An account lives somewhere; route to it. |
 | 03 | [Exactly-Once Money Movement End to End](03-exactly-once-money-movement/) | Build | ~150 min | ✅ | Idempotency, outbox, consumer dedupe, and a ledger that cannot double-post. |
-| 04 | [Reconciliation at Scale: Streams, Buckets, and Breaks](04-reconciliation-at-scale/) | Build | ~120 min | 🚧 | Match a billion records a day and surface the breaks. |
+| 04 | [Reconciliation at Scale: Streams, Buckets, and Breaks](04-reconciliation-at-scale/) | Build | ~120 min | ✅ | Match a billion records a day and surface the breaks. |
 | 05 | [Batch vs Real-Time Settlement Pipelines](05-batch-vs-real-time-settlement/) | Build | ~90 min | ✅ | The nightly job that moves the actual money. |
 | 06 | [Observability for Money Movement](06-observability-for-money-movement/) | Build | ~90 min | ✅ | Metrics that detect a stuck payment before a customer does. |
 | 07 | [Incident Management for Payments](07-payment-incident-management/) | Learn | ~60 min | ✅ | Stop the bleeding, then reconcile. |

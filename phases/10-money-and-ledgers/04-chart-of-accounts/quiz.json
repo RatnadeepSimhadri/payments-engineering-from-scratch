@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A wallet customer's 500.00 balance sits in the platform's bank account. How should the 500.00 owed to the customer be classified?",
+      "options": ["As an asset, because the cash is in our bank account", "As revenue, because the platform received the payment", "As a liability, because the customer has a claim to it", "As equity, because it is held until the customer spends it"],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "The bank balance is the asset; the obligation to the customer is a separate, matching liability. Treating it as an asset is the classic mistake: if the company stopped trading tonight the customer would have a legal claim to the 500.00, which is the lesson's test for a liability."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Which account types are debit-normal, and where does that rule come from?",
+      "options": ["Assets and expenses, from ASSETS + EXPENSES = LIABILITIES + EQUITY + REVENUE", "Assets and revenue, because both of them grow when money comes in", "Liabilities and expenses, because both represent outflows of money", "Assets only; every other type is credit-normal by bookkeeping custom"],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Rearranging the accounting equation puts assets and expenses on the left (debit-normal) and liabilities, equity, and revenue on the right (credit-normal). Revenue does grow when money comes in, but it sits on the right of the equation, so a credit increases it."
+    },
+    {
+      "stage": "check",
+      "question": "A platform withholds 5% of a merchant's sales for 90 days as a reserve. What type is account 2300 Merchant Reserve?",
+      "options": ["ASSET, because the withheld cash sits in the platform's bank", "LIABILITY, because the merchant is still owed the withheld amount", "EXPENSE, because it covers future chargeback losses as they arise", "REVENUE, because the platform keeps it whenever a chargeback lands"],
+      "correct": 1,
+      "explanation": "The platform has only delayed payment; the merchant remains owed the reserve until it is released or applied to a chargeback. The cash is an asset in the bank account, but that is a different account from the obligation the reserve records."
+    },
+    {
+      "stage": "check",
+      "question": "The merchant sub-ledger balances sum to 1,284,311.07 and GL control account 2100 shows 1,284,290.07. What does this tell you?",
+      "options": ["Nothing, as long as the general-ledger trial balance sums to zero", "Rounding drift across forty thousand accounts, which is expected", "The GL is batched daily, so it always lags the sub-ledger slightly", "Something posted 21.00 to one ledger and not the other; investigate"],
+      "correct": 3,
+      "explanation": "The control-account invariant says the sum of sub-ledger balances equals the GL balance exactly; a break means a posting reached one and not the other. A balanced trial balance does not help: each ledger can balance internally while disagreeing with the other."
     },
     {
       "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
+      "question": "In the marketplace example a seller has been paid out, then the buyer is refunded. Which entry records what the seller now owes?",
+      "options": ["Dr 2100 Seller Payable, leaving the payable with a negative balance", "Dr 4100 Commission Revenue for the full refunded order amount", "Dr 1250 Seller Receivable, an asset for the amount the seller owes", "Dr 5300 Bad Debt immediately, since the seller was already paid"],
+      "correct": 2,
+      "explanation": "Once the payable is zero the seller owes the platform money, which is a claim the platform controls: an asset. Driving 2100 negative is the strongest distractor; it balances, but it hides credit risk inside a liability and can make the payout job try to pay a negative amount. Write-off to bad debt comes only if collection fails."
+    },
+    {
+      "stage": "post",
+      "question": "Under safeguarding rules, which daily check should the chart let the platform run without reconstruction?",
+      "options": ["Safeguarding bank (1020) balance at least Customer Funds (2200) balance", "Settlement Bank (1010) balance at least Merchant Payable (2100) balance", "Fee Revenue (4100) balance at least Processor Fees (5200) balance", "Processor Receivable (1200) balance equals zero at the end of each day"],
+      "correct": 0,
+      "explanation": "Safeguarding requires customer funds to be held in a segregated, identifiable account and reconciled against what is owed to customers, so the chart needs one asset account for the segregated bank and one liability account for customer funds. 1010 is the company's own operating cash and must not be the account that covers customer money."
     }
   ]
 }

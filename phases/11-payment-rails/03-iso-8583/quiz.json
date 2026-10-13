@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A binary record has no delimiters and no field tags between its values. What must a parser know to find where each value starts?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "A checksum at the end of the record that marks each boundary",
+        "The byte offsets of every field, sent in a separate header message",
+        "Which fields are present and the length rule of every preceding field",
+        "The character set, because a change of character class ends a field"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "With no delimiters, position is cumulative: a field starts where the previous present field ended, so the parser needs the presence map (the bitmap) and each field's length rule (the dictionary). Guessing boundaries from a change of character class fails as soon as two adjacent numeric fields meet, such as DE11 followed by DE12."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A request carries data elements 2, 3, 4, 7, 11, 12, 13, 22, 37, 41, 42, and 49. What is the first byte of the primary bitmap?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "0x72, because bits 2, 3, 4, and 7 are set and bit 1 is clear",
+        "0xF2, because bit 1 is always set when the bitmap is present",
+        "0x4E, because the lowest element sits in the least significant bit",
+        "0x70, because DE7 belongs to the second byte of the bitmap"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "Byte 1 covers bits 1 to 8 with bit 1 as the most significant bit: 0 1 1 1 0 0 1 0 is 0x72. Bit 1 is set only when an element above 64 is present, which would make it 0xF2; reading the byte least-significant-first would give 0x4E, the mirror image."
+    },
+    {
+      "stage": "check",
+      "question": "The decoder reads an LLVAR prefix of 99 for DE2, whose dictionary maximum is 19. What should it do?",
+      "options": [
+        "Read 19 characters and treat the remaining 80 as the next element",
+        "Read all 99 characters, because the sender's prefix is authoritative",
+        "Truncate the PAN to 19 digits and log a warning before forwarding it",
+        "Reject the message with an error naming DE2 and the announced length"
+      ],
+      "correct": 3,
+      "explanation": "An announced length above the dictionary maximum means the message is malformed, and every way of continuing produces a wrong field. Trusting the prefix is the strongest distractor: it is exactly the bug in The Problem that read the merchant name into the PAN and broke the audit insert."
+    },
+    {
+      "stage": "check",
+      "question": "DE4 is 000000012345 and DE49 is 414 (Kuwaiti dinar, exponent 3). How should the parser represent the amount?",
+      "options": [
+        "As the double 123.45, using the usual two-decimal rule for amounts",
+        "As Money with 12345 minor units in KWD, which is 12.345 dinars",
+        "As the string 000000012345, leaving interpretation to the ledger",
+        "As BigDecimal 12345.000, using DE49 only to choose the display scale"
+      ],
+      "correct": 1,
+      "explanation": "DE4 is an integer count of minor units and the exponent comes from ISO 4217 for the DE49 currency, so the value is 12345 fils, or 12.345 KWD, held as Money with no decimal or float. Applying a default two-decimal rule is the reversal bug in The Problem that produced an amount off by one fils."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "Why do the tests assert encode(decode(bytes)) equals the original bytes, rather than only comparing decoded field maps?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Byte comparison is faster than comparing two maps field by field",
+        "Field maps cannot be compared because Java and Go order them differently",
+        "Network certification requires a byte-level test before go-live",
+        "Byte equality also catches reordering, prefix padding, and trimming"
       ],
-      "correct": 1,
-      "explanation": "TODO"
+      "correct": 3,
+      "explanation": "Two messages can decode to the same field map while differing on the wire: a padded length prefix, a trimmed fixed field, or reordered elements. Only byte equality proves encoder and decoder agree on every rule. Map ordering is a real difference between languages, but comparing values by key does not depend on it, so it is not the reason."
+    },
+    {
+      "stage": "post",
+      "question": "An issuer receives a message whose bitmap sets bit 63, and its dictionary has no entry for DE63. What is the correct behaviour?",
+      "options": [
+        "Fail with a format error naming DE63, because its length is unknown",
+        "Skip DE63 by reading to the end of the message and process the rest",
+        "Assume DE63 is LLLVAR, since private-use elements usually are",
+        "Clear bit 63 and re-encode the message without the unknown element"
+      ],
+      "correct": 0,
+      "explanation": "Without a dictionary entry the parser cannot know where DE63 ends, so any element after it would be read from the wrong offset. Guessing LLLVAR is the strongest distractor because it is often right, but when it is wrong the parser forwards corrupted fields; the fix is to add DE63 to the dictionary from the network specification."
     }
   ]
 }

@@ -2,6 +2,13 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-10-13 — High-priority gap fixes (199/199, verified by the stricter audit)
+
+- Audit tightened: now fails placeholder quizzes, docs below 350 (Build) / 300 (Learn, Capstone) lines, and Build lessons without an `outputs/` artifact. The tracker dropped from 199 to 183 complete, exposing the gaps.
+- Fixed all 32 gaps across 19 lessons: 16 placeholder quizzes rewritten, 11 missing artifacts added, 5 short lessons expanded (9/01 192→355, 1/07 254→351, 10/04 268→376, 15/06 273→312, 15/04 298→313).
+- Corrections found while fixing: 9/01 alert-latency claim (burn rate 8 fires after 4.5 h, not ~30 min); 15/06 tie-out identity signs; 1/07 SipHash arrived in Python 3.4 (PEP 456).
+- Verification: audit 199/199, 0 issues; no TODO quizzes; 143/143 Java Build lessons pass; 3/3 projects 4/4; skills in sync.
+
 ## 2026-10-13 — Batch 3: Phases 10–14 complete — Java pass DONE
 
 - Authored the final 38 Track C lessons: 161 → 199 complete. **Every lesson in the curriculum is complete in Java.**

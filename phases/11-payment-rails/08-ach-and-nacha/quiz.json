@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A fixed-width record holds an amount in a 10-character numeric field of US cents. How is 1,234.56 USD written?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "0001234.56, keeping the decimal point so the reader knows the scale",
+        "0000123456, right-justified and zero-filled as an integer of cents",
+        "123456    , left-justified and space-filled like the name fields",
+        "1234560000, left-justified and zero-filled to the field's full width"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "Amounts are integer minor units, and Nacha numeric fields are right-justified and zero-filled, so 123456 cents becomes 0000123456. Left-justifying is the strongest distractor because alphameric fields work that way, but a reader that parses the field as a number would see 1234560000 cents or reject the spaces."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "A batch has three entries to receiving DFIs 011999993, 061999998, and 121999993 (check digits included). What entry hash goes in the Batch Control?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "0195999984, the sum of the full nine-digit routing numbers",
+        "0000000003, the count of entries in the batch, zero-filled",
+        "Each prefix's check digit summed, then zero-filled to ten digits",
+        "0019599997, the sum of the eight-digit prefixes, zero-filled"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "The entry hash sums the eight-digit receiving DFI identification of each entry, excluding the check digit, and keeps the rightmost ten digits: 01199999 + 06199999 + 12199999 = 19599997. Summing the full nine-digit numbers is the common mistake; the receiver would compute a different hash and reject the batch."
     },
     {
-      "stage": "post",
-      "question": "TODO",
+      "stage": "check",
+      "question": "A subscription business debits a consumer's checking account under an authorization captured on its website. Which SEC code and transaction code apply?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "WEB in the Batch Header and 27 on each Entry Detail record",
+        "PPD in the Batch Header and 22 on each Entry Detail record",
+        "CCD in the Batch Header and 27 on each Entry Detail record",
+        "WEB in the Batch Header and 37 on each Entry Detail record"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The SEC code says how the debit was authorized (WEB: online, consumer) and the transaction code says account type and direction (27: checking debit). 37 is the closest distractor, but it debits a savings account; PPD with 22 would be a consumer credit, and CCD is for business receivers."
+    },
+    {
+      "stage": "check",
+      "question": "An entry settles on Thursday 2026-10-15. What is the last date an RDFI may return it with R01, Insufficient Funds?",
+      "options": [
+        "Saturday 2026-10-17, two calendar days after the settlement date",
+        "Friday 2026-10-16, one banking day after the settlement date",
+        "Monday 2026-10-19, two banking days after the settlement date",
+        "Monday 2026-12-14, sixty calendar days after the settlement date"
+      ],
+      "correct": 2,
+      "explanation": "R01 is an operational return with a two-banking-day window: Friday is day one, the weekend is skipped, and Monday the 19th is day two. The sixty-calendar-day window applies to unauthorized-debit returns such as R10, which is why a business that treats settlement as final keeps receiving returns for weeks."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "Why does the entry hash sum receiving routing numbers when the Batch Control already carries total debits and total credits?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "It is a cryptographic checksum that proves the file was not tampered with",
+        "It lets the ACH Operator sort entries to the receiving banks more quickly",
+        "It catches an entry sent to the wrong bank even when its amount is right",
+        "It replaces the trace number as the key for matching returns to entries"
       ],
-      "correct": 1,
-      "explanation": "TODO"
+      "correct": 2,
+      "explanation": "Amount errors are already caught by the debit and credit totals; the entry hash covers a different field, so a shifted or altered routing number changes a declared total. It is not cryptographic: anyone can recompute it, and the format's authentication comes from the transport and the ODFI agreement, not from the file."
+    },
+    {
+      "stage": "post",
+      "question": "Debits come back with R01, R02, R09, and R10. Which of them may the Originator re-present?",
+      "options": [
+        "All four, as long as each is retried within two banking days",
+        "R01 and R10, because the customer can fund or approve the debit later",
+        "Only R02, after the customer provides a replacement account number",
+        "R01 and R09, at most twice more within 180 days, marked RETRY PYMT"
+      ],
+      "correct": 3,
+      "explanation": "Only insufficient and uncollected funds may be re-presented, up to two more times within 180 days of the original settlement, with the description RETRY PYMT. R10 is the dangerous distractor: it means the customer says the debit was not authorized, so retrying it is a new unauthorized debit that counts toward the 0.5 percent threshold."
     }
   ]
 }

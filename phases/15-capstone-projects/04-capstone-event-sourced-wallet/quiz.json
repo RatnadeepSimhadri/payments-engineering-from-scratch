@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A wallet table holds only the current balance. The regulator asks for each wallet's balance at 23:59:59 last Saturday. What does the system need to answer?",
+      "options": ["A nightly backup of the wallets table taken shortly after midnight", "An index on updated_at so the most recent change can be found quickly", "A read replica that lags the primary by a known, fixed interval", "A complete, ordered history of every change that can be folded to that time"],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "A point-in-time balance is a fold over every event up to that instant, so it needs a complete history. A backup is a snapshot at one arbitrary moment and misses changes between midnight and the backup; an updated_at index only finds the last change, not the value before it. This is why the capstone makes the event stream the source of truth and the balance derived data."
     },
     {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "stage": "check",
+      "question": "Two writers both load wallet w-1 at version 6 and decide a top-up. Writer A appends first. What happens to writer B under Requirements 4 and 6?",
+      "options": ["Its append succeeds at version 8, since appends are serialized by the store lock", "Its append fails with VERSION_CONFLICT; it reloads version 7 and re-decides", "Its append is merged with A's batch so both credits land at version 7 together", "Its command is rejected as a duplicate because it shares a version with A's"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "append succeeds only if the current version equals expectedVersion. After A, the stream is at 7, so B's append with expectedVersion 6 fails and writes nothing. The handler reloads, re-decides against the new balance, and retries up to 3 times. A store lock serializes writes but would not by itself stop B from deciding on a stale balance; the version check is what ties the decision to the state it read."
+    },
+    {
+      "stage": "check",
+      "question": "A wallet has balance 1,000.00 and a 300.00 hold. CaptureHold for 280.00 succeeds. What does Milestone 3 expect in the stream?",
+      "options": ["HoldCaptured(280.00) and HoldReleased(20.00) in one batch, so version advances by two", "A single HoldCaptured(280.00) event; the 20.00 remainder stays held until expiry", "A Debited(280.00) event followed later by a separate ReleaseHold command for 20.00", "HoldCaptured(300.00) followed by Credited(20.00) to refund the unused part of the hold"],
+      "correct": 0,
+      "explanation": "Requirement 8 and the decision table choose two events in one batch: the capture and the release of the remainder are atomic, and the version advances by two. Leaving 20.00 held would understate available balance; a separate later command could be lost between the two steps. Capturing 300.00 and crediting 20.00 would misstate what actually happened."
+    },
+    {
+      "stage": "check",
+      "question": "The projection runner crashes after handling position 150 but before saving the checkpoint. What must be true for Milestone 4 step 2 to pass?",
+      "options": ["The checkpoint is saved before handling so the event is never seen twice", "The runner rewinds to position 0 and rebuilds every projection after a crash", "The handler is idempotent on (streamId, version) so re-handling changes nothing", "The store deletes position 150 so it cannot be delivered again after restart"],
+      "correct": 2,
+      "explanation": "Saving after handling gives at-least-once delivery, so on restart position 150 is handled again and the handler must recognise it by (streamId, version). Saving the checkpoint first would turn a crash into a lost event, which is worse. A full rebuild works but is not the requirement, and the store never deletes events."
+    },
+    {
+      "stage": "post",
+      "question": "With a 10,000.00 INR cap and 4,000 concurrent TopUp(7.00) commands against an empty wallet, what is the maximum number accepted?",
+      "options": ["1,429, because the cap check runs before the credit is added", "4,000, because each top-up alone is far below the 10,000.00 cap", "1,428, leaving 9,996.00; the next would reach 10,003.00", "1,000, because the daily credit limit stops the run first"],
+      "correct": 2,
+      "explanation": "The cap applies to balance after the command, so a top-up is accepted only if balance plus 7.00 is at most 10,000.00. 1,428 times 7.00 is 9,996.00; one more would be 10,003.00 and is rejected BALANCE_CAP_EXCEEDED. 1,429 is the off-by-one you get by checking the balance before adding. The daily limit is 50,000.00, well above the cap."
+    },
+    {
+      "stage": "post",
+      "question": "Requirement 14 adds a channel field in Credited v3. A stream holds v1 events written two years ago. How does the reference design handle them?",
+      "options": ["A one-time migration rewrites every v1 event in place to the v3 shape", "Upcasters rewrite v1 to v3 on read; the log on disk keeps the v1 bytes", "evolve checks schemaVersion and contains a branch for each historical shape", "The v1 events are archived and replaced by a snapshot written at version v"],
+      "correct": 1,
+      "explanation": "Upcasting happens on read, so the aggregate and projections only see the current shape while the log stays immutable; M6 step 2 asserts the raw bytes still contain v1. Rewriting the log violates the rule that events are never updated. Branching inside evolve spreads knowledge of old shapes through the domain code instead of keeping it in the upcaster."
     }
   ]
 }

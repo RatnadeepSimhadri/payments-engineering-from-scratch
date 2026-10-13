@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A remittance backend converts 19.99 USD at 0.308 and credits 6.15 KWD, rounding to two decimals like every other currency. What went wrong?",
+      "options": ["The rate should have been inverted before multiplying", "The amount should have been rounded down to protect the platform", "KWD has three decimals, so 6.157 KWD was due, not 6.15", "Two decimals is right, but HALF_EVEN should have been used"],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "The ISO 4217 exponent for KWD is 3, so the correct minor unit is the fils and the exact result 6.15692 rounds to 6.157. Changing the rounding mode would not help: any mode applied at two decimals still discards a whole fils of precision the currency has."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Converting 19.99 USD to JPY at 14937/100, what does the single exact conversion produce with HALF_EVEN?",
+      "options": ["2986 JPY, from 29,859,063 / 10,000 = 2985.9063 yen", "2985 JPY, because yen amounts are always truncated toward zero", "298,591 JPY, because the USD cents are kept as yen sen", "2985.91 JPY, keeping two decimals to match the USD input"],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The numerator is 1999 x 14937 x 1 (JPY exponent 0) and the denominator is 100 x 100 (rate denominator times the USD minor units), giving 2985.9063, which rounds to 2986. Keeping two decimals is the KWD bug in reverse: JPY has no minor unit, so 2985.91 JPY is not a legal amount."
+    },
+    {
+      "stage": "check",
+      "question": "EUR/GBP is crossed from USD/EUR (10 s old, 20 bps) and USD/GBP (90 s old, 50 bps). What provenance does the derived rate carry?",
+      "options": ["The newer timestamp (10 s) and the narrower spread (20 bps)", "The average timestamp (50 s) and the summed spread (70 bps)", "No timestamp at all, since derived rates are always recomputed", "The older timestamp (90 s) and the wider spread (50 bps)"],
+      "correct": 3,
+      "explanation": "A cross rate is only as fresh as its stalest input and at least as wide as its widest parent, so `cross` takes min(observedAt) and max(spreadBps). Taking the newer timestamp would let a stale USD/GBP rate pass a freshness check it should fail."
+    },
+    {
+      "stage": "check",
+      "question": "19.99 USD converts to 18.42 EUR and back at the same rate to 19.98 USD. Where does the 0.01 USD go?",
+      "options": ["Nowhere: it is display rounding and is fixed by more decimals", "To an FX rounding gain account, since the platform's USD pool kept it", "Back to the customer automatically on the next conversion they make", "To spread revenue, since the platform priced the conversion"],
+      "correct": 1,
+      "explanation": "Each of the two roundings was correct in isolation, and together they left one cent in the platform's USD pool that it does not owe anyone; that is FX rounding gain and must be posted so the trial balance still sums to zero. It is not spread revenue: both legs used the mid rate, so no spread was charged."
     },
     {
       "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A RateTable based on USD has maxAge 300 s. USD/EUR is 10 s old and USD/GBP is 400 s old. What does rate(EUR, GBP, now) do?",
+      "options": ["Returns the cross rate, because one of its two inputs is still fresh", "Throws StaleRateException naming USD/GBP, the input that is too old", "Returns the last cached EUR/GBP rate and logs a staleness warning", "Throws StaleRateException naming EUR/GBP, the pair that was requested"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "`rate` calls requireFresh on each direct input before crossing, so the USD/GBP check fails first and its message names that pair and its age. The error is about the input, not the derived EUR/GBP pair, which is what tells an operator which provider feed has stalled."
+    },
+    {
+      "stage": "post",
+      "question": "Why does FxRate.bid() return a rate with spreadBps set to 0 instead of carrying the original 50 bps?",
+      "options": ["Because spreads only apply to cross rates, not to direct quotes", "Because a zero spread makes the bid rate equal to the mid rate", "Because the spread is already applied, and 0 makes double use visible", "Because the gcd reduction in the constructor discards the spread field"],
+      "correct": 2,
+      "explanation": "bid() multiplies the mid by (20000 - 50) / 20000, so the spread is already in the numerator; recording 0 means calling bid() again cannot silently widen it twice. The bid value still differs from mid; only the metadata says no further spread remains to apply."
     }
   ]
 }

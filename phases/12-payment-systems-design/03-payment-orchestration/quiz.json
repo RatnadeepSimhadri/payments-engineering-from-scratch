@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A checkout makes four calls in a single try block: tokenize, authorize, capture, ledger post. Capture fails with auth_expired and the handler returns 500. What is left behind?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Nothing, because the failed capture rolls back the earlier authorization",
+        "A hold on the customer's card and a stored token that nothing will clean up",
+        "A ledger entry crediting the merchant for a payment that was never captured",
+        "A captured payment that the merchant must refund manually to the customer"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "The authorization and the token were real side effects on other systems, and no code undoes them, so the hold stays until it expires and the token violates the vault's retention policy. The ledger post never ran because it comes after capture; a remote call has no transaction to roll back."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "The process crashes after the acquirer approved AUTHORIZE but before the saga record was saved. What makes recovery safe?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The recovering process voids every authorization it finds for the payment",
+        "The acquirer rejects any second authorization for the same card and amount",
+        "Recovery skips AUTHORIZE when the saga record shows that TOKENIZE is done",
+        "The step key saga_5:authorize:fwd is reused, so the acquirer replays its reply"
       ],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "The key is a pure function of saga id, step, and direction, with no attempt number, so the retried call is recognized and the stored response is returned without a second hold. Acquirers do not dedupe on card and amount; two legitimate purchases of the same price are common."
     },
     {
-      "stage": "post",
-      "question": "TODO",
+      "stage": "check",
+      "question": "CAPTURE returns the business decline auth_expired. What does the orchestrator do?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "Begin compensation at once, since a decline is an answer, not an outage",
+        "Retry the capture with the same key until the retry budget is exhausted",
+        "Retry the capture with a new key in case the stored decline was stale",
+        "Move the saga straight to DEAD_LETTERED so a human can inspect the decline"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "A decline means the downstream looked at the request and refused it; retrying gets the same answer and, for some codes, network penalties. Retrying within a budget is the right reaction to an outage, where the outcome is unknown. Dead-lettering is for compensations that cannot complete, not forward declines."
+    },
+    {
+      "stage": "check",
+      "question": "LEDGER_POST fails past its budget after CAPTURE succeeded. The capture is refunded. What is the compensation for AUTHORIZE?",
+      "options": [
+        "Void the authorization, because every DONE step runs its listed compensation",
+        "Refund the amount a second time, because the void and refund are equivalent",
+        "A recorded no-op, because the capture consumed the auth and was refunded",
+        "Dead-letter the saga, because a captured authorization cannot be compensated"
+      ],
+      "correct": 2,
+      "explanation": "A compensation restores the state the downstream would have had given everything since; the refund already returned the money and a captured authorization cannot be voided. Running the listed void mechanically is the strongest distractor: the acquirer refuses with already_captured, which would wrongly dead-letter the saga."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "voidAuth keeps failing with an outage until its compensation budget is exhausted. What happens next, and why?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "The saga is marked COMPENSATED, because the hold will expire within seven days",
+        "The saga is dead-lettered and skipped by recover() until a human redrives it",
+        "recover() retries it on every restart, because an unfinished saga must resume",
+        "The orchestrator compensates the failed void by capturing and refunding instead"
       ],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "A compensation cannot itself be compensated and must not be abandoned, so it is parked with its record intact for someone accountable. Retrying on every restart is the tempting answer, but during a downstream outage it turns each deploy into a retry storm against the system that is already down."
+    },
+    {
+      "stage": "post",
+      "question": "Why does the saga store save and load copies of the record instead of returning the stored object itself?",
+      "options": [
+        "Copies let several orchestrator threads modify one saga without any locks",
+        "Copies use less memory than shared references once the sagas are archived",
+        "Copies are required so that the idempotency keys can be derived from them",
+        "An unsaved change is then lost on a crash, just like an uncommitted row"
+      ],
+      "correct": 3,
+      "explanation": "If the orchestrator mutated the stored object directly, a crash between a downstream call and save would still leave the change visible, and the tests would hide exactly the bug recovery must handle. Copies do not make concurrent modification safe; that is the job of the store's version check."
     }
   ]
 }

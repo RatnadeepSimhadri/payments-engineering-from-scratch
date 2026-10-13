@@ -94,6 +94,21 @@ The command never touches a balance column. The balance is whatever the fold say
 
 What the design does not do: it is not a double-entry ledger. A wallet stream records what happened to one wallet; the ledger from `phases/15-capstone-projects/01-capstone-ledger-service` records where the money came from and went to. In production the wallet service emits events and a ledger integration posts balanced entries from them (Exercise 3 of the ledger capstone). It also does not give you cross-aggregate transactions: a transfer between two wallets is two streams and a saga, not one append.
 
+### Failure modes the design must close
+
+Each row is a way the Problem section's wallet lost money or history, the mechanism in this capstone that closes it, and the milestone test that proves it closed.
+
+| Failure | What goes wrong in the mutable-balance design | Mechanism here | Proven by |
+|---------|-----------------------------------------------|----------------|-----------|
+| Stale-read cap breach | two writers read 9,600.00, each adds 500.00, both pass a 10,000.00 cap check | `append` with `expectedVersion`; loser reloads and re-decides | M2 step 2 |
+| Lost history row | `UPDATE wallets` commits, `INSERT transactions` times out | the event is the only write; there is no second statement to lose | M2 step 3 |
+| Retried top-up credits twice | client times out and resends; balance moves twice | `commandId` table returns the stored outcome | M2 step 4 |
+| Torn write after crash | half a record at the end of the log is read as garbage | CRC per batch; truncate the torn tail on open | M2 step 5 |
+| Projection double-counts on restart | crash after `handle`, before checkpoint; event handled twice | handlers idempotent on `(streamId, version)` | M4 step 2 |
+| Old events unreadable after a deploy | v1 `Credited` lacks `currency`; new code throws on load | upcaster chain applied on read | M6 step 1 |
+
+The first row is worth working by hand. Wallet at version 12, balance 9,600.00 INR, cap 10,000.00. Writer A decides `TopUp(300.00)` at version 12 and appends with `expectedVersion=12`: success, version 13, balance 9,900.00. Writer B also decided `TopUp(300.00)` at version 12, so its append with `expectedVersion=12` fails with `VERSION_CONFLICT`. B reloads (version 13, balance 9,900.00), re-decides, and gets `BALANCE_CAP_EXCEEDED` with `headroom = 10000` minor (100.00 INR, too little for 300.00). The final balance is 9,900.00, and the stream contains exactly one `Credited` for the pair.
+
 ## Requirements
 
 Each requirement is a sentence you can turn into a test. The milestone that first satisfies it is in brackets.

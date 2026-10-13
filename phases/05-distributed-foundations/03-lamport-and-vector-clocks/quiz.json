@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 2,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "A ledger orders postings from two services by each host's wall-clock timestamp. What is the fundamental flaw?",
+      "options": ["Timestamps need nanosecond precision to break ties between hosts", "Clock reads are too slow to run on every posting in a hot path", "Wall clocks cannot express a total order across more than two hosts", "Two hosts' clocks drift and step, so their readings do not show causality"],
       "correct": 3,
-      "explanation": "TODO"
+      "explanation": "The only meaningful order between events on different machines is causal: did information about one reach the other? Independent clocks drift and NTP can step them backwards, so a later event can carry an earlier stamp, as in the 600 ms step that lost the refund. More precision does not help; a precise reading of a wrong clock is still wrong."
     },
     {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "stage": "check",
+      "question": "A node's Lamport clock is at 5 and it receives a message stamped 2. What is its clock after the receive?",
+      "options": ["6, because the receive rule is max(local, remote) + 1", "5, because the remote clock is behind and is ignored", "3, because the receiver adopts the sender's time plus one", "7, because a receive counts as both a tick and a merge"],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The receive rule is C := max(C, t) + 1 = max(5, 2) + 1 = 6. The clock must still advance because the receive is a new event on this process and must be stamped strictly after the node's previous event. Staying at 5 would give two events on one node the same stamp and break monotonicity."
+    },
+    {
+      "stage": "check",
+      "question": "Event a has Lamport time 3 and event b has Lamport time 5, on different nodes. What can you conclude?",
+      "options": ["a happened before b, because its counter is smaller", "a and b are concurrent, because they are on different nodes", "b did not happen before a, but a may or may not precede b", "Nothing at all, because Lamport times are only local"],
+      "correct": 2,
+      "explanation": "The clock condition says a -> b implies C(a) < C(b). Its contrapositive rules out b -> a, since C(b) is not smaller. But the converse does not hold: a smaller stamp is necessary for happens-before, never sufficient, so a may precede b or be concurrent with it. Concluding a -> b is exactly the mistake vector clocks exist to avoid."
+    },
+    {
+      "stage": "check",
+      "question": "Compare the vector clocks [1,0,0] (the capture) and [0,1,0] (the refund). What is the relation?",
+      "options": ["BEFORE, because the capture's first component is the largest", "CONCURRENT, because each has a component greater than the other's", "EQUAL, because both vectors have the same sum of components", "AFTER, because the refund node has a higher index than payments"],
+      "correct": 1,
+      "explanation": "Component 0 is greater on the left and component 1 is greater on the right, so neither vector dominates: the events are concurrent. The refund was issued with no knowledge of the capture. Sums and node indices carry no causal meaning; only componentwise dominance does."
     },
     {
       "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
+      "question": "Why must merge (componentwise max) be idempotent for a vector clock carried on a payments message bus?",
+      "options": ["So the vector can be compressed before it is attached to a message", "So that two replicas with different cluster sizes can still compare", "So that the Lamport total order and the vector order always agree", "So a redelivered message leaves the receiver's knowledge unchanged"],
+      "correct": 3,
+      "explanation": "At-least-once delivery redelivers messages. Because max(a, a) = a, merging the same vector twice adds nothing, so the clock's knowledge is not corrupted. Mismatched cluster sizes are a separate problem the code rejects with an exception, and the Lamport and vector orders do not always agree on concurrent pairs, which is the whole point of the lesson."
+    },
+    {
+      "stage": "post",
+      "question": "A ledger must decide whether a refund was issued with knowledge of the capture it reverses. Which tool fits?",
+      "options": ["A vector clock, because a -> b exactly when V(a) < V(b)", "A Lamport clock, because a total order puts the capture first", "Synchronised NTP wall clocks with a 10 ms uncertainty bound", "A per-payment sequence number assigned by the refunds service"],
+      "correct": 0,
+      "explanation": "Only a vector clock characterises causality exactly, so it can tell a causal refund from a concurrent one and route the concurrent case to a conflict handler. A Lamport total order also puts the capture first, but it would do so even if the refund were issued an hour earlier: the order is a convention, not evidence. A sequence number assigned by one service sees only that service's events."
     }
   ]
 }

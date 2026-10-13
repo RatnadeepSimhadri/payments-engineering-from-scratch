@@ -4,75 +4,75 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
+      "question": "A limit allows 5 attempts per card per calendar hour, resetting on the hour. What is the most attempts an attacker can make in two seconds?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "5, because the limit applies to any span of time shorter than an hour",
+        "6, because the boundary second is counted in both of the two hours",
+        "10, by sending 5 at 02:59:59 and 5 more just after the 03:00:00 reset",
+        "Unlimited, because a calendar window only counts the approved attempts"
       ],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "A fixed window resets at the boundary, so straddling it doubles the limit in an instant. A sliding window looks back the same distance at every attempt and has no boundary to straddle. Counting only approvals is a separate bug; this limit counts attempts but still resets on the hour."
     },
     {
       "stage": "check",
-      "question": "TODO",
+      "question": "With W = 3600 s, an attempt was recorded at exactly t0. At t0 + 3600 s, is it still inside the window (now - W, now]?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "No, an entry exactly W old has left, so it is evicted at t0 + 3600 s",
+        "Yes, it stays in the window until t0 + 3601 s, one second past the boundary",
+        "Yes, because the window is closed at both ends and includes the instant now - W",
+        "It depends on whether the attempt was allowed or flagged for review at the time"
       ],
       "correct": 0,
-      "explanation": "TODO"
+      "explanation": "The interval is half-open, so eviction pops entries whose timestamp is at or before now - W. Keeping it one second longer is the classic off-by-one: a client that retries at exactly the Retry-After instant is denied again under a limit documented as per hour."
+    },
+    {
+      "stage": "check",
+      "question": "A card hits its hard limit and the client retries the denied attempt every minute. Why must denied attempts not be recorded in the window?",
+      "options": [
+        "Recording them would double-count attempts the processor already saw",
+        "Each denied retry would refill the window, so the denial never ends",
+        "Denied attempts carry no amount, so the amount window could not sum them",
+        "Recording them would breach PCI DSS rules on storing failed card attempts"
+      ],
+      "correct": 1,
+      "explanation": "A limit should only count attempts it let through to the thing it protects. If denials were recorded, the window would never drain while the client keeps retrying. The processor never saw a hard-denied attempt, so the double-counting distractor gets the flow backwards."
+    },
+    {
+      "stage": "check",
+      "question": "A merchant has 716.00 USD in open authorizations and a hard exposure limit of 2,000.00 USD. A 1,400.00 USD attempt is denied. What clears the breach?",
+      "options": [
+        "Waiting until the oldest open authorization is more than 24 hours old",
+        "Retrying after the Retry-After interval included in the denial reason",
+        "A merchant override that raises only the per-card soft amount limit",
+        "Capturing, voiding, or expiring enough of the open authorizations"
+      ],
+      "correct": 3,
+      "explanation": "Exposure is a balance of money currently at risk, not a rate, so it falls only when authorizations are resolved through release. Waiting does nothing, which is why exposure reasons carry no Retry-After and why an exposure limit needs an authorization-expiry job or it ratchets shut."
     },
     {
       "stage": "post",
-      "question": "TODO",
+      "question": "One attempt breaches a soft per-card amount limit and a hard merchant exposure limit. What should the engine return?",
       "options": [
-        "A",
-        "B",
-        "C",
-        "D"
+        "REVIEW, since the soft breach is the one evaluated first in the list",
+        "DENY citing only the exposure limit, which caused the denial outcome",
+        "DENY listing both breaches with observed, projected, and threshold values",
+        "ALLOW, since one soft breach cancels a hard breach in the same request"
       ],
-      "correct": 1,
-      "explanation": "TODO"
+      "correct": 2,
+      "explanation": "The engine evaluates every limit, and the outcome is the worst severity breached, so any hard breach means DENY. Citing only the hard limit is the tempting shortcut, but the merchant then learns too late that resolving exposure alone still leaves the attempt flagged for review."
+    },
+    {
+      "stage": "post",
+      "question": "Two API servers each check a limit of 5 and then record the attempt in separate steps. A burst of concurrent attempts arrives. What goes wrong, and what fixes it?",
+      "options": [
+        "Several callers read 4 of 5 and all pass; make check-and-record one atomic step",
+        "Attempts are counted twice by both servers; hash them by card to one server",
+        "The sliding window drifts with clock skew; use a fixed calendar window instead",
+        "The deque grows without bound; evict entries on a background thread instead"
+      ],
+      "correct": 0,
+      "explanation": "A non-atomic read-decide-write lets concurrent callers all see the same count and all succeed, so a limit of 5 admits many more. Across a fleet the fix is an atomic operation such as a Redis Lua script or MULTI/EXEC. Sharding by card narrows the race but still needs the atomic step within each server."
     }
   ]
 }

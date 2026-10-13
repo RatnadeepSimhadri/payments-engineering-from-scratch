@@ -4,75 +4,45 @@
   "questions": [
     {
       "stage": "pre",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 1,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "Two services both claim ledger sequence slot 48,117,203 on a 3-replica store using R + W > N quorum writes. What can still go wrong?",
+      "options": ["Nothing, because overlapping quorums guarantee a single winner for the slot", "Reads may be stale, but two writers can never both receive success", "Both writers can believe they won, since quorums order a reader after a writer only", "The write fails outright, because quorum stores reject a second write to one key"],
       "correct": 2,
-      "explanation": "TODO"
+      "explanation": "R + W > N guarantees a later read overlaps the latest write; it says nothing about two concurrent writers, and last-writer-wins silently discards one of them after both were told they succeeded. Agreement on one value needs a protocol like Paxos, where acceptors enforce promises across competing proposers."
     },
     {
       "stage": "check",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 3,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "correct": 0,
-      "explanation": "TODO"
-    },
-    {
-      "stage": "post",
-      "question": "TODO",
-      "options": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
+      "question": "An acceptor has promised ballot 1.4. It now receives ACCEPT(1.3, debit). What does it do, and which rule requires it?",
+      "options": ["Accepts it, because no value has been accepted yet in this slot", "NACKs it under P1, because 1.3 is below the ballot it promised", "Accepts it under P2, because it must report what it has accepted", "Ignores it silently, because only the leader may send ACCEPT messages"],
       "correct": 1,
-      "explanation": "TODO"
+      "explanation": "P1: once an acceptor promises ballot b, it never accepts a lower ballot. 1.3 < 1.4, so it refuses and replies NACK carrying 1.4 so the proposer can jump above it. P2 is about reporting accepted values in promises, not about which accepts to honour, and single-decree Paxos has no leader."
+    },
+    {
+      "stage": "check",
+      "question": "Proposer p3 wants debit. Its PREPARE 2.3 gathers a majority of promises, one reporting (1.4, credit). What must p3 propose in phase 2?",
+      "options": ["Credit, because it must adopt the value with the highest reported ballot", "Debit, because its own ballot 2.3 is higher than the reported 1.4", "Debit, because credit was reported by only one of the promising acceptors", "Nothing; it must abandon the slot and retry with a higher ballot"],
+      "correct": 0,
+      "explanation": "If any promise reports an accepted value, the proposer must propose the value with the highest reported ballot. Credit may already be chosen, and this rule is what keeps every higher ballot proposing the same value. A higher ballot gives p3 the right to propose, not the right to pick the value; the debit goes into the next slot."
+    },
+    {
+      "stage": "check",
+      "question": "At what moment is a value chosen in single-decree Paxos?",
+      "options": ["When the proposer receives a majority of PROMISE replies for its ballot", "When the first learner has received any ACCEPTED message for the value", "When the proposer that sent the ACCEPT messages marks itself decided", "When a majority of acceptors have accepted the same ballot and value"],
+      "correct": 3,
+      "explanation": "Chosen is a fact about acceptor state: a majority accepted one ballot. It can be true before any proposer or learner knows, for example when every ACCEPTED reply is lost. Treating the proposer's decision as the moment of choice is the trap that leads to re-submitting a different value and double-posting."
+    },
+    {
+      "stage": "post",
+      "question": "An acceptor restarts after a crash without having fsynced its promised ballot and accepted value. Why is that unsafe?",
+      "options": ["It slows recovery, because the proposer must resend every PREPARE message", "It forgets promises, so it can accept a lower ballot and let a second value win", "It loses its proposer id, so two proposers may end up sharing one ballot", "It makes the learner count its old ACCEPTED twice toward the same majority"],
+      "correct": 1,
+      "explanation": "P1 is a promise about the future. An acceptor with amnesia can accept a ballot below one it already promised, or fail to report a value it accepted, which breaks the overlap argument and allows a second value to be chosen: the bug described in Paxos Made Live. Ballot uniqueness depends on the proposer id, which is configuration, not acceptor state."
+    },
+    {
+      "stage": "post",
+      "question": "Two proposers keep NACKing each other's ballots and no value is ever accepted. Which statement is correct?",
+      "options": ["Safety is violated, because acceptors have promised two different ballots", "The cluster needs more acceptors, since a majority of three is too small", "Ballots must be compared by proposer id first to break the tie for good", "Safety holds but liveness fails; a stable leader or random backoff fixes it"],
+      "correct": 3,
+      "explanation": "This is the dueling-proposer livelock: nothing is accepted, so nothing unsafe can happen, but the rounds climb forever. FLP says no asynchronous protocol can guarantee liveness, so production systems add a distinguished proposer (multi-Paxos, Raft) or randomized backoff. Promising successive ballots is normal; a promise means 'not lower', not 'yes'."
     }
   ]
 }
