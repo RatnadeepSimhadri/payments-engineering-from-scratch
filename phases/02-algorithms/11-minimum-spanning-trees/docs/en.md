@@ -3,7 +3,7 @@
 > Union-find meets greedy.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 10 (Disjoint Sets), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 2, Lesson 07 (Greedy Algorithms and Exchange Arguments), Phase 2, Lesson 08 (Graph Traversal)
 **Time:** ~60 minutes
 
@@ -341,9 +341,35 @@ components: 2, edges: 6, total 27
 
 The test file has 36 assertions: the union-find invariants, the exact Kruskal trace, Prim from every start node giving 39, the checker accepting both results and rejecting two deliberately wrong trees, tie handling on a square of equal weights, parallel edges, a disconnected forest, thirty seeded random graphs where Kruskal and Prim agree and both pass the checker, and the clustering.
 
+### In Python
+
+```python
+for removed in f.edges:
+    without = UnionFind(g.nodes())
+    for e in f.edges:
+        if e is not removed:  # identity, like Java's != on references: parallel equal edges stay distinct
+            without.union(e.u, e.v)
+```
+
+`WeightedEdge`, `WeightedGraph`, `UnionFind`, `SpanningForest`, and `Mst` keep their names and algorithms; three things differ, all in `code/python/main.py`:
+
+- **Value equality versus identity.** `WeightedEdge` is a frozen dataclass, so `==` and `in` compare by value, as a Java record's `equals` and `List.contains` do. The cut-property checker's "every edge except this one" loop uses `is not`, because the Java uses `!=` on references there; with value comparison, two parallel edges of equal weight would both be skipped.
+- **Stable sort and tuple heap.** `sorted(..., key=lambda e: e.weight)` is stable like `List.sort`, so Kruskal keeps insertion order among equal weights (the square test pins it). Prim's frontier holds `(weight, insertion index)` tuples in `heapq`, the same tie-break as the Java's `long[]` comparator, so equal-weight edges pop in the same order and the edge lists match.
+- **Totals are checked by hand.** Python integers do not overflow, so `add_exact` raises `ArithmeticError` outside the signed 64-bit range wherever the Java calls `Math.addExact`; one extra test sums two `2**62` edges to pin it. Argument errors raise `ValueError`; a `None` node raises `TypeError`, the `requireNonNull` mapping.
+
+The test file carries a port of `java.util.Random` so the 30 random graphs are the ones the Java test checks.
+
+```bash
+cd phases/02-algorithms/11-minimum-spanning-trees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 36 checks plus the overflow test.
+
 ### Porting notes
 
-Python's `sorted` is stable like `List.sort`, and `heapq` holds `(weight, index)` tuples the same way; Python's integers do not overflow so `Math.addExact` has no analogue. Go's `sort.SliceStable` is required (plain `sort.Slice` is not stable, and the tie-break would become run-dependent); Go has no generic heap, so `container/heap` needs a small type implementing `Len/Less/Swap/Push/Pop`. Both ports keep node order in an explicit slice or list beside the adjacency map, for the same reason the Java uses `LinkedHashMap`: a Go `map` iterates in random order by design. Errors in Go are return values; `WeightedEdge` construction returns `(WeightedEdge, error)`.
+Go's `sort.SliceStable` is required (plain `sort.Slice` is not stable, and the tie-break would become run-dependent); Go has no generic heap, so `container/heap` needs a small type implementing `Len/Less/Swap/Push/Pop`. The port keeps node order in an explicit slice beside the adjacency map, for the same reason the Java uses `LinkedHashMap`: a Go `map` iterates in random order by design. Errors in Go are return values; `WeightedEdge` construction returns `(WeightedEdge, error)`.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Sloppy quorums, hinted handoff, and read repair.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 6, Lesson 01 (Replication: Leader-Based, Multi-Leader, Leaderless); Phase 6, Lesson 02 (Replication Lag and Read-Your-Writes); Phase 5, Lesson 05 (Consistency Models)
 **Time:** ~75 minutes
 
@@ -346,9 +346,34 @@ N=3 R=3 W=1 strict                        0         26       5206       0       
 
 Read the table as the three-way trade. `1/1` fails almost nothing and is wrong 1,404 times. `2/2` strict is never wrong and fails 1,096 writes and 557 reads out of 8,000 each. `2/2` sloppy fails 8 writes and is wrong 55 times. The `hinted` column, 6,107, is how much of the sloppy store's availability came from writing to the wrong nodes. Nothing in the table changes if you add read repair except that the stale replicas are fixed faster; read repair cannot make a read see a value that no responder holds.
 
+### In Python
+
+```python
+def java_string_hash(s: str) -> int:
+    h = 0
+    data = s.encode("utf-16-be")
+    for i in range(0, len(data), 2):
+        h = (31 * h + ((data[i] << 8) | data[i + 1])) & 0xFFFFFFFF
+    return h - (1 << 32) if h >= (1 << 31) else h
+```
+
+Differences, all in `code/python/main.py`:
+
+- **Placement needs Java's `String.hashCode`.** Python's `hash()` is salted per process, so it cannot place keys at all. `java_string_hash` reproduces the 32-bit wrapping `31*h + c` over UTF-16 code units and returns it signed; `home_nodes` then uses `%`, which with a positive divisor is exactly `Math.floorMod`. The test suite pins three known Java hash values, including one that lands on `Integer.MIN_VALUE`.
+- **`Versioned` is a frozen dataclass** and `newer_than` compares the tuples `(timestamp, writer_id)`, the same lexicographic rule. Being frozen, it is hashable, so `replicas_agree` can put versions in a `set` like the Java `HashSet`.
+- **Map order is made explicit.** Java's `TreeMap` iterates hints and keys in sorted order; Python dicts iterate in insertion order, so `handoff` and `anti_entropy` call `sorted(...)` where the Java relies on the tree. SplitMix64 is masked to 64 bits after every step, and with that the experiment table matches the Java numbers exactly.
+- **Errors** are `QuorumNotReached(Exception)` and `ValueError` for bad configs. A real coordinator would issue the N requests concurrently with `asyncio` and wait for the first W or R by hand; that changes latency, not the intersection argument.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The design is three maps and a predicate, and ports directly. In Python, `Versioned` is a frozen dataclass and `newer_than` compares the tuple `(timestamp, writer_id)` directly, which is the same lexicographic rule; `hints` is a `dict[int, dict[str, Versioned]]`. In Go, `Versioned` is a comparable struct so it can be a map value and a set element without further work; `Put` returns `bool` as here, and `QuorumNotReached` becomes a sentinel error checked with `errors.Is`. Keep the SplitMix64 generator and the order in which `reachable` consumes it identical, because the experiment table's numbers depend on it. A real implementation sends the N requests concurrently and waits for the first W or R; that changes latency, not the intersection argument, and in Go is a `sync.WaitGroup` plus a channel, in Python an `asyncio.gather` with `return_when=FIRST_COMPLETED` semantics built by hand.
+The design is three maps and a predicate, and ports directly to Go. `Versioned` is a comparable struct so it can be a map value and a set element without further work; `Put` returns `bool` as here, and `QuorumNotReached` becomes a sentinel error checked with `errors.Is`. Keep the SplitMix64 generator and the order in which `reachable` consumes it identical, because the experiment table's numbers depend on it. A real implementation sends the N requests concurrently and waits for the first W or R; that changes latency, not the intersection argument, and in Go is a `sync.WaitGroup` plus a channel.
 
 ## Use It
 

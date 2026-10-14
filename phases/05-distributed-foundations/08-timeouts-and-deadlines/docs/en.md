@@ -3,7 +3,7 @@
 > The downstream call that outlives its caller.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 07 (RPC, Framing, and Serialization Over Raw Sockets); Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks)
 **Time:** ~60 minutes
 
@@ -340,9 +340,32 @@ deadline  400 ms: FAILED_FAST after 2 attempts, 400 ms, per-attempt budgets [300
 
 The test file has 39 assertions. The ones to read first are the three about the `CHARGE` effect: that it exists without propagation, that it is recorded after t = 500, and that it does not exist with propagation.
 
+### In Python
+
+`code/python/main.py` has the same `Deadline`, `Context`, `RemoteService`, `Client`, `DeadlineAwareRetrier`, and `Hedger`, and prints the same demo line for line, including the seed-42 latency study (`p50=41 ms p99=919 ms; hedged p99=113 ms`). Python has no standard context type, so `Context` is a frozen dataclass passed explicitly, exactly like the Java record. Three things differ.
+
+- **Time stays in integer milliseconds.** `time.monotonic()` returns float seconds, and float budgets reintroduce rounding into the subtraction chain (`0.5 - 0.4 - 0.1` is `-2.8e-17`, a budget that is both "nearly zero" and negative). Every clock and budget in the port is an `int`, and `Deadline.NONE` is `2**63 - 1` so it compares and prints like `Long.MAX_VALUE`.
+- **Overflow and parsing are Java's, on purpose.** A Python `int` never wraps, so `saturating_add` first reproduces the 64-bit wrap with `to_int64` and then applies the same sign test the Java uses. `from_wire` validates the digits with the grammar `Long.parseLong` accepts, because Python's `int()` also accepts `" 5"` and `"1_0"`, and a header parser that is laxer than the sender's peers is a bug. The `u` and `n` units divide with truncation toward zero, not `//`.
+- **The study's generator is `java.util.Random`, ported.** `JavaRandom` reproduces the 48-bit LCG and `nextInt(bound)`, so `Hedger.study(42, 10_000, 60)` draws the same 20,000 latencies in both languages; a test pins the three percentiles.
+
+```python
+@staticmethod
+def saturating_add(a: int, b: int) -> int:
+    r = to_int64(a + b)
+    return INT64_MAX if ((a ^ r) & (b ^ r)) < 0 else r
+```
+
+For in-process cancellation (which this lesson does not need, because the fake clock makes every wait explicit), `asyncio.timeout()` is the standard-library deadline; it takes a relative delay and converts it to an absolute loop time, the same shape as `Deadline.after`.
+
+```bash
+cd phases/05-distributed-foundations/08-timeouts-and-deadlines/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Go has this mechanism in the standard library: `context.WithDeadline` and `context.WithTimeout` implement `withTimeout` with the same min rule, `ctx.Deadline()` returns the absolute instant, and `ctx.Done()` is a channel the work can select on, which gives in-process cancellation this Java version lacks. A Go port would make `Service.Call` take a `context.Context` and return `(string, error)`, with `context.DeadlineExceeded` as the sentinel. Python has no standard context type; a port would pass a `Deadline` dataclass explicitly, use `asyncio.timeout()` for the in-process case, and keep the integer-millisecond model since Python `float` seconds would reintroduce rounding into the budget arithmetic. In both languages the wire format and the `requireBudget` admission check port unchanged.
+Go has this mechanism in the standard library: `context.WithDeadline` and `context.WithTimeout` implement `withTimeout` with the same min rule, `ctx.Deadline()` returns the absolute instant, and `ctx.Done()` is a channel the work can select on, which gives in-process cancellation this Java version lacks. A Go port would make `Service.Call` take a `context.Context` and return `(string, error)`, with `context.DeadlineExceeded` as the sentinel. The wire format and the `requireBudget` admission check port unchanged.
 
 ## Use It
 

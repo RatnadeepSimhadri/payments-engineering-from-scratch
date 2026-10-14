@@ -3,7 +3,7 @@
 > Flags, bitmaps, and the bit tricks in ISO 8583 and Snowflake IDs.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes), Phase 1, Lesson 06 (Hash Maps from Scratch)
 **Time:** ~60 minutes
 
@@ -369,9 +369,37 @@ Math.abs(Long.MIN_VALUE)      = -9223372036854775808  (still negative: there is 
 (lo + hi) / 2 with int        = -97483648  vs  lo + ((hi - lo) >>> 1) = 2050000000  (the binary-search midpoint bug)
 ```
 
+### In Python
+
+```python
+MASK64 = (1 << 64) - 1
+
+def to_int64(v: int) -> int:
+    """Wrap to a signed 64-bit value, exactly what a Java long does on overflow."""
+    v &= MASK64
+    return v - (1 << 64) if v >= (1 << 63) else v
+
+def urshift64(v: int, n: int) -> int:
+    """Java's >>> on a long: view the value as unsigned 64 bits, then shift in zeros."""
+    return to_int64((v & MASK64) >> n)
+```
+
+`code/python/main.py` keeps `Bits`, `AccountFlags`, `Bitmap`, `Iso8583Bitmap`, and `SnowflakeId` with the same layouts. What differs:
+
+- **Python ints have no width.** There is no sign bit to overflow into, no `>>>`, and a negative int has infinitely many leading ones (`-8 >> 100 == -1`). A Java `long` is represented as a Python int in `[LONG_MIN, LONG_MAX]`; every operation that can leave that range goes through `to_int64`, and every unsigned view masks with `MASK64` first. `popcount_kernighan` must mask before its loop, or `v &= v - 1` never reaches zero for a negative input.
+- **The traps are emulated, not native.** `Math.abs(Long.MIN_VALUE)`, `(byte) 0x80`, `1 << 32` on an `int`, the int midpoint overflow, and `-7 / 2` all behave correctly in plain Python, which is the point: the demo calls `to_int64`, `to_int8`, `to_int32`, `urshift32`, `java_div`, and `java_rem` to show what Java and Go do, and `test_python_differs_from_java` pins the difference (`-7 // 2 == -4`, `-7 % 2 == 1`).
+- **Bitmap words are unsigned.** `Bitmap` stores each word as an int in `0..2^64-1`, the honest type for a bit set, so `next_set_bit` finds the trailing zeros with `(word & -word).bit_length() - 1`. ISO 8583 hex parses with `int(hex, 16)`, which plays `Long.parseUnsignedLong`.
+- **Names that are keywords.** `AccountFlags.with` and `Bitmap.and`/`or` become `with_`, `and_`, `or_`. Exceptions map to `ValueError` (`IllegalArgumentException`), `IndexError`, and `RuntimeError` for the backwards clock.
+
+```bash
+cd phases/01-complexity-and-core-structures/11-bit-manipulation/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python integers are unbounded and have no `>>>`: `extract` is `(v >> shift) & mask` and works because there is no sign bit to drag in, but a negative Python int shifted right stays negative forever (`-8 >> 100 == -1`), so convert to unsigned with `v & 0xFFFFFFFFFFFFFFFF` first when porting the two's-complement demos. Go has `uint64`, which is the honest type for a bitmap word and an ISO bitmap; `>>` on `uint64` is logical and on `int64` arithmetic, so the two shifts are one operator chosen by type. Go's `math/bits` provides `OnesCount64`, `TrailingZeros64`, and `Len64`; Python has `int.bit_count()` since 3.10. Neither language reduces the shift count mod 64: Python shifts are exact, Go panics or yields zero for an oversized shift.
+Go has `uint64`, which is the honest type for a bitmap word and an ISO bitmap; `>>` on `uint64` is logical and on `int64` arithmetic, so the two shifts are one operator chosen by type. Go's `math/bits` provides `OnesCount64`, `TrailingZeros64`, and `Len64`. Go does not reduce the shift count mod 64: it panics or yields zero for an oversized shift.
 
 ## Use It
 

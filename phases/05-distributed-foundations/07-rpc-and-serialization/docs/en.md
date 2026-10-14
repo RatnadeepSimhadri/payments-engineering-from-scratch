@@ -3,7 +3,7 @@
 > Length-prefixed frames, request IDs, and a client that survives a half-open connection.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 02 (Failure Models); Phase 5, Lesson 06 (CAP and PACELC); Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes)
 **Time:** ~120 minutes
 
@@ -367,9 +367,32 @@ naive retry of Credit(bob, 50.00 USD) = 125.00 USD  <- applied 2 times for one i
 
 The last line is the hand-off to Lesson 09. Keep it: it is the one-screen demonstration that "retry on timeout" is not a complete policy for anything that moves money.
 
+### In Python
+
+`code/python/main.py` is the same codec, framer, envelope, simulated socket, server, and client, method for method, and the demo prints the same bytes, the same segment timings, and the same round-trip times as Java: `Rng` is SplitMix64 masked to 64 bits, so seed 42 cuts the stream into the same ten reads. Four things differ.
+
+- **Integers have no width.** A Java `long` is 64 bits whether you want it or not; a Python `int` is whatever size the value needs, so the width lives in the codec. `u8`/`u16`/`u32` range-check on write exactly as in Java, `i64` writes `v & MASK64` (two's complement) and rejects values outside the `long` range, and `ByteReader.i64` decodes with `int.from_bytes(..., signed=True)`. `int.to_bytes(n, "big")` and `int.from_bytes` stand in for the shift loops; `struct.pack(">BqI")` would work too, but `struct.error` on a short buffer is the same class of leak as `ArrayIndexOutOfBoundsException`, so the explicit `_need()` check stays either way.
+- **`bytes` are immutable and compare by value.** `Framer.feed` concatenates `self._pending + chunk` and slices, which is the same O(n) copy the Java `Arrays.copyOf` does; a production framer would keep a `bytearray` and `del buf[:consumed]`. Because `bytes` compare by value, `RpcMessage` can be a frozen dataclass whose equality includes the payload, which a Java record holding a `byte[]` cannot offer.
+- **Two names change.** Python cannot overload one name as both a static and an instance method, so Java's static `Framer.frame(payload, maxFrame)` is `Framer.frame_with_max`, and `await` is a keyword, so the client's method is `await_`.
+- **Exceptions.** `CodecException`, `RpcTimeoutException`, and `RpcErrorException` keep their names; `IllegalArgumentException` (unknown account, currency mismatch) is `ValueError`, and `dispatch` catches `(CodecException, ValueError)` to turn both into an `ERROR` response, as the Java `catch` does.
+
+```python
+def i64(self, v: int) -> "ByteWriter":
+    if not INT64_MIN <= v <= INT64_MAX:
+        raise CodecException(f"i64 out of range: {v}")
+    self._buf += (v & MASK64).to_bytes(8, "big")
+    return self
+```
+
+```bash
+cd phases/05-distributed-foundations/07-rpc-and-serialization/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `struct.pack(">BqI")` and `struct.unpack_from` replace `ByteWriter`/`ByteReader`, but keep the explicit `need()` check, because `struct.error` on a short buffer is the same class of leak as an array exception; `bytes` is immutable so the framer's pending buffer is a `bytearray` with `del buf[:consumed]`. Integers are unbounded, so `u32` needs an explicit range check on write. Go: `encoding/binary.BigEndian.PutUint32` and `binary.BigEndian.Uint64` are the codec; errors are returned, not thrown, so `feed` returns `([][]byte, error)` and the server closes the connection on a non-nil error. A real Go port would run the client's `await` on a `net.Conn` with `SetReadDeadline`, which is the kernel-level equivalent of the simulated clock, and a real Java port would use `SocketChannel` in non-blocking mode with a `Selector`.
+Go: `encoding/binary.BigEndian.PutUint32` and `binary.BigEndian.Uint64` are the codec; errors are returned, not thrown, so `feed` returns `([][]byte, error)` and the server closes the connection on a non-nil error. A real Go port would run the client's `await` on a `net.Conn` with `SetReadDeadline`, which is the kernel-level equivalent of the simulated clock, and a real Java port would use `SocketChannel` in non-blocking mode with a `Selector`.
 
 ## Use It
 

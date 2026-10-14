@@ -3,7 +3,7 @@
 > Three concurrency models, one fan-out/fan-in problem.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model); Phase 4, Lesson 05 (Producers, Consumers, and Bounded Queues); Phase 5, Lesson 08 (Timeouts and Deadlines) is helpful but not required
 **Time:** ~90 minutes
 
@@ -324,9 +324,32 @@ gamma still has 1 outstanding call: the timeout abandoned the wait, it did not c
 
 The whole run takes well under a second because no code path sleeps. The 800 ms in the output is simulated.
 
+### In Python
+
+```python
+alarm = timer.after(timeout_millis)
+deadline = then_apply(alarm, lambda _: Quote.timed_out(adapter.name(), timeout_millis))
+either = apply_to_either(call, deadline)
+when_complete(call, lambda: alarm.cancel())  # the answer arrived: the alarm is no longer needed
+return exceptionally(either, lambda t: Quote.failed(adapter.name(), t))
+```
+
+`code/python/main.py` keeps `ScriptedAdapter`, `ManualTimer`, `FanOut` (`with_timeout`, `quote_all`, `first_ok`, `cheapest`), `BlockingFanOut`, and `count_started_before_release`, and prints the same timeline and outcomes. What differs:
+
+- **`CompletableFuture` becomes `concurrent.futures.Future` plus five helpers.** A `Future` runs its done-callbacks synchronously in the completing thread, just as a `CompletableFuture` runs its dependents, so `then_apply`, `when_complete`, `apply_to_either`, `exceptionally`, and `all_of` are a few lines each and the simulated clock stays deterministic. One trap is real: `Future` runs callbacks in registration order, while `CompletableFuture` keeps its dependents on a stack and typically runs the most recently registered first. Registering the alarm cancellation before the race (the Java order) lets the cancelled alarm win, and every quote that arrives after the fan-out starts comes back `FAILED (CancelledError)`. The port registers `apply_to_either` first, and `test_answer_wins_over_its_own_alarm_cancellation` pins it.
+- **There are no virtual threads.** Model 1 is `ThreadPoolExecutor(max_workers=2)` and starves exactly as the Java pool does: 2 of 3 gated tasks start. Model 2 uses `ThreadPerTaskExecutor`, a small `Executor` that starts a fresh OS thread per task. It has the same shape as `newVirtualThreadPerTaskExecutor`, so all 3 tasks (and, in the tests, all 200) start, but each blocked task holds a real kernel thread, so it does not scale to a hundred thousand waits. The scalable Python model is `asyncio`, where a waiting coroutine holds no thread at all.
+- **`asyncio.wait_for` cancels; this port abandons.** `FanOut.with_timeout`, like Java's `applyToEither` and the gamma line in the demo, stops waiting and leaves the request outstanding. `asyncio.wait_for` cancels the awaited task. `wait_for_cancels_inner` shows this with `timeout=0`, so nothing waits on a real clock, and `AsyncioContrastTest` asserts the inner task was cancelled.
+- **Exceptions and names.** `IllegalStateException` from `fail` becomes `RuntimeError`, so the demo prints `FAILED (RuntimeError: HTTP 503 from processor)`. `Optional` becomes `None`. Python has no `CountDownLatch`, so the port defines one on `threading.Condition`.
+
+```bash
+cd phases/04-concurrency/06-executors-goroutines-and-async/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Go: the natural form is one goroutine per adapter writing to a results channel (or a slice slot guarded by a `sync.WaitGroup`), a `context.WithTimeout(ctx, 800*time.Millisecond)` passed into each call, and `select { case q := <-ch: ... case <-ctx.Done(): ... }` for the race; `golang.org/x/sync/errgroup` packages the fan-in but is not standard library, so the lesson's port uses `sync.WaitGroup`. Inject time with a `Timer` interface whose production implementation wraps `time.After` and whose test implementation is advanced manually, exactly as here; `go test -race` must pass. Python: `asyncio.gather(*[asyncio.wait_for(a.quote(req), 0.8) for a in adapters], return_exceptions=True)` is the fan-out, with `TimeoutError` instances in the result list mapped to `TIMED_OUT`. Note that `wait_for` *does* cancel the inner coroutine on timeout, a difference from both Java and Go worth a test. Use the loop's `time()` through an injected timer and drive tests with a custom event loop or `asyncio.sleep(0)` stepping rather than real sleeps.
+Go: the natural form is one goroutine per adapter writing to a results channel (or a slice slot guarded by a `sync.WaitGroup`), a `context.WithTimeout(ctx, 800*time.Millisecond)` passed into each call, and `select { case q := <-ch: ... case <-ctx.Done(): ... }` for the race; `golang.org/x/sync/errgroup` packages the fan-in but is not standard library, so the lesson's port uses `sync.WaitGroup`. Inject time with a `Timer` interface whose production implementation wraps `time.After` and whose test implementation is advanced manually, exactly as here; `go test -race` must pass.
 
 ## Use It
 

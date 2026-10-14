@@ -3,7 +3,7 @@
 > Range sums over balances with O(log n) updates.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 03 (Dynamic Arrays), Phase 1, Lesson 08 (Binary Search Trees), Phase 1, Lesson 11 (Bit Manipulation), Phase 2, Lesson 05 (Divide and Conquer)
 **Time:** ~90 minutes
 
@@ -372,9 +372,32 @@ Expected output, abbreviated:
 
 Section 5 is the one that earns trust: 257 positions (not a power of two), 20,000 random range adds and range sums, three structures and a plain array, zero disagreements.
 
+### In Python
+
+`code/python/main.py` has the same classes (`FenwickTree`, `SegmentTree`, `LazySegmentTree`, `BalanceHistory`, plus `Currency` and `Money`) with the same methods in snake_case (`prefix_sum`, `range_sum`, `first_index_with_prefix_at_least`, `range_add`, `divide_half_even`). The 1-indexed Fenwick layout ports unchanged: `i & -i` isolates the lowest set bit of a Python `int` exactly as it does for a Java `int`. Three things differ:
+
+- **Overflow is checked by hand.** Python integers never overflow, so a sum past `Long.MAX_VALUE` would silently become a big number that no Java or Go service could store. `add_exact`, `subtract_exact`, and `multiply_exact` reproduce `Math.*Exact` and raise `OverflowError` (an `ArithmeticError`, like Java's `ArithmeticException`), and the overflow tests assert that error rather than a correct big sum:
+
+```python
+def add_exact(a: int, b: int) -> int:
+    r = a + b
+    if not LONG_MIN <= r <= LONG_MAX:
+        raise OverflowError("long overflow")
+    return r
+```
+
+- **Truncating division for half-even rounding.** `-25 // 10` is `-3` in Python, but `-25 / 10` is `-2` in Java. `divide_half_even` uses `java_div` and `java_rem`, which truncate toward zero, so `divide_half_even(-25, 10)` is `-2` in both languages. The test pins that case.
+- **Explicit index checks.** A Python list accepts `-1` and returns the last element, which would let `fw.add(-1, x)` corrupt the last day without any error. `check_index` reproduces `Objects.checkIndex` and raises `IndexError`; `ValueError` replaces `IllegalArgumentException` for `lo > hi` and empty inputs. The randomized demo uses `JavaRandom` (a bit-exact `java.util.Random`, including `nextBoolean`), so the 20,000 operations are the same as in Java. Recursion depth in the lazy tree is `log2 n`, far below Python's limit.
+
+```bash
+cd phases/03-systems-data-structures/10-segment-trees-and-fenwick-trees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python integers do not overflow, so the `addExact` calls become plain `+` and the overflow tests become tests that a huge sum is simply correct; use lists of `int` and keep the 1-indexed Fenwick layout (`i & -i` works identically on Python ints). The recursive lazy tree is fine in Python for `n` up to the default recursion limit's comfort zone (depth is `log2 n`, so 10 million elements is depth 24). In Go, use `[]int64`, write a small `addChecked` since there is no `Math.addExact`, and return `error` from the range-checked methods instead of panicking; the lazy tree's recursion is unchanged. In all three languages keep `rangeSum` bottom-up with separate `left` and `right` accumulators so the same code serves non-commutative operations later.
+In Go, use `[]int64`, write a small `addChecked` since there is no `Math.addExact`, and return `error` from the range-checked methods instead of panicking; the lazy tree's recursion is unchanged. Keep `rangeSum` bottom-up with separate `left` and `right` accumulators so the same code serves non-commutative operations later.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Range queries over transactions by timestamp need order, not just hashing.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 04 (Linked Lists), Phase 1, Lesson 06 (Hash Maps from Scratch)
 **Time:** ~90 minutes
 
@@ -382,9 +382,46 @@ ideal balanced height for 4096 keys: 12
 
 The tests also cross-check 3,000 random `put`/`remove`/`rangeQuery`/`floorKey` operations against `java.util.TreeMap`, which is the cheapest way to find a delete bug: write the reference-model test first, then the implementation.
 
+### In Python
+
+```python
+@dataclass(frozen=True, order=True)
+class TxKey:
+    timestamp_millis: int
+    sequence: int
+
+    @staticmethod
+    def lowest(timestamp_millis: int) -> TxKey:
+        return TxKey(timestamp_millis, LONG_MIN)
+```
+
+```python
+def _compare(self, a: K, b: K) -> int:
+    """compareTo as a function returning -1/0/1, counted once per call like the Java version."""
+    self._comparisons += 1
+    if a < b:
+        return -1
+    if b < a:
+        return 1
+    return 0
+```
+
+`code/python/main.py` keeps the same tree, `TxKey`, `TransactionIndex`, and trimmed `Money`. What differs:
+
+- **No `Comparable` bound.** Keys only need `<`. `TxKey` is a `@dataclass(order=True)`, which compares `(timestamp_millis, sequence)` as a tuple, exactly `Long.compare` then `Long.compare`. `_compare` stays a function so the comparison counter, and therefore the "2048.5 comparisons per lookup" line, is identical to Java.
+- **Iteration is mandatory, not a style choice.** CPython's default recursion limit is 1,000, so a recursive in-order walk of the 4,096-node chain would raise `RecursionError`. All traversals use an explicit `list` as a stack, and the test that walks a 1,000-node chain pins that.
+- **Integer ranges are explicit.** `Long.MIN_VALUE`/`Long.MAX_VALUE` become `LONG_MIN = -(1 << 63)` and `LONG_MAX`; `Money.plus` checks the 64-bit range by hand (`add_exact`) because Python ints never overflow, and a test asserts the `OverflowError`. A `None` key raises `TypeError` where Java throws `NullPointerException`.
+- **Same random data.** `JavaRandom` reproduces `java.util.Random`, so the transaction amounts, the shuffled insert order (height 25), and the 3,000-operation cross-check use the same sequences; the reference model is a `dict` plus `bisect` over sorted keys instead of `TreeMap`. Nodes use `__slots__`.
+
+```bash
+cd phases/01-complexity-and-core-structures/08-binary-search-trees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python has no `Comparable` bound; use `__lt__`/`__eq__` on the key type (a `@dataclass(order=True)` for `TxKey`) and keep `compare` as a function returning -1/0/1 so the counter still works. Python's default recursion limit (1,000) makes the iterative traversals mandatory, not optional. Go has no generics constraint for ordering beyond `cmp.Ordered`, which excludes structs, so pass a `func(a, b K) int` comparator into the constructor; `remove` and `get` return `(V, bool)` instead of `nil`. Neither language has `Long.compare` overflow hazards for the composite key, but both need the same "compare, do not subtract" discipline for consistency. Memory in Python is a concern at 4,096 nodes per object (each node is a full object with a `__dict__`); use `__slots__`.
+Go has no generics constraint for ordering beyond `cmp.Ordered`, which excludes structs, so pass a `func(a, b K) int` comparator into the constructor; `remove` and `get` return `(V, bool)` instead of `nil`. Go has no `Long.compare` overflow hazard for the composite key, but it needs the same "compare, do not subtract" discipline for consistency.
 
 ## Use It
 

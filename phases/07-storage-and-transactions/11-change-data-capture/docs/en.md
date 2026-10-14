@@ -3,7 +3,7 @@
 > Turn the database log into an event stream.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs), Phase 7, Lesson 10 (Secondary Indexes: Local vs Global), Phase 6, Lesson 01 (Replication Strategies)
 **Time:** ~75 minutes
 
@@ -351,11 +351,42 @@ Expected output, abbreviated:
 
 Section 3 is the one to show a colleague who proposes a CDC consumer that increments a counter.
 
+### In Python
+
+```python
+def _frozen(m: Mapping[str, str] | None) -> Mapping[str, str] | None:
+    """Copy then wrap read-only: Collections.unmodifiableMap(new LinkedHashMap<>(m))."""
+    return None if m is None else MappingProxyType(dict(m))
+
+@dataclass(frozen=True)
+class LogRecord:
+    lsn: int
+    tx_id: int
+    op: Op
+    ...
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "before", _frozen(self.before))
+        object.__setattr__(self, "after", _frozen(self.after))
+```
+
+Differences, all in `code/python/main.py`:
+
+- **Immutable images.** A frozen dataclass stops reassigning `record.after`, but not `record.after["x"] = "y"`. `__post_init__` therefore copies each image and wraps it in `types.MappingProxyType`, so mutation raises `TypeError` where Java throws `UnsupportedOperationException`; the test asserts exactly that. `BalanceViewSink.all()` returns a key-sorted `MappingProxyType` for the same reason.
+- **Interfaces become protocols.** `Clock` and `Sink` are `typing.Protocol`s; any object with `now_millis()` or `apply(event)` fits, which is how `RecordingSink`, the two totals sinks and the view plug into one `CdcConnector`. The Java `poll(max)` / `poll(max, crash)` overloads become one method with `crash_before_commit: bool = False`.
+- **Numbers and errors.** Amounts are strings of minor units parsed with `int(...)`. `Money.plus` and `minus` check the signed 64-bit range by hand and raise `OverflowError`, mirroring `Math.addExact`; a Python-only test pins it. `LogTruncatedException` is a `RuntimeError` subclass carrying `requested` and `oldest_available`; committing a finished transaction raises plain `RuntimeError`.
+- **Same output.** Maps print through `_jmap`, which matches Java's `{k=v}` format, so `diff` of the two demos is empty, including the skipped counts and the forced re-snapshot at LSN 17.
+
+```bash
+cd phases/07-storage-and-transactions/11-change-data-capture/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-- **Numeric model.** Amounts travel as strings of minor units and are parsed with `int(...)` in Python and `strconv.ParseInt` in Go; Python's unbounded `int` removes the overflow check that `Math.addExact` provides, and Go needs a hand-written checked add.
-- **Immutability.** `LogRecord`'s unmodifiable maps become `types.MappingProxyType` or a frozen dataclass with tuple-of-pairs in Python; Go copies the map on construction and documents that callers must not mutate it, since Go has no immutable map.
-- **Errors.** `LogTruncatedException` becomes a Python exception class and a Go error type (`errors.As`) carrying `requested` and `oldestAvailable`; `IllegalStateException` on a finished transaction becomes `RuntimeError`/`error`.
+- **Numeric model.** Amounts travel as strings of minor units and are parsed with `strconv.ParseInt` in Go; Go needs a hand-written checked add in place of `Math.addExact`.
+- **Immutability.** Go copies the map on construction and documents that callers must not mutate it, since Go has no immutable map.
+- **Errors.** `LogTruncatedException` becomes a Go error type (`errors.As`) carrying `requested` and `oldestAvailable`; `IllegalStateException` on a finished transaction becomes an `error`.
 - **Concurrency.** A Go port that runs `poll` in a goroutine alongside writers must guard `CommitLog` and the tables with a mutex and pass `go test -race`; the snapshot seam then becomes observable (Exercise 3) and the LSN guard in the sink is what keeps the view correct.
 
 ## Use It

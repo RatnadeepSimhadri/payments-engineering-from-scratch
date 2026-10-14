@@ -3,7 +3,7 @@
 > Millions of timeouts with O(1) insert and tick.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 04 (Linked Lists), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 3, Lesson 08 (LRU and LFU Caches)
 **Time:** ~75 minutes
 
@@ -341,9 +341,32 @@ Expected output, abbreviated:
 
 Section 2 is the correctness evidence: nine delays spanning three levels, each fires at exactly its deadline. Section 3 is the trade-off made visible. Section 4 is the memory argument in two numbers.
 
+### In Python
+
+`code/python/main.py` has the same classes (`ManualClock`, `TimerEntry`, `Bucket`, `TimingWheel`, `HierarchicalTimer`, `HeapTimer`) and the same methods in snake_case (`advance_to`, `deadline_millis`, `cascades`). `Clock` is a `typing.Protocol` with one method, `now_millis`. Four things differ:
+
+- **Floor arithmetic is native.** Python's `//` and `%` already floor, which is exactly what `Math.floorDiv` and `Math.floorMod` do, so the bucket index is `(deadline // tick_millis) % wheel_size` with no helper. `Math.ceilDiv` becomes `-(-a // b)`, and `add_exact`/`multiply_exact` keep the Java overflow checks on the deadline arithmetic.
+- **`TimerEntry` uses `__slots__`.** The entry has six mutable fields (`prev`, `next`, `bucket`, and the two flags), and 200,000 of them are live in the demo. Slots keep each entry compact and catch a misspelt field name at assignment time. A cancelled entry still unlinks itself in `O(1)` through its `bucket` back-pointer.
+- **Closures bind late.** A `lambda` that captures a loop variable sees its final value when it runs, so the workload loops bind the index as a default argument. Without `i=i`, every timer would record the last `i`, and the wheel-versus-heap comparison would pass for the wrong reason:
+
+```python
+for i in range(n):
+    delay = 1 + rng.next_int(600_000)  # up to 10 minutes
+    wheel_entries.append(wheel_t.schedule(delay, lambda i=i: wheel_order.append(i)))
+    heap_entries.append(heap_t.schedule(delay, lambda i=i: heap_order.append(i)))
+```
+
+- **`heapq` with a `(deadline, id, entry)` tuple is the comparison heap.** It gives the same total order as the Java comparator. The workload's delays come from `JavaRandom`, a bit-exact `java.util.Random`, so the pending counts, fired counts, and cascades match Java line for line. `ValueError` replaces `IllegalArgumentException`. Recursion depth is the number of wheel levels (four in the demo).
+
+```bash
+cd phases/03-systems-data-structures/12-time-wheels-and-timers/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: the entry is a plain class with `__slots__` for `prev`, `next`, `bucket`; use `-(-a // b)` for ceiling division and `//`, `%` directly (Python floors, which is what `floorDiv`/`floorMod` do). The recursion depth equals the number of levels, so it is trivially safe. Go: `Clock` is an interface with `NowMillis() int64`; `Schedule` returns `(*TimerEntry, error)` for a negative delay; the wheel and buckets are plain structs with pointer links; if the timer is to be driven from one goroutine while `Cancel` is called from others, guard the entry's `cancelled` flag and the bucket unlink with a `sync.Mutex` on the facade and run the tests under `go test -race`. In all three languages keep the rounding rule in `schedule`, not in the wheel, so the wheel's arithmetic stays tick-aligned.
+Go: `Clock` is an interface with `NowMillis() int64`; `Schedule` returns `(*TimerEntry, error)` for a negative delay; the wheel and buckets are plain structs with pointer links. If the timer is to be driven from one goroutine while `Cancel` is called from others, guard the entry's `cancelled` flag and the bucket unlink with a `sync.Mutex` on the facade and run the tests under `go test -race`. Keep the rounding rule in `Schedule`, not in the wheel, so the wheel's arithmetic stays tick-aligned.
 
 ## Use It
 

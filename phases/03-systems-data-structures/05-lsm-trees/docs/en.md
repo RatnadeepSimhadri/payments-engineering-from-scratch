@@ -3,7 +3,7 @@
 > Write-optimized storage, built with a sorted map and some files.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 3, Lesson 01 (Bloom Filters from Scratch), Phase 3, Lesson 04 (B-Trees and Why Databases Love Them), Phase 1, Lesson 09 (Merge Sort and k-Way Merge)
 **Time:** ~120 minutes
 
@@ -347,9 +347,32 @@ tables=1, keys=[a, c, d, e, f, g], b -> null
 files written=3 deleted=2 (compaction rewrote, then removed the inputs)
 ```
 
+### In Python
+
+`code/python/main.py` has the same classes (`Entry`, `Hashing`, `BloomFilter`, `SimulatedDisk`, `Memtable`, `SSTable`, `LsmTree`) and the same file format byte for byte, so the demo's disk totals and write amplification match Java's exactly. Four things differ:
+
+- **No sorted map in the standard library.** `Memtable` is a plain `dict`, and `entries()` returns `dict(sorted(...))`, a key-ordered snapshot, at flush time. That is `O(n log n)` once per flush instead of `O(log n)` per put, which is fine for a write buffer of 1,000 entries. Every "sorted map" the Java code passes around (SSTable input, decoded blocks, compaction output) is an insertion-ordered `dict` built in key order.
+- **`struct` replaces `DataOutputStream`.** `writeInt`, `writeLong`, and `writeBoolean` become `struct.pack(">i")` and `struct.pack(">q?")`. `writeUTF` is not plain UTF-8: it writes a 2-byte length and then *modified* UTF-8 (NUL as `C0 80`, characters outside the BMP as two 3-byte surrogates). `write_utf` and `read_utf` implement exactly that, and a test pins the bytes against Java's output.
+- **`heapq` with a tuple key is the k-way merge.** The tuple sorts by key, then by negated `seq` so the newest version pops first, with the table index as a tie-breaker so iterators are never compared:
+
+```python
+heap.append((head[0], -head[1].seq, idx, head[1], it))  # key, then newest first on ties
+...
+k, _, idx, e, it = heapq.heappop(heap)
+if k != last_key:  # first occurrence of k is the newest
+```
+
+- **Names that collide.** Java's `Entry.value(v, seq)` and `Entry.tombstone(seq)` factories share names with the record's fields, which a frozen dataclass cannot express, so they are `Entry.of_value` and `Entry.of_tombstone`. Bloom-filter hashes are masked to 64 bits after every multiply so they equal Java's `long` values. The demo uses `JavaRandom` (a bit-exact `java.util.Random`), so the payment statuses and every counter match line for line.
+
+```bash
+cd phases/03-systems-data-structures/05-lsm-trees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python's `sortedcontainers` is not standard library, so the memtable becomes a `dict` plus `sorted()` at flush time (`O(n log n)` per flush, which is fine) or a `bisect`-maintained list; `struct.pack` replaces `DataOutputStream`, and `heapq.merge` with a `key` on `(key, -seq)` is the k-way merge. Go has no ordered map either: use a slice kept sorted with `sort.Search` for the memtable or a skip list from Lesson 07, `encoding/binary` for the file format, and `container/heap` for the merge; `[]byte` files in a `map[string][]byte` are the disk. In both, the only sharp edge is that the test for "disk files equal live tables" depends on deleting inputs after writing the output, in that order.
+Go has no ordered map: use a slice kept sorted with `sort.Search` for the memtable or a skip list from Lesson 07, `encoding/binary` for the file format, and `container/heap` for the merge; `[]byte` files in a `map[string][]byte` are the disk. The only sharp edge is that the test for "disk files equal live tables" depends on deleting inputs after writing the output, in that order.
 
 ## Use It
 

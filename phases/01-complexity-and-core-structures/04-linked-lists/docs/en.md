@@ -3,7 +3,7 @@
 > Pointer chasing is slow; here is when linked lists still win.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays)
 **Time:** ~75 minutes
 
@@ -371,9 +371,39 @@ list, nodes in shuffled order: 132.20 ms  (195.6x the array)
 
 The test harness prints `46 passed, 0 failed`. The timings will differ on your machine; the sums and the ordering will not.
 
+### In Python
+
+```python
+class DoublyLinkedList(Generic[T]):
+    class Node:
+        __slots__ = ("value", "prev", "next", "owner")
+
+    def unlink(self, node: Node) -> T:
+        """O(1): the node knows both neighbours, so no search is needed."""
+        self._require_owned(node)
+        node.prev.next = node.next
+        node.next.prev = node.prev
+        node.prev = node.next = None
+        node.owner = None
+        self._size -= 1
+        return node.value
+```
+
+`code/python/main.py` keeps all three lists, the sentinel, ownership checks, and `PendingAuthorization`. What differs:
+
+- **`__slots__` on every node.** Without it each node carries a per-instance `__dict__` and the memory-per-element row of the cost table roughly doubles. `IntrusiveNode` declares `prev`, `next`, `owner`, and subclasses such as `PendingAuthorization` add their own slots.
+- **Exceptions.** `IndexOutOfBoundsException` and `NoSuchElementException` both become `IndexError` (what `list.pop()` raises on an empty list), `IllegalArgumentException` becomes `ValueError`, and `IllegalStateException` (adding an element that is already in a list) becomes `RuntimeError`.
+- **The benchmark measures the interpreter, not the cache.** The shuffle uses a `JavaRandom` that reproduces `java.util.Random`, so the shuffled permutation is identical to Java's and all three sums print `499999500000`. The ratios are not: every `c.value` is a bytecode dispatch and a reference-count update, so the array scan is around 30 ms rather than under 1 ms, and the shuffled list is roughly 10x the array instead of 200x. The ordering (array < in-order list < shuffled list) still holds. Python takes the best of 3 rounds instead of 5 to stay under ten seconds.
+
+```bash
+cd phases/01-complexity-and-core-structures/04-linked-lists/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port uses `__slots__ = ("value", "prev", "next", "owner")` on the node classes, since without it each node carries a dictionary and the memory-per-element row in the cost table roughly doubles; exceptions map one to one (`IndexError`, `ValueError`). A Go port makes `Node[T]` a generic struct with pointer fields, returns `(T, bool)` or `error` instead of throwing, and must take care that `unlink` nils the pointers so the GC can collect the node; the intrusive variant embeds a `ListHook` struct in the element, exactly as `container/list` would not let you do. In both languages the measured gap between array and shuffled list is wider, not narrower, because their object headers are larger.
+A Go port makes `Node[T]` a generic struct with pointer fields, returns `(T, bool)` or `error` instead of throwing, and must take care that `unlink` nils the pointers so the GC can collect the node; the intrusive variant embeds a `ListHook` struct in the element, exactly as `container/list` would not let you do.
 
 ## Use It
 

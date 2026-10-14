@@ -3,7 +3,7 @@
 > Detect the dangerous structure instead of locking.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 7, Lesson 06 (MVCC and Snapshot Isolation), Phase 7, Lesson 05 (Two-Phase Locking), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -326,9 +326,35 @@ T10 tries to write A, which T9 read: ABORTED immediately: T10 -rw-> T9 -rw-> T10
 
 Section 3 shows readers `[3, 4, 7]` on B: T3 and T4 committed long ago, but T8 (seq-wise concurrent with all of them) is still active, so their SIREADs are retained until `releaseFinished` runs after T8 commits.
 
+### In Python
+
+```python
+reader.out_conflicts[writer.id] = None
+writer.in_conflicts[reader.id] = None
+if reader.is_active() and writer.is_committed() and writer.out_conflicts:
+    self.abort(reader, f"{reader} -rw-> {writer} -rw-> T{_first(writer.out_conflicts)}: "
+                       f"{writer} is a committed pivot")
+elif writer.is_active() and reader.is_committed() and reader.in_conflicts:
+    self.abort(writer, f"T{_first(reader.in_conflicts)} -rw-> {reader} -rw-> {writer}: "
+                       f"{reader} is a committed pivot")
+```
+
+Differences, all in `code/python/main.py`:
+
+- **Ordered sets are dicts.** The conflict sets and the SIREAD sets are `dict[int, None]`: Python has no `LinkedHashSet`, and a plain `set` has no first element. The abort messages name `iterator().next()` in Java, so `_first` takes `next(iter(...))` and both languages blame the same transaction. Membership (`p.id in q.out_conflicts`), removal (`pop(id, None)`) and emptiness read the same as with a set.
+- **Iterate over copies when the loop can abort.** `read` and `_check_readers_of` loop over `list(...)` snapshots because `_record_rw` may abort the current transaction, which removes it from `_txns` and from every SIREAD set mid-loop. Python raises `RuntimeError: dictionary changed size during iteration` where Java would throw `ConcurrentModificationException`.
+- **Errors and numbers.** `SerializationFailureException` and `WriteConflictException` are `RuntimeError` subclasses; using a finished transaction raises a plain `RuntimeError` naming the abort reason, and a test checks it is not the serialization failure. `end_seq` starts at `INT64_MAX` to mirror `Long.MAX_VALUE`, and `Money` checks 64-bit overflow by hand as in Lesson 06.
+- **No threads.** Concurrency is event order (`begin_seq`, `end_seq`), never wall-clock time, so the demo's edges, aborts and counts (`commits = 8, aborts = 2`) are identical to Java's.
+
+```bash
+cd phases/07-storage-and-transactions/07-serializable-snapshot-isolation/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port keeps the same two sets per transaction and uses `set[int]`; exceptions map one to one. A Go port returns `error` from `Read`, `Write`, `Delete`, and `Commit` with sentinel `ErrSerializationFailure` and `ErrWriteConflict`; because `Read` can now fail, its signature becomes `(V, bool, error)`, which is the honest shape of a serializable read. The event counter and the conflict sets must be protected by the store's single mutex if goroutines are introduced; the detection logic itself is sequential by design. Neither language needs anything beyond maps and sets.
+A Go port returns `error` from `Read`, `Write`, `Delete`, and `Commit` with sentinel `ErrSerializationFailure` and `ErrWriteConflict`; because `Read` can now fail, its signature becomes `(V, bool, error)`, which is the honest shape of a serializable read. The event counter and the conflict sets must be protected by the store's single mutex if goroutines are introduced; the detection logic itself is sequential by design. Go needs nothing beyond maps and slices.
 
 ## Use It
 

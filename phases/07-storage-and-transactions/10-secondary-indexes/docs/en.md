@@ -3,7 +3,7 @@
 > Find all payments for a customer across shards.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 7, Lesson 01 (Partitioning Strategies and Rebalancing), Phase 7, Lesson 02 (Write-Ahead Logs), Phase 3, Lesson 06 (Consistent Hashing and Virtual Nodes)
 **Time:** ~75 minutes
 
@@ -383,11 +383,40 @@ after drain: 0 dangling, 0 missing, consistent=true
 
 The `cust_alice` line is the one to keep. Five rows across four shards means the global index saved nothing on reads for her, and cost an extra request. The index is a bet that most queries have `k` well below `N`.
 
+### In Python
+
+```python
+@staticmethod
+def fnv1a64(key: str) -> int:
+    h = Hashing.FNV_OFFSET
+    for b in key.encode("utf-8"):
+        h ^= b
+        h = (h * Hashing.FNV_PRIME) & MASK64
+    return to_int64(h)
+
+@staticmethod
+def partition_for(key: str, partitions: int) -> int:
+    return Hashing.fnv1a64(key) % partitions
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The hash is made signed on purpose.** Python ints never wrap, so every multiply is masked with `MASK64`, and `to_int64` reinterprets the result as the signed `long` Java holds. That matters for routing: Java uses `Math.floorMod` on the signed value, and Python's `%` with a positive divisor is exactly `floorMod`. Taking `%` of the *unsigned* value would send some keys to a different shard (for `n = 3` every negative hash moves, because `2**64 % 3 == 1`); a Python-only test pins the difference. Python's built-in `hash()` is randomised per process and is never used.
+- **Ordered containers are sorted at read time.** `TreeMap` and `TreeSet` become `dict` and `set`, and `lookup_customer`, `lookup`, `scan` and `all_entries` call `sorted(...)`. `Locator` is a `@dataclass(frozen=True, order=True)`, whose field order `(shard_id, payment_id)` gives the same ordering as the Java `compareTo`. `find_by_customer_global` groups by shard in an insertion-ordered `dict`, standing in for `LinkedHashMap`.
+- **Errors.** Constructor guards raise `ValueError` (Java `IllegalArgumentException`); a `Payment` with a `None` field raises `TypeError` where Java's `requireNonNull` throws `NullPointerException`. `QueryResult.payments` is a tuple, the read-only list `Collections.unmodifiableList` returns.
+- **Same bills.** Request counters move on the same calls (including the `lookup_customer` calls `placement` makes), so every count in the demo matches Java line for line.
+
+```bash
+cd phases/07-storage-and-transactions/10-secondary-indexes/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-- **Hashing.** Python's `hash()` and Go's map hashing are per-process randomised; both ports must implement FNV-1a 64 over UTF-8 bytes by hand. Python needs `& 0xFFFFFFFFFFFFFFFF` after each multiply; Go uses `uint64` so the wrap is free and `% uint64(n)` needs no `floorMod`.
-- **Ordered sets.** `TreeSet<Locator>` and `TreeMap` give deterministic iteration. Python uses `dict` plus `sorted()` at read time; Go uses `map` plus `sort.Slice` on a comparable `Locator` struct. Do not rely on map iteration order in either.
-- **Errors.** The constructor guards become `ValueError` in Python and `error` returns from `NewPartitionedStore` in Go. `Shard.getMany` skipping missing ids is a filter, not an error, in all three.
+- **Hashing.** Go's map hashing is per-process randomised; the port must implement FNV-1a 64 over UTF-8 bytes by hand. Go uses `uint64` so the wrap is free and `% uint64(n)` needs no `floorMod`.
+- **Ordered sets.** `TreeSet<Locator>` and `TreeMap` give deterministic iteration. Go uses `map` plus `sort.Slice` on a comparable `Locator` struct. Do not rely on map iteration order.
+- **Errors.** The constructor guards become `error` returns from `NewPartitionedStore` in Go. `Shard.getMany` skipping missing ids is a filter, not an error, in all three.
 - **Concurrency.** This lesson is single-threaded by design. A Go port that drains the queue from a goroutine must guard the index partitions with a mutex and pass `go test -race`; the staleness tests then need the drain to be externally triggered, exactly as here, or they become timing-dependent.
 
 ## Use It

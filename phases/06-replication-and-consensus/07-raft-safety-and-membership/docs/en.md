@@ -3,7 +3,7 @@
 > Joint consensus and why you cannot just swap the config.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 6, Lesson 06 (Raft II: Log Replication and Commit); Phase 6, Lesson 05 (Raft I: Terms, Leader Election, and a Simulated Network); Phase 6, Lesson 03 (Quorums: R + W > N and Its Limits)
 **Time:** ~120 minutes
 
@@ -394,9 +394,38 @@ seeds converged on all writes in the final configuration: 12/12; membership chan
 no Election Safety, Leader Completeness, Log Matching, or State Machine Safety check fired (each would have thrown)
 ```
 
+### In Python
+
+```python
+@dataclass(frozen=True)
+class Configuration:
+    old_members: frozenset
+    new_members: Optional[frozenset] = None
+
+    def all(self) -> list[int]:
+        s = set(self.old_members)
+        if self.new_members is not None:
+            s |= self.new_members
+        return sorted(s)
+```
+
+`code/python/main.py` is Lesson 06's Python port with the same additions as the Java, and the demo prints the same trace line for line. What differs:
+
+- **Sets are `frozenset`, iteration is `sorted`.** `Configuration` is a frozen dataclass, so `==` compares members exactly like the Java record and `decode(encode(c)) == c` holds. Java iterates `TreeSet`s; Python sets have no order, so `all()` and `replication_targets()` return sorted lists. The order matters: it decides which RequestVote and AppendEntries hit the network first, and therefore which seeded delay each one draws.
+- **`Snapshot` copies its data.** `__post_init__` replaces `data` with a fresh `dict` (the Java `new TreeMap<>(data)`), so the leader's live `KVStore.data` keeps changing without corrupting a snapshot it already sent. `Snapshot` and `Message` are `eq=False`: the checker compares `LogEntry`s and `Configuration`s, never snapshots.
+- **No constructor overloads.** Java has `Cluster(size, initialMembers, seed, drop, delay, config)` and `Cluster(size, seed, drop, delay)`; Python has one `Cluster(size, seed, drop_rate, max_delay, config=DEFAULT_CONFIG, initial_members=None)`, where `None` means every server starts in the configuration.
+- **Errors.** `IllegalStateException` (a compacted `term_at`, two leaders, every Figure 3 violation) is `RuntimeError`; bad timing configs are `ValueError`. Booleans are printed through `fmt_bool` so the demo says `true`, as the Java does.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `Configuration` is a frozen dataclass with `frozenset` members (hashable, comparable); `disjointQuorumsPossible` can use `itertools` subsets but the bitmask loop ports as is; the `Snapshot` holds a `dict` copy; everything else is Lesson 06's port with the index translation `index - snapshot_index` in `Storage`. Go: `Configuration` holds `map[int]bool` sets with a hand-written `Equal`; `Snapshot.Data` is a `map[string]string` that must be copied on construction; `Message` grows a `*Snapshot` field (nil for every other kind); errors from `termAt` below the snapshot become a panic because it is a programming error, not a runtime condition. In both, keep the single-threaded simulation; a production port would persist `Storage` with a write-ahead log and `fsync` before replying.
+Go: `Configuration` holds `map[int]bool` sets with a hand-written `Equal`; `Snapshot.Data` is a `map[string]string` that must be copied on construction; `Message` grows a `*Snapshot` field (nil for every other kind); errors from `termAt` below the snapshot become a panic because it is a programming error, not a runtime condition. Keep the single-threaded simulation; a production port would persist `Storage` with a write-ahead log and `fsync` before replying.
 
 ## Use It
 

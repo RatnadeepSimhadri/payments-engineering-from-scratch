@@ -3,7 +3,7 @@
 > One account, one mailbox, no locks.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 05 (Producers, Consumers, and Bounded Queues); Phase 4, Lesson 07 (Deadlocks, Lock Ordering, and Detection)
 **Time:** ~75 minutes
 
@@ -348,9 +348,36 @@ seed 42: 32 messages delivered, 32 traced
   balance = 1000.00 USD (expected 1000.00 USD); messages processed = 100001; max concurrent receive() = 1
 ```
 
+### In Python
+
+`code/python/main.py` is the same runtime class for class: `ActorCell`, `DeterministicScheduler`, `ThreadedScheduler`, `AccountActor`, `TransferCoordinator`. Four things differ.
+
+- **Messages are frozen dataclasses and `receive` is a `match`.** Python has no sealed hierarchy, so the exhaustiveness check the Java compiler gives you becomes a `case _:` that raises `ValueError`, exactly like the Java `default` branch. `Transfer.from_` carries a trailing underscore because `from` is a keyword.
+- **The mailbox is a `collections.deque`.** `append` and `popleft` are atomic in CPython, which is the property `ConcurrentLinkedQueue` gives Java. `AtomicBoolean` and `AtomicInteger` are tiny lock-guarded classes: the GIL makes `count += 1` *look* atomic, but it is a read, an add and a write, and a thread switch can land between them.
+- **The GIL does not change the lesson.** Only one thread runs Python bytecode at a time, but the interpreter switches threads between bytecodes, so two pool threads can still both be inside `receive` for the same actor if the CAS on `scheduled` is removed. The `max_concurrent_receives == 1` assertion is what proves the scheduler, not the GIL, keeps rule 3.
+- **The seeded scheduler uses a port of `java.util.Random`.** `JavaRandom` reproduces the JDK's 48-bit LCG and `nextInt(bound)`, so seed 42 picks the same actor at every step in both languages and the demo traces are identical line for line.
+
+```python
+def _run(self, cell: ActorCell) -> None:
+    try:
+        for _ in range(self._throughput):  # drain a batch
+            if not cell.process_one():
+                break
+    finally:
+        cell.scheduled.set(False)          # release first ...
+        if cell.mailbox:                   # ... then re-check: a message may have landed in between
+            self.schedule(cell)
+```
+
+```bash
+cd phases/04-concurrency/08-the-actor-model/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Go: goroutines and channels *are* an actor runtime with the mailbox made explicit. An actor is a goroutine with a `for msg := range mailbox` loop, `tell` is a channel send, and rule 3 holds because one goroutine owns the loop; a buffered channel gives you the bounded mailbox this lesson lacks. Supervision is a `recover()` in the loop plus a decision to continue, re-create state, or close the channel. The deterministic scheduler is harder because Go's scheduler is not pluggable; drive actors from a single test goroutine that calls a `step()` method instead of running their loops. Python: `asyncio.Queue` per actor and a task per actor gives the same shape; the event loop is single-threaded, so rule 3 holds and the deterministic scheduler is simply the event loop. Messages are frozen dataclasses. In both ports, keep the seed-driven `DeterministicScheduler` as the test harness so the 25-seed conservation test ports unchanged.
+Go: goroutines and channels *are* an actor runtime with the mailbox made explicit. An actor is a goroutine with a `for msg := range mailbox` loop, `tell` is a channel send, and rule 3 holds because one goroutine owns the loop; a buffered channel gives you the bounded mailbox this lesson lacks. Supervision is a `recover()` in the loop plus a decision to continue, re-create state, or close the channel. The deterministic scheduler is harder because Go's scheduler is not pluggable; drive actors from a single test goroutine that calls a `step()` method instead of running their loops. Keep the seed-driven `DeterministicScheduler` as the test harness so the 25-seed conservation test ports unchanged.
 
 ## Use It
 

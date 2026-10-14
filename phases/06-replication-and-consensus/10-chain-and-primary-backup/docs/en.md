@@ -3,7 +3,7 @@
 > Strong consistency with high read throughput.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 6, Lesson 01 (Replication Strategies); Phase 6, Lesson 02 (Replication Lag and Read-Your-Writes); Phase 5, Lesson 13 (Gossip Protocols and Failure Detection); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
@@ -342,9 +342,39 @@ primary-backup (1 primary + 2 backups), same workload:
   n0 PRIMARY handled updates=200  queries=1000 acks=402  total=1602
 ```
 
+### In Python
+
+```python
+def send(self, m: Message) -> None:
+    self.sent += 1
+    if m.to in self._down or (m.from_ >= 0 and m.from_ in self._down):
+        self.dropped += 1
+        return
+    link = (m.from_, m.to)
+    earliest = max(self._now + 1, self._last_delivery_per_link.get(link, 0))
+    at = earliest + self._rng.next_int(self._max_delay)
+    self._last_delivery_per_link[link] = at
+    heapq.heappush(self._in_flight, (at, self._seq, m))
+    self._seq += 1
+```
+
+`code/python/main.py` is the same design, and the demo output matches the Java line for line, including the per-replica message counts in the load table. What differs:
+
+- **The FIFO link key is a tuple.** Java packs `(from, to)` into one `long` with a shift and a mask; Python keys the dict on `(m.from_, m.to)`, which is the same injective mapping without the bit arithmetic. The in-flight queue is `heapq` on `(deliver_at, seq, message)`; `seq` is unique, so ties never compare messages.
+- **Insertion order is the `dict` default.** `Sent` (a `LinkedHashMap` in Java), the client's `pending` and `replies` maps are plain dicts, which keep insertion order, so a SYNC after a reconfiguration resends updates in the order they were forwarded. Balances are a `dict` printed through `fmt_map` to match `TreeMap.toString()`.
+- **One `Message` dataclass, many factories.** The Java factory `Message.update(...)` is `Message.update_msg(...)` in Python because `update` is also a field name on the frozen dataclass. `Request`, `Update` and `Money` are frozen dataclasses, so `==` on histories is structural, which is what the Update Propagation check needs.
+- **Errors and overflow.** An unexpected message kind raises `RuntimeError`; `Money.plus` keeps `Math.addExact`'s 64-bit bound explicitly because Python integers never overflow.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `Message` becomes a dataclass with optional fields (or a small class per kind); `LinkedHashMap` is a plain `dict`, which preserves insertion order; `TreeMap` for balances is a `dict` sorted on print. Go: one `Message` struct with a `Kind` and nil-able fields; `Sent` is a `map[int64]Update` plus a slice to keep order, since Go maps are unordered; the FIFO network's per-link map keys on a `[2]int`. In either port the simulation stays single-threaded; a real deployment runs each replica's `handle` on a TCP read loop, and TCP's ordering is what makes the FIFO assumption hold.
+Go: one `Message` struct with a `Kind` and nil-able fields; `Sent` is a `map[int64]Update` plus a slice to keep order, since Go maps are unordered; the FIFO network's per-link map keys on a `[2]int`. The simulation stays single-threaded; a real deployment runs each replica's `handle` on a TCP read loop, and TCP's ordering is what makes the FIFO assumption hold.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Dirty reads, lost updates, write skew: produce each one on purpose, because the one you have never seen is the one in production.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs and Crash Recovery), Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
@@ -380,9 +380,42 @@ write skew           Y                  Y                -                Y     
 
 The phantom row is the one to stare at: `REPEATABLE_READ` shows `Y` while the level above and below it in ANSI's ordering both show `-`, and `SNAPSHOT`, which ANSI would rank higher, shows `Y` for write skew where `REPEATABLE_READ` shows `-`.
 
+### In Python
+
+```python
+def read(self, key: str) -> int | None:
+    def op() -> int | None:
+        match self.level:
+            case Isolation.READ_UNCOMMITTED:
+                v = self.store.committed.get(key)  # sees in-place writes of others
+            case Isolation.READ_COMMITTED:
+                v = self.writes[key] if key in self.writes else self.store.committed.get(key)
+            case Isolation.REPEATABLE_READ | Isolation.SERIALIZABLE:
+                if key not in self.writes:
+                    self.store.lock_shared(self.id, key)
+                v = self.writes[key] if key in self.writes else self.store.committed.get(key)
+            case Isolation.SNAPSHOT:
+                v = self.writes[key] if key in self.writes else self.snapshot.get(key)
+        ...
+    return self._guarded(op)
+```
+
+Differences, all in `code/python/main.py`:
+
+- **`match` replaces the `switch` expressions.** Each operation is a nested `op` closure handed to `_guarded`, which plays the role of the Java `Supplier`: a `ConflictException` is traced, the transaction aborts and releases its locks, and the exception is re-raised.
+- **Two error kinds, kept apart.** `ConflictException` subclasses `Exception`, not `RuntimeError`; using an aborted or committed transaction raises `RuntimeError` (Java's `IllegalStateException`). `_quietly` catches both, but the tests can tell them apart, and one test asserts the classes stay unrelated.
+- **No `TreeMap`.** `committed` and the snapshot are plain `dict`s; `_with_prefix` sorts the keys and filters by prefix, which is what `tailMap(prefix)` plus the early `break` computes. Balances are `int` minor units and never overflow.
+- **Same trace text.** `_j` prints `None` as `null` and `_jmap` prints a scan like Java's `TreeMap.toString`, so `diff` of the two demos is empty. There are no threads: concurrency is the scripted interleaving, exactly as in Java.
+
+```bash
+cd phases/07-storage-and-transactions/04-isolation-levels-and-anomalies/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port replaces the `switch` expressions with `match`/`case` on the enum, uses `dict` for the lock table and a sorted list of keys with `bisect` for prefix scans, and keeps balances as `int`; `ConflictException` and the aborted-transaction `IllegalStateException` become two exception classes so `quietly` can catch exactly those. A Go port returns `(int64, error)` from `Read` and `error` from `Write` and `Commit`, with sentinel `ErrConflict` and `ErrNotActive` for `errors.Is`; the `snapshot` copy is a `map[string]int64` plus a sorted key slice for prefix scans. Neither port needs threads: the store is single-threaded by design, and concurrency is modelled by interleaving calls. If a port adds goroutines or threads, every method of `Store` must hold one mutex, because the lock table is itself shared state.
+A Go port returns `(int64, error)` from `Read` and `error` from `Write` and `Commit`, with sentinel `ErrConflict` and `ErrNotActive` for `errors.Is`; the `snapshot` copy is a `map[string]int64` plus a sorted key slice for prefix scans. The port needs no goroutines: the store is single-threaded by design, and concurrency is modelled by interleaving calls. If it adds goroutines, every method of `Store` must hold one mutex, because the lock table is itself shared state.
 
 ## Use It
 

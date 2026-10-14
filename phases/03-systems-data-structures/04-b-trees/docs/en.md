@@ -3,7 +3,7 @@
 > Pages, fan-out, and the disk access pattern behind every index.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 3, Lesson 03 (Balanced Trees: AVL and Red-Black), Phase 1, Lesson 03 (Binary Search), Phase 0, Lesson 09 (Memory, Caches, and Why Arrays Win)
 **Time:** ~120 minutes
 
@@ -355,9 +355,37 @@ range(100000, 100999): 1000 keys in 35 page reads
 after removing every odd id: size=100000 height=4 nodes=3124 ... merges=3125
 ```
 
+### In Python
+
+`code/python/main.py` keeps the same names: `PageStats`, `BTree` with `lower_bound`, `put`, `remove`, `range`, `check_invariants`, `height_bound`, and a frozen `Split` dataclass in place of the Java record. Three things differ:
+
+- **List slicing replaces `subList(...).clear()`.** A split copies the upper half into the new right page and truncates the left in place; `pop()`, `pop(0)`, and `insert(0, ...)` do the borrow rotations. Since the right page gets fresh lists, there is no aliasing to worry about:
+
+```python
+mid = len(n.keys) // 2
+mid_key, mid_value = n.keys[mid], n.values[mid]
+right = BTreeNode()
+right.keys = n.keys[mid + 1:]
+right.values = n.values[mid + 1:]
+del n.keys[mid:]
+del n.values[mid:]
+if not n.is_leaf():
+    right.children = n.children[mid + 1:]
+    del n.children[mid + 1:]
+```
+
+- **The page search stays hand-written.** `bisect.bisect_left` would compute the same index faster, but `lower_bound` is the within-page binary search the lesson is about, so it is spelled out. Keys compare with `<` and `==` instead of `compareTo`. Recursion depth is the tree height (4 or 5), so the recursion limit is not a concern.
+- **Same random keys, same page counts.** The demo's random ids come from `JavaRandom`, a bit-exact port of `java.util.Random`, with `next_long() & LONG_MAX` standing in for `nextLong() & Long.MAX_VALUE`. `java_shuffle` reproduces `Collections.shuffle`. That makes the node, split, read, write, and merge counts identical to Java's, which is a strong check that both versions touch the same pages. `IllegalStateError` replaces `IllegalStateException`, and `ValueError` replaces `IllegalArgumentException` for an order below 3.
+
+```bash
+cd phases/03-systems-data-structures/04-b-trees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The design ports without change. Python lists give `insert`, `pop`, and slice deletion for the split and merge bookkeeping; recursion depth is the tree height, so there is no recursion-limit concern. Go uses slices with `append` and `copy` for the same operations and needs care that the right sibling gets a fresh backing array rather than aliasing the left's; generics (`[K cmp.Ordered, V any]`) replace `Comparable`. Neither port needs concurrency. The `PageStats` counters are plain integers in both, and the tests assert the same read counts, which is a useful cross-language check that the two implementations visit the same pages.
+The design ports to Go without change. Go uses slices with `append` and `copy` for the split and merge bookkeeping and needs care that the right sibling gets a fresh backing array rather than aliasing the left's; generics (`[K cmp.Ordered, V any]`) replace `Comparable`. It needs no concurrency. The `PageStats` counters are plain integers, and the tests assert the same read counts, which is a useful cross-language check that the implementations visit the same pages.
 
 ## Use It
 

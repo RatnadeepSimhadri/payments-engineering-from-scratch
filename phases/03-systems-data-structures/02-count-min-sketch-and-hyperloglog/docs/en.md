@@ -3,7 +3,7 @@
 > Counting distinct cards per merchant in constant memory.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 3, Lesson 01 (Bloom Filters from Scratch), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 1, Lesson 11 (Bit Manipulation)
 **Time:** ~90 minutes
 
@@ -350,9 +350,33 @@ a=20193 b=19987 merged=30083 (true union 30000, sum would say 40180)
 
 The test suite asserts the never-underestimate invariant over 100,000 events, the paper's sizing formulas, HLL accuracy within three standard errors, and that merging equals building over the combined input.
 
+### In Python
+
+The full port is `code/python/main.py`; it is the same three classes (`Hashing`, `CountMinSketch`, `HyperLogLog`) with the same method names in snake_case. Three things differ:
+
+- **64-bit wraparound is explicit.** Python integers never overflow, so FNV-1a would grow without bound and every column index would disagree with Java. Every multiply is masked back to 64 bits, which makes the Python hashes bit-identical to the Java `long`s read as unsigned:
+
+```python
+@staticmethod
+def fnv1a64(key: str) -> int:
+    h = Hashing.FNV_OFFSET
+    for b in key.encode("utf-8"):
+        h = ((h ^ b) * Hashing.FNV_PRIME) & MASK64
+    return h
+```
+
+- **Unsigned arithmetic is free; leading zeros are not.** Because the masked hash is already non-negative, `column` is a plain `% width` (Java needs `Long.remainderUnsigned`), and `index` is `h >> (64 - p)` with no `>>>`. There is no `numberOfLeadingZeros`, so `rho` uses `bit_length()`: `64 - rest.bit_length() + 1`.
+- **Same random stream, same rounding.** The demo drives the sketches from `JavaRandom`, a bit-exact port of `java.util.Random` (48-bit LCG, `nextInt`, `nextLong`, polar-method `nextGaussian`), so seed 42 produces the same merchants and card tokens and the output matches Java line for line. `cardinality` uses `math.floor(x + 0.5)` because Python's `round` is banker's rounding and `Math.round` is not, and `fmt_fixed` reproduces Java's half-up `%.2f`.
+
+```bash
+cd phases/03-systems-data-structures/02-count-min-sketch-and-hyperloglog/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python integers are unbounded, so the Count-Min counters cannot overflow, but the hash must be masked to 64 bits after every FNV multiply (`& 0xFFFFFFFFFFFFFFFF`) or the two implementations disagree on every index; `rho` uses `(rest).bit_length()` rather than a leading-zero intrinsic. Go has `bits.LeadingZeros64` and native `uint64`, so `column` is a plain `%` with no unsigned-remainder helper, and `rho` is a one-liner. Neither port needs `double` anywhere except the HLL estimate, which is an estimate by definition. A merge of sketches from different languages is correct only if the serialization is integer-exact: write the registers and counters as bytes, never as JSON floats.
+Go has `bits.LeadingZeros64` and native `uint64`, so `column` is a plain `%` with no unsigned-remainder helper, and `rho` is a one-liner. It needs `float64` only for the HLL estimate, which is an estimate by definition. A merge of sketches from different languages is correct only if the serialization is integer-exact: write the registers and counters as bytes, never as JSON floats.
 
 ## Use It
 

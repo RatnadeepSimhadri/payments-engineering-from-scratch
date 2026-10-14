@@ -3,7 +3,7 @@
 > Commit the row and the event in one transaction or lose one of them.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs), Phase 7, Lesson 11 (Change Data Capture), Phase 7, Lesson 12 (The Saga Pattern)
 **Time:** ~90 minutes
 
@@ -354,9 +354,46 @@ Expected output, abbreviated:
 
 Sections 1 and 2 are the two halves of the dual-write problem; sections 3 and 4 are the fix and its one honest cost.
 
+### In Python
+
+```python
+def commit(self) -> None:
+    self._require_open()
+    self._open = False
+    s = self._store
+    for p in self._pending_payments:
+        s._payments[p.payment_id] = p
+    for e in self._pending_events:
+        seq = s._next_seq
+        s._next_seq += 1
+        s._outbox[seq] = replace(e, seq=seq, published=False)
+    ...
+
+def __exit__(self, exc_type, exc, tb) -> bool:
+    if self._open:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+    return False
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The transaction is also a context manager.** `Store.Tx` keeps the Java API (`insert_payment(...).insert_outbox(...).commit()`, `rollback()`), and adds `__enter__`/`__exit__`, so `with store.begin() as tx:` commits on success and rolls back on an exception. That makes "both rows or neither" the default shape of the code, not a discipline; a Python-only test covers both exits. The inner class is a nested `class Tx` holding a reference to its `Store`, because Python has no implicit outer instance.
+- **Records are frozen dataclasses.** `OutboxEvent.mark_published` and the seq assignment at commit use `dataclasses.replace`, the equivalent of building a new record. `Broker.from` is `from_`, because `from` is a keyword.
+- **Errors and money.** `CrashException` and `BrokerUnavailableException` are `RuntimeError` subclasses, and the relay catches only the broker one, so a crash escapes `poll()` as it does in Java. A closed or duplicate transaction raises `RuntimeError` (`IllegalStateException`). `Money.plus` checks the signed 64-bit range by hand and raises `OverflowError`, as `Math.addExact` would.
+- **Same output.** No threads, a simulated clock and scripted crash points: the demo's counts and the broker order `11 12 13 14 15` match Java exactly.
+
+```bash
+cd phases/07-storage-and-transactions/13-transactional-outbox/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The design ports directly. In Python, `Store.Tx` is a context manager (`with store.begin() as tx:`) whose `__exit__` commits on success and rolls back on exception, which makes the atomicity idiomatic rather than a discipline; `Money` is a frozen dataclass over `int`. In Go, `Tx.Commit()` and `Broker.Publish()` return `error`, `BrokerUnavailable` is a sentinel for `errors.Is`, and the injected crash is a returned `ErrCrash` rather than a panic so `poll()` can be tested without `recover()`. A Go relay that runs as a goroutine with a ticker is the natural next step, and its tests then need `-race`; the single-threaded version here needs neither.
+The design ports directly. In Go, `Tx.Commit()` and `Broker.Publish()` return `error`, `BrokerUnavailable` is a sentinel for `errors.Is`, and the injected crash is a returned `ErrCrash` rather than a panic so `poll()` can be tested without `recover()`. A Go relay that runs as a goroutine with a ticker is the natural next step, and its tests then need `-race`; the single-threaded version here needs neither.
 
 ## Use It
 

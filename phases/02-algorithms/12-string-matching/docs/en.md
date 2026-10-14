@@ -3,7 +3,7 @@
 > Sanctions screening scans millions of names against thousands of patterns.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 12 (Strings and Encodings), Phase 1, Lesson 13 (Tries), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 2, Lesson 08 (Graph Traversal)
 **Time:** ~90 minutes
 
@@ -358,9 +358,33 @@ Acme Widgets Inc               -> clear
 
 The 38 tests cover: three hand-computed failure tables; overlapping matches in all three single-pattern matchers; the pathological input; `roll` agreeing with a fresh hash on every window; 200 random two-letter inputs where KMP and Rabin-Karp agree with naive; the textbook `ushers` trace; 100 random texts where Aho-Corasick agrees with KMP run per pattern; and the whole-token rules of the screener.
 
+### In Python
+
+```python
+def roll(self, window_hash: int, out: str, in_: str) -> int:
+    h = (window_hash - (ord(out) * self._high_power) % self.MOD + self.MOD) % self.MOD
+    return (h * self.BASE + ord(in_)) % self.MOD
+```
+
+The five classes and the `Match` record keep their names and algorithms; three things differ, all in `code/python/main.py`:
+
+- **Strings are code points, not UTF-16 units.** Indexing a Python `str` yields code points, so `len("𝔘")` is 1 where Java's `length()` is 2, and `ord(c)` replaces the implicit `char`-to-`long` widening in the rolling hash. For every input in the lesson and the tests (ASCII, plus `ü`, which is one unit in both) the hashes, indices, and matches are identical; a name containing characters outside the Basic Multilingual Plane would give different offsets in the two languages. `normalize` uses `str.upper()` and `str.isalnum()` for `toUpperCase(Locale.ROOT)` and `Character.isLetterOrDigit`; they agree on Latin, Cyrillic, and Arabic letters, and a production screener would pin a Unicode normalization form (NFKC) in both.
+- **Hash arithmetic cannot overflow.** Python integers are unbounded and `%` with a positive modulus is never negative, so the `+ MOD` in `roll` is kept only so the line reads like the Java; the hash values are the same numbers. `text.startswith(pattern, i)` is `regionMatches`.
+- **Trie nodes are a small class with `__slots__`.** Children live in a `dict`, which also iterates in insertion order (the Java `HashMap` does not), but the BFS needs only depth order, so the automaton and the matches are the same. `Match` is a frozen dataclass whose `__str__` prints `Match[pattern=..., start=...]` like the Java record, so the demo output is identical.
+
+The test file carries a port of `java.util.Random` so the 300 random strings are the same inputs as the Java run.
+
+```bash
+cd phases/02-algorithms/12-string-matching/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo output is identical to the Java run, and the suite runs the same 38 checks.
+
 ### Porting notes
 
-Python strings are sequences of code points rather than UTF-16 units, so `len("𝔘")` is 1 where Java's is 2; the algorithms are unchanged but the test for surrogate pairs would differ. Python integers do not overflow, so the rolling hash needs no care about intermediate size, and `%` already returns a non-negative result for a positive modulus. Go strings are bytes; the natural port works on `[]rune` after `[]rune(s)` conversion, or on bytes with `BASE = 256` exactly, and the trie's children map is `map[rune]*node`. Go has no exceptions, so the empty-pattern check returns an error from a constructor function. In both languages the automaton's BFS is identical.
+Go strings are bytes; the natural port works on `[]rune` after `[]rune(s)` conversion, or on bytes with `BASE = 256` exactly, and the trie's children map is `map[rune]*node`. Go has no exceptions, so the empty-pattern check returns an error from a constructor function. The automaton's BFS is identical.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > How ConcurrentHashMap and sync.Map avoid a global lock.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch); Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 03 (Compare-and-Swap and Lock-Free Structures)
 **Time:** ~90 minutes
 
@@ -358,9 +358,36 @@ The throughput section prints operations per millisecond for the three maps on a
 
 The test suite runs the same single-threaded contract against all three maps, then a four-phase barrier-synchronised concurrent test against each: disjoint inserts, cross reads, contended `compute` increments on 100 shared keys, and removals. The assertions (every shared key equals `threads x bumps`; size after removals equals the shared-key count) hold under every legal interleaving, which is what makes a concurrent test deterministic even though the schedule is not.
 
+### In Python
+
+```python
+def get(self, key):
+    _require(key, "key")
+    t = self._table                                   # one atomic load of the table reference
+    n = t[Hashing.bucket_index(key, len(t))]           # one atomic load of the bucket
+    while n is not None:                               # immutable nodes: no further synchronization
+        if n.key == key:
+            return n.value
+        n = n.next
+    return None
+```
+
+`code/python/main.py` keeps `ConcurrentStore`, `GlobalLockMap`, `StripedHashMap` (one `threading.Lock` per segment), `LockFreeReadMap`, and the barrier-forced races. What differs:
+
+- **The hash is rebuilt in 32-bit arithmetic.** Python's `hash(str)` is salted per process, so `Hashing.stable_hash` computes `String.hashCode` over UTF-16 code units and masks to 32 bits after each step, and `spread` masks after each multiply. The segment index uses the unsigned view of the hash before shifting, which is Java's `>>>`. The result: every key lands in the same stripe and bucket as in Java (`acct-1->s8 ... acct-8->s5`), and a test pins those placements.
+- **The publish guarantee comes from the interpreter, not `volatile`.** Python has no `final` fields and no `volatile`. Reading `self._table` and `t[i]` are single atomic operations under the GIL (and under the free-threaded build's per-object locks), so a reader still sees the old chain or the new one. Nodes are made immutable by refusing `__setattr__` after construction, and a test asserts the `AttributeError`, so the "walk without synchronization" argument holds for the same reason it does in Java: nothing a reader can reach is ever mutated.
+- **The GIL changes the throughput story, not the race story.** Only one thread runs bytecode at a time, so striping cannot add parallelism and the benchmark measures lock and hashing overhead instead (Python runs 20,000 ops per thread rather than 100,000 to stay under ten seconds). The check-then-act race is unchanged: `threading.Barrier` holds all eight threads in the gap after `get`, so all eight still believe they created the record, and `put_if_absent` still produces exactly one winner.
+- **Counters and nulls.** `size()` uses an `AtomicInteger` built on a lock, because `+=` is a read, an add, and a write that a thread switch can split. `None` keys and values raise `TypeError` where Java throws `NullPointerException`, so `None` from `get` always means absent.
+
+```bash
+cd phases/04-concurrency/04-concurrent-hash-maps/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: with the GIL, a `dict` is already atomic per operation, so `StripedHashMap` is mostly a teaching exercise; implement it with `threading.Lock` per segment and keep the same method names. There are no `final`-field or `volatile` semantics to make `LockFreeReadMap` meaningful; document that the GIL (or, in free-threaded builds, per-object locks) provides the publish guarantee. Go: `sync.Mutex` per segment for striping; for lock-free reads use `atomic.Pointer[node]` per bucket and `atomic.Pointer[[]*node]` for the table, with immutable node structs. `go test -race` must pass, and it will flag any plain field read that races with a write, which is a good check that every shared read is through an atomic. Compare the result with `sync.Map`, which is designed for the write-once-read-many case and uses a read-only map promoted from a dirty map.
+Go: `sync.Mutex` per segment for striping; for lock-free reads use `atomic.Pointer[node]` per bucket and `atomic.Pointer[[]*node]` for the table, with immutable node structs. `go test -race` must pass, and it will flag any plain field read that races with a write, which is a good check that every shared read is through an atomic. Compare the result with `sync.Map`, which is designed for the write-once-read-many case and uses a read-only map promoted from a dirty map.
 
 ## Use It
 

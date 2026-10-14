@@ -3,7 +3,7 @@
 > Stability matters when you sort transactions by amount and need time order preserved.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays from Scratch), Phase 1, Lesson 09 (Heaps and Priority Queues from Scratch)
 **Time:** ~120 minutes
 
@@ -341,9 +341,41 @@ heapSort with a (amount, seq) tie-break is deterministic: true
 
 The test run prints `66 passed, 0 failed`.
 
+### In Python
+
+```python
+class CountingComparator:
+    def __init__(self, inner: Comparator) -> None:
+        self._inner = inner
+        self.comparisons = 0
+
+    def __call__(self, a: Any, b: Any) -> int:
+        self.comparisons += 1
+        return self._inner(a, b)
+```
+
+The design is the same; four things differ, all in `code/python/main.py`:
+
+- **Comparators are plain callables.** A comparator is any `(a, b) -> int` function; `Transaction.BY_AMOUNT` and `BY_SEQ` are static methods and `then_comparing(BY_AMOUNT, BY_SEQ)` replaces `Comparator.thenComparing`. `CountingComparator` is a callable object, so it can be passed anywhere a comparator is expected. The library equivalent, `sorted(xs, key=...)`, takes a key function instead; `functools.cmp_to_key` adapts a comparator when you need one.
+- **The same seed gives the same numbers.** `JavaRandom` is a bit-for-bit port of `java.util.Random` (the 48-bit LCG, `next(bits)`, and `nextInt(bound)` with its rejection loop), so the pivots, the random arrays, and every comparison count in the demo match the Java output exactly. Python's own `random.Random(42)` is a Mersenne Twister and would give different counts.
+- **No primitive/object split.** A Python list holds references, so there is no `int[]` fast path and no `(T[]) new Object[]` cast; `merge_sort` allocates `[None] * len(a)` once. The closing line of the demo names `sorted()`/`list.sort()` (Timsort, stable) instead of the two `Arrays.sort` overloads.
+- **Overloads become defaults.** `insertion_sort(a, cmp, from_=0, to=None)` covers both Java overloads; `from` is a keyword, hence `from_`.
+
+```python
+def insertion_sort(a: list, cmp: Comparator, from_: int = 0, to: int | None = None) -> None:
+```
+
+```bash
+cd phases/02-algorithms/01-sorting-algorithms/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo numbers are identical to the Java run; the test suite runs the same 66 checks (insertion sort on 4096 elements makes the run take a couple of seconds in CPython).
+
 ### Porting notes
 
-Python's `sorted` and `list.sort` are Timsort and stable; a port would pass `key=` functions instead of comparators and use `functools.cmp_to_key` only for the counting wrapper. There is no primitive-array distinction, so everything is the stable path. Go's `sort.Sort` is pattern-defeating quicksort since Go 1.19 and is not stable; `sort.Stable` and `slices.SortStableFunc` are the stable calls, and the port's stability test would need to show `sort.Slice` scrambling the ledger the way `heapSort` does here. Go generics (`[T any]`) express the `Sorts` signatures directly; `*rand.Rand` is injected in place of `java.util.Random`. Neither language needs the `(T[]) new Object[]` cast, which exists only because Java generics are erased.
+Go's `sort.Sort` is pattern-defeating quicksort since Go 1.19 and is not stable; `sort.Stable` and `slices.SortStableFunc` are the stable calls, and the port's stability test would need to show `sort.Slice` scrambling the ledger the way `heapSort` does here. Go generics (`[T any]`) express the `Sorts` signatures directly; `*rand.Rand` is injected in place of `java.util.Random`. Go does not need the `(T[]) new Object[]` cast, which exists only because Java generics are erased.
 
 ## Use It
 

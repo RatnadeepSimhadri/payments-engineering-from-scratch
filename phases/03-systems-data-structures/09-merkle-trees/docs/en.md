@@ -3,7 +3,7 @@
 > Verify two ledgers agree by comparing one hash.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 3, Lesson 01 (Bloom Filters)
 **Time:** ~75 minutes
 
@@ -348,9 +348,33 @@ Expected output, abbreviated:
 
 The root in section 1 is reproducible: anyone who runs this file on any machine gets `4d637a9b...`, because SHA-256 and the canonical serialization are fully specified. That reproducibility is the property the whole lesson rests on.
 
+### In Python
+
+`code/python/main.py` has the same records as frozen dataclasses (`Currency`, `Money`, `Posting`, `ProofStep`, `Diff`) and the same `MerkleTree` methods in snake_case (`hash_leaf`, `hash_node`, `proof`, `verify`, `diff`, `of_postings`). The demo prints the same root, `4d637a9b...`, and the tests pin it. Three things differ:
+
+- **`hashlib` and `hmac` replace `MessageDigest`.** `hashlib.sha256()` has the same `update`/`digest` shape, so the domain-separated hashes read line for line like the Java code. The final root comparison uses `hmac.compare_digest`, the constant-time counterpart of `MessageDigest.isEqual`:
+
+```python
+@staticmethod
+def verify(leaf_data: bytes, proof: list[ProofStep], expected_root: bytes) -> bool:
+    h = MerkleTree.hash_leaf(leaf_data)
+    for step in proof:
+        h = MerkleTree.hash_node(step.sibling, h) if step.sibling_on_left else MerkleTree.hash_node(h, step.sibling)
+    return hmac.compare_digest(h, expected_root)
+```
+
+- **`bytes` is immutable, so no defensive copies.** Java clones every `byte[]` it hands out, and its test checks `root() != root()`. In Python a caller cannot write into the returned root at all, and the test asserts that `root[0] = 0` raises `TypeError`. Use `bytes` everywhere, never `str`, which would re-encode.
+- **Index checks are explicit.** A Python list accepts `-1` and returns the last element, so `proof` checks `0 <= index < leaf_count()` itself and raises `IndexError`, the counterpart of `Objects.checkIndex`. `ValueError` replaces `IllegalArgumentException` for an empty tree or a leaf-count mismatch in `diff`. `Money.__post_init__` rejects a `float` amount, which Java's `long` field rejects at compile time.
+
+```bash
+cd phases/03-systems-data-structures/09-merkle-trees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The design ports without structural change. Python's `hashlib.sha256()` has the same `update`/`digest` shape as `MessageDigest`; use `hmac.compare_digest` for the constant-time root comparison and `bytes` everywhere (never `str`, which would re-encode). Go's `crypto/sha256` gives `sha256.New()` with `Write` and `Sum(nil)`, and `crypto/subtle.ConstantTimeCompare` for the final check; `levels` becomes `[][][]byte`, `proof` returns `([]ProofStep, error)` for an out-of-range index, and `diff` returns `(Diff, error)` for a leaf-count mismatch instead of panicking. The canonical posting bytes must be identical across the three languages, so keep the integer-minor-units `|`-separated form and add a cross-language test that pins the eight-posting root `4d637a9b...` as a constant.
+The design ports to Go without structural change. Go's `crypto/sha256` gives `sha256.New()` with `Write` and `Sum(nil)`, and `crypto/subtle.ConstantTimeCompare` for the final check; `levels` becomes `[][][]byte`, `proof` returns `([]ProofStep, error)` for an out-of-range index, and `diff` returns `(Diff, error)` for a leaf-count mismatch instead of panicking. The canonical posting bytes must be identical in every language, so keep the integer-minor-units `|`-separated form and pin the eight-posting root `4d637a9b...` as a constant in the Go tests too.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Make the scheduler your test input.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 07 (Deadlocks, Lock Ordering, and Detection); Phase 4, Lesson 01 (Threads and the Memory Model)
 **Time:** ~75 minutes
 
@@ -341,11 +341,32 @@ same seed again: violations = 735 (identical: true)
 
 The stress section follows and its first line varies between runs; that variation is the point of the lesson.
 
+### In Python
+
+`code/python/main.py` ports Part 1 unchanged in shape: the instructions are frozen dataclasses, `Machine.step` is a `match` over them, and `Explorer.random` uses `JavaRandom`, an exact port of `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so seed 42 samples the same 1,000 schedules and every number in the model-checking half of the demo matches Java's. `IllegalStateException` becomes `IllegalStateError`, and `add_exact` reproduces `Math.addExact`'s overflow error because a Python `int` never overflows. Part 2 is where the languages part ways.
+
+- **The GIL hides the race unless you give it somewhere to switch.** CPython only hands the GIL to another thread at "eval breaker" checks (function calls and loop back-edges). `loaded = self._balance; self._balance = loaded + delta` has no check between the load and the store, so on a stock interpreter the racy counter loses nothing and the stress test passes: a green test over a bug the model checker proves in 20 schedules. The port therefore puts one no-op call, `_preemption_point()`, between the load and the store, standing in for the instruction boundary where a real CPU would interleave:
+
+```python
+def add(self, delta: int) -> None:
+    loaded = self._balance
+    _preemption_point()
+    self._balance = loaded + delta
+```
+
+- **Collide as hard as the runtime allows.** `CyclicBarrier` becomes `threading.Barrier`, and `StressTest.run` drops `sys.setswitchinterval` from the default 5 ms to 10 microseconds for the duration of the run (and restores it in `finally`). With both, most rounds of the racy counter lose updates; without the preemption point, almost none do. On free-threaded CPython (3.13t) neither trick is needed.
+- **The racy line still varies.** Like Java's, the `racy :` stress line differs between runs; everything else in the demo is identical to the Java output. The tests assert only what the Java tests assert about the race (nothing is ever gained, every round is reported), so they never flake.
+
+```bash
+cd phases/04-concurrency/12-testing-concurrent-code/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
 - **Go**: the machine and explorer port directly (a `sync.Mutex` is not needed anywhere in them, because they are single-threaded). The stress harness uses a `sync.WaitGroup` plus a `chan struct{}` closed as the starting gun in place of `CyclicBarrier`, and the tests must pass under `go test -race ./...`; the race detector will flag `RacyCounter` in the stress test, which is correct and is why the Go port keeps the racy stress test in the demo but out of `go test`. Go also has `runtime.Gosched()` for hand-placed yield points and `GOMAXPROCS=1` for the single-core experiment in Step 6.
-- **Python**: the model is pure data and ports unchanged. For stress, `threading.Barrier` replaces `CyclicBarrier`, and `sys.setswitchinterval(1e-6)` makes the GIL hand off far more often, which widens the race window dramatically (Lesson 10). With free-threaded CPython the racy counter loses updates without that trick.
-- Registers and memory stay `int`/`int64`; `Math.addExact` becomes Python's unbounded `int` and a hand-written checked add in Go.
+- Registers and memory stay `int64`; `Math.addExact` becomes a hand-written checked add in Go.
 
 ## Use It
 

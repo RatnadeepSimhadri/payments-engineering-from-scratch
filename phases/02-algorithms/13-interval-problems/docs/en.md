@@ -3,7 +3,7 @@
 > Holds, authorizations, and overlapping settlement windows.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 2, Lesson 01 (Sorting Algorithms), Phase 2, Lesson 07 (Greedy Algorithms and Exchange Arguments), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~60 minutes
 
@@ -351,9 +351,35 @@ expired by 14:00: [fuel, restaurant, parking]
 
 The 46 tests cover the half-open predicates on touching intervals, the hand-traced merge, contained and unsorted input, coverage and gaps including the empty and out-of-range cases, the event-order rule for touching intervals in the sweep, the textbook scheduling instance and the earliest-start counterexample, a brute-force cross-check of greedy size, sweep peak, and coverage on 100 seeded random instances, and the hold book's exposure at the 17:00 boundary.
 
+### In Python
+
+```python
+events: list[tuple[int, int]] = []
+for iv in input_:
+    if iv.is_empty():
+        continue
+    events.append((iv.start, +1))
+    events.append((iv.end, -1))
+events.sort(key=lambda e: (e[0], e[1]))  # -1 sorts before +1
+```
+
+`Interval`, `Intervals`, `Hold`, `HoldBook`, `Peak`, and `PeakExposure` keep their names and algorithms; three things differ, all in `code/python/main.py`:
+
+- **Ordering comes from the dataclass.** `Interval` is `@dataclass(frozen=True, order=True)` with fields `(start, end)`, so `sorted(intervals)` uses exactly the start-then-end order of the Java `compareTo` (which is also provided as `compare_to`). Events are tuples, and `sort(key=(time, delta))` is stable like `List.sort`, so the hold events that tie on both keep insertion order and the peak is reported at the same instant with the same count.
+- **`Money` guards by hand.** Python integers do not overflow, so `plus`/`minus` raise `ArithmeticError` outside the signed 64-bit range where `Math.addExact` would throw. `Money` also rejects a `float` (or `bool`) amount at construction with `TypeError`, as Phase 10, Lesson 01's Python port does; Java's `long` field makes that mistake a compile error, Python needs the runtime check, and one extra test pins it.
+- **Half-open is spelled `start <= t < end`.** Chained comparison makes `contains` read like the definition. The `-1 before +1` rule is the second element of the sort key; changing `-1` to `1` and `+1` to `0` (a common "make it a boolean" refactor) silently counts touching windows as overlapping, which the "touching intervals count as 1" test catches.
+
+```bash
+cd phases/02-algorithms/13-interval-problems/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 46 checks plus the float guard. The test file carries a port of `java.util.Random` so the 100 random instances match.
+
 ### Porting notes
 
-Python's `sorted` with a key tuple `(time, delta)` gives the same event order, and `bisect` makes the weighted-scheduling extension in Exercise 3 short; integers are unbounded, so overflow checks disappear but the `Money` type should still reject floats at construction. Go has no tuple sort key; `sort.Slice` with a two-clause `less` function does it, and `sort.SliceStable` is not required here because the `(time, delta)` key is total for the events that matter. Go's `Money` arithmetic needs the explicit overflow checks from Phase 10, Lesson 01. In both ports keep intervals half-open and keep the `-1 before +1` rule; it is the single most common porting error for sweep lines.
+Go has no tuple sort key; `sort.Slice` with a two-clause `less` function does it, and `sort.SliceStable` is not required here because the `(time, delta)` key is total for the events that matter. Go's `Money` arithmetic needs the explicit overflow checks from Phase 10, Lesson 01. Keep intervals half-open and keep the `-1 before +1` rule; it is the single most common porting error for sweep lines.
 
 ## Use It
 

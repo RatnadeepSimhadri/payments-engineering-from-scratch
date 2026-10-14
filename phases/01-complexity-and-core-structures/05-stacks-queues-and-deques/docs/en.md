@@ -3,7 +3,7 @@
 > A ring buffer is the data structure inside every message broker.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 03 (Dynamic Arrays), Phase 1, Lesson 04 (Linked Lists)
 **Time:** ~60 minutes
 
@@ -332,9 +332,40 @@ a consumer at offset 9 reads msg9 next; 3 messages of lag
 
 The test harness prints `45 passed, 0 failed`.
 
+### In Python
+
+```python
+def offer_first(self, value: T) -> bool:
+    """Enqueue at the front, stealing the slot before head. Under DROP_OLDEST when full, drops the newest."""
+    if self.is_full():
+        if self._policy is OverflowPolicy.REJECT:
+            return False
+        self._tail -= 1
+        self._slots[self.index_of(self._tail)] = None
+        self._dropped += 1
+    self._head -= 1
+    if self._head < 0:
+        self._rebase()
+    self._slots[self.index_of(self._head)] = value
+    return True
+```
+
+`code/python/main.py` keeps `ArrayStack`, `OverflowPolicy`, and the sequence-numbered `RingBuffer`. What differs:
+
+- **`%` floors in Python.** `-1 % 4` is `3` in Python but `-1` in Java and Go, so the port could drop `_rebase` and still index correctly. It keeps it anyway: `head_sequence()` is an offset other code compares, and every language must report the same offset after an `offer_first` at sequence 0. Sequences are plain `int`, so the Java `long` never needs a cast to `int` for `size()`.
+- **`None` is the empty signal.** `poll_first`, `poll_last`, `peek_first`, and `peek_last` return `None` when empty, exactly like the Java nullable return. That works because the demo never stores `None`; a buffer that must hold `None` would need a sentinel object or an exception.
+- **Exceptions.** `NoSuchElementException` from `pop` and `peek` on an empty stack becomes `IndexError` (what `list.pop()` raises), out-of-range `get` is `IndexError`, and a bad capacity is `ValueError`.
+- **The model is `collections.deque`.** The model-based test replays the same 2,000 operations as Java by porting `java.util.Random(11)` exactly, then compares against `collections.deque` instead of `ArrayDeque`.
+
+```bash
+cd phases/01-complexity-and-core-structures/05-stacks-queues-and-deques/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python's `%` already returns a non-negative result for a negative dividend, so the port could drop `rebase`, but keeping it preserves identical sequence values across languages, which matters when tests compare offsets. Go's `%` behaves like Java's, so `rebase` stays; `pollFirst` returns `(T, bool)` rather than a nullable, since a zero value is a legal element. In both languages the model-based test uses `collections.deque` or a slice-backed reference deque in place of `ArrayDeque`. None of the sequence arithmetic changes.
+Go's `%` behaves like Java's, so `rebase` stays; `pollFirst` returns `(T, bool)` rather than a nullable, since a zero value is a legal element. The model-based test uses a slice-backed reference deque in place of `ArrayDeque`. None of the sequence arithmetic changes.
 
 ## Use It
 

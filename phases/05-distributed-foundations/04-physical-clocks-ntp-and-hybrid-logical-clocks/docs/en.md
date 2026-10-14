@@ -3,7 +3,7 @@
 > Clock skew is why your timestamps cannot order transactions.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 03 (Time, Order, and Clocks: Lamport and Vector Clocks), Phase 5, Lesson 02 (Failure Models)
 **Time:** ~75 minutes
 
@@ -365,9 +365,33 @@ rejected: logical time 1700000002000 is 2000 ms ahead of physical time 170000000
 
 The test run prints `40 passed, 0 failed`.
 
+### In Python
+
+`code/python/main.py` keeps every type and method (`TrueTime`, `DriftingClock`, `NtpSample`, `NtpClient`, `HlcTimestamp`, `HybridLogicalClock`, `Node`, `Trace`) and prints the same demo, digit for digit, including the jittery NTP samples. Four things had to be made explicit to get there.
+
+- **Java's integer division truncates; Python's `//` floors.** An NTP offset is negative whenever the client is ahead, and `((t2 - t1) + (t3 - t4)) / 2` on `-301` is `-150` in Java but `-301 // 2` is `-151`. `NtpSample.offset` uses a `tdiv` helper that truncates toward zero, and a test pins the `-150` case.
+- **`Math.round` is not `round`.** `Math.round(x)` is `floor(x + 0.5)`; Python's `round` is banker's rounding (`round(2.5) == 2`). `DriftingClock.now` uses `java_round`, so a drift that lands on exactly half a millisecond rounds the same way in both languages.
+- **The seeded generator is ported, not substituted.** `JavaRandom` reproduces `java.util.Random`'s 48-bit LCG and the JDK 17+ `nextLong(bound)` that `Random` inherits from `RandomGenerator`, including its rejection loop. Seed 7 draws `33, 16, 8, 7` in both languages, which is why the jittery samples and the best-of-8 correction (146 ms) match.
+- **No 64-bit integer.** `HlcTimestamp` is a frozen dataclass whose `__post_init__` enforces the 48-bit `l` and 16-bit `c` bounds that a Java `long` and `int` would otherwise suggest, so `pack` can never produce a value wider than 64 bits. The counter overflow is `ArithmeticError` (Java's `ArithmeticException`), and `ClockDriftException` keeps its name.
+
+```python
+def tdiv(a: int, b: int) -> int:
+    """Java's long division truncates toward zero; Python's // floors."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
+```
+
+For real clocks, `time.monotonic_ns()` is the monotonic clock and `time.time_ns()` the wall clock; the lesson reads neither, because every clock derives from the injected `TrueTime`.
+
+```bash
+cd phases/05-distributed-foundations/04-physical-clocks-ntp-and-hybrid-logical-clocks/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python has no 64-bit integer, so `pack` works on arbitrary-precision `int` and the 48-bit bound must be enforced explicitly in the constructor; `time.monotonic_ns()` is the monotonic clock and `time.time_ns()` the wall clock. Go's `time.Time` carries both a wall and a monotonic reading since Go 1.9, which is why `time.Since` was the Cloudflare fix; an HLC in Go would hold `l` and `c` as `int64`/`uint16` and return `(HlcTimestamp, error)` from `Receive` for the drift bound instead of throwing. Both ports keep the same type names (`DriftingClock`, `NtpSample`, `HybridLogicalClock`) and the same 40 test cases. The seeded `Random` must be replaced by each language's seeded generator with the same seed documented, and the expected jittery-sample values in the demo will differ between languages because the generators differ; the invariants the tests check will not.
+Go's `time.Time` carries both a wall and a monotonic reading since Go 1.9, which is why `time.Since` was the Cloudflare fix; an HLC in Go would hold `l` and `c` as `int64`/`uint16` and return `(HlcTimestamp, error)` from `Receive` for the drift bound instead of throwing. Keep the same type names (`DriftingClock`, `NtpSample`, `HybridLogicalClock`) and the same 40 test cases. `math/rand` is a different generator from `java.util.Random`, so either port the 48-bit LCG as the Python version does or document the seed and accept that the jittery-sample values in the demo differ; the invariants the tests check will not.
 
 ## Use It
 

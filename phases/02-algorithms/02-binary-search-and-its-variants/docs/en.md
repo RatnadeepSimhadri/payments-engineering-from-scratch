@@ -3,7 +3,7 @@
 > Lower bound, upper bound, and search over answer spaces.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays from Scratch), Phase 2, Lesson 01 (Sorting)
 **Time:** ~75 minutes
 
@@ -347,9 +347,39 @@ largest per-payout cap within budget = 204.62 USD -> total 599.99 USD; one cent 
 
 The test run prints `45 passed, 0 failed`.
 
+### In Python
+
+```python
+@staticmethod
+def first_true(lo: int, hi: int, predicate: Callable[[int], bool]) -> int:
+    while lo < hi:
+        mid = lo + ((hi - lo) >> 1)
+        if predicate(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+```
+
+The loop, the predicates, and the `CappedBatch` search are line-for-line the same; three things differ, all in `code/python/main.py`:
+
+- **No midpoint overflow.** Python integers are arbitrary precision, so `(lo + hi) // 2` is safe and `>>` replaces `>>>` (there is no unsigned shift and none is needed for non-negative ranges). The code keeps `lo + ((hi - lo) >> 1)` so the shape matches the Java. To print the same wrapped value as the Java demo, `to_int32` masks the sum to 32-bit two's complement and `trunc_div` divides toward zero the way Java's `/` does (`-7 // 2` is `-4` in Python but `-7 / 2` is `-3` in Java); a test pins both.
+- **`firstTrueLong` is the same function.** With one integer type, `first_true` and `first_true_long` are identical; both are kept so the names match. `integer_sqrt` keeps the `x > n // x` guard even though `x * x` cannot overflow, because the guard is the lesson.
+- **Checked addition is explicit.** `CappedBatch.total_with_cap` calls `add_exact`, which raises `ArithmeticError` outside the signed 64-bit range, so a Python total fails exactly where `Math.addExact` would. Predicates are lambdas; `IllegalArgumentException` maps to `ValueError`.
+
+The standard library already has the primitive: `bisect.bisect_left(a, t)` is `lower_bound` and `bisect.bisect_right(a, t)` is `upper_bound` (both take `key=` since 3.10). The test suite checks the JDK-style negative encoding against `bisect_left`.
+
+```bash
+cd phases/02-algorithms/02-binary-search-and-its-variants/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo output matches the Java run line for line; the suite runs the Java's 45 checks plus 3 for the 32-bit wraparound helpers.
+
 ### Porting notes
 
-Python has arbitrary-precision integers, so the midpoint overflow does not exist and `(lo + hi) // 2` is safe; the `bisect` module provides `bisect_left` (lower bound) and `bisect_right` (upper bound) with an optional `key=` since 3.10, and a port would test the hand-written `first_true` against them. Go's `sort.Search(n, f)` *is* `firstTrue` for `int`, and `slices.BinarySearchFunc` returns `(index, found)` instead of an encoded negative; the overflow concern applies to `int` on 32-bit targets and to `int64` answer spaces, so `lo + (hi-lo)/2` stays. Neither language changes the design: one primitive, predicates as closures, `Money` as integer minor units.
+Go's `sort.Search(n, f)` *is* `firstTrue` for `int`, and `slices.BinarySearchFunc` returns `(index, found)` instead of an encoded negative; the overflow concern applies to `int` on 32-bit targets and to `int64` answer spaces, so `lo + (hi-lo)/2` stays. The port does not change the design: one primitive, predicates as closures, `Money` as integer minor units.
 
 ## Use It
 

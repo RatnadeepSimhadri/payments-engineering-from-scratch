@@ -3,7 +3,7 @@
 > Reserve funds, capture, ship, and undo in the right order when step three fails.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs), Phase 7, Lesson 08 (Two-Phase Commit), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
@@ -413,9 +413,39 @@ Expected output, abbreviated:
 
 Section 3 is the one to keep. The balance is 45.00 before recovery and 45.00 after, and the wallet's call counter shows capture was invoked a second time. That is the whole argument for idempotent participants in one line of output.
 
+### In Python
+
+```python
+for i in range(frm, len(self._steps)):
+    step = self._steps[i]
+    self._log.append(order.saga_id, SagaLog.STEP_STARTED, step.name(), "")
+    self._clock.advance(self._step_latency_ms)
+    try:
+        step.execute(order)
+    except StepFailedException as e:
+        self._log.append(order.saga_id, SagaLog.STEP_FAILED, step.name(), str(e))
+        return self._backward(order, i - 1, step.name(), str(e))
+    if self.crash_point == CrashPoint.after_execute(step.name()):
+        raise CrashException(f"after {step.name()} executed, before STEP_COMPLETED logged")
+    self._log.append(order.saga_id, SagaLog.STEP_COMPLETED, step.name(), "")
+```
+
+Differences, all in `code/python/main.py`:
+
+- **Two exception types, caught precisely.** `StepFailedException` and `CrashException` are both `RuntimeError` subclasses, and `_forward` catches only the first, so an injected crash escapes to the caller exactly as the Java `RuntimeException` does. `CurrencyMismatchException` extends `ValueError`, the Python twin of `IllegalArgumentException`.
+- **Interfaces and records.** `SagaStep` is a `typing.Protocol`; the three steps are plain classes with `name`, `execute` and `compensate`. `Order`, `SagaRecord`, `CrashPoint` and `SagaOutcome` are frozen dataclasses, so `crash_point == CrashPoint.after_execute(...)` is value equality like the Java record `equals`. `status_of` and `recover` use `match` on the `SagaLog` string constants (dotted names are value patterns, never captures).
+- **Money.** `Money` rejects floats at construction, orders with `compare_to` (and `<` via `functools.total_ordering`), and checks the signed 64-bit range by hand in `plus` and `minus`, raising `OverflowError` where Java's `Math.addExact` throws; a Python-only test pins it. `usd` keeps the Java helper's behaviour of stripping the dot, so always pass two decimals.
+- **No threads.** The simulated clock and the scripted crash points make every recovery replayable; the demo prints the same log lines, `clock=250 ms` and `log records=42` in both languages.
+
+```bash
+cd phases/07-storage-and-transactions/12-saga-pattern/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The design ports without structural change. In Python, `Money` is a frozen dataclass over `int` (no overflow to check, but reject `float` at construction), the two exception types become two `Exception` subclasses, and `statusOf` is a plain loop over a list of dataclasses. In Go, `execute` and `compensate` return `error`; distinguish a step refusal from a crash with two sentinel errors (`ErrStepFailed`, `ErrCrash`) and `errors.Is`, and have the orchestrator return the crash error up to the caller rather than panicking so tests can assert on it. The log's `records()` copy becomes a slice copy to keep callers from mutating it. Neither port needs concurrency: the saga runs one step at a time by design, and the semantic-lock demo is about visibility between sagas, not about threads.
+The design ports without structural change. In Go, `execute` and `compensate` return `error`; distinguish a step refusal from a crash with two sentinel errors (`ErrStepFailed`, `ErrCrash`) and `errors.Is`, and have the orchestrator return the crash error up to the caller rather than panicking so tests can assert on it. The log's `records()` copy becomes a slice copy to keep callers from mutating it. The Go port needs no concurrency: the saga runs one step at a time by design, and the semantic-lock demo is about visibility between sagas, not about threads.
 
 ## Use It
 

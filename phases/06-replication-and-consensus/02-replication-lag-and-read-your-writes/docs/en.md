@@ -3,7 +3,7 @@
 > A customer pays, refreshes, and sees no payment.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 6, Lesson 01 (Replication: Leader-Based, Multi-Leader, Leaderless); Phase 5, Lesson 05 (Consistency Models); Phase 5, Lesson 03 (Lamport and Vector Clocks)
 **Time:** ~75 minutes
 
@@ -331,9 +331,38 @@ LEADER            stale own-write reads    0/6000  redirects    0  leader reads 
 
 Read the last block as a cost table. `ANY_REPLICA` is free and wrong 72% of the time in this deliberately laggy setup. `LEADER` is right and puts all 6,000 reads on the one machine you were trying to protect. `READ_YOUR_WRITES` is right and sends 30% of reads to the leader, every one of them a read that would otherwise have lied; the other 70% stayed on replicas. Both consistent-prefix runs reach `appliedLsn=400`: eventual consistency was never in doubt, the question was what was visible on the way.
 
+### In Python
+
+```python
+def tick(self, now: int) -> None:
+    while self._inbox and self._inbox[0][0] <= now:
+        _, lsn, record = heapq.heappop(self._inbox)
+        self._arrived[lsn] = record
+    if self.apply_in_order:
+        while self.applied_lsn + 1 in self._arrived:
+            self._apply(self._arrived.pop(self.applied_lsn + 1))
+    else:
+        for lsn in sorted(self._arrived):
+            self._apply(self._arrived.pop(lsn))
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The in-flight queue is `heapq` on `(arrive_at, lsn, record)` tuples.** LSNs are unique, so ties on arrival time never fall through to comparing `LogRecord`s. The reorder buffer is a plain `dict`; in-order mode only asks "is `applied_lsn + 1` here?", and on-arrival mode sorts the keys, which is what Java's `TreeMap.pollFirstEntry` loop does.
+- **SplitMix64 is masked by hand.** Python integers do not wrap, so `Rng` applies `& MASK64` after every addition and multiplication, and the per-replica seed `seed * 7919 + 1000003 * (i + 1)` is masked too. With the masks in place the demo prints exactly the same lines as the Java version; drop one and every delay changes.
+- **No overloads.** Java has `write(key, value)` and `write(Session, key, value)`; Python names the second one `write_session`. LSNs are unbounded `int`s, so there is no overflow to guard, and `Money` uses `divmod` on the absolute value so negative amounts format like Java.
+- **Absent values are `None`.** `Replica.read` returns `Optional[str]`, and `AnomalyDetector.observe_pair` checks `is None` exactly where the Java checks `== null`.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The design ports without change: a list for the log, a heap for in-flight records, a sorted map for the reorder buffer. In Python use `heapq` with `(arrive_at, lsn)` tuples and a plain `dict` for the buffer (check `applied_lsn + 1 in arrived`); integers are unbounded so there is no LSN overflow to guard. In Go, `container/heap` needs the boilerplate `Len/Less/Swap/Push/Pop` type, `map[int64]LogRecord` is the buffer, and `Read` should return `(string, bool)` rather than a nullable string. Keep the SplitMix64 generator byte-for-byte identical (mask to 64 bits in Python) so the seeded lag pattern, and therefore the demo output, matches across languages. The single-threaded tick loop needs no locks; a real replica would run `receive` and `tick` on different threads and would protect `arrived` and `appliedLsn` with one mutex or an atomic watermark.
+The design ports to Go without change: a slice for the log, a heap for in-flight records, a map for the reorder buffer. In Go, `container/heap` needs the boilerplate `Len/Less/Swap/Push/Pop` type, `map[int64]LogRecord` is the buffer, and `Read` should return `(string, bool)` rather than a nullable string. Keep the SplitMix64 generator byte-for-byte identical so the seeded lag pattern, and therefore the demo output, matches across languages. The single-threaded tick loop needs no locks; a real replica would run `receive` and `tick` on different threads and would protect `arrived` and `appliedLsn` with one mutex or an atomic watermark.
 
 ## Use It
 

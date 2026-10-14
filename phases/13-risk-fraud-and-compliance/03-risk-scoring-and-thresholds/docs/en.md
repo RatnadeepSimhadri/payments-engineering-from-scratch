@@ -3,7 +3,7 @@
 > A score is useless without the threshold decision.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 13, Lesson 01 (Fraud Patterns); Phase 13, Lesson 02 (A Rules Engine with Velocity Checks); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -487,9 +487,32 @@ everything wrong at once -> DECLINE (score 861, p=0.862)
 
 `MainTest` prints `47 passed, 0 failed`.
 
+### In Python
+
+```python
+def jf(x: float, digits: int, plus: bool = False) -> str:
+    d = Decimal(repr(float(x))).quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP)
+    s = f"{d:f}"
+    return "+" + s if plus and not s.startswith("-") else s
+```
+
+`code/python/main.py` prints the same dataset counts, weights, sweep table, band, calibration bins, and explanations as the Java version, digit for digit. Getting there took four deliberate choices:
+
+- **`java.util.Random` is ported, not replaced.** `random.Random(42)` is a Mersenne Twister and would generate a different dataset. `JavaRandom` reproduces the 48-bit LCG, `next_double`, and the polar-method `next_gaussian` with its cached second value; `java_shuffle` is `Collections.shuffle`. Same seed, same 20,000 rows, same 14,000/6,000 split.
+- **Floats are summed the Java way.** Python 3.12+ `sum()` uses compensated summation, which is more accurate and therefore not bit-identical to a Java `+=` loop. Every float accumulation (gradients, ECE) uses `reduce(operator.add, ...)` instead. `Scorecard.train` works column by column with `map` so 400 epochs take about two seconds; its docstring lists the three rewrites that keep it exact, and a test asserts two runs give identical weights.
+- **Java's rounding rules are explicit.** `Math.round` rounds half up (`java_round`), and `String.format("%.2f")` rounds the shortest decimal half up, where Python's f-strings round the exact binary value half to even (`0.125` prints `0.13` in Java, `0.12` in Python). `jf` reproduces the Java output. `math.exp` raises `OverflowError` where Java returns `Infinity`, so `sigmoid(-1000)` is caught and returns `0.0` like the Java.
+- **Money stays integer.** Costs are `Money` with `int` minor units; `times` reapplies the sign after `divmod` because Python's `//` floors where Java truncates, and `_check_long` keeps `Math.addExact`'s 64-bit bound.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: probabilities are `float` and that is correct here; costs stay `int` minor units, and `math.exp` overflows for `z < -709`, so compute the sigmoid as `exp(z) / (1 + exp(z))` when `z < 0`. Python's `random.Random(42)` produces a different stream from `java.util.Random(42)`, so the port will fit different weights; tests should assert properties (positive weights, AUC > 0.95, conservation) rather than exact numbers, which the Java tests already do. Go: `math/rand` with `rand.New(rand.NewSource(seed))`, `sort.SliceStable` for the AUC ranking, and `Money` as an `int64` struct with `(Money, error)` returns for overflow. No concurrency is needed; scoring is pure and safe to share across goroutines once trained.
+Go: `math/rand` with `rand.New(rand.NewSource(seed))` produces a different stream from `java.util.Random`, so either port the 48-bit LCG (as the Python version does) or assert properties (positive weights, AUC > 0.95, conservation) rather than exact numbers, which the Java tests already do. Use `sort.SliceStable` for the AUC ranking and `Money` as an `int64` struct with `(Money, error)` returns for overflow. No concurrency is needed; scoring is pure and safe to share across goroutines once trained.
 
 ## Use It
 

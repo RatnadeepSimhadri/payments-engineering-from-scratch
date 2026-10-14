@@ -3,7 +3,7 @@
 > Context in Go, virtual threads in Java, task groups in Python.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 4, Lesson 06 (Executors, Goroutines, and asyncio); Phase 4, Lesson 01 (Threads and the Memory Model); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
@@ -372,11 +372,42 @@ subtasks cancelled = 3 of 3; completed normally = 0; still running after close =
 
 The last line is the one to keep. "Still running after close = 0" is the property the Problem's service lacked.
 
+### In Python
+
+`code/python/main.py` keeps the thread-based design class for class (`CancellationToken`, `Subtask`, `StructuredScope`, `authorize`) rather than switching to `asyncio`, so the walkthrough above reads the same. Four things differ.
+
+- **There is no thread interrupt.** Python cannot interrupt a thread blocked in `Condition.wait` or `Lock.acquire`, so `Subtask.interrupt()` only sets a flag a body may poll. That loses nothing here because every blocking body in the lesson waits through `wait_for_signal_or_cancel`, which registers an `on_cancel` callback that notifies its condition: the token is the one signal Python has, and it is enough. A body that blocks in something the token cannot wake (a socket read with no timeout) would make `join` wait, which is the same honesty the Java scope has about non-interruptible calls.
+- **Durations are integer nanoseconds.** `Deadline.after(clock, millis(200))` takes an `int`, not a `timedelta`, because `timedelta` stops at microseconds and the clock is in nanoseconds. `NONE` is `2**63 - 1` and `add_exact` reproduces `Math.addExact`'s overflow error, since a Python `int` would otherwise grow without complaint.
+- **Exceptions.** `IllegalStateException` becomes `RuntimeError`, `ExecutionException` is a small class whose original failure is `__cause__` (raised with `raise ... from`), and the deadline surfaces as the built-in `TimeoutError`. `CancelledException` keeps its name.
+- **The scope is a context manager.** `with StructuredScope(...) as scope:` is the `try`-with-resources; `__exit__` calls `close()`, so an early `return` inside the block still cancels and joins.
+
+```python
+def wait_for_signal_or_cancel(token: CancellationToken) -> None:
+    monitor = threading.Condition()
+
+    def wake() -> None:
+        with monitor:
+            monitor.notify_all()
+
+    token.on_cancel(wake)
+    with monitor:
+        while not token.is_cancelled():
+            monitor.wait(0.005)
+    token.throw_if_cancelled()
+```
+
+The executor is `ThreadPerTaskExecutor`, one new thread per task, the closest standard-library match for `newVirtualThreadPerTaskExecutor`; a fixed `ThreadPoolExecutor` would deadlock the fan-out if it had fewer workers than blocked siblings. The demo output is identical to Java's.
+
+```bash
+cd phases/04-concurrency/11-structured-concurrency-and-cancellation/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
 - **Go** already has the token: `context.Context`. `context.WithCancelCause` gives the first-reason-wins rule, `WithDeadline` takes the minimum against the parent automatically, and `AfterFunc` (Go 1.21) is `onCancel`. The scope is what the standard library lacks: build it from `sync.WaitGroup` plus a `sync.Once` around `cancel`, and make `Wait` the join. Bodies select on `ctx.Done()`; there is no interrupt, so a blocking call that does not take a context cannot be cancelled, which is why every network API in Go takes one. Run the tests with `go test -race ./...`.
-- **Python** has both halves in `asyncio`: `TaskGroup` (3.11) is the scope with shutdown-on-failure semantics, `asyncio.timeout()` is the deadline, and cancellation is `CancelledError` raised at the next `await`. The difference to carry over is that a Python task cancelled while awaiting cleanup can be cancelled again; code the `onCancel` callbacks as `finally` blocks with `asyncio.shield` only where the cleanup itself must complete. For thread-based Python there is no interrupt; poll a `threading.Event` the way the Java bodies poll the token.
-- In both ports the deadline stays an absolute instant on an injectable clock, and the tests advance the clock instead of sleeping.
+- As in the Java and Python versions, the deadline stays an absolute instant on an injectable clock, and the tests advance the clock instead of sleeping.
 
 ## Use It
 

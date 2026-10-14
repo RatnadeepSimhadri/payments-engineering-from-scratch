@@ -3,7 +3,7 @@
 > A PN-counter for balances that can be reconciled without coordination.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 03 (Lamport and Vector Clocks), Phase 6, Lesson 01 (Replication Strategies), Phase 6, Lesson 03 (Quorums), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -336,9 +336,33 @@ NaiveSum   500 trials: commutative ok, associative ok, idempotent 493 failures  
 
 The test prints `37 passed, 0 failed`.
 
+### In Python
+
+```python
+def add_exact(a: int, b: int) -> int:
+    r = a + b
+    if r < LONG_MIN or r > LONG_MAX:
+        raise OverflowError("long overflow")
+    return r
+```
+
+`code/python/main.py` has the same types and method names; what differs:
+
+- **Overflow is checked by hand.** Python integers are unbounded, so a G-Counter slot could silently grow past `Long.MAX_VALUE` where the Java one throws. `add_exact` and `subtract_exact` keep the 64-bit contract, and the test "gcounter overflow is an error" expects `ArithmeticError` exactly as the Java test expects `ArithmeticException`.
+- **`java.util.Random` is ported bit for bit.** The property checks draw their random states from `JavaRandom` (the 48-bit LCG with `next(bits)`, `next_int(bound)` and `next_boolean`), and `java_shuffle` is `Collections.shuffle`. With the same seed the Python version draws the same 500 states, so the demo prints the same `493 failures` for the naive sum counter.
+- **Structural equality is explicit.** The CRDTs are mutable (`increment`, `add`), so they define `__eq__` over their internal `dict`s and `set`s rather than being frozen dataclasses; `Tag` and `LWWRegister` are frozen dataclasses, so tags are hashable set members. The `Crdt` interface is a `Protocol` with one method, `merge`.
+- **Sorted printing.** `fmt_map` reproduces `TreeMap.toString()` (`{A=3, B=6}`), and `ORSet.elements()` returns a sorted list, so the demo output matches the Java line for line.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-In Python the slot maps become `dict[str, int]`; integers are unbounded so the `addExact` overflow checks disappear, and `merge` should build a new dict rather than mutating, with `__eq__` on dataclasses giving structural equality for free. Tags should be a frozen dataclass or a tuple so they are hashable. In Go, `map[string]int64` plus hand-written checked addition (as in the Phase 10 Money port); `merge` returns a new struct and `reflect.DeepEqual` or a hand-written `Equal` compares states, and because Go maps iterate in random order, `String()` must sort keys before printing or the demo output will not be stable. Neither language has generics quite like Java's self-referential `Crdt<T>`; Python can use a `Protocol`, Go 1.22 generics can express `type Crdt[T any] interface{ Merge(T) T }` with a method-set constraint. Concurrency does not appear: all merges are sequential by design.
+In Go, `map[string]int64` plus hand-written checked addition (as in the Phase 10 Money port); `merge` returns a new struct and `reflect.DeepEqual` or a hand-written `Equal` compares states, and because Go maps iterate in random order, `String()` must sort keys before printing or the demo output will not be stable. Go 1.22 generics can express `type Crdt[T any] interface{ Merge(T) T }` with a method-set constraint in place of Java's self-referential `Crdt<T>`. Concurrency does not appear: all merges are sequential by design.
 
 ## Use It
 

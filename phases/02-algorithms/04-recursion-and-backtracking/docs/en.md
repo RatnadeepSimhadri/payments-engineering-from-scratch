@@ -3,7 +3,7 @@
 > Enumerating settlement allocations is a constrained search.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 2, Lesson 01 (Sorting)
 **Time:** ~75 minutes
 
@@ -345,9 +345,39 @@ this thread overflowed at a recursion depth of about 9835 trivial frames (JVM de
 
 The depth figure varies by machine and JVM flags. The test run prints `41 passed, 0 failed`.
 
+### In Python
+
+```python
+@staticmethod
+@contextmanager
+def recursion_limit(limit: int) -> Iterator[None]:
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(limit)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(old)
+```
+
+The enumerations, the allocator (recursive and explicit-stack), and N-Queens are the same code with `snake_case` names, and every count in the demo matches the Java run. Three things differ, all in `code/python/main.py`:
+
+- **The depth limit is a counter, not a stack size.** CPython raises `RecursionError` when the number of Python frames passes `sys.getrecursionlimit()`, which defaults to 1,000. So the demo's measured-depth line reads "about 997 trivial frames (sys.getrecursionlimit() = 1000)" where the JVM reports a machine-dependent figure in the thousands, and `sum_recursive(1_000)` (1,001 frames), which the JVM handles easily, fails at the default limit. `Depth.recursion_limit` is the Python counterpart of `-Xss`: the demo and the tests use it to raise the limit for that call and to lower it so the failure shows up quickly. No test depends on the exact depth; they assert that the failure happens and that the probe stays under whatever limit is set.
+- **`RecursionError` is an ordinary exception.** It subclasses `RuntimeError`, so unlike `StackOverflowError` a broad `except Exception` swallows it. The probe catches it by name, and the rule stays the same: convert the recursion, do not catch the error.
+- **Interpreter cost is visible.** The unpruned 24-receivable search visits 32,838,111 nodes, which takes several seconds in CPython instead of well under one on the JVM. The visit counts match exactly; the gap is the reason the node counter, not the clock, is the instrument.
+
+Lists print through a small `jstr` helper so the output matches `List.toString`, `Frame` is a frozen dataclass, and `IllegalArgumentException` maps to `ValueError`. `itertools.permutations`, `combinations`, and `product` are the library versions; they yield lazily instead of building lists.
+
+```bash
+cd phases/02-algorithms/04-recursion-and-backtracking/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Apart from the depth line, the demo output matches the Java run line for line. The suite covers the Java's 41 checks plus 4 for the recursion-limit behaviour.
+
 ### Porting notes
 
-Python's default recursion limit is 1,000 frames (`sys.getrecursionlimit()`), which makes the explicit-stack version mandatory for anything deeper than toy sizes, and `itertools.permutations`, `combinations`, and `product` provide the enumerations lazily as generators; a port should yield rather than build lists. Go has growable goroutine stacks (up to 1 GB by default), so recursion depth is rarely the limit, but the same explicit-stack conversion applies and the `Frame` record becomes a struct; slices used as the `chosen` path must be copied at the leaf (`append([]Money(nil), chosen...)`) for the same reason the Java code copies `current`. Both languages keep `Money` as integer minor units; Python's `int` removes the overflow concern on `sum`.
+Go has growable goroutine stacks (up to 1 GB by default), so recursion depth is rarely the limit, but the same explicit-stack conversion applies and the `Frame` record becomes a struct; slices used as the `chosen` path must be copied at the leaf (`append([]Money(nil), chosen...)`) for the same reason the Java code copies `current`. `Money` stays integer minor units in `int64`.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Last-writer-wins loses data by design.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 03 (Lamport and Vector Clocks), Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks), Phase 6, Lesson 01 (Replication Strategies), Phase 6, Lesson 08 (CRDTs)
 **Time:** ~75 minutes
 
@@ -335,9 +335,36 @@ A removed pen, B concurrently added a book -> union/max merge: {book=2, pen=2}
 
 The test prints `38 passed, 0 failed`.
 
+### In Python
+
+```python
+@staticmethod
+def maximal(all_: list) -> list:
+    out: list = []
+    for candidate in all_:
+        obsolete = any(other is not candidate and candidate.obsoleted_by(other) for other in all_)
+        if not obsolete and candidate not in out:
+            out.append(candidate)
+    return out
+```
+
+`code/python/main.py` keeps every type and method name (in snake_case); the demo prints the same lines as the Java. What differs:
+
+- **Identity versus equality.** Java's `maximal` uses `other != candidate`, a reference comparison, and `out.contains(candidate)`, an `equals` comparison. Python spells those `is not` and `not in`. Swapping them would be a silent bug: two equal siblings arriving from two replicas would obsolete each other.
+- **Values are frozen dataclasses.** `Dot`, `Versioned`, `CaseFile` (with a `frozenset` of notes) and `Cart` (a `dict` of quantities) get structural `==` for free, which is what `merge_from` uses to skip siblings it already holds. `VersionVector` wraps a `dict` and returns new vectors from `increment` and `merge`, so it is immutable in practice.
+- **`MergeFunction` is a tiny class around a callable** so the call site still reads `fn.merge(siblings)`; `Cart.UNION_MAX` and `CaseFile.UNION_NOTES_STRICTEST_STATUS` are attached after the class bodies because they build instances of the class.
+- **Printing.** Java's `TreeMap` and `TreeSet` print sorted; `fmt_map` and `fmt_set` reproduce `{A=1, B=1}` and `[a, b]`. A missing key is `None` where the Java returns `null`.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `VersionVector` wraps a `dict[str, int]` and returns new dicts from `increment` and `merge`; `Versioned` and `Dot` are frozen dataclasses so they are hashable and `in` works for deduplication; `MergeFunction` is just a callable `Callable[[list[V]], V]`. Go: `map[string]int64` for the vector, a `Dot` struct, `Versioned[V any]` generic struct, and `MergeFunc[V any] func([]V) V`; record equality becomes a hand-written `Equal` because struct equality on a map field does not compile; map iteration must be sorted before printing. Neither port needs concurrency primitives: the stores are single-threaded by design, and a production port would wrap each key's sibling list in a mutex or an actor.
+Go: `map[string]int64` for the vector, a `Dot` struct, `Versioned[V any]` generic struct, and `MergeFunc[V any] func([]V) V`; record equality becomes a hand-written `Equal` because struct equality on a map field does not compile; map iteration must be sorted before printing. The port needs no concurrency primitives: the stores are single-threaded by design, and a production port would wrap each key's sibling list in a mutex or an actor.
 
 ## Use It
 

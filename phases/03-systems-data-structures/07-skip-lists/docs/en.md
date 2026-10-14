@@ -3,7 +3,7 @@
 > The probabilistic ordered structure inside Redis sorted sets.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 3, Lesson 03 (Balanced Trees: AVL and Red-Black), Phase 1, Lesson 04 (Linked Lists), Phase 0, Lesson 08 (Probability for Engineers)
 **Time:** ~60 minutes
 
@@ -350,9 +350,30 @@ sorted input: levels=17, average steps per get = 33.1
 level=1, average steps per get = 11364 (n/2 = 10000)
 ```
 
+### In Python
+
+`code/python/main.py` is the same `SkipList` with `forward` and `span` lists per node, the same `update`/`rank` arrays in `put`, and the same method names in snake_case (`by_rank`, `level_histogram`, `check_invariants`, `default_max_level`). Three things differ:
+
+- **The coin is a bit-exact `java.util.Random`.** `random.Random(seed)` would give a different stream, so `JavaRandom` ports the 48-bit LCG and `nextDouble` (`(next(26) << 27) + next(27)` scaled by 2^-53). Seed 2024 then yields the same levels for every node, and the histogram, level counts, search-step averages, and ranks match Java line for line.
+- **One constructor per signature.** Python has no overloading, so the Java `IntSupplier` constructor becomes a class method, and the degenerate demo passes a lambda:
+
+```python
+flat: SkipList[int, int] = SkipList.with_level_source(16, 0.5, lambda: 1)
+for i in range(20_000 - 1, -1, -1):
+    flat.put(i, i)
+```
+
+- **The flat demo inserts in descending order.** With the coin fixed at 1, the list depends only on the key set. Java's ascending inserts each walk the whole list, about 2 * 10^8 pointer steps: trivial for the JIT but about a minute in CPython. Inserting from the top puts each key at the head in `O(1)`, which builds the same list, so the measured search cost (the point of the demo) is unchanged. The test still inserts its 2,000-key flat list in ascending order. `ValueError` replaces `IllegalArgumentException`, and `IllegalStateError` replaces `IllegalStateException`.
+
+```bash
+cd phases/03-systems-data-structures/07-skip-lists/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python ports directly with lists of forward pointers per node and `random.Random(seed)` injected; comparisons use `<` on keys, and the degenerate-coin demo passes a lambda. Go uses `[]*Node` and `[]int` per node, `*rand.Rand` from `rand.New(rand.NewSource(seed))`, and generics `[K cmp.Ordered, V any]`. The one real port concern is the concurrent variant: in Go a lock-free skip list needs `atomic.Pointer` for every forward pointer and the Fraser/Harris marking trick for deletes, and tests must run under `-race`; this lesson's single-threaded design needs none of that.
+Go uses `[]*Node` and `[]int` per node, `*rand.Rand` from `rand.New(rand.NewSource(seed))`, and generics `[K cmp.Ordered, V any]`. The one real port concern is the concurrent variant: in Go a lock-free skip list needs `atomic.Pointer` for every forward pointer and the Fraser/Harris marking trick for deletes, and tests must run under `-race`; this lesson's single-threaded design needs none of that.
 
 ## Use It
 

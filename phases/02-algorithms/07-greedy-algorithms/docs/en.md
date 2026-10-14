@@ -3,7 +3,7 @@
 > When taking the best local step is provably optimal, and when it is a bug.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 09 (Heaps and Priority Queues from Scratch), Phase 2, Lesson 01 (Sorting), Phase 2, Lesson 04 (Recursion and Backtracking)
 **Time:** ~60 minutes
 
@@ -341,9 +341,38 @@ pay 187.41 USD greedily: 11 pieces {1x10000 1x5000 1x2000 1x1000 1x500 2x100 1x2
 
 The test run prints `41 passed, 0 failed`.
 
+### In Python
+
+```python
+pq: list[tuple[int, int, Node]] = []  # (weight, order, node): heapq compares tuples left to right
+...
+while len(pq) > 1:
+    a = heapq.heappop(pq)[2]  # the two lightest: the greedy choice
+    b = heapq.heappop(pq)[2]
+    merged = Node(a.weight + b.weight, -1, a, b, order)
+    heapq.heappush(pq, (merged.weight, merged.order, merged))
+    order += 1
+```
+
+Same classes, same algorithms, same tests; three things differ, all in `code/python/main.py`:
+
+- **Heaps are `heapq` over tuples.** The Huffman heap holds `(weight, order, node)` tuples, so the tuple comparison is the `comparingLong(weight).thenComparingLong(order)` comparator, and `order` is unique, so a comparison never reaches the `Node` itself. The lane heap in `min_resources` is a plain list of `int` end times. Sorting uses `key=lambda iv: (iv.end, iv.start)` in place of the `Comparator` chain.
+- **`TreeMap` becomes `sorted(frequencies)`.** A `dict` preserves insertion order, not key order, so `build` iterates `sorted(frequencies)` to assign `order` in ascending symbol order. The "deterministic across builds" test passes the same table in reversed insertion order and expects identical codes.
+- **Sentinels and identity.** `optimal_table` marks impossible amounts with `LONG_MAX` (`2**63 - 1`) so the "impossible" assertion reads the same as Java's `Long.MAX_VALUE`; `greedy` returns `None` instead of `null`. `Node` is a frozen dataclass with `eq=False`, so `decode`'s "back at the root" check is an identity test (`is not root`), the same as Java's `!=` on references.
+
+The test file carries a small port of `java.util.Random` so the 300 interval instances and 200 USD amounts are the same random inputs as the Java run.
+
+```bash
+cd phases/02-algorithms/07-greedy-algorithms/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo output is identical to the Java run, and the suite runs the same 41 checks.
+
 ### Porting notes
 
-Python's `heapq` is a min-heap over tuples, so the Huffman node ordering becomes `(weight, order, node)` tuples rather than a comparator, and `sorted(key=lambda iv: (iv.end, iv.start))` replaces the `Comparator` chain; `functools.total_ordering` is unnecessary when the heap key is a tuple. Go's `container/heap` requires implementing `Len/Less/Swap/Push/Pop` on a slice type, which is where the deterministic tie-break on `order` must live; `sort.Slice` with a two-key less function replaces the sort. Both languages keep amounts as integers in minor units and should port the DP oracle alongside the greedy so `isCanonical` works unchanged.
+Go's `container/heap` requires implementing `Len/Less/Swap/Push/Pop` on a slice type, which is where the deterministic tie-break on `order` must live; `sort.Slice` with a two-key less function replaces the sort. Amounts stay integers in minor units, and the port should include the DP oracle alongside the greedy so `isCanonical` works unchanged.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Settlement dependencies and build graphs.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 2, Lesson 08 (Graph Traversal: BFS, DFS, and Connected Components), Phase 1, Lesson 05 (Stacks, Queues, and Deques)
 **Time:** ~60 minutes
 
@@ -391,9 +391,38 @@ rejected: cycle detected: submit-to-bank -> reconcile -> submit-to-bank
 
 The test file checks 41 assertions: both orders satisfy the validator, Kahn's order matches the hand trace exactly, the 100,000-node chain does not overflow the stack, the cycle is reported as the two-node loop and not as every downstream node, the levels and the slack column match the hand computation, and a cyclic graph cannot be scheduled.
 
+### In Python
+
+```python
+in_degree = g.in_degrees()
+ready: deque[str] = deque(node for node, d in in_degree.items() if d == 0)
+order: list[str] = []
+while ready:
+    node = ready.popleft()
+    order.append(node)
+    for nxt in g.successors(node):
+        in_degree[nxt] -= 1
+        if in_degree[nxt] == 0:
+            ready.append(nxt)
+```
+
+`Digraph`, `TopoSort`, `CycleException`, and `DagScheduler` keep their names and their algorithms; three things differ, all in `code/python/main.py`:
+
+- **Insertion order is free.** A `dict` preserves insertion order (guaranteed since 3.7), so `Digraph` needs no `LinkedHashMap`, and `schedule` uses a `dict` with `None` values as the insertion-ordered set that `LinkedHashSet` provides. `successors` returns a tuple and `nodes` a keys view, the read-only counterparts of `Collections.unmodifiableList` and `unmodifiableSet`. The Kahn order, the DFS order, the levels, and every slack value match the Java run.
+- **The iterative DFS is still required, for a different reason.** CPython stops at `sys.getrecursionlimit()` (1,000 frames by default) long before the JVM's stack runs out, so a recursive DFS would fail on the 100,000-node chain at depth 1,000 rather than around ten thousand. The explicit stack of `_Frame` objects (with `__slots__`, holding the node and the next successor index) is the same code as the Java.
+- **Exceptions.** `CycleException` subclasses `RuntimeError`, the closest built-in to `IllegalStateException`, and carries the cycle the same way; argument errors (`unknown node`, a missing duration, a negative duration) raise `ValueError`. A test checks that a cycle is not reported as a `ValueError`, so callers can tell a bad graph from a bad argument. Durations are summed with `add_exact`, which raises `ArithmeticError` where `Math.addExact` would.
+
+```bash
+cd phases/02-algorithms/10-topological-sort-and-dags/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 41 checks plus 2.
+
 ### Porting notes
 
-The Python port keeps insertion order for free (`dict` preserves it since 3.7) and uses `collections.deque` for the ready queue; the iterative DFS is still necessary because CPython's default recursion limit is 1,000 frames. The Go port uses a `[]string` for node order beside a `map[string][]string` for adjacency, because Go maps iterate in deliberately randomized order and a scheduler built on bare map iteration would produce a different valid order on every run. Go returns `(order, cycle, err)` rather than throwing; `errors.As` recovers the cycle. Durations stay `int64` in both ports, and Go's addition needs the hand-written overflow check from Phase 10, Lesson 01.
+The Go port uses a `[]string` for node order beside a `map[string][]string` for adjacency, because Go maps iterate in deliberately randomized order and a scheduler built on bare map iteration would produce a different valid order on every run. Go returns `(order, cycle, err)` rather than throwing; `errors.As` recovers the cycle. Durations stay `int64`, and Go's addition needs the hand-written overflow check from Phase 10, Lesson 01.
 
 ## Use It
 

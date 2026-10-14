@@ -3,7 +3,7 @@
 > Ten deposits of $9,900.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 05 (Sliding Windows and Two Pointers), Phase 13, Lesson 02 (Rules Engine and Velocity Checks), Phase 13, Lesson 03 (Risk Scoring and Thresholds)
 **Time:** ~90 minutes
 
@@ -353,9 +353,33 @@ Expected output, abbreviated:
 
 The laundromat is the lesson. Its deposits are 8,400 to 9,300, every day, from one branch, and at an 80% floor they are indistinguishable from the structurer's 9,400 to 9,950 from three branches. The test file runs the same population with the floor raised to 93% and shows the structurer still alerts and the laundromat does not. Whether 93% is the right floor for a real bank depends on its customer base, which is why it is a parameter; and the laundromat's one-branch, same-time-every-day regularity is itself a feature a richer scenario would use to clear it (Exercise 1).
 
+### In Python
+
+```python
+def jdiv(a: int, b: int) -> int:
+    q = abs(a) // abs(b)
+    return q if (a < 0) == (b < 0) else -q
+
+score = min(100, 50 + 10 * count + jdiv((total.minor_units - threshold.minor_units) * 10, threshold.minor_units))
+```
+
+`code/python/main.py` has the same scenarios, detectors, merge step, and generator, and its demo prints the same population (1,792 transactions), the same four alerts with the same scores and evidence, and the same first alert in full. What differs:
+
+- **Integer division is Java's.** Python's `//` floors and `%` takes the sign of the divisor; `jdiv` and `jmod` truncate toward zero like Java's `/` and `%`. Every score, the `basis_points` half-even rounding, the 96% pass-through split, and `Hours.format` go through them. The inputs here are non-negative, so `//` would usually agree, but the helpers make the port correct for every input rather than for this data; a test pins `jdiv(-7, 2) == -3`.
+- **The generator is `java.util.Random`.** `JavaRandom` ports the 48-bit LCG and `nextInt(bound)`, and `normal_account` draws its random numbers into local variables in the order Java evaluates the call's arguments (counterparty, amount, hour, minute). Change that order and every account changes.
+- **Ordering is explicit.** Accounts are evaluated in `sorted()` order (Java's `TreeMap`), transactions sort on `(timestamp, id)`, and alerts on `(-severity, -score, account, scenario)`, the same comparator chain as the Java.
+- **One harmless difference.** Java prints each scenario's `Map.of(...)` parameters in an order that changes from one JVM run to the next; Python prints them in declaration order. Every other line of the demo is identical.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The two-pointer loops port directly; the only care needed is that Python's `//` floors, so the score formula's `(sum - threshold) * 10 / threshold` must be computed with explicit `int` arithmetic on positive numbers, which it always is here. Python's `random.Random(seed)` and Go's `rand.New(rand.NewSource(seed))` give deterministic populations but not the same ones as Java, so the Python and Go tests should assert on properties (planted accounts found, laundromat alerts at 80% and not at 93%) rather than on transaction counts. Go would return `([]Alert, error)` from `Evaluate` and a sentinel `ErrMissingParam` from the scenario; the `Map<String, Long>` becomes `map[string]int64`. Nothing here is concurrent; if accounts were evaluated in parallel goroutines, the alert slice would need a mutex or a channel fan-in, and `go test -race` would confirm it.
+Go's `rand.New(rand.NewSource(seed))` gives a deterministic population but not the Java one, so the Go tests should either port `java.util.Random`'s LCG (as the Python version does) or assert on properties (planted accounts found, laundromat alerts at 80% and not at 93%) rather than on transaction counts. Go would return `([]Alert, error)` from `Evaluate` and a sentinel `ErrMissingParam` from the scenario; the `Map<String, Long>` becomes `map[string]int64`. Nothing here is concurrent; if accounts were evaluated in parallel goroutines, the alert slice would need a mutex or a channel fan-in, and `go test -race` would confirm it.
 
 ## Use It
 

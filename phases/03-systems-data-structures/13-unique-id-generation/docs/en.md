@@ -3,7 +3,7 @@
 > Sortable, collision-resistant IDs for a distributed ledger.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 1, Lesson 11 (Bit Manipulation), Phase 3, Lesson 04 (B-Trees and Why Databases Love Them)
 **Time:** ~60 minutes
 
@@ -325,9 +325,30 @@ Expected output, abbreviated:
 
 Every value above is reproducible because the clock and the randomness are injected; run it twice and diff the output.
 
+### In Python
+
+`code/python/main.py` keeps the Java design, including the two-half layout: `Uuid(msb, lsb)` and `Ulid(timestamp_millis, random_hi, random_lo)` are frozen, ordered dataclasses. The generators (`UuidV4Generator`, `UuidV7Generator`, `UlidGenerator`, `SnowflakeGenerator`) and `ClockMovedBackwardsException` keep their Java names. Three things differ:
+
+- **Halves are unsigned, so ordering is free.** Python integers have no sign bit to misread, so each half is stored masked to 64 bits, and `order=True` compares `(msb, lsb)` as unsigned numbers. That is the comparison `Long.compareUnsigned` has to spell out in Java. Java's `-1L` (all ones) is accepted and normalised, which is how the ULID carry tests are written:
+
+```python
+def __post_init__(self) -> None:
+    object.__setattr__(self, "msb", self.msb & MASK64)
+    object.__setattr__(self, "lsb", self.lsb & MASK64)
+```
+
+- **Wraparound is explicit where Java relies on it.** The monotonic ULID increment is `(random_lo + 1) & MASK64` with a carry into `random_hi` when the low word wraps to zero. Java gets the wrap for free from `long` overflow. `Ulid.parse` masks its shift registers the same way. `Uuid.parse` checks that every digit is hex, because `int(x, 16)` would also accept `_`, `+`, and whitespace, which `Long.parseUnsignedLong` rejects.
+- **Same seed, same ids.** `random.Random(7)` would produce different bits, so `JavaRandom` ports `java.util.Random` exactly (48-bit LCG, `nextInt`, signed `nextLong`). The demo's UUIDv4, UUIDv7, ULID, and Snowflake values match Java's character for character, and a test pins the first three. Use `secrets` for real ids. `fmt_sci` reproduces Java's `%.1e` (half-up, two-digit exponent such as `e-07`), so the collision table also matches. `ValueError` replaces `IllegalArgumentException`.
+
+```bash
+cd phases/03-systems-data-structures/13-unique-id-generation/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python has arbitrary-precision integers, so a UUID is one 128-bit `int` and the ULID random part is one 80-bit `int`; the two-long juggling disappears, and `int.to_bytes`/`from_bytes` plus `format(x, '032x')` do the hex. `random.Random(seed)` gives the seeded source; use `secrets` in production. Go: `uint64` pairs as here, `bits.Add64` for the ULID carry, `math/rand/v2` with a seeded `PCG` for reproducibility and `crypto/rand` in production; return `(uint64, error)` from the Snowflake generator instead of throwing. In both, keep the unsigned comparison explicit; Python's ints are signed-agnostic but Go's `int64` would reintroduce the `java.util.UUID` ordering bug.
+Go: `uint64` pairs as here, `bits.Add64` for the ULID carry, `math/rand/v2` with a seeded `PCG` for reproducibility and `crypto/rand` in production; return `(uint64, error)` from the Snowflake generator instead of throwing. Keep the unsigned comparison explicit: Go's `int64` would reintroduce the `java.util.UUID` ordering bug.
 
 ## Use It
 

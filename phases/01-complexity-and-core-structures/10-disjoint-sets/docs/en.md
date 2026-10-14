@@ -3,7 +3,7 @@
 > Linking accounts, merging entities, and detecting fraud rings.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 02 (Amortized Analysis), Phase 1, Lesson 06 (Hash Maps from Scratch)
 **Time:** ~60 minutes
 
@@ -316,9 +316,42 @@ ring of 7 flagged for review: [acct:1001, acct:1002, acct:1003, acct:1004, card:
 
 The tests cross-check 2,000 random unions against a brute-force label array (merge by relabelling every element, O(n) per union), which is the simplest possible reference model and the one to write first when porting.
 
+### In Python
+
+```python
+def find(self, x: int) -> int:
+    self._check_index(x)
+    parent = self._parent
+    root = x
+    hops = 0
+    while parent[root] != root:
+        root = parent[root]
+        hops += 1
+    self._hops += hops
+    if self._path_compression:
+        while parent[x] != root:
+            nxt = parent[x]
+            parent[x] = root
+            x = nxt
+    return root
+```
+
+`code/python/main.py` keeps `DisjointSet` (three `list[int]`s), `EntityLinker`, and both switchable heuristics. What differs:
+
+- **The loop is mandatory.** A recursive `find` raises `RecursionError` on the naive chain, because CPython's default limit is 1,000 frames and the chain is 1,999 deep. The two-pass loop above also binds `self._parent` to a local and accumulates hops locally, which roughly halves the cost of each hop in the interpreter.
+- **The heuristics demo runs at one tenth the size.** The naive variant is O(n^2) pointer hops by design: about 200 million on Java's 20,000-element chain and tens of millions more on the random workload. CPython follows roughly 10-30 million pointers a second, so `demo_heuristics` runs n = 2,000 with 3,000 random unions. The table has the same shape (naive depth n-1 and n/2 hops per find; rank-only depth 1; compression repairs the chain after one find), and `test_demo_table_matches_java_at_n_2000` pins the exact numbers the Java algorithm prints at that size. Every other section, including the 100,000 unions over 50,000 elements, prints the same numbers as Java.
+- **Same random workloads.** `JavaRandom` reproduces `java.util.Random(seed).nextInt(bound)`, so seeds 3, 11, and 99 drive identical unions.
+- **Exceptions.** An out-of-range element raises `IndexError`, a negative `n` raises `ValueError`, and exceeding the linker's capacity raises `RuntimeError` where Java throws `IllegalStateException`.
+
+```bash
+cd phases/01-complexity-and-core-structures/10-disjoint-sets/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: use three `list[int]`s or `array('i')`; the recursive `find` hits the 1,000-frame limit on the chain workload, so keep the two-pass loop. Go: `[]int32` and the same loops; `union` and `find` would return `(int, error)` for the index check, or panic, since an out-of-range element is a programming error not a runtime condition. Neither language needs changes to the algorithm; the only numeric concern is that `rank` fits in a byte (it never exceeds 64) if memory matters. In Go a concurrent version would wrap the arrays in a `sync.Mutex`; compression's writes make `sync.RWMutex` useless because every read is also a write.
+Go: `[]int32` and the same loops; `union` and `find` would return `(int, error)` for the index check, or panic, since an out-of-range element is a programming error not a runtime condition. The algorithm does not change; the only numeric concern is that `rank` fits in a byte (it never exceeds 64) if memory matters. In Go a concurrent version would wrap the arrays in a `sync.Mutex`; compression's writes make `sync.RWMutex` useless because every read is also a write.
 
 ## Use It
 

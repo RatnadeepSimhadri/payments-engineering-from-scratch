@@ -3,7 +3,7 @@
 > Hand-encode a varint and never fear a wire format again.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 11 (Bit Manipulation), Phase 1, Lesson 12 (Strings and Encodings), Phase 0, Lesson 06 (Reading a Spec)
 **Time:** ~90 minutes
 
@@ -334,9 +334,34 @@ Expected output, abbreviated:
 
 Read section 4's first bytes against the spec: `08` is field 1 VARINT, `81 80 40` is the varint for 1,048,577 (that is 2^20 + 1, needing 21 bits, three groups), `10` is field 2 VARINT, `9d 1f` is ZigZag(-1999), `1a 03 55 53 44` is field 3 LENGTH_DELIMITED, length 3, `USD`. You can now decode a protobuf message with a hex dump and a pencil.
 
+### In Python
+
+`code/python/main.py` has the same classes (`ByteSink`, `ByteSource`, `Varint`, `WireType`, `Encoder`, `Decoder`, `PostingV1`, `Audit`, `PostingV2`, `Json`) and the same `MalformedMessageException`. It produces the same 94 bytes for the sample posting and the same totals over the 10,000 seeded postings. Three things differ:
+
+- **A `long` has to be modelled.** Python integers are unbounded, so a value has no sign bit at position 63 until you give it one. Every value that is a Java `long` passes through `to_int64`, and the unsigned view is `value & MASK64`, which stands in for Java's `>>>`. Without that, `zigzag_encode(Long.MIN_VALUE)` returns `2**64 - 1` instead of `-1`, and reading `ff ... 01` returns `2**64 - 1` instead of `-1`. The tests pin both cases. Python's `>>` on a negative `int` is arithmetic, like Java's `>>`, so the ZigZag sign trick ports unchanged:
+
+```python
+@staticmethod
+def zigzag_encode(n: int) -> int:
+    return to_int64((n << 1) ^ (n >> 63))
+
+@staticmethod
+def zigzag_decode(n: int) -> int:
+    return to_int64(((n & MASK64) >> 1) ^ -(n & 1))
+```
+
+- **No overloading.** `ByteSink.write` takes either an `int` or `bytes`, `Decoder(...)` takes either raw bytes or a `ByteSource` slice, and `PostingV1.decode` takes bytes or a `Decoder`. Methods named `bytes` and `bool` on `Encoder` and `Decoder` keep the Java names. They shadow the built-ins only as attributes, not inside method bodies. `ByteSource.slice` is a bounded window over the same buffer, as in Java, so a nested decoder cannot read past its length prefix.
+- **Records print like records.** `PostingV1.__str__` reproduces Java's `PostingV1[id=..., amount=...]`, so the schema-evolution line of the demo matches. `int(float(2**53 + 1))` shows the same lost unit as Java's `(long)(double)` cast. The 10,000 random postings come from `JavaRandom`, with each draw in Java's left-to-right argument order, so the binary and JSON byte totals match.
+
+```bash
+cd phases/03-systems-data-structures/15-serialization-formats/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `bytearray` for the sink, `memoryview` slices for nested messages, and plain `int` everywhere; because Python ints are unbounded, `zigzag_encode` must mask to 64 bits explicitly (`((n << 1) ^ (n >> 63)) & 0xFFFF_FFFF_FFFF_FFFF`) and the reader must reject the 65-bit case by hand. Go: `[]byte` with `append` for the sink, a `struct{ buf []byte; pos int }` for the source, `encoding/binary.PutUvarint` exists but write your own to match the lesson's error handling, and return `error` instead of throwing (`errors.Is(err, ErrMalformed)`). In all three, keep the spec vectors (`08 96 01`, `12 07 74 65 73 74 69 6e 67`, `1a 03 08 96 01`) as tests: they are the cross-language contract.
+Go: `[]byte` with `append` for the sink, a `struct{ buf []byte; pos int }` for the source, `encoding/binary.PutUvarint` exists but write your own to match the lesson's error handling, and return `error` instead of throwing (`errors.Is(err, ErrMalformed)`). Keep the spec vectors (`08 96 01`, `12 07 74 65 73 74 69 6e 67`, `1a 03 08 96 01`) as tests: they are the cross-language contract.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Sampling transactions for audit without storing them all.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 2, Lesson 01 (Sorting Algorithms), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~60 minutes
 
@@ -338,9 +338,35 @@ p99    4472.57 USD (sorted says 4472.57 USD)
 
 The 39 tests are mostly statistical: the generator's uniformity over 70,000 draws, the reservoir invariant over 30,000 streams with a specific check that the last item is not favoured, the 9:1 weighted selection rate, both shuffles' permutation frequencies against their exact expected values, quickselect against a sort for every rank and under twenty seeds, and Miller-Rabin against trial division for every `n` below 5,000 including the one-sided-error property. Because the generator is seeded, every one of these is deterministic: the tolerances exist to make the test meaningful, not to absorb flakiness.
 
+### In Python
+
+```python
+def _next_u64(self) -> int:
+    self._state = (self._state + 0x9E3779B97F4A7C15) & MASK64
+    z = self._state
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64  # >> on a masked value is Java's >>>
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+    return z ^ (z >> 31)
+```
+
+Every class keeps its name and algorithm, and every number in the demo matches the Java run. Four things differ, all in `code/python/main.py`:
+
+- **SplitMix64 needs explicit 64-bit wraparound.** Python integers never wrap, so the state and both multiplies are masked with `MASK64`. The state is held unsigned, which makes `>>` a logical shift (Java's `>>>`); `next_long` converts to a signed value with `to_int64` so it returns exactly what Java's `nextLong()` returns (the reference output `0xE220A8397B1DCDAF` is negative as a Java `long`, and a test checks that). `random.Random` must not be substituted: it is a Mersenne Twister and the reference test would fail.
+- **The heap's array order is part of the output.** `WeightedReservoirSampler.sample()` iterates the heap's backing array, as the Java iterates `PriorityQueue`. `heapq.heappop` sifts differently from `PriorityQueue.poll` (hole to a leaf, then back up), which can arrange equal keys differently, so the port includes `JavaPriorityQueue`, a short transcription of the JDK's `siftUp`/`siftDown`. The weighted sample prints in the same order as the Java run. `math.pow` and Java's `Math.pow` are each within one ulp of the exact result and agree on every key in the demo; a disagreement could only swap two keys that differ in the last bit.
+- **Truncating division in `Money.__str__`.** This lesson's Java `toString` uses `/` and `%` directly; for a negative amount those truncate toward zero, where Python's `//` and `%` floor. `trunc_div` and `java_rem` reproduce the Java result (`-150` prints `-1.50 USD`), and a test pins it.
+- **The `2^31` guard stays.** In Python `x * x` cannot overflow, so `MillerRabin` would be correct without the `n < 2^31` restriction; it is kept so both languages accept and reject the same inputs. `pow(base, exp, mod)` is the built-in equivalent of `pow_mod`.
+
+```bash
+cd phases/02-algorithms/14-randomized-algorithms/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 39 checks plus 2 for the signed and truncating conversions.
+
 ### Porting notes
 
-SplitMix64 ports exactly with unsigned 64-bit arithmetic: Python needs `& 0xFFFFFFFFFFFFFFFF` after every multiply and add because its integers do not wrap, and `>>` on the masked value is already a logical shift; Go's `uint64` wraps and `>>` is logical, so the function is a direct transcription. Python's `random` and Go's `math/rand` must not be substituted or the test on the reference output fails. `Math.pow` and `nextDouble` behave identically given IEEE 754 doubles. Quickselect and Fisher-Yates are language-neutral; in Go the generic reservoir becomes `ReservoirSampler[T any]`. Miller-Rabin in Python can drop the `2^31` guard entirely since `x * x` never overflows.
+SplitMix64 ports to Go directly: `uint64` wraps and `>>` is logical, so the function is a direct transcription. Go's `math/rand` must not be substituted or the test on the reference output fails. Quickselect and Fisher-Yates are language-neutral, and the generic reservoir becomes `ReservoirSampler[T any]`; `container/heap` needs the same siftUp/siftDown as `java.util.PriorityQueue` if the weighted sample must print in the same order.
 
 ## Use It
 

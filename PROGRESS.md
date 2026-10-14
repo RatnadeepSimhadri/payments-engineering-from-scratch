@@ -1,6 +1,6 @@
 # Progress Tracker
 
-Generated 2026-10-13T23:37:52+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
+Generated 2026-10-14T00:38:15+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
 
 ## Overall
 
@@ -9,11 +9,11 @@ Generated 2026-10-13T23:37:52+00:00 by `python3 scripts/progress.py` from the re
 | Area | Status |
 |---|---|
 | Java implementations | 143 / 143 Build lessons (primary, gates completion) |
-| Python implementations | 40 / 143 Build lessons (port in progress, not gating) |
+| Python implementations | 96 / 143 Build lessons (port in progress, not gating) |
 | Go implementations | 40 / 143 Build lessons (port in progress, not gating) |
 | Projects | 3 ready: `idempotent-payment-gateway` (4 stages, Java), `ledger-engine` (4 stages, Java), `raft-kv` (4 stages, Java) |
 | Skills | 9 / 9 present and mirrored to `.claude/skills/` |
-| Git | HEAD `2dd6d9b fix(audit): fail placeholder quizzes, shallow docs, missing Build artifacts`; 43 uncommitted files |
+| Git | HEAD `073a5e0 docs: pause Python port; save resume plan and log`; 121 uncommitted files |
 
 ## By track and phase
 

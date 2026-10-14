@@ -3,7 +3,7 @@
 > Why a lock with a timeout needs a monotonic token to be safe.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 11 (Circuit Breakers and Bulkheads); Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks); Phase 4, Lesson 01 (Threads and the Memory Model)
 **Time:** ~90 minutes
 
@@ -337,9 +337,36 @@ Three things to take from the output. The write log in the unfenced run ends wit
 
 The test file has 32 assertions. The pair to read first is "pause after the check: the stale write lands anyway on unfenced storage" and "pause after the check: fenced storage still rejects."
 
+### In Python
+
+`code/python/main.py` keeps the lesson's types and method names (`Lease`, `LeaseLock.try_acquire`, `FencedStorage`, `PayoutWorker.payout`, `RaceStudy.run`) and prints the same demo as Java, including `lost updates=995` for the seed-7 study. Three things differ.
+
+- **`Optional<Lease>` is `Lease | None`.** `try_acquire` returns `None` when the lock is held, and the demo's `orElseThrow()` becomes a small `or_else_throw` helper. Forgetting the check is the same bug in both languages, but Python only reports it when `None.token` is read, which is exactly the moment the lease mattered; the type hint `Optional[Lease]` is the only warning.
+- **Same exceptions, Python base classes.** `LeaseExpiredException` and `StaleTokenException` keep their names and subclass `RuntimeError`; `StaleTokenException` still carries `presented` and `highest_seen`, and a test reads them. `IllegalArgumentException` for a non-positive ttl is `ValueError`. The worker's `Result` enum stays nested as `PayoutWorker.Result`, and `Lease` is a frozen dataclass, so a renewal returns a new `Lease` rather than mutating the one a paused client is still holding.
+- **The race study uses `java.util.Random`, ported.** `random.Random(7)` would also reproduce, but it would draw different pauses from Java's generator, so `JavaRandom` ports the JDK's 48-bit LCG and `nextInt(bound)`. The 2,000 pauses, and therefore the 995 lost updates, match the Java run exactly.
+
+```python
+def write(self, key: str, value: int, token: int) -> None:
+    seen = self._highest_token.get(key, 0)
+    if token < seen:
+        self._log.append(f"REJECTED {key}={value} (token {token} < {seen})")
+        raise StaleTokenException(key, token, seen)
+    self._highest_token[key] = token
+    self._data[key] = value
+    self._log.append(f"{key}={value} (token {token})")
+```
+
+Tokens and balances are plain `int`s: tokens because the comparison must be exact, balances because they are minor units (Phase 10, Lesson 01).
+
+```bash
+cd phases/05-distributed-foundations/12-leases-and-fencing-tokens/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The design ports directly. In Go, `LeaseLock` would guard its fields with a `sync.Mutex` (the lock service is shared state even in a simulation), `tryAcquire` would return `(Lease, bool)`, and `write` would return `error` with a sentinel `ErrStaleToken` for `errors.Is`; run the tests under `go test -race`. In Python, `Lease` is a frozen dataclass, the exceptions subclass `Exception`, and the balance stays an `int` of minor units; the randomized study uses `random.Random(seed)` so results reproduce. The fencing comparison is integer `<` in every language and must stay that way; a float timestamp as a token would reintroduce the ordering ambiguity the lesson removes.
+The design ports directly. In Go, `LeaseLock` would guard its fields with a `sync.Mutex` (the lock service is shared state even in a simulation), `tryAcquire` would return `(Lease, bool)`, and `write` would return `error` with a sentinel `ErrStaleToken` for `errors.Is`; run the tests under `go test -race`. The fencing comparison is integer `<` in every language and must stay that way; a float timestamp as a token would reintroduce the ordering ambiguity the lesson removes.
 
 ## Use It
 

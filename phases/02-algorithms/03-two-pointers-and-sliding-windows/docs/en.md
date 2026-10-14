@@ -3,7 +3,7 @@
 > Velocity checks are sliding-window problems.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 2, Lesson 01 (Sorting)
 **Time:** ~60 minutes
 
@@ -349,9 +349,33 @@ maxima [3, 3, 5, 5, 6, 7]
 
 The test run prints `50 passed, 0 failed`.
 
+### In Python
+
+```python
+def _evict_older_than(self, cutoff_exclusive: int) -> None:
+    while self._window and self._window[0].timestamp_ms <= cutoff_exclusive:
+        self._total = self._total.minus(self._window.popleft().amount)
+```
+
+The classes, method names (in `snake_case`), and every test case are the same; three things differ, all in `code/python/main.py`:
+
+- **The deque is `collections.deque`.** It has `O(1)` `append`/`popleft`/`pop` at both ends, so `max_of_each_window` and `VelocityChecker` use it exactly as the Java uses `ArrayDeque`: `dq[0]` is `peekFirst`, `dq[-1]` is `peekLast`. Its `maxlen` option is tempting for fixed windows but wrong for time windows, where eviction is by timestamp, not count.
+- **Integers do not overflow, so `Money` checks by hand.** `plus` and `minus` call `_check_long`, which raises `ArithmeticError` outside the signed 64-bit range where `Math.addExact` would throw; the currency check is unchanged and raises `ValueError` (the `IllegalArgumentException` mapping used throughout). A test pins the overflow.
+- **Strings are code points.** `longest_without_repeat` keeps `last_seen` in a `dict` instead of a 65,536-entry `int[]`, and iterates code points rather than UTF-16 units; for any string in the Basic Multilingual Plane the answers are identical. The `>= left` guard is the same line.
+
+`Decision` is an `Enum`, also reachable as `VelocityChecker.Decision` so the Java spelling works. The test file carries a small port of `java.util.Random` so the 600 brute-force oracle trials are the same random arrays as the Java run.
+
+```bash
+cd phases/02-algorithms/03-two-pointers-and-sliding-windows/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 50 checks plus one for the overflow guard.
+
 ### Porting notes
 
-Python's `collections.deque` has `O(1)` `append`/`popleft` and a `maxlen` option that is tempting for fixed windows but wrong for time windows (eviction is by timestamp, not count); integers do not overflow, so `Money.plus` loses its `addExact` but keeps the currency check. Go has no deque in the standard library: a slice used as a queue with `q = q[1:]` leaks the backing array until reallocation, so the port should implement a ring buffer (Phase 1, Lesson 05) or use `container/list`; `int64` arithmetic needs the explicit overflow check from Phase 10, Lesson 01; `record` returns `(Decision, error)` for the out-of-order case rather than panicking. The algorithms themselves are identical in all three.
+Go has no deque in the standard library: a slice used as a queue with `q = q[1:]` leaks the backing array until reallocation, so the port should implement a ring buffer (Phase 1, Lesson 05) or use `container/list`; `int64` arithmetic needs the explicit overflow check from Phase 10, Lesson 01; `record` returns `(Decision, error)` for the out-of-order case rather than panicking. The algorithms themselves are identical.
 
 ## Use It
 

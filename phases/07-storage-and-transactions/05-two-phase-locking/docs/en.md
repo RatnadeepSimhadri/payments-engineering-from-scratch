@@ -3,7 +3,7 @@
 > Serializable the old way: hold every lock you take until you commit, and when two transactions each wait for the other, pick one and kill it.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 7, Lesson 04 (Isolation Levels and Their Anomalies), Phase 4, Lesson 07 (Deadlocks, Lock Ordering, and Detection), Phase 2, Lesson 08 (Graph Traversal: BFS and DFS), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -400,9 +400,45 @@ Expected output, abbreviated:
 
 The test file checks 40 assertions: the compatibility matrix, FIFO grant order, cycle detection on chains and on a cycle with a hanger-on, both deadlock shapes, both victim policies, conservation of money, equality with the serial schedule, undo order, the early-release anomaly, and the two-phase rule.
 
+### In Python
+
+```python
+def _execute(self, t: Txn, op: Op) -> bool:
+    match op:
+        case Op.Read(key=key):
+            if not self._lock(t, key, LockMode.S):
+                return False
+            ...
+        case Op.Add(key=key, delta=delta):
+            if not self._lock(t, key, LockMode.X):
+                return False
+            before = self.db.get(key)
+            t.undo.setdefault(key, before)
+            self.db[key] = before.plus(delta)
+        case Op.Unlock(key=key):
+            t.phase = Txn.Phase.SHRINKING
+            self._grant(self.locks.release(t.id, key))
+        case Op.Commit():
+            self.commit(t)
+    return True
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The sealed `Op` becomes four frozen dataclasses** attached to an `Op` base class, so the scripts still read `Op.Add("acct:A", usd(-1))` and `match`/`case` with class patterns replaces the Java `switch` over records.
+- **Ordering is explicit.** Java's `TreeMap` and `TreeSet` give sorted iteration for free; Python iterates `sorted(self.table)` in `release_all` and `wait_for_graph`, and `find_cycle` visits start nodes and neighbours in sorted order. That is what makes the cycle `[1, 2]` and the victim `T2` identical in both languages. Holders stay in an insertion-ordered `dict` (`LinkedHashMap`) and the queue is a `collections.deque`, with `appendleft` for upgrades.
+- **`Money` checks overflow by hand.** `Money.plus` calls `add_exact`, which raises `OverflowError` outside the signed 64-bit range, because Python's `int` would otherwise grow past `Long.MAX_VALUE` silently. A Python-only test pins this. `Optional<List<Integer>>` becomes `list[int] | None`.
+- **No threads, no GIL question.** The scheduler interleaves steps itself, so every deadlock is replayed by `run(1, 2, 1, 2)` in both languages and the demo output is identical.
+
+```bash
+cd phases/07-storage-and-transactions/05-two-phase-locking/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port keeps `Money` as an `int`-based frozen dataclass that rejects floats; the sealed `Op` interface becomes a union of dataclasses matched with `match`/`case`; `Optional<List<Integer>>` becomes `list[int] | None`. A Go port uses `map[int]LockMode` for holders and a slice for the queue, returns `(granted bool)` from `Acquire` and `error` from the two-phase check with a sentinel `ErrTwoPhaseViolation`; `sealed interface Op` becomes an interface with a type switch. Neither port needs threads: concurrency is modelled by the scheduler's interleaving, which is what makes every deadlock replayable. A port that does add real threads must run `acquire`, `releaseAll`, and the detector under one mutex, since the lock table is itself shared state, and should run detection on a timer rather than on every wait.
+A Go port uses `map[int]LockMode` for holders and a slice for the queue, returns `(granted bool)` from `Acquire` and `error` from the two-phase check with a sentinel `ErrTwoPhaseViolation`; `sealed interface Op` becomes an interface with a type switch. The port needs no goroutines: concurrency is modelled by the scheduler's interleaving, which is what makes every deadlock replayable. A port that does add real goroutines must run `acquire`, `releaseAll`, and the detector under one mutex, since the lock table is itself shared state, and should run detection on a timer rather than on every wait.
 
 ## Use It
 

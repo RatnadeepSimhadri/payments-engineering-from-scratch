@@ -3,7 +3,7 @@
 > SWIM-style membership without a coordinator.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 02 (Failure Models); Phase 5, Lesson 08 (Timeouts and Deadline Propagation); Phase 5, Lesson 12 (Leases, Fencing Tokens, and Distributed Locks)
 **Time:** ~75 minutes
 
@@ -333,9 +333,33 @@ t=111  n2 hears it is SUSPECT@0 -> refutes with incarnation 1
 seeds where every live node declared n7 DEAD: 20/20; mean detection+dissemination 79 ticks, worst 104 ticks; false positives across all seeds: 0
 ```
 
+### In Python
+
+`code/python/main.py` ports the simulation class for class (`Update`, `SwimNode`, `Network`, `Cluster`) and reproduces the Java run exactly: the same event trace, `DEAD everywhere by t=188`, `36` indirect acks, and `79`/`104` ticks over the 20 lossy seeds. That only works because every source of ordering was made explicit.
+
+- **The generator and the shuffle are ported, not borrowed.** `Rng` is SplitMix64 masked to 64 bits, and `Rng.shuffle` is the same Fisher-Yates loop as the Java one. `random.Random(seed).shuffle` draws from a different generator, so the probe order, and with it every detection time in the demo, would differ.
+- **Java's sorted and linked maps become explicit orders.** `view` is a `TreeMap` in Java, so iteration is by member id; the Python `dict` would iterate in insertion order (`[1, 2, 0]` for the three-node test node), so `SwimNode` iterates `sorted(self.view)` wherever the order can matter (choosing probe targets and helpers). The gossip queue relies on the opposite property: `LinkedHashMap` keeps insertion order and `put` on an existing key keeps its position, and a Python `dict` does exactly the same, so `_gossip_queue[update] = sent` is a faithful port. `take_gossip` sorts with `sorted`, which is stable like `List.sort`, so ties keep queue order. `Network.tick` visits nodes in id order, as Java's `TreeMap` does, and the in-flight queue is a `heapq` keyed by `(deliver_at, seq)`.
+- **`Update` is a frozen dataclass.** It is hashable, so it keys the gossip queue just as the Java record does; `Message.piggyback` is a tuple so a message cannot be mutated after it is sent. `Message.from_` has a trailing underscore because `from` is a keyword, and `alive_members()`/`dead_members()` return sorted lists in place of `TreeSet`.
+
+```python
+def shuffle(self, items: list) -> None:
+    """Fisher-Yates with this generator (not random.shuffle), so permutations replay with the seed."""
+    for i in range(len(items) - 1, 0, -1):
+        j = self.next_int(i + 1)
+        items[i], items[j] = items[j], items[i]
+```
+
+The simulation is single-threaded in both languages, so the GIL plays no part.
+
+```bash
+cd phases/05-distributed-foundations/13-gossip-and-failure-detection/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `Update` is a frozen dataclass so it can key the gossip queue (a `dict` preserves insertion order, matching `LinkedHashMap`); `random.Random(seed).shuffle` is a different Fisher-Yates than the one here, so port `Rng.shuffle` verbatim if traces must match across languages. Go: `Update` is a comparable struct usable as a map key; map iteration is randomised, so sort the gossip queue by `(sent, member)` before taking from it or the piggyback order (and therefore convergence time) will differ run to run; the `Network`'s priority queue is `container/heap`. Neither port needs goroutines or threads: the simulation is single-threaded by design, and a production port would run `tick` from a timer and `handle` from a UDP read loop with one mutex around the view.
+Go: `Update` is a comparable struct usable as a map key; map iteration is randomised, so sort the gossip queue by `(sent, member)` before taking from it or the piggyback order (and therefore convergence time) will differ run to run; the `Network`'s priority queue is `container/heap`. The port needs no goroutines: the simulation is single-threaded by design, and a production port would run `tick` from a timer and `handle` from a UDP read loop with one mutex around the view.
 
 ## Use It
 

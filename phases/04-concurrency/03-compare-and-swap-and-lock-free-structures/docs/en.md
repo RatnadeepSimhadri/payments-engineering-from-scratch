@@ -3,7 +3,7 @@
 > A lock-free stack and the ABA problem that breaks it.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model); Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 1, Lesson 05 (Stacks, Queues, and Deques)
 **Time:** ~90 minutes
 
@@ -373,9 +373,36 @@ after:  [N1=pay_001]   <- every job captured exactly once
 
 The test file runs the same ABA interleaving and asserts the duplicate pop, then asserts the stamped version rejects exactly one stale CAS. It also runs real multi-threaded stress on both structures and checks conservation: every pushed value is popped exactly once. Those stress tests cannot prove the absence of a race (Lesson 01), but they would catch a broken `next` ordering within a few runs.
 
+### In Python
+
+```python
+class AtomicReference(Generic[T]):
+    """java.util.concurrent.atomic.AtomicReference: compare_and_set compares by identity (`is`), like Java's ==."""
+
+    def compare_and_set(self, expected: Optional[T], new: Optional[T]) -> bool:
+        with self._lock:
+            if self._value is expected:
+                self._value = new
+                return True
+            return False
+```
+
+`code/python/main.py` keeps `TreiberStack`, `PooledStack`, `StampedPooledStack`, `MichaelScottQueue`, and `Progress`, with every CAS loop written line for line. What differs:
+
+- **There is no CAS instruction to call.** CPython exposes no atomic compare-and-swap to Python code, so the port supplies `AtomicReference`, `AtomicLong`, and `AtomicStampedReference` whose `compare_and_set` holds a private `threading.Lock` for the compare and the write. The CAS is therefore blocking, and the structures are lock-free in shape only; what carries over is the algorithm: read, compute, CAS, retry. `compare_and_set` compares with `is`, not `==`, because Java's CAS compares references, and the ABA bug depends on that.
+- **The GIL hides races, so the seam matters more.** Python threads switch only between bytecodes (every 5 ms by default), so the window between `head.get()` and the CAS is rarely hit by chance and the stress tests mostly check conservation. The ABA bug is not left to chance in either language: `before_cas` runs thread B's pop, pop, push inside thread A's gap, and the tests assert the duplicate pop of `pay_002` and, with the stamp, exactly one rejected stale CAS and a final stamp of 8.
+- **`Optional` becomes `None`.** `pop`, `peek`, and `dequeue` return the value or `None`; `push` and `enqueue` reject `None` with `TypeError` (Java's `NullPointerException`), so `None` can only mean empty. `Thread.onSpinWait()` becomes `on_spin_wait()`, which calls `time.sleep(0)` to release the GIL so a spinning consumer does not starve the producers.
+- **Real threads still run.** The stress test pushes 80,000 values from four `threading.Thread`s and the queue test runs four producers against four consumers; both pass reliably because every shared counter is an `AtomicLong` rather than a bare `+=`, which the GIL does not make atomic.
+
+```bash
+cd phases/04-concurrency/03-compare-and-swap-and-lock-free-structures/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: CPython has no CAS on arbitrary references; `threading.Lock` is the primitive, and a "lock-free" stack would be a lock-protected list. The ABA demonstration still works with the same seam, because it is about reference reuse, not the hardware instruction; use a `version` integer next to `head` under the lock to show the fix. Go: `sync/atomic.Pointer[Node]` provides `CompareAndSwap`, so the Treiber stack and the Michael-Scott queue port line for line; for the stamp, pack a pointer and counter into a single struct behind `atomic.Pointer[stamped]` (allocate a new stamped pair per CAS) since Go has no double-word CAS. Both ports keep the `beforeCas` hook so the ABA test stays deterministic, and the Go tests must pass under `go test -race`.
+Go: `sync/atomic.Pointer[Node]` provides `CompareAndSwap`, so the Treiber stack and the Michael-Scott queue port line for line; for the stamp, pack a pointer and counter into a single struct behind `atomic.Pointer[stamped]` (allocate a new stamped pair per CAS) since Go has no double-word CAS. The port keeps the `beforeCas` hook so the ABA test stays deterministic, and the Go tests must pass under `go test -race`.
 
 ## Use It
 

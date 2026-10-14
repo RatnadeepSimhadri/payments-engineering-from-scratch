@@ -1,12 +1,12 @@
 # Python Port Plan (deferred)
 
-**Status (2026-10-13):** deferred. The learner is taking the course in Java first; resume this plan later.
+**Status (2026-10-13):** Wave 1 (batches A–F, 56 lessons) DONE and merged to main. Wave 2 (batches G–L) remaining.
 **Scope:** 103 Build lessons without `code/python/` + Python versions of the 3 projects. 40 Build lessons already have Python (and Go).
 **Done when:** all 143 Build lessons and 3 projects pass `--lang python`; then set `"ci": true` for Python in `languages.json`.
 
-## Partial work already done
+## Partial work (resolved)
 
-Branch `wip/python-port` (not merged) holds ports started before the pause: 00/05, 02/01, 02/02, 03/02, 04/08, 06/02 and 07/01 pass their Python tests but have not been checked for output parity with Java or had their docs finished; 06/03 quorums has `main.py` only. Start there: `git checkout wip/python-port`, verify those eight against the brief, then continue with the remaining batches.
+The ports started before the pause (formerly branch `wip/python-port`, now merged as part of Wave 1): 00/05, 02/01, 02/02, 03/02, 04/08, 06/02 and 07/01 pass their Python tests but have not been checked for output parity with Java or had their docs finished; 06/03 quorums has `main.py` only. Start there: `git checkout wip/python-port`, verify those eight against the brief, then continue with the remaining batches.
 
 ## How to resume
 1. `python3 scripts/progress.py` shows current coverage (the "Python implementations" row).

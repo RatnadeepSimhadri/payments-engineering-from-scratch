@@ -2,6 +2,16 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-10-13 — Python port Wave 1 complete (Phases 0–7 + Phase 13 Build lessons)
+
+- Ported 56 lessons to Python (batches A–F of `docs/porting/python-port-plan.md`), including the 8 partial ports from `wip/python-port`, which were verified and finished. Python coverage: 40 → 96 of 143 Build lessons.
+- Parity: same class/method names, every Java test case ported (Python assertion counts ≥ Java), demo output diffed against Java and identical apart from wall-clock timings and three documented exceptions.
+- Documented substitutions: 13/11 Ed25519 seal → HMAC-SHA256 (no stdlib Ed25519); 04/03 CAS emulated with a lock (no CPython CAS); 04/12 explicit preemption point because the GIL hides the race; 01/10 heuristics section runs at n=2,000 (Java n=20,000) for runtime; 02/04 Python recursion limit differs from the JVM stack.
+- Bit-exact ports of `java.util.Random`, `Collections.shuffle`, Java `String.hashCode`, truncating division and 64-bit wraparound where lessons depend on them.
+- Verification: audit 199/199, 0 issues; Python 96 passed / 0 failed / 47 skipped (not yet ported); Java 143/143; projects 3/3.
+- Remaining: Wave 2 = 47 lessons (Phases 8–12, 14) + Python versions of the 3 projects. Python stays `ci: false` until then.
+- Noted for later: 07/10 Go porting note suggests `% uint64(n)`, which would shard negative hashes differently from Java's `Math.floorMod`; fix when doing the Go port.
+
 ## 2026-10-13 — Python port paused; learner starts the course in Java
 
 - Decision: take the course in Java now; Python and Go ports deferred.

@@ -3,7 +3,7 @@
 > Range vs hash, hot keys, and moving a shard without downtime.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 3, Lesson 06 (Consistent Hashing and Virtual Nodes), Phase 6, Lesson 01 (Replication Strategies)
 **Time:** ~75 minutes
 
@@ -365,11 +365,39 @@ Expected output, abbreviated:
 
 The three percentages in the middle block are the lesson. Keep them for the next design review where someone proposes `mod N`.
 
+### In Python
+
+```python
+@staticmethod
+def fnv1a64(key: str) -> int:
+    h = 0xCBF29CE484222325
+    data = key.encode("utf-16-be")
+    for i in range(0, len(data), 2):
+        h ^= (data[i] << 8) | data[i + 1]
+        h = (h * 0x100000001B3) & MASK64
+    return h
+```
+
+Differences, all in `code/python/main.py`:
+
+- **64-bit wraparound is explicit.** Python integers never overflow, so every multiply in `fnv1a64` and `hash64` is masked with `MASK64 = 0xFFFFFFFFFFFFFFFF`. Forget one mask and the hash grows without bound and every partition number changes. The hash iterates UTF-16 code units, which is exactly what Java's `charAt` sees (and the same as the bytes for ASCII keys), so both languages route every key to the same partition. Python's built-in `hash()` is randomised per process and is never used.
+- **Unsigned by default.** The masked value is already non-negative, so `hash64(key) % P` replaces `Long.remainderUnsigned`. The test compares `fnv1a64("")` with `0xCBF29CE484222325` directly; in Java the same bits are a negative `long`. The ring sorts unsigned values where Java's `TreeMap` sorts signed ones; that is a rotation of the same circle, so "first node clockwise" picks the same owner.
+- **The ring is a sorted list plus `bisect`.** `bisect_left` on the sorted hashes is `TreeMap.ceilingEntry`, with an explicit wrap to index 0. `partitions_per_node` returns a dict built from `sorted(...)`, and dict insertion order stands in for `LinkedHashMap` in the rebalancer's donor choice.
+- **Exceptions.** `IllegalArgumentException` maps to `ValueError`, `IllegalStateException` to `RuntimeError`, and `WrongOwnerException` is a `RuntimeError` subclass carrying `partition` and `current_version`. `Rebalancer.Move` is a frozen dataclass whose source field is `from_`, because `from` is a keyword.
+
+```bash
+cd phases/07-storage-and-transactions/01-partitioning-and-rebalancing/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo prints the same numbers as the Java version (79.8%, 18.9%, 21.2%, 236 keys copied).
+
 ### Porting notes
 
-- **Hashing.** Python's `hash()` and Go's map hash are randomised per process; the port must implement FNV-1a and the finaliser by hand on the UTF-8 bytes, masking to 64 bits in Python (`& 0xFFFFFFFFFFFFFFFF` after each multiply) and using `uint64` in Go so that `mod P` needs no unsigned-remainder helper.
-- **Errors.** `WrongOwnerException` becomes a Python exception class carrying `partition` and `current_version`, and a Go error type with those fields checked via `errors.As`; the state-machine guards become `ValueError`/`error` returns.
-- **Ordering.** The ring uses `TreeMap.ceilingEntry`; Python uses `bisect` on a sorted list of hashes, Go uses `sort.Search` on a sorted slice. `partitionsPerNode` uses a `TreeMap` for sorted printing; the ports should sort keys explicitly.
+- **Hashing.** Go's map hash is randomised per process; the port must implement FNV-1a and the finaliser by hand on the key's bytes, using `uint64` so that `mod P` needs no unsigned-remainder helper.
+- **Errors.** `WrongOwnerException` becomes a Go error type carrying `Partition` and `CurrentVersion`, checked via `errors.As`; the state-machine guards become `error` returns.
+- **Ordering.** The ring uses `TreeMap.ceilingEntry`; Go uses `sort.Search` on a sorted slice. `partitionsPerNode` uses a `TreeMap` for sorted printing; the port should sort keys explicitly.
 - **Concurrency.** This lesson is single-threaded by design. A Go port that runs migration writes from goroutines must guard the node maps with a mutex and pass `go test -race`.
 
 ## Use It

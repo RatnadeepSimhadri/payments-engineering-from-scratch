@@ -3,7 +3,7 @@
 > Rotations, invariants, and why Java's TreeMap is red-black.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 05 (Binary Search Trees), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 0, Lesson 04 (Recursion and the Call Stack)
 **Time:** ~120 minutes
 
@@ -394,9 +394,35 @@ first expiry at or after t0+30s: +30738 ms
 after removing every even key: size=50000 height=16, invariants hold
 ```
 
+### In Python
+
+`code/python/main.py` has the same classes (`NaiveBst`, `AvlTree`, `RedBlackTree`) with the same methods in snake_case (`rotate_right`, `ceiling_key`, `check_invariants`, `black_height`). Four things differ:
+
+- **Comparison operators instead of `compareTo`.** Keys are compared with `<` and `==`, so any type with a total order (int, str, tuple) works without a `Comparable` bound. `get` returns `None` for a missing key, and `contains_key` is `get(key) is not None`, which mirrors Java's `get(key) != null` (and its blind spot for stored `None` values).
+- **`None` stands in for `null` leaves.** `AvlTree.node_height(None)` is 0 and `is_red(None)` is `False`, so property 3 (null leaves are black) is still encoded without sentinel nodes. The invariant checkers raise `IllegalStateError`, the Python counterpart of `IllegalStateException`.
+- **Recursion limit on the naive tree.** Python stops at about 1,000 nested calls, and the degenerate BST of 2,000 sorted keys is 2,000 levels deep, so `NaiveBst.height` walks level by level instead of recursing. The balanced trees keep the recursive `put`, `remove`, and `verify` because their depth is `O(log n)`:
+
+```python
+def height(self) -> int:
+    level = [self._root] if self._root is not None else []
+    h = 0
+    while level:
+        h += 1
+        level = [c for n in level for c in (n.left, n.right) if c is not None]
+    return h
+```
+
+- **Same shuffle, same numbers.** The random-order demo and tests use `JavaRandom`, a bit-exact port of `java.util.Random`, and `java_shuffle`, which is `Collections.shuffle` (swap `i - 1` with `nextInt(i)` from the end). Seed 2024 produces the same permutation as Java, so heights, rotation counts, and recoloring counts match line for line. `fmt_fixed` reproduces Java's half-up `%.1f`.
+
+```bash
+cd phases/03-systems-data-structures/03-balanced-trees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Both trees port directly. Python has no `null`-safe field access, so `height(n)` and `is_red(n)` stay as module functions that accept `None`; recursion depth is not a concern because depth is `O(log n)`, but a naive BST demo of 2,000 sorted keys would hit Python's default recursion limit if `height` were recursive, so compute it iteratively there. Go uses `*Node` with `nil` checks and returns the new subtree root from `put` exactly as Java does; generics (`[K cmp.Ordered, V any]`) replace `Comparable`. Neither port needs concurrency; the structure is single-writer by design, and a concurrent ordered map is Lesson 07's skip list.
+The tree ports directly to Go: it uses `*Node` with `nil` checks and returns the new subtree root from `put` exactly as Java does; generics (`[K cmp.Ordered, V any]`) replace `Comparable`. No port needs concurrency; the structure is single-writer by design, and a concurrent ordered map is Lesson 07's skip list.
 
 ## Use It
 

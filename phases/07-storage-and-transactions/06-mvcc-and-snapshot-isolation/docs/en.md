@@ -3,7 +3,7 @@
 > Readers never block writers, and the write-skew they let through.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 7, Lesson 04 (Isolation Levels and Anomalies), Phase 7, Lesson 05 (Two-Phase Locking), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
@@ -345,9 +345,33 @@ vacuum after it finished removed 5; versions of A now: 1, total: 2
 
 Section 4 is worth reading twice. The first vacuum, with the long-running transaction open, did remove six versions: history older than its snapshot was already dead. What it could not remove were the five versions committed *during* the transaction, because the transaction's snapshot sits below all of them. Those five are the bloat a long reader causes.
 
+### In Python
+
+```python
+def read(self, txn: Transaction[V], key: str) -> V | None:
+    self._require_active(txn)
+    if key in txn.writes:
+        return txn.writes[key]
+    v = self._visible_version(key, txn.start_ts)
+    return None if v is None or v.is_tombstone() else v.value
+```
+
+Differences, all in `code/python/main.py`:
+
+- **`Optional<V>` becomes `V | None`.** A tombstone is a `Version` whose `value` is `None`, and an own buffered delete is a `None` in `txn.writes`, so `read` returns `None` for "absent" in every case. `write` rejects `None` with `TypeError`, as Java's `requireNonNull` does, so a delete can only come from `delete()`. The store is `Generic[V]` for readers; at runtime the tests store plain `int`s and the demo stores `Money`.
+- **Overflow is checked by hand.** `Money.plus` and `minus` route through `_check_int64`, which raises `OverflowError` outside the signed 64-bit range: the Python twin of `Math.addExact`. `Money` also rejects floats in `__post_init__`, as the Phase 10 reference does. A Python-only test pins the overflow.
+- **Errors.** `WriteConflictException` is a `RuntimeError` subclass; using a finished transaction raises a plain `RuntimeError` (Java's `IllegalStateException`), and the test checks it is not the conflict type. `history` returns a tuple, the read-only view `Collections.unmodifiableList` gives in Java.
+- **No threads.** Concurrency is the order of calls, as in Java, so the demo's timestamps, the conflict message and the vacuum counts (6 with the long runner open, then 5) match line for line.
+
+```bash
+cd phases/07-storage-and-transactions/06-mvcc-and-snapshot-isolation/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port replaces `Optional<V>` with `V | None` and the generic store with duck typing; `Money` must reject floats in `__post_init__` as the Phase 10 reference does, and arbitrary-precision `int` removes the overflow checks. A Go port returns `(V, bool)` from `Read` and `error` from `Commit` with a sentinel `ErrWriteConflict` for `errors.Is`; the version chain is a `[]Version` and vacuum reslices it. Neither port needs threads: the store is single-threaded by design and concurrency is modelled by interleaving calls. If a port does add goroutines or threads, the whole `commit` must hold one mutex, because validate-then-publish is the critical section.
+A Go port returns `(V, bool)` from `Read` and `error` from `Commit` with a sentinel `ErrWriteConflict` for `errors.Is`; the version chain is a `[]Version` and vacuum reslices it. The port needs no goroutines: the store is single-threaded by design and concurrency is modelled by interleaving calls. If it does add goroutines, the whole `commit` must hold one mutex, because validate-then-publish is the critical section.
 
 ## Use It
 

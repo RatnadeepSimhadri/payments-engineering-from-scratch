@@ -3,7 +3,7 @@
 > JIT warm-up, GC pauses, and the GIL make naive timing meaningless.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 0, Lesson 03 (Testing from the Standard Library)
 **Time:** ~75 minutes
 
@@ -337,9 +337,37 @@ FileChannel.write             25.0%  25.0%
 
 Read the first `ArrayList.get` row carefully. Its first fork is 58 ns and the next two are 8 ns, so the row is marked `UNSTABLE`, and the pooled p50 of 11 ns is not a number you should quote. That is the harness telling the truth: the first benchmark to run in this JVM paid for compiling the harness loop itself. Sections 4 and 5 are scripted and print identical numbers on every machine; the tests pin them.
 
+### In Python
+
+```python
+def _time_iteration(self, body: BenchmarkBody) -> int:
+    bh = self._blackhole
+    start = self._ticker.nano_time()
+    for _ in range(self._config.ops_per_iteration):
+        body(bh)
+    end = self._ticker.nano_time()
+    elapsed = end - start
+    if elapsed < 0:
+        raise RuntimeError(f"ticker went backwards: {start} -> {end}")
+    return elapsed // self._config.ops_per_iteration  # elapsed >= 0, so floor == Java truncation
+```
+
+`code/python/main.py` keeps every type and the scripted-ticker invariant (two readings per iteration). What differs:
+
+- **The ticker is `time.perf_counter_ns()`**, CPython's monotonic nanosecond clock. `time.time_ns()` is wall-clock and can jump, exactly like `currentTimeMillis`.
+- **No JIT, so warm-up barely shows.** CPython 3.11 interprets bytecode (its specialising interpreter adapts within a few calls), so section 1's warm-up samples sit close to the measured ones. Dead-code elimination is not a concern either; the `Blackhole` exists to keep the design identical, and its XOR fold is masked to 64 bits so it matches a Java `long`. Section 1 runs 2,000 ops per iteration instead of 20,000 so the interpreted demo stays under ten seconds.
+- **Different structures, same question.** The stdlib has no `LinkedList` or `TreeMap`, so section 2 compares `list` with `collections.deque` (a linked list of 64-slot blocks, so `deque[i]` is O(n) but with a small constant) and section 3 compares `dict` with a `SortedMap` built on `bisect`. Expect every Python row to be 10-50x the Java row: one interpreted call per op dominates.
+- **Seeded data matches Java.** `seeded_ints` uses a `JavaRandom` that reproduces `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so both languages benchmark the same index sequence. Sections 4 and 5 print the same numbers as Java.
+
+```bash
+cd phases/00-setup-and-tooling/05-benchmarking-and-profiling/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python has no JIT in CPython, so warm-up is about the OS cache and the allocator rather than compilation, but the GIL means a benchmark's threads serialise, and `time.perf_counter_ns()` is the monotonic ticker; dead-code elimination is not a concern because the interpreter does no such optimisation, so the blackhole exists only to keep the design identical. Go's compiler is ahead-of-time, so there is no warm-up tier, but the compiler does eliminate dead stores and fold constants; `testing.B` with `b.N` and `b.ReportAllocs()` is the standard-library harness, `time.Now()` is monotonic in Go 1.9+, and the blackhole is a package-level `var sink`. Both ports keep nearest-rank percentiles, the per-fork spread, and the coordinated-omission back-fill unchanged, since none of that is language-specific.
+Go's compiler is ahead-of-time, so there is no warm-up tier, but the compiler does eliminate dead stores and fold constants; `testing.B` with `b.N` and `b.ReportAllocs()` is the standard-library harness, `time.Now()` is monotonic in Go 1.9+, and the blackhole is a package-level `var sink`. The port keeps nearest-rank percentiles, the per-fork spread, and the coordinated-omission back-fill unchanged, since none of that is language-specific.
 
 ## Use It
 

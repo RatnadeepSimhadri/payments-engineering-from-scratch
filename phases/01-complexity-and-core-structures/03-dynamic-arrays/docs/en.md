@@ -3,7 +3,7 @@
 > Growth factors, memory layout, and why 1.5x beats 2x in some runtimes.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 02 (Amortized Analysis)
 **Time:** ~75 minutes
 
@@ -344,9 +344,34 @@ down to 15:    size=15 capacity=32 (15*4 < 64 -> shrink to 32)
 
 The test harness prints `38 passed, 0 failed`.
 
+### In Python
+
+```python
+def _resize(self, new_capacity: int) -> None:
+    if new_capacity < self._size:
+        raise RuntimeError("cannot shrink below size")
+    # Arrays.copyOf: a new backing list of new_capacity slots holding the live prefix.
+    self._elements = self._elements[:self._size] + [None] * (new_capacity - self._size)
+    self._stats.reallocations += 1
+    self._stats.elements_copied += self._size
+```
+
+`code/python/main.py` keeps `GrowthPolicy`, `ArrayStats`, `DynamicArray`, and the same thresholds. What differs:
+
+- **The backing store is a fixed-length `list` of slots.** Python's own `list` is already a dynamic array that hides its capacity, so the port preallocates `[None] * capacity` and never calls `append` on it; `size` is tracked by hand, and the tail shifts in `insert` and `remove` are slice assignments of equal length, the Python spelling of `System.arraycopy`.
+- **Bounds are checked by hand, and negative indexes are rejected.** A Python list would happily answer `a[-1]`; `_check_index` raises `IndexError` for anything outside `0..size-1`, which is what `Objects.checkIndex` does. `NoSuchElementException` from `remove_last` on an empty array also becomes `IndexError`, matching `list.pop()`.
+- **No overflow guard.** Python integers are arbitrary precision, so `size * 4L` becomes a plain `self._size * 4 < capacity`.
+- **`GrowthPolicy` is an `Enum` with a `next` method** instead of constant-specific bodies; the arithmetic (`max(capacity + 1, capacity + (capacity >> 1))`) is identical, so the capacity sequences, copy counts, and slack percentages print the same numbers as Java.
+
+```bash
+cd phases/01-complexity-and-core-structures/03-dynamic-arrays/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The Python port replaces `Object[]` with a preallocated `list` of `None` (`[None] * capacity`) and must manage `size` itself, since Python's own `list` already hides capacity; `int` cannot overflow so the `size * 4L` guard becomes a plain multiply. The Go port uses a `[]T` slice with `make([]T, size, capacity)` and `copy`, returns `(T, error)` from `get` and `remove` instead of throwing, and zeroes the vacated slot with the zero value of `T` so the GC can reclaim pointer-typed elements. Neither language changes the design: same `GrowthPolicy`, same `ArrayStats`, same hysteresis thresholds, same tests.
+The Go port uses a `[]T` slice with `make([]T, size, capacity)` and `copy`, returns `(T, error)` from `get` and `remove` instead of throwing, and zeroes the vacated slot with the zero value of `T` so the GC can reclaim pointer-typed elements. It does not change the design: same `GrowthPolicy`, same `ArrayStats`, same hysteresis thresholds, same tests.
 
 ## Use It
 

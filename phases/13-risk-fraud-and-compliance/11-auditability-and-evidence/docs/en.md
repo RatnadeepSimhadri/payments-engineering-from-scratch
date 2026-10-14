@@ -3,7 +3,7 @@
 > Hash-chained decision logs a regulator can verify.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 13, Lesson 03 (Risk Scoring and Thresholds); Phase 13, Lesson 10 (Data Privacy and Retention); Phase 3, lessons on hashing; Phase 10, Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
@@ -409,9 +409,39 @@ bundle with the review result changed: ok=false first bad=#5  entry #5 content d
 
 `MainTest` prints `50 passed, 0 failed`. To act as the regulator, save a bundle to a file and run `java -cp .out Verifier bundle.txt <tsa-public-key>`; it prints the decoded entries and `VERIFIED` with exit code 0, or each problem and `FAILED` with exit code 1.
 
+### In Python
+
+```python
+def stamp(self, digest_hex: str) -> TimestampToken:
+    t = self._clock()
+    unsigned = TimestampToken(digest_hex, t, "")
+    mac = hmac.new(self._key, unsigned.signed_bytes(), hashlib.sha256).digest()
+    return TimestampToken(digest_hex, t, b64(mac))
+
+@staticmethod
+def verify(key_base64: Optional[str], token: TimestampToken) -> bool:
+    ...
+    expected = hmac.new(key, token.signed_bytes(), hashlib.sha256).digest()
+    return hmac.compare_digest(expected, sig)
+```
+
+`code/python/main.py` builds the same log: every entry hash, both Merkle roots, both head hashes, and every audit path are byte-identical to the Java output, because they use only SHA-256 and netstrings. One substitution changes the seal, and it changes what the seal proves:
+
+- **The seal is HMAC-SHA256, not Ed25519.** The standard library has no Ed25519, so `TimestampAuthority` holds a 32-byte secret key and seals with `hmac.new(key, signed_bytes, sha256)`. The log operator never holds that key, so it still cannot move a seal's time, swap a root, or mint a seal of its own; every tamper test from the Java suite passes, plus one that tries exactly that with a different key. The difference is who can check: an Ed25519 public key lets anyone verify and nobody but the authority sign, while an HMAC key lets whoever holds it do both. The regulator must get the key from the authority out of band and must be trusted not to forge with it. For evidence that has to convince a third party, use an asymmetric signature (RFC 3161 tokens are RSA or ECDSA signed).
+- **Names follow the substitution.** Because the key is secret, the bundle carries `tsa-key-id` (a SHA-256 fingerprint of the key) where the Java bundle carries `tsa-public-key`, and the methods are `verification_key_base64()` and `tsa_verification_key()`. `verify_bundle` with no trusted key reports a problem rather than falling back to a key inside the bundle, since there is none. In the demo only the `tsa-signature` and `tsa-key-id` lines differ from the Java output.
+- **The verifier is a separate entry point in the same file.** `Verifier` lives in `main.py` (one file per lesson), and the regulator runs it as `python3 main.py verify bundle.txt <trusted-key>`, which prints the decoded entries and `VERIFIED` (exit 0) or each problem and `FAILED` (exit 1).
+- **Java string and time behaviour is ported where it matters.** `java_split` drops trailing empty strings like `String.split`; `instant_str` prints `2026-01-01T00:08:06.250Z` like `Instant.toString()`; netstring lengths count `len(s.encode("utf-8"))` bytes, and the parser rejects lengths that `Integer.parseInt` would reject even though `int()` accepts them. Comparisons of digests use `hmac.compare_digest`, the constant-time equivalent of `MessageDigest.isEqual`.
+
+Run it from `code/python/`:
+
+```bash
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `hashlib.sha256` and `hmac.compare_digest` cover hashing and constant-time comparison, but Ed25519 is not in the standard library, so a stdlib-only port signs checkpoints with HMAC-SHA256 under a key the verifier shares, which proves integrity to the key holder but not to a third party; say so in the port. Netstring lengths must use `len(s.encode("utf-8"))`. Go: `crypto/sha256`, `crypto/ed25519` (deterministic signatures from a 32-byte seed, no PRNG needed), `crypto/subtle.ConstantTimeCompare`, and `encoding/base64`; return `(Report, error)` from the verifier instead of throwing. In both, keep the verifier a separate entry point (`verifier.py`, `cmd/verifier`) because it is a separate program run by a separate party.
+Go: `crypto/sha256`, `crypto/ed25519` (deterministic signatures from a 32-byte seed, no PRNG needed), `crypto/subtle.ConstantTimeCompare`, and `encoding/base64`; return `(Report, error)` from the verifier instead of throwing. Keep the verifier a separate entry point (`cmd/verifier`) because it is a separate program run by a separate party. Unlike the Python port, Go can keep the Ed25519 seal exactly as the Java version has it.
 
 ## Use It
 
