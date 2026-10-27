@@ -3,7 +3,7 @@
 > Dirty reads, lost updates, write skew: produce each one on purpose, because the one you have never seen is the one in production.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs and Crash Recovery), Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
@@ -413,9 +413,41 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port returns `(int64, error)` from `Read` and `error` from `Write` and `Commit`, with sentinel `ErrConflict` and `ErrNotActive` for `errors.Is`; the `snapshot` copy is a `map[string]int64` plus a sorted key slice for prefix scans. The port needs no goroutines: the store is single-threaded by design, and concurrency is modelled by interleaving calls. If it adds goroutines, every method of `Store` must hold one mutex, because the lock table is itself shared state.
+```go
+// ConflictError carries the reason; errors.Is(err, ErrConflict) is true for every one of them.
+type ConflictError struct{ Msg string }
+
+func (e *ConflictError) Error() string        { return e.Msg }
+func (e *ConflictError) Is(target error) bool { return target == ErrConflict }
+
+func (t *Txn) guarded(op func() error) error {
+    if t.Status != Active {
+        return fmt.Errorf("%w: T%d is %s", ErrNotActive, t.ID, t.Status)
+    }
+    err := op()
+    if errors.Is(err, ErrConflict) {
+        t.Store.Trace = append(t.Store.Trace, fmt.Sprintf("  %s -> T%d ABORTED", err, t.ID))
+        t.Abort()
+    }
+    return err
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Conflicts are values, and they still abort.** `Read` returns `(int64, bool, error)` (the `bool` is Java's nullable `Long`), `Scan` returns `(map[string]int64, error)`, and `Write`/`Commit` return `error`. `ConflictError` implements `Is` so one sentinel `ErrConflict` matches every conflict while the message keeps the exact lock-table reason that the trace prints; `ErrNotActive` is the `IllegalStateException` for a finished transaction. `guarded` does what the Java `guarded()` does, minus the rethrow: the scenarios simply discard the error, which is what the Java `quietly()` helper did.
+- **Ordered maps by hand.** Java's `LinkedHashMap` for buffered writes becomes `orderedWrites` (a key slice plus a map) so `Commit` applies writes in the order they were issued; `TreeMap` iteration becomes `sortedKeys` wherever the order is observable (scan traces, `describeHolders`, the predicate-lock sweep). `undoEntry{Value, Present}` stands in for a `null` previous value in the `READ_UNCOMMITTED` undo log.
+- **No goroutines.** The store is single-threaded by design and concurrency is modelled by interleaving calls, so the port has no mutex; `go test -race` passes trivially. A version that drives transactions from goroutines must hold one mutex across every `Store` method, because the lock table is itself shared state.
+
+```bash
+cd phases/07-storage-and-transactions/04-isolation-levels-and-anomalies/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same matrix and the same four traces as the Java version, line for line.
 
 ## Use It
 

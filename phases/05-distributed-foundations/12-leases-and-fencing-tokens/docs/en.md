@@ -3,7 +3,7 @@
 > Why a lock with a timeout needs a monotonic token to be safe.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 11 (Circuit Breakers and Bulkheads); Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks); Phase 4, Lesson 01 (Threads and the Memory Model)
 **Time:** ~90 minutes
 
@@ -364,9 +364,35 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The design ports directly. In Go, `LeaseLock` would guard its fields with a `sync.Mutex` (the lock service is shared state even in a simulation), `tryAcquire` would return `(Lease, bool)`, and `write` would return `error` with a sentinel `ErrStaleToken` for `errors.Is`; run the tests under `go test -race`. The fencing comparison is integer `<` in every language and must stay that way; a float timestamp as a token would reintroduce the ordering ambiguity the lesson removes.
+`code/go/main.go` keeps the lesson's types and method names (`Lease`, `LeaseLock.TryAcquire`, `FencedStorage`, `PayoutWorker.Payout`, `RunRaceStudy`) and prints the same demo as Java, including `lost updates=995` for the seed-7 study from the ported `java.util.Random` (`javarandom.go`). Three things differ.
+
+- **`Optional<Lease>` is `(Lease, bool)`, and failures are errors.** `TryAcquire` returns `ok == false` when the lock is held, which is an expected outcome, not a fault. `Renew` and `Release` return a `*LeaseExpiredError` (matching `ErrLeaseExpired`), and `Storage.Write` returns a `*StaleTokenError` carrying `Presented` and `HighestSeen` (matching `ErrStaleToken`). The worker's `errors.Is(err, ErrStaleToken)` is the `catch` block; the release after a successful write discards its error on purpose, because a lease that already expired has nothing left to release.
+- **The lock service is guarded by a `sync.Mutex`.** Even in a simulation the lock service is shared state, so every method on `LeaseLock` takes the mutex, and a test lets 50 goroutines race for one lease under `go test -race` to prove exactly one wins and exactly one token is minted. `Lease` is a value type, so a renewal returns a new `Lease` rather than mutating the one a paused client is still holding.
+- **Two programming errors panic.** A non-positive ttl and a clock moved backwards are caller bugs, so `TryAcquire` and `FakeClock.Advance` panic where every other failure is a returned error.
+
+```go
+func (s *FencedStorage) Write(key string, value, token int64) error {
+    seen := s.highestToken[key]
+    if token < seen {
+        s.log = append(s.log, fmt.Sprintf("REJECTED %s=%d (token %d < %d)", key, value, token, seen))
+        return &StaleTokenError{key, token, seen}
+    }
+    s.highestToken[key] = token
+    s.data[key] = value
+    s.log = append(s.log, fmt.Sprintf("%s=%d (token %d)", key, value, token))
+    return nil
+}
+```
+
+Tokens and balances are `int64`: tokens because the comparison must be exact, balances because they are minor units (Phase 10, Lesson 01). A float timestamp as a token would reintroduce the ordering ambiguity the lesson removes.
+
+```bash
+cd phases/05-distributed-foundations/12-leases-and-fencing-tokens/code/go
+go run .
+go test -race ./...
+```
 
 ## Use It
 

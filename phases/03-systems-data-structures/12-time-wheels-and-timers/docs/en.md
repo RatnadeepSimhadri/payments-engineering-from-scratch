@@ -3,7 +3,7 @@
 > Millions of timeouts with O(1) insert and tick.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 04 (Linked Lists), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 3, Lesson 08 (LRU and LFU Caches)
 **Time:** ~75 minutes
 
@@ -364,9 +364,30 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `Clock` is an interface with `NowMillis() int64`; `Schedule` returns `(*TimerEntry, error)` for a negative delay; the wheel and buckets are plain structs with pointer links. If the timer is to be driven from one goroutine while `Cancel` is called from others, guard the entry's `cancelled` flag and the bucket unlink with a `sync.Mutex` on the facade and run the tests under `go test -race`. Keep the rounding rule in `Schedule`, not in the wheel, so the wheel's arithmetic stays tick-aligned.
+`code/go/main.go` has the same types (`ManualClock`, `TimerEntry`, `Bucket`, `TimingWheel`, `HierarchicalTimer`, `HeapTimer`) and the same methods in exported CamelCase (`AdvanceTo`, `DeadlineMillis`, `Cascades`). `Clock` is an interface with one method, `NowMillis() int64`. Four things differ:
+
+- **Floor arithmetic is written out.** Go's `/` and `%` truncate toward zero like Java's primitives, so `floorDiv`, `floorMod`, and `ceilDiv` reproduce `Math.floorDiv`, `Math.floorMod`, and `Math.ceilDiv` by hand; a test pins them on negative inputs and on a wheel started at a negative time. `addChecked` and `mulChecked` keep the Java overflow checks on the deadline arithmetic and return `ErrOverflow`.
+- **Errors are values.** `NewTimingWheel`, `NewHierarchicalTimer`, and `Schedule` return `(value, error)`, and `ManualClock.Advance` returns an `error`, each wrapping `ErrInvalidArgument` where the Java throws `IllegalArgumentException`; the tests check with `errors.Is`. The one `panic` left is `NewTimerEntry` with a `nil` task, the counterpart of `Objects.requireNonNull`.
+- **Closures capture per-iteration variables.** Since Go 1.22 each loop iteration has its own `i`, but the workload still copies it into `id := int64(i)` so the intent is visible and the code reads the same as the Java `final long id = i`:
+
+```go
+for i := 0; i < n; i++ {
+    delay := 1 + int64(rng.NextIntN(600_000)) // up to 10 minutes
+    id := int64(i)
+    wheelEntries = append(wheelEntries, must(wheelT.Schedule(delay, func() { wheelOrder = append(wheelOrder, id) })))
+    heapEntries = append(heapEntries, must(heapT.Schedule(delay, func() { heapOrder = append(heapOrder, id) })))
+}
+```
+
+- **`container/heap` is the comparison heap.** `entryHeap` orders by deadline, then by id, the same total order as the Java comparator. The workload's delays come from `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random`), so the pending counts, fired counts, and cascades match Java line for line. The timer is single-threaded by design, like the Java; a version driven from one goroutine with `Cancel` called from others would guard the entry flags and the bucket unlink with a `sync.Mutex` on the facade.
+
+```bash
+cd phases/03-systems-data-structures/12-time-wheels-and-timers/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

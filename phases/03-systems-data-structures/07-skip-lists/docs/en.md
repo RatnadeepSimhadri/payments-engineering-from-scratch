@@ -3,7 +3,7 @@
 > The probabilistic ordered structure inside Redis sorted sets.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 3, Lesson 03 (Balanced Trees: AVL and Red-Black), Phase 1, Lesson 04 (Linked Lists), Phase 0, Lesson 08 (Probability for Engineers)
 **Time:** ~60 minutes
 
@@ -371,9 +371,27 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go uses `[]*Node` and `[]int` per node, `*rand.Rand` from `rand.New(rand.NewSource(seed))`, and generics `[K cmp.Ordered, V any]`. The one real port concern is the concurrent variant: in Go a lock-free skip list needs `atomic.Pointer` for every forward pointer and the Fraser/Harris marking trick for deletes, and tests must run under `-race`; this lesson's single-threaded design needs none of that.
+`code/go/main.go` is the same `SkipList[K cmp.Ordered, V any]` with `forward` and `span` slices per node, the same `update`/`rank` arrays in `Put`, and the same method names in exported CamelCase (`ByRank`, `LevelHistogram`, `CheckInvariants`, `DefaultMaxLevel`). Three things differ:
+
+- **The coin is a bit-exact `java.util.Random`.** `math/rand` would give a different stream, so `javarandom.go` ports the 48-bit LCG and `NextDouble` (`(next(26) << 27) + next(27)` scaled by 2^-53) and `Shuffle` reproduces `Collections.shuffle`. Seed 2024 then yields the same level for every node, and the histogram, level counts, search-step averages, and ranks match Java line for line (only Java's half-up `%.0f` of 1562.5 prints differently).
+- **Two constructors, one with an error.** Go has no overloading, so the Java `IntSupplier` constructor becomes `NewSkipListWithLevelSource(maxLevel, p, func() int)`, and the degenerate demo passes a closure that always returns 1. `NewSkipList(maxLevel, p, rng)` validates its arguments and returns `(*SkipList, error)` with `ErrInvalidArgument`; the level-source constructor, like its Java twin, does not validate:
+
+```go
+flat := NewSkipListWithLevelSource[int, int](16, 0.5, func() int { return 1 })
+for i := 0; i < 20_000; i++ {
+    flat.Put(i, i)
+}
+```
+
+- **Absence and violations are values.** `Get` returns `(V, bool)` and `ByRank` returns `(K, bool)` instead of `null`; the header node holds the zero `K` and is recognised by pointer identity (`x != s.header`), which is what the Java does with its `null` key. `CheckInvariants` returns an `error` wrapping `ErrInvariantViolated` instead of throwing `IllegalStateException`. Keys compare with `<` and `==` directly, which `cmp.Ordered` guarantees.
+
+```bash
+cd phases/03-systems-data-structures/07-skip-lists/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

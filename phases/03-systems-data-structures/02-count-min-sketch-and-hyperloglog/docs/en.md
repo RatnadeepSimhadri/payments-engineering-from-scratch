@@ -3,7 +3,7 @@
 > Counting distinct cards per merchant in constant memory.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 3, Lesson 01 (Bloom Filters from Scratch), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 1, Lesson 11 (Bit Manipulation)
 **Time:** ~90 minutes
 
@@ -374,9 +374,30 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go has `bits.LeadingZeros64` and native `uint64`, so `column` is a plain `%` with no unsigned-remainder helper, and `rho` is a one-liner. It needs `float64` only for the HLL estimate, which is an estimate by definition. A merge of sketches from different languages is correct only if the serialization is integer-exact: write the registers and counters as bytes, never as JSON floats.
+The full port is `code/go/main.go`; it is the same three parts (`Hashing` as package-level functions, `CountMinSketch`, `HyperLogLog`) with the same method names in exported CamelCase. Three things differ:
+
+- **Unsigned hashes, no helpers.** The hash functions return `uint64`, so FNV-1a's multiply wraps exactly like Java's `long`, `Column` is a plain `%` (Java needs `Long.remainderUnsigned`), the register index is `hash >> (64 - p)` with no `>>>`, and `Rho` is `bits.LeadingZeros64`:
+
+```go
+func Rho(hash uint64, precision int) int {
+    rest := hash << precision // discard the index bits; the rest now leads
+    if rest == 0 {
+        return 64 - precision + 1 // all remaining bits were zero
+    }
+    return bits.LeadingZeros64(rest) + 1
+}
+```
+
+- **Errors are values.** Every `IllegalArgumentException` in the Java (bad width, epsilon outside (0,1), negative count, precision outside 4..16, merging different shapes) becomes an `error` wrapping the sentinel `ErrInvalidArgument`, so constructors are `NewCountMinSketch(width, depth) (*CountMinSketch, error)` and `Merge` returns `(*HyperLogLog, error)`. The tests check with `errors.Is`. `Add(key)` cannot fail, so it has no error return; `AddCount(key, n)` does.
+- **Same random stream, same rounding.** `javarandom.go` is a bit-exact port of `java.util.Random` (48-bit LCG, `NextIntN`, `NextLong`, polar-method `NextGaussian`), so seed 42 produces the same merchants and card tokens and every count in the demo matches Java. `Cardinality` uses `math.Floor(x + 0.5)` because `Math.round` is half-up and Go's `math.Round` is half-away-from-zero. Only `%.2f` of the standard error prints differently (`1.62` vs Java's half-up `1.63` for 1.625).
+
+```bash
+cd phases/03-systems-data-structures/02-count-min-sketch-and-hyperloglog/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

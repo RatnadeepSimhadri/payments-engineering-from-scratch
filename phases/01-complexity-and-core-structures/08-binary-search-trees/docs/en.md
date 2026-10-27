@@ -3,7 +3,7 @@
 > Range queries over transactions by timestamp need order, not just hashing.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 04 (Linked Lists), Phase 1, Lesson 06 (Hash Maps from Scratch)
 **Time:** ~90 minutes
 
@@ -419,9 +419,37 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go has no generics constraint for ordering beyond `cmp.Ordered`, which excludes structs, so pass a `func(a, b K) int` comparator into the constructor; `remove` and `get` return `(V, bool)` instead of `nil`. Go has no `Long.compare` overflow hazard for the composite key, but it needs the same "compare, do not subtract" discipline for consistency.
+```go
+type BinarySearchTree[K, V any] struct {
+    cmp         func(a, b K) int
+    root        *node[K, V]
+    size        int
+    comparisons int64
+}
+
+// CompareTxKey orders by timestamp then sequence: compare, never subtract.
+func CompareTxKey(a, b TxKey) int {
+    if c := cmp.Compare(a.TimestampMillis, b.TimestampMillis); c != 0 {
+        return c
+    }
+    return cmp.Compare(a.Sequence, b.Sequence)
+}
+```
+
+`code/go/main.go` keeps the same tree, `TxKey`, `TransactionIndex`, and trimmed `Money`. What differs:
+
+- **A comparator instead of a `Comparable` bound.** Go's `cmp.Ordered` constraint covers numbers and strings but not structs, so `NewBinarySearchTree` takes a `func(a, b K) int` and `NewOrderedTree[K cmp.Ordered, V]` wraps `cmp.Compare` for the common case. `TxKey` supplies `CompareTxKey`, which compares field by field with `cmp.Compare`, never by subtraction: `a.Sequence - b.Sequence` would overflow for the `math.MinInt64` sentinel that `LowestTxKey` uses. The counted `compare` method stays, so the "2048.5 comparisons per lookup" line is identical.
+- **`(V, bool)` instead of `null`.** `Get`, `Put` (the previous value), `Remove`, `MinKey`, `MaxKey`, `FloorKey`, and `CeilingKey` return a second result that says whether a value existed; a zero `int` or empty string is a legal value, so `nil` cannot carry the signal. `RangeQuery` returns `([]Entry, error)` with `ErrInvalidRange`.
+- **Money is checked by hand.** `Money.Plus` returns `(Money, error)`: `ErrCurrencyMismatch` for mixed currencies and `ErrOverflow` from `addChecked`, because Go's `+` on `int64` wraps silently where Java's `Math.addExact` throws. `SumBetween` propagates the error.
+- **Same random data.** `JavaRandom` reproduces `java.util.Random`, so the transaction amounts, the shuffled insert order (height 25), and the 3,000-operation cross-check use the same sequences; the reference model in the test is a sorted key slice searched with `sort.SearchInts` plus a `map`, standing in for `TreeMap`. All traversals are iterative with an explicit slice stack, as in Java.
+
+```bash
+cd phases/01-complexity-and-core-structures/08-binary-search-trees/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

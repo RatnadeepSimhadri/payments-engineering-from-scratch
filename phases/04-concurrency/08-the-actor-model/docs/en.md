@@ -3,7 +3,7 @@
 > One account, one mailbox, no locks.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 05 (Producers, Consumers, and Bounded Queues); Phase 4, Lesson 07 (Deadlocks, Lock Ordering, and Detection)
 **Time:** ~75 minutes
 
@@ -375,9 +375,34 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: goroutines and channels *are* an actor runtime with the mailbox made explicit. An actor is a goroutine with a `for msg := range mailbox` loop, `tell` is a channel send, and rule 3 holds because one goroutine owns the loop; a buffered channel gives you the bounded mailbox this lesson lacks. Supervision is a `recover()` in the loop plus a decision to continue, re-create state, or close the channel. The deterministic scheduler is harder because Go's scheduler is not pluggable; drive actors from a single test goroutine that calls a `step()` method instead of running their loops. Keep the seed-driven `DeterministicScheduler` as the test harness so the 25-seed conservation test ports unchanged.
+`code/go/main.go` keeps the same runtime: `ActorCell`, `DeterministicScheduler`, `ThreadedScheduler`, `AccountActor`, `TransferCoordinator`, and the same seeded `JavaRandom` (`javarandom.go`), so seed 42 produces the same 32-line trace as Java. Four things differ.
+
+- **Failures are returned, not thrown.** `Receive(message Message) error` replaces `void receive(Message)`. A wrong-currency deposit returns a `*CurrencyMismatchError` (which matches `ErrCurrencyMismatch` under `errors.Is`), a `Crash` returns `errors.New(reason)`, and `ProcessOne` hands any non-nil error to `supervise`. A `panic` is reserved for programming errors the Java code also treats as such: `Tell(nil)` and a negative opening balance in a factory that cannot return an error.
+- **The sealed hierarchy is a marker interface.** `type Message interface{ isMessage() }` closes the set to the structs in this package; `Describe`'s type switch is the exhaustive case list. `Spawn` and `Ref` return `(*ActorRef, error)` with `ErrActorExists` and `ErrNoSuchActor` instead of throwing.
+- **The mailbox is a mutex-guarded slice and the counters are `sync/atomic` types.** Go's `atomic.Bool.CompareAndSwap` is the real CAS the `scheduled` flag needs. `MaxConcurrentReceives` is updated with a CAS loop, the hand-written form of `accumulateAndGet(now, Math::max)`.
+- **The executor is a bounded semaphore.** `ThreadedScheduler` runs each drain in its own goroutine but holds a slot in a channel of capacity `workers`, so at most four drains run at once, and `Close()` waits on a `sync.WaitGroup` the way closing an `ExecutorService` does. `go test -race ./...` is the proof that rule 3 holds: with the CAS removed, the detector reports the overlapping `Receive` calls on `balance`.
+
+```go
+func (s *ThreadedScheduler) run(cell *ActorCell) {
+    defer func() {
+        cell.Scheduled.Store(false)  // release first ...
+        if !cell.Mailbox.IsEmpty() { // ... then re-check: a message may have landed in between
+            s.Schedule(cell)
+        }
+    }()
+    for i := 0; i < s.throughput && cell.ProcessOne(); i++ {
+        // drain a batch
+    }
+}
+```
+
+```bash
+cd phases/04-concurrency/08-the-actor-model/code/go
+go run .
+go test -race ./...
+```
 
 ## Use It
 

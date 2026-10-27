@@ -3,7 +3,7 @@
 > Length-prefixed frames, request IDs, and a client that survives a half-open connection.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 02 (Failure Models); Phase 5, Lesson 06 (CAP and PACELC); Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes)
 **Time:** ~120 minutes
 
@@ -390,9 +390,42 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `encoding/binary.BigEndian.PutUint32` and `binary.BigEndian.Uint64` are the codec; errors are returned, not thrown, so `feed` returns `([][]byte, error)` and the server closes the connection on a non-nil error. A real Go port would run the client's `await` on a `net.Conn` with `SetReadDeadline`, which is the kernel-level equivalent of the simulated clock, and a real Java port would use `SocketChannel` in non-blocking mode with a `Selector`.
+`code/go/main.go` is the same codec, framer, envelope, simulated socket, server, and client, method for method, and the demo prints the same bytes, segment timings, and round-trip times: `Rng` is SplitMix64 on a `uint64`, so seed 42 cuts the stream into the same ten reads. Three things differ.
+
+- **Errors are values, and the codec makes them sticky.** `ByteWriter.U8(256)` cannot throw, so it records the first range error and `ToBytes()` returns it, which keeps the chained `NewByteWriter().U8(kind).I64(id).String(method)...` style. `ByteReader` works the same way: every read checks bounds, the first failure parks in `Err()`, later reads return zero values, and a decoder reads all its fields then checks once (the `bufio.Scanner` pattern). All codec failures match `ErrCodec` under `errors.Is`; `Framer.Feed` returns `([][]byte, error)` and the server closes the connection on a non-nil error.
+- **`encoding/binary` is the shift loop.** `binary.BigEndian.AppendUint32` and `binary.BigEndian.Uint64` replace the hand-written byte shuffling; the width lives in the Go type (`uint16`, `uint32`, `int64`), and the `int64(uint64)` conversion is Java's two's-complement `i64`. Go's `/` and `%` truncate like Java's, so nothing in `Money.String` changes.
+- **Typed errors for the two client outcomes.** `*RpcTimeoutError` (matching `ErrTimeout`) carries the request id, timeout, and connection id, and `*RpcRemoteError` (matching `ErrRemote`) carries the method and the server's reason. `IllegalArgumentException` becomes `ErrNoSuchAccount`, `ErrCurrencyMismatch`, or `ErrInvalidCurrency`, and `Dispatch` turns any of them, or a codec error, into an `ERROR` response. Go maps iterate in random order, so `RpcServer` keeps its links in a slice to poll them deterministically.
+
+```go
+func (f *Framer) Feed(chunk []byte) ([][]byte, error) {
+    joined := append(f.pending, chunk...)
+    var out [][]byte
+    pos := 0
+    for len(joined)-pos >= Header {
+        length := int64(binary.BigEndian.Uint32(joined[pos:]))
+        if length > int64(f.MaxFrame) {
+            return nil, codecErr("frame length %d exceeds max %d; closing connection", length, f.MaxFrame)
+        }
+        if int64(len(joined)-pos-Header) < length { // header complete, body not yet
+            break
+        }
+        out = append(out, append([]byte(nil), joined[pos+Header:pos+Header+int(length)]...))
+        pos += Header + int(length)
+    }
+    f.pending = append([]byte(nil), joined[pos:]...)
+    return out, nil
+}
+```
+
+A real Go port would run the client's `Await` on a `net.Conn` with `SetReadDeadline`, which is the kernel-level equivalent of the simulated clock.
+
+```bash
+cd phases/05-distributed-foundations/07-rpc-and-serialization/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

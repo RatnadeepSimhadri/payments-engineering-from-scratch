@@ -3,7 +3,7 @@
 > Union-find meets greedy.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 10 (Disjoint Sets), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 2, Lesson 07 (Greedy Algorithms and Exchange Arguments), Phase 2, Lesson 08 (Graph Traversal)
 **Time:** ~60 minutes
 
@@ -367,9 +367,37 @@ python3 -m unittest -v
 
 The demo output is identical to the Java run; the suite covers the Java's 36 checks plus the overflow test.
 
-### Porting notes
+### In Go
 
-Go's `sort.SliceStable` is required (plain `sort.Slice` is not stable, and the tie-break would become run-dependent); Go has no generic heap, so `container/heap` needs a small type implementing `Len/Less/Swap/Push/Pop`. The port keeps node order in an explicit slice beside the adjacency map, for the same reason the Java uses `LinkedHashMap`: a Go `map` iterates in random order by design. Errors in Go are return values; `WeightedEdge` construction returns `(WeightedEdge, error)`.
+```go
+// frontierEntry is (weight, insertion index) so equal weights pop in a reproducible order.
+type frontierEntry struct {
+    weight int64
+    index  int
+}
+
+type frontierHeap []frontierEntry
+
+func (h frontierHeap) Less(i, j int) bool {
+    return cmp.Or(cmp.Compare(h[i].weight, h[j].weight), cmp.Compare(h[i].index, h[j].index)) < 0
+}
+```
+
+`WeightedEdge`, `WeightedGraph`, `UnionFind`, `SpanningForest`, `Kruskal`, and `Prim` keep their names and algorithms; three things differ, all in `code/go/main.go`:
+
+- **Order is kept by hand, and the sort must be stable.** Go maps iterate in randomized order, so `WeightedGraph` holds the nodes in a `[]string` beside the adjacency map, and `Clusters` records the order in which roots first appear instead of relying on a `LinkedHashMap`. Kruskal sorts with `slices.SortStableFunc`; the plain `slices.SortFunc` is pattern-defeating quicksort and not stable, and the "ties: kruskal keeps insertion order" test would fail on it. Prim's frontier is `container/heap` over a slice type whose `Less` compares `(weight, index)`, the same tie-break as the Java's `long[]` comparator, so the demo's edge order matches bit for bit.
+- **Value equality, with positions where Java uses identity.** `WeightedEdge` is a struct, so `==` and `slices.Contains` compare by value, like a record's `equals`. The cut-property checker's "every edge except this one" loop skips by *position* in the slice, because the Java compares references there; skipping by value would drop both of two parallel equal-weight edges. Totals are added with `addChecked`, which returns `ErrOverflow` where `Math.addExact` throws; two tests sum a pair of `1 << 62` edges to see it fire in both algorithms.
+- **Errors are values, with one deliberate panic.** `NewWeightedEdge`, `Prim`, `Kruskal`, `Incident`, and `Clusters` return `(T, error)` with the sentinels `ErrSelfLoop`, `ErrNegativeWeight`, `ErrUnknownNode`, `ErrBadK`, and `ErrOverflow`. `AddEdge` stays chainable (`NewWeightedGraph().AddEdge(...).AddEdge(...)`) and therefore panics on a self-loop or negative weight: a bad edge in a graph literal is a programming error, and untrusted input goes through `NewWeightedEdge` first. `Other` panics for the same reason.
+
+The test file replays `java.util.Random(42)` through `javarandom.go`, so the 30 random graphs are the ones the Java test checks.
+
+```bash
+cd phases/02-algorithms/11-minimum-spanning-trees/code/go
+go run .
+go test ./...
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 36 checks plus 5 for the unknown-node error, Prim's exact order, and the overflow guards.
 
 ## Use It
 

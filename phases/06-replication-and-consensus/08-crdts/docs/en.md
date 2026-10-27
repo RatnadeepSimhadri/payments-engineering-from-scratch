@@ -3,7 +3,7 @@
 > A PN-counter for balances that can be reconciled without coordination.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 03 (Lamport and Vector Clocks), Phase 6, Lesson 01 (Replication Strategies), Phase 6, Lesson 03 (Quorums), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -360,9 +360,34 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go, `map[string]int64` plus hand-written checked addition (as in the Phase 10 Money port); `merge` returns a new struct and `reflect.DeepEqual` or a hand-written `Equal` compares states, and because Go maps iterate in random order, `String()` must sort keys before printing or the demo output will not be stable. Go 1.22 generics can express `type Crdt[T any] interface{ Merge(T) T }` with a method-set constraint in place of Java's self-referential `Crdt<T>`. Concurrency does not appear: all merges are sequential by design.
+```go
+type Crdt[T any] interface {
+    Merge(other T) T
+    Equal(other T) bool
+}
+
+func Check[T Crdt[T]](gen func() T, trials int) Result {
+    for i := 0; i < trials; i++ {
+        a, b, c := gen(), gen(), gen()
+        if !a.Merge(b).Equal(b.Merge(a)) { comm++ }
+        ...
+```
+
+`code/go/main.go` has the same types and method names; what differs:
+
+- **The self-referential interface is a generic constraint.** Java's `Crdt<T extends Crdt<T>>` becomes `Crdt[T any]` with `Merge(T) T` and `Equal(T) bool`, and `Check[T Crdt[T]]` and `Converges[T Crdt[T]]` take any type whose methods close over itself. `GSet[E cmp.Ordered]` and `ORSet[E cmp.Ordered]` are generic in the element so `Elements()` can be sorted; `LWWRegister[V comparable]` gets `Equal` from `==`.
+- **Overflow and bad input are errors.** `Increment`, `Credit`, and `Debit` return `error`; the sentinels `ErrOverflow`, `ErrNegativeIncrement`, `ErrCurrencyMismatch`, and `ErrNegativeAmount` are checked with `errors.Is`. `addExact` and `subtractExact` are the Phase 10 helpers. `Merge` has no error slot, so a currency mismatch there is a programming error and panics.
+- **`java.util.Random` is ported bit for bit.** `JavaRandom` is the 48-bit LCG with `next(bits)`, `NextInt(bound)` (power-of-two shortcut plus the rejection loop) and `NextBoolean`; `Shuffle` is `Collections.shuffle`. With the same seed the Go demo draws the same 500 states and prints the same `493 failures` for the naive sum counter.
+- **Maps have no order and no structural equality.** Every CRDT defines `Equal` over its maps by hand, `fmtMap` reproduces `TreeMap.toString()` (`{A=3, B=6}`) by sorting keys, and `GCounter.Merge` keeps a slot that is present at 0, exactly as `TreeMap.merge` would, or the commutativity check fails on states that differ only by an empty slot.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

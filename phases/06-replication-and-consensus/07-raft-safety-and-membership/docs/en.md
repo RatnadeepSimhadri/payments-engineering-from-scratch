@@ -3,7 +3,7 @@
 > Joint consensus and why you cannot just swap the config.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 6, Lesson 06 (Raft II: Log Replication and Commit); Phase 6, Lesson 05 (Raft I: Terms, Leader Election, and a Simulated Network); Phase 6, Lesson 03 (Quorums: R + W > N and Its Limits)
 **Time:** ~120 minutes
 
@@ -423,9 +423,35 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `Configuration` holds `map[int]bool` sets with a hand-written `Equal`; `Snapshot.Data` is a `map[string]string` that must be copied on construction; `Message` grows a `*Snapshot` field (nil for every other kind); errors from `termAt` below the snapshot become a panic because it is a programming error, not a runtime condition. Keep the single-threaded simulation; a production port would persist `Storage` with a write-ahead log and `fsync` before replying.
+```go
+type Configuration struct {
+    OldMembers []int // sorted
+    NewMembers []int // nil for a simple configuration
+}
+
+func (c Configuration) HasQuorum(acks map[int]bool) bool {
+    if !MajorityOf(c.OldMembers, acks) {
+        return false
+    }
+    return c.NewMembers == nil || MajorityOf(c.NewMembers, acks)
+}
+```
+
+`code/go/main.go` is Lesson 06's Go port with the same additions as the Java, and the demo prints the same trace line for line. What differs:
+
+- **Sets are sorted slices or `map[int]bool`.** Member sets are kept sorted (what Java's `TreeSet` iterates as), so `All()` and `ReplicationTargets()` return the same order the Java does; that order decides which RequestVote and AppendEntries hit the network first and therefore which seeded delay each one draws. Vote and ack sets are `map[int]bool`, and the trace sorts them before printing. Slices have no `==`, so `Configuration.Equal` is written by hand and the checker compares `LogEntry` structs, which do.
+- **`nil` is the missing configuration.** A spare server is created with a `*Configuration` bootstrap of `nil`, `Storage.ConfigAt` returns `nil` when neither the log nor the snapshot knows one, and `cfgString` prints `null` where the Java would. `Snapshot` is a pointer that `NewSnapshot` fills with a copy of the state machine's map; `Message.Snapshot` is `nil` on every other kind.
+- **Programming errors panic; the checker panics too.** `TermAt` below the snapshot, `Get` of a missing index, two leaders in one term, and each Figure 3 violation are `panic`s, as in Lesson 06, because there is no correct value to return; the test recovers them with `checkPanics`. Bad timing configs are the one runtime error: `NewConfig` returns `(Config, error)`.
+- **No constructor overloads.** `NewClusterWithMembers(size, initialMembers, seed, drop, delay, config)` is the full constructor; `NewCluster(size, seed, drop, delay)` starts every server in the configuration with `DefaultConfig`. `KVStore.Get` returns `(string, bool)`.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

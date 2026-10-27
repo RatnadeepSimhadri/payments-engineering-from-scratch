@@ -3,7 +3,7 @@
 > Hash-chained decision logs a regulator can verify.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 13, Lesson 03 (Risk Scoring and Thresholds); Phase 13, Lesson 10 (Data Privacy and Retention); Phase 3, lessons on hashing; Phase 10, Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
@@ -439,9 +439,36 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `crypto/sha256`, `crypto/ed25519` (deterministic signatures from a 32-byte seed, no PRNG needed), `crypto/subtle.ConstantTimeCompare`, and `encoding/base64`; return `(Report, error)` from the verifier instead of throwing. Keep the verifier a separate entry point (`cmd/verifier`) because it is a separate program run by a separate party. Unlike the Python port, Go can keep the Ed25519 seal exactly as the Java version has it.
+```go
+func NewTimestampAuthority(seed int64, clock Clock) *TimestampAuthority {
+    keySeed := make([]byte, ed25519.SeedSize)
+    newSHA1PRNG(seed).nextBytes(keySeed)          // the JDK's SHA1PRNG, so the key is the Java key
+    private := ed25519.NewKeyFromSeed(keySeed)
+    return &TimestampAuthority{private, private.Public().(ed25519.PublicKey), clock}
+}
+
+func (a *TimestampAuthority) Stamp(digestHex string) TimestampToken {
+    t := a.clock.Millis()
+    unsigned := TimestampToken{digestHex, t, ""}
+    return TimestampToken{digestHex, t, base64.StdEncoding.EncodeToString(ed25519.Sign(a.private, unsigned.SignedBytes()))}
+}
+```
+
+`code/go/main.go` and `code/go/verifier.go` keep the Java design whole, Ed25519 seal included, and the demo output is byte for byte the Java output, down to the public key and the signatures. How:
+
+- **`crypto/ed25519` is in the standard library**, so the seal stays an asymmetric signature: anyone with the published key can verify and nobody but the authority can sign. The Python port had to substitute HMAC; Go does not. Signatures are deterministic (RFC 8032), so matching the Java key is enough to match the Java signatures, and the key is matched by reproducing the JDK's `SHA1PRNG` (SHA-1 state, the 20-byte counter update, and `setSeed(long)`'s little-endian byte order) from which Java's key generator draws its 32-byte seed. `PublicKeyBase64` wraps the raw key in the X.509 `SubjectPublicKeyInfo` prefix so the `tsa-public-key` line is identical and the two verifiers accept each other's bundles.
+- **Errors are values.** `ParseNetstrings`, `EntryFromCanonical`, `AuditPath`, `Append`, `Seal`, `ExportBundle` and `ParseBundle` return errors (`ErrBadNetstring`, `ErrBadEntry`, `ErrLeafOutOfRange`, `ErrClockWentBackwards`, `ErrNothingToSeal`, `ErrBadBundle`) that tests check with `errors.Is`; the verifier folds them into `Report.Problems` as the Java folds exceptions. `VerifyToken` returns `false` on any decoding failure. Digests are compared with a constant-time loop, the equivalent of `MessageDigest.isEqual`.
+- **The verifier is a subcommand, not a second `main`.** One `package main` per lesson means `go run . verify bundle.txt [trusted-key]` runs `verifierMain` in `verifier.go`; it prints the decoded entries and `VERIFIED` (exit 0) or each problem and `FAILED` (exit 1). An empty trusted key falls back to the key in the bundle and says so.
+- **Java string and time behaviour is ported where it matters.** `javaSplit` drops trailing empty strings like `String.split`; `instantString` prints `2026-01-01T00:08:06.250Z` like `Instant.toString()`; netstring lengths count UTF-8 bytes; the payload is a `map[string]string` whose keys are sorted at hash time and print time, standing in for `TreeMap`.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

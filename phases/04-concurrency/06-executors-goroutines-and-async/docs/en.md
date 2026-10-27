@@ -3,7 +3,7 @@
 > Three concurrency models, one fan-out/fan-in problem.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model); Phase 4, Lesson 05 (Producers, Consumers, and Bounded Queues); Phase 5, Lesson 08 (Timeouts and Deadlines) is helpful but not required
 **Time:** ~90 minutes
 
@@ -347,9 +347,48 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: the natural form is one goroutine per adapter writing to a results channel (or a slice slot guarded by a `sync.WaitGroup`), a `context.WithTimeout(ctx, 800*time.Millisecond)` passed into each call, and `select { case q := <-ch: ... case <-ctx.Done(): ... }` for the race; `golang.org/x/sync/errgroup` packages the fan-in but is not standard library, so the lesson's port uses `sync.WaitGroup`. Inject time with a `Timer` interface whose production implementation wraps `time.After` and whose test implementation is advanced manually, exactly as here; `go test -race` must pass.
+```go
+// FixedPool is Model 1: a bounded semaphore channel plays the pool's n threads.
+func (p *FixedPool) Execute(task func()) {
+    p.wg.Add(1)
+    go func() {
+        defer p.wg.Done()
+        p.permits <- struct{}{} // no permit free: this task waits for a goroutine that is itself waiting
+        defer func() { <-p.permits }()
+        task()
+    }()
+}
+
+// WithTimeout races the call against its own alarm; the first to settle completes the result.
+call.OnComplete(func(q Quote, err error) {
+    alarm.Cancel() // the answer arrived: the alarm is no longer needed
+    if err != nil {
+        result.Complete(quoteFailed(adapter.Name(), err))
+        return
+    }
+    result.Complete(q)
+})
+alarm.OnComplete(func(_ struct{}, err error) {
+    if err == nil { // fired, not cancelled
+        result.Complete(quoteTimedOut(adapter.Name(), timeoutMillis))
+    }
+})
+```
+
+`code/go/main.go` and `future.go` keep `ScriptedAdapter`, `ManualTimer`, `WithTimeout`, `QuoteAll`, `FirstOK`, `Cheapest`, `BlockingQuoteAll`, and `CountStartedBeforeRelease`, and print the same timeline and outcomes. What differs:
+
+- **Goroutines are the virtual threads.** Model 2 is `GoroutinePerTask`, which runs `go task()` and nothing else: a blocked goroutine costs a few kilobytes of stack and no OS thread, so all 3 gated tasks (and all 200 in the test) start, exactly as under `newVirtualThreadPerTaskExecutor`. Model 1 is `FixedPool`, a semaphore channel of `n` permits; a task that blocks while holding a permit starves the task behind it, so 2 of 3 start. `Executor` is the one-method `java.util.concurrent.Executor` shape plus `Close`, which waits on a `sync.WaitGroup`, and a generic `Submit[T]` plays `ExecutorService.submit`.
+- **`CompletableFuture` becomes a 100-line `Future[T]`.** The standard library has no promise type, so `future.go` defines one on a mutex, a closed-on-settle channel, and callbacks that run synchronously in the completing goroutine. That synchronous rule is what keeps `ManualTimer.Advance` deterministic: when it returns, every consequence of the alarms it fired has already happened, so the tests assert `IsDone()` without sleeping or polling. `Then` and `AllOf` are `thenApply` and `allOf`; `Get` is `join()`; `Done()` returns the channel for callers who prefer `select`. The race in `WithTimeout` is first-completion-wins, which is what `applyToEither` computes.
+- **Errors instead of exceptions.** `ProcessorAdapter.Quote` returns `(*Future[Quote], error)`, so a client library that fails before sending is an error value rather than a synchronous throw, and `WithTimeout` turns it into a `FAILED` quote with the same message. `Fail` settles a future with an `error`; `Quote.Detail` carries `err.Error()`, so the demo prints `FAILED (HTTP 503 from processor)` where Java prefixes the exception class. `Optional<Quote>` becomes `*Quote` (nil for none) and `Cheapest` returns `(Quote, bool)`.
+- **The abandon-versus-cancel point is the same.** `WithTimeout` stops waiting and leaves gamma's request outstanding, as Java's `applyToEither` does; a production Go service would pass a `context.WithTimeout` into the adapter so the HTTP call is cancelled too. `CountDownLatch` is a few lines on a channel in `future.go`. The suite passes under `go test -race ./...`.
+
+```bash
+cd phases/04-concurrency/06-executors-goroutines-and-async/code/go
+go run .
+go test -race ./...
+```
 
 ## Use It
 

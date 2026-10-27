@@ -3,7 +3,7 @@
 > Rotations, invariants, and why Java's TreeMap is red-black.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 05 (Binary Search Trees), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 0, Lesson 04 (Recursion and the Call Stack)
 **Time:** ~120 minutes
 
@@ -420,9 +420,28 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The tree ports directly to Go: it uses `*Node` with `nil` checks and returns the new subtree root from `put` exactly as Java does; generics (`[K cmp.Ordered, V any]`) replace `Comparable`. No port needs concurrency; the structure is single-writer by design, and a concurrent ordered map is Lesson 07's skip list.
+`code/go/main.go` has the same three types (`NaiveBst`, `AvlTree`, `RedBlackTree`) with the same methods in exported CamelCase (`RotateRight`, `CeilingKey`, `CheckInvariants`, `BlackHeight`). Four things differ:
+
+- **Generics with `cmp.Ordered` instead of `Comparable`.** `AvlTree[K cmp.Ordered, V any]` compares keys with `cmp.Compare(key, n.Key)`, which returns -1, 0, or 1 exactly like `compareTo`, so every `c < 0` / `c > 0` branch reads the same as the Java. `nil` stands in for `null` leaves: `avlHeight(nil)` is 0 and `isRed(nil)` is false, so property 3 (null leaves are black) needs no sentinel nodes.
+- **Absence is a second return value.** Go has no `null` for an `int` value, so `Get` returns `(V, bool)` and `CeilingKey` returns `(K, bool)`; `ContainsKey` is the `bool` half of `Get`. `Verify` takes `*K` bounds so "unbounded" is `nil` rather than a null key.
+- **Invariant violations are errors, not exceptions.** `CheckInvariants` returns `error` instead of throwing `IllegalStateException`; every violation wraps the sentinel `ErrInvariantViolated`, so the corruption tests use `errors.Is`. The `AvlNode` fields are exported for exactly that reason: the tests hand-build an unbalanced chain, a stale height, and a disordered node and check that `Verify` names each one:
+
+```go
+func (t *AvlTree[K, V]) CheckInvariants() error {
+    _, err := Verify(t.root, nil, nil)
+    return err
+}
+```
+
+- **Same shuffle, same numbers.** The random-order demo and tests use `JavaRandom` (`javarandom.go`), a bit-exact port of `java.util.Random`, and its `Shuffle`, which is `Collections.shuffle` (swap `i - 1` with `nextInt(i)` from the end). Seed 2024 produces the same permutation as Java, so heights, rotation counts, and recoloring counts match line for line.
+
+```bash
+cd phases/03-systems-data-structures/03-balanced-trees/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

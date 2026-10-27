@@ -3,7 +3,7 @@
 > Growth factors, memory layout, and why 1.5x beats 2x in some runtimes.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 02 (Amortized Analysis)
 **Time:** ~75 minutes
 
@@ -369,9 +369,37 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The Go port uses a `[]T` slice with `make([]T, size, capacity)` and `copy`, returns `(T, error)` from `get` and `remove` instead of throwing, and zeroes the vacated slot with the zero value of `T` so the GC can reclaim pointer-typed elements. It does not change the design: same `GrowthPolicy`, same `ArrayStats`, same hysteresis thresholds, same tests.
+```go
+func (a *DynamicArray[T]) Remove(index int) (T, error) {
+    var zero T
+    if err := a.checkIndex(index); err != nil {
+        return zero, err
+    }
+    old := a.elements[index]
+    if moved := a.size - index - 1; moved > 0 {
+        copy(a.elements[index:], a.elements[index+1:a.size])
+    }
+    a.size--
+    a.elements[a.size] = zero // the GC can reclaim a pointer-typed element
+    a.maybeShrink()
+    return old, nil
+}
+```
+
+`code/go/main.go` keeps `GrowthPolicy`, `ArrayStats`, `DynamicArray`, and the same thresholds. What differs:
+
+- **The backing store is a `[]T` whose length is the capacity.** Go slices are already dynamic arrays with a hidden `cap`, so the port never calls `append` on the backing slice: `make([]T, capacity)` allocates it, `size` is tracked by hand, and the tail shifts in `Insert` and `Remove` are `copy` calls, the Go spelling of `System.arraycopy`. `copy` handles overlapping ranges correctly in both directions.
+- **Errors are values.** `Get`, `Set`, `Remove`, and `RemoveLast` return `(T, error)`; `Insert` returns `error`. `ErrIndexOutOfBounds` and `ErrEmpty` are sentinels the tests match with `errors.Is`. The one panic is `resize` being asked to shrink below `size`, which is a bug in the array, not a caller mistake.
+- **`DynamicArray[T any]` is a generic type.** The `[T any]` parameter replaces Java's `Object[]` plus unchecked casts; vacated slots are set to the zero value of `T` instead of `null`, which has the same effect on the garbage collector when `T` is a pointer type.
+- **`GrowthPolicy` is an `int` enum with a `Next` method** instead of constant-specific bodies; the arithmetic (`max(capacity+1, capacity+(capacity>>1))`) is identical, so the capacity sequences, copy counts, and slack percentages print the same numbers as Java.
+
+```bash
+cd phases/01-complexity-and-core-structures/03-dynamic-arrays/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

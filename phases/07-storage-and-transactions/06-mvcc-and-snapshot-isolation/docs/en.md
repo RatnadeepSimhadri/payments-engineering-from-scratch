@@ -3,7 +3,7 @@
 > Readers never block writers, and the write-skew they let through.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 7, Lesson 04 (Isolation Levels and Anomalies), Phase 7, Lesson 05 (Two-Phase Locking), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
@@ -369,9 +369,46 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port returns `(V, bool)` from `Read` and `error` from `Commit` with a sentinel `ErrWriteConflict` for `errors.Is`; the version chain is a `[]Version` and vacuum reslices it. The port needs no goroutines: the store is single-threaded by design and concurrency is modelled by interleaving calls. If it does add goroutines, the whole `commit` must hold one mutex, because validate-then-publish is the critical section.
+```go
+// Version is one immutable version of a key. Tombstone replaces Java's null value.
+type Version[V any] struct {
+    CommitTs  int64
+    TxnID     int64
+    Value     V
+    Tombstone bool
+}
+
+func (s *MvccStore[V]) Commit(txn *Transaction[V]) (int64, error) {
+    if err := s.requireActive(txn); err != nil {
+        return 0, err
+    }
+    for _, key := range txn.writeKeys {
+        if newest, ok := s.newestVersion(key); ok && newest.CommitTs > txn.StartTs {
+            s.Abort(txn)
+            return 0, fmt.Errorf("%w: %s lost %s to T%d (committed at %d > snapshot %d)",
+                ErrWriteConflict, txn, key, newest.TxnID, newest.CommitTs, txn.StartTs)
+        }
+    }
+    // ... publish every write at one fresh timestamp
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Generics with an explicit tombstone.** `MvccStore[V any]`, `Transaction[V]` and `Version[V]` are type parameters like the Java generics, but Go has no `null` for an arbitrary `V`, so a deleted key is a `Version` with `Tombstone: true` and a buffered delete is a `pendingWrite{Delete: true}`. `Read` returns `(V, bool, error)`: the `bool` is Java's `Optional` (false for a missing key or a tombstone), the `error` is `ErrNotActive` for a finished transaction.
+- **Conflicts are values.** `Commit` returns `(int64, error)`; a first-committer-wins loss wraps the sentinel `ErrWriteConflict` and still aborts the transaction before returning, exactly as the Java `commit` aborts before throwing. Callers check `errors.Is(err, ErrWriteConflict)`. `Money.Plus`/`Minus` return `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow` instead of `Math.addExact` throwing.
+- **Version chains are slices.** Each key's chain is a `[]Version[V]` in ascending `CommitTs`; `Vacuum` reslices (`chain = chain[keepFrom:]`) instead of `subList(...).clear()`, and iterates keys in sorted order so the removed count is deterministic. The `LinkedHashMap` write set is a key slice plus a map so versions are published in the order the writes were issued.
+- **No goroutines.** The store is single-threaded by design and concurrency is modelled by interleaving calls, so there is no mutex and `go test -race` passes trivially. A version that commits from several goroutines must hold one mutex across the whole of `Commit`, because validate-then-publish is the critical section.
+
+```bash
+cd phases/07-storage-and-transactions/06-mvcc-and-snapshot-isolation/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same four sections as the Java version, line for line (commits = 16, aborts = 1).
 
 ## Use It
 

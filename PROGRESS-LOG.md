@@ -2,6 +2,16 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-10-27 — Go port Wave 1 complete (56 lessons, Phases 0–7 + Phase 13)
+
+- Ported batches A–F of `docs/porting/go-port-plan.md`. Go coverage: 40 → **96 / 143** Build lessons; `languages.json` keeps Go `ci: false` until Wave 2.
+- Parity: same type/method names, every Java assertion ported (Go counts ≥ Java), demo output byte-identical to Java in every lesson except documented cosmetic rounding lines (`%.2f`/`%.0f` of exact .5 values; 13/06 `Map.of` print order). Bit-exact `java.util.Random` (incl. `nextGaussian`), SplitMix64, `String.hashCode`, `floorMod`, modified-UTF-8 `writeUTF`, and JDK `SHA1PRNG` ports where lessons depend on them.
+- Go-native where Java used JDK crypto: 13/11 uses `crypto/ed25519` (same key and signatures as Java — Go verifier verifies a Java-exported bundle); AES-GCM via `crypto/cipher`. No HMAC substitutions.
+- Fixed the 07/10 secondary-index porting note: Go shards with `floorMod` on the signed hash, matching Java.
+- Every Go lesson passes `go vet`, `gofmt -l`, and `go test -race`.
+- Verification: audit 199/199, 0 issues; Go 96 passed / 0 failed / 47 skipped (Wave 2); Java 143/143; Python 143/143.
+- Next: Go Wave 2 = 47 lessons (Phases 8–12, 14) + Go versions of the 3 projects; then Go `ci: true`.
+
 ## 2026-10-26 — Python port complete (Wave 2: 47 lessons + 3 projects)
 
 - Ported batches G–L: Phases 8, 9, 10, 11, 12, 14 lessons and the three projects. Python coverage: 96 → **143 / 143** Build lessons; all 3 projects pass 4/4 stages in Python.

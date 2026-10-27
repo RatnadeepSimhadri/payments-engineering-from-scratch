@@ -3,7 +3,7 @@
 > Sortable, collision-resistant IDs for a distributed ledger.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 1, Lesson 11 (Bit Manipulation), Phase 3, Lesson 04 (B-Trees and Why Databases Love Them)
 **Time:** ~60 minutes
 
@@ -346,9 +346,26 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `uint64` pairs as here, `bits.Add64` for the ULID carry, `math/rand/v2` with a seeded `PCG` for reproducibility and `crypto/rand` in production; return `(uint64, error)` from the Snowflake generator instead of throwing. Keep the unsigned comparison explicit: Go's `int64` would reintroduce the `java.util.UUID` ordering bug.
+`code/go/main.go` keeps the Java design, including the two-half layout: `Uuid{Msb, Lsb uint64}` and `Ulid{TimestampMillis, RandomHi int64; RandomLo uint64}` are comparable structs. The generators (`UuidV4Generator`, `UuidV7Generator`, `UlidGenerator`, `SnowflakeGenerator`) keep their Java names, and `ClockMovedBackwardsError` is an error value that carries the drift. Three things differ:
+
+- **Halves are unsigned, so ordering is free.** Storing the UUID halves and the low ULID word as `uint64` makes plain `<` the unsigned comparison Java has to spell out with `Long.compareUnsigned`; an `int64` would reintroduce the `java.util.UUID` ordering bug. The ULID increment wraps naturally: `lo := last.RandomLo + 1` becomes 0 exactly where the Java `long` does, and the carry moves into `RandomHi`. Java's `-1L` in the carry tests is `math.MaxUint64` here.
+- **Errors are values.** `ParseUuid`, `ParseUlid`, `NewUlid`, and `NewSnowflakeGenerator` return `(value, error)` with `ErrInvalidArgument`; `UlidGenerator.Next` returns `ErrIllegalState` on a randomness overflow; `SnowflakeGenerator.Next` returns a `*ClockMovedBackwardsError`, which satisfies both `errors.As` (to read `ByMillis`) and `errors.Is(err, ErrClockMovedBackwards)` through its `Is` method:
+
+```go
+if g.lastMillis-now > g.maxBackwardsMillis {
+    return 0, &ClockMovedBackwardsError{ByMillis: g.lastMillis - now}
+}
+```
+
+- **Same seed, same ids.** `math/rand` would produce different bits, so `javarandom.go` ports `java.util.Random` exactly (48-bit LCG, `NextIntN`, signed `NextLong`). The demo's UUIDv4, UUIDv7, ULID, and Snowflake values match Java's character for character, and a test pins the first three. Use `crypto/rand` for real ids. `strconv.ParseUint(s, 16, 64)` rejects `_` and signs like `Long.parseUnsignedLong`, and a test pins that too.
+
+```bash
+cd phases/03-systems-data-structures/13-unique-id-generation/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Sampling transactions for audit without storing them all.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 2, Lesson 01 (Sorting Algorithms), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~60 minutes
 
@@ -364,9 +364,32 @@ python3 -m unittest -v
 
 The demo output is identical to the Java run; the suite covers the Java's 39 checks plus 2 for the signed and truncating conversions.
 
-### Porting notes
+### In Go
 
-SplitMix64 ports to Go directly: `uint64` wraps and `>>` is logical, so the function is a direct transcription. Go's `math/rand` must not be substituted or the test on the reference output fails. Quickselect and Fisher-Yates are language-neutral, and the generic reservoir becomes `ReservoirSampler[T any]`; `container/heap` needs the same siftUp/siftDown as `java.util.PriorityQueue` if the weighted sample must print in the same order.
+```go
+func (r *Rng) NextLong() int64 {
+    r.state += 0x9E3779B97F4A7C15
+    z := r.state
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 // uint64 wraps and >> is logical: Java's >>>
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    return int64(z ^ (z >> 31))
+}
+```
+
+Every type keeps its name and algorithm, and every number in the demo matches the Java run. Four things differ, all in `code/go/`:
+
+- **SplitMix64 is a direct transcription.** The state is a `uint64`, so multiplication wraps and `>>` is the logical shift Java spells `>>>`; the only conversion is the final `int64(...)` so `NextLong` returns the same signed value as Java (the reference output `0xE220A8397B1DCDAF` is negative, and a test checks that). `NextDouble` shifts the unsigned value right by 11 and scales by `2^-53`. `math/rand` must not be substituted: it is a different generator and the reference test would fail.
+- **The heap's array order is part of the output.** `WeightedReservoirSampler.Sample()` returns the heap's backing array, as the Java iterates `PriorityQueue`. `container/heap` sifts differently from the JDK (hole to a leaf, then back up), which can arrange keys differently, so `javapq.go` is a short transcription of `PriorityQueue.offer`/`poll` with the JDK's `siftUp`/`siftDown`; the weighted sample prints in the same order as the Java run and a test pins it. `math.Pow` and `Math.pow` agree on every key in the demo.
+- **Generics and errors.** `ReservoirSampler[T any]` and `WeightedReservoirSampler[T any]` take the element type as a parameter, `FisherYates[T any]` shuffles any slice, and constructors and `Select`, `Percentile`, `IsProbablePrime`, and `Rng.NextInt` return `(T, error)` with the sentinels `ErrBadK`, `ErrBadWeight`, `ErrEmpty`, `ErrKRange`, `ErrBadQ`, `ErrBadBound`, and `ErrTooLarge`. Inside the algorithms the generator is called through `nextInt`, which panics on a non-positive bound because every caller has already validated it; a bad bound there is a programming error, not an input.
+- **Integer semantics match without help.** Go's `/` and `%` truncate toward zero like Java's, so `Money.String` prints `-150` as `-1.50 USD` with no helper (a test pins it), `int64` multiplication wraps like `long`, and the `n < 2^31` guard in Miller-Rabin is doing the same job as in Java: keeping `x * x` inside 63 bits. `math/big`'s `ProbablyPrime` is the production version.
+
+```bash
+cd phases/02-algorithms/14-randomized-algorithms/code/go
+go run .
+go test ./...
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 39 checks plus 7 that pin the sign of the reference value, the demo's samples and shuffle counts, the `q = 0` sentinel, and the truncating `String`.
 
 ## Use It
 

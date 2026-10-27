@@ -3,7 +3,7 @@
 > Make the scheduler your test input.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 07 (Deadlocks, Lock Ordering, and Detection); Phase 4, Lesson 01 (Threads and the Memory Model)
 **Time:** ~75 minutes
 
@@ -363,10 +363,29 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-- **Go**: the machine and explorer port directly (a `sync.Mutex` is not needed anywhere in them, because they are single-threaded). The stress harness uses a `sync.WaitGroup` plus a `chan struct{}` closed as the starting gun in place of `CyclicBarrier`, and the tests must pass under `go test -race ./...`; the race detector will flag `RacyCounter` in the stress test, which is correct and is why the Go port keeps the racy stress test in the demo but out of `go test`. Go also has `runtime.Gosched()` for hand-placed yield points and `GOMAXPROCS=1` for the single-core experiment in Step 6.
-- Registers and memory stay `int64`; `Math.addExact` becomes a hand-written checked add in Go.
+`code/go/main.go` ports Part 1 shape for shape: the instructions are small structs behind an `Instruction` interface, `Machine.Step` is a type switch over them, and `Random` drives the same `JavaRandom` (`javarandom.go`), so seed 42 finds 735 violations in 1,000 schedules in all three languages and every line of the model-checking half of the demo matches Java's. Four things differ.
+
+- **Errors are values.** `Machine.Step` returns `ErrNotEnabled` or `ErrUnlockNoHold` where Java throws `IllegalStateException`, and `Exhaustive`/`Random` return `(ExplorationResult, error)` so a malformed program surfaces instead of panicking mid-search. `Math.addExact` becomes `addChecked`; `Program.InterleavingsUpperBound` uses `mulChecked`, because Go's `int64` wraps silently like Java's primitive `long`.
+- **No `Optional`.** `ExplorationResult.Counterexample` and `FinalMemory` are `nil` when the exploration was clean. Go maps have no insertion order, so `Program` keeps `Vars` and `FormatMemory` sorts keys to print `{a=100, b=100}` like the `LinkedHashMap`.
+- **The barrier is a closed channel.** `StressRun` parks every goroutine on `<-start` and `close(start)` releases them all at once: that is the `CyclicBarrier`. A `sync.WaitGroup` is the `join`.
+- **The race detector is the fourth tool.** `go test -race ./...` instruments every memory access and reports the `RacyCounter` race the moment two goroutines touch `balance`, with both stacks. That is also why the racy stress test must step aside under the detector: `race_on.go` and `race_off.go` set `raceDetectorEnabled` with build tags, and `TestStressHarness` skips the racy half when it is true. Under the detector the race is a failure, not a probability; without it, the stress line still varies between runs exactly as in Java. Try `GOMAXPROCS=1 go run .` for the single-core experiment: the racy stress line usually drops to 0 of 20 while the model checker still reports 18 violations.
+
+```go
+func (c *RacyCounter) Add(delta int64) { loaded := c.balance; c.balance = loaded + delta }
+
+if raceDetectorEnabled {
+    t.Skip("RacyCounter is a deliberate data race: the race detector would (correctly) fail the run")
+}
+```
+
+```bash
+cd phases/04-concurrency/12-testing-concurrent-code/code/go
+go run .
+go test ./...          # runs the racy stress test too
+go test -race ./...    # skips it, and would flag RacyCounter if it ran
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Pointer chasing is slow; here is when linked lists still win.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays)
 **Time:** ~75 minutes
 
@@ -401,9 +401,48 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port makes `Node[T]` a generic struct with pointer fields, returns `(T, bool)` or `error` instead of throwing, and must take care that `unlink` nils the pointers so the GC can collect the node; the intrusive variant embeds a `ListHook` struct in the element, exactly as `container/list` would not let you do.
+```go
+// IntrusiveNode is embedded in the element; the element is its own list cell.
+type IntrusiveNode struct {
+    prev, next *IntrusiveNode
+    owner      any // the *IntrusiveList[T] this element is linked into; nil once unlinked
+    self       any // the element that embeds this hook: Go's stand-in for container_of
+}
+
+type PendingAuthorization struct {
+    IntrusiveNode
+    ID          string
+    AmountMinor int64
+}
+
+func (l *DoublyLinkedList[T]) Unlink(node *Node[T]) (T, error) {
+    if err := l.requireOwned(node); err != nil {
+        var zero T
+        return zero, err
+    }
+    node.prev.next = node.next
+    node.next.prev = node.prev
+    node.prev, node.next = nil, nil // nil the links so the GC can collect the node
+    node.owner = nil
+    l.size--
+    return node.Value, nil
+}
+```
+
+`code/go/main.go` keeps all three lists, the sentinel, ownership checks, and `PendingAuthorization`. What differs:
+
+- **Generics instead of erasure.** `SinglyLinkedList[T comparable]` (it needs `==` for `RemoveFirstOccurrence`), `DoublyLinkedList[T any]` with a `*Node[T]` handle, and `IntrusiveList[T Intrusive]`, where `Intrusive` is a constraint satisfied by any pointer type that embeds `IntrusiveNode`. The sentinel is a plain `Node[T]` value inside the list struct, so an empty list is one allocation.
+- **Embedding replaces inheritance.** Java's `abstract class IntrusiveNode` becomes a struct the element embeds; the promoted `hook()` method gives the list access to the links. Linux's `container_of` macro has no Go equivalent, so `AddLast` stores the element in the hook's `self` field and iteration reads it back.
+- **Errors are values.** `Get`, `Unlink`, `RemoveFirst`, and `RemoveLast` return `(T, error)`; `InsertBefore`, `MoveToFront`, `SpliceAll`, `AddLast`, and `Remove` return `error`. The sentinels `ErrEmpty`, `ErrIndexOutOfBounds`, `ErrNotOwned`, `ErrAlreadyLinked`, and `ErrSpliceSelf` are matched with `errors.Is`.
+- **The benchmark measures the cache, like Java.** The shuffle uses a `JavaRandom` that reproduces `java.util.Random`, so the permutation is identical and all three sums print `499999500000`. Go has no JIT, so the in-order list sits a little further from the slice than in Java, but the ordering (slice < in-order list < shuffled list) and the hundreds-of-times gap for the shuffled list are the same.
+
+```bash
+cd phases/01-complexity-and-core-structures/04-linked-lists/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

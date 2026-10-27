@@ -3,7 +3,7 @@
 > Turn the database log into an event stream.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs), Phase 7, Lesson 10 (Secondary Indexes: Local vs Global), Phase 6, Lesson 01 (Replication Strategies)
 **Time:** ~75 minutes
 
@@ -382,12 +382,41 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-- **Numeric model.** Amounts travel as strings of minor units and are parsed with `strconv.ParseInt` in Go; Go needs a hand-written checked add in place of `Math.addExact`.
-- **Immutability.** Go copies the map on construction and documents that callers must not mutate it, since Go has no immutable map.
-- **Errors.** `LogTruncatedException` becomes a Go error type (`errors.As`) carrying `requested` and `oldestAvailable`; `IllegalStateException` on a finished transaction becomes an `error`.
-- **Concurrency.** A Go port that runs `poll` in a goroutine alongside writers must guard `CommitLog` and the tables with a mutex and pass `go test -race`; the snapshot seam then becomes observable (Exercise 3) and the LSN guard in the sink is what keeps the view correct.
+```go
+// LogTruncatedError is returned when a reader asks for an LSN the log has already truncated.
+type LogTruncatedError struct {
+    Requested       int64
+    OldestAvailable int64
+}
+
+func (e *LogTruncatedError) Is(target error) bool { return target == ErrLogTruncated }
+
+func (c *CdcConnector) PollWithCrash(maxEvents int, crashBeforeCommit bool) (int, error) {
+    from := c.offsets.Load(c.Name)
+    batch, err := c.db.Log().ReadFrom(from, maxEvents)
+    if err != nil {
+        return 0, err // the consumer must re-snapshot
+    }
+    // ... deliver every record, then save the offset unless we "crash"
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Rows are an ordered type, not a map.** Java's `LinkedHashMap<String, String>` with `null` for a missing image becomes `*Row`: an insertion-ordered column list behind `Get`, `Copy`, `Equal` and `String`, with `nil` standing for the missing `before` of an insert or `after` of a delete. `Row` has no public setter and every `Put`, commit and log append stores a `Copy`, which is how the port keeps log records immutable without Java's `Collections.unmodifiableMap`; the test mutates the caller's row after commit and checks the record did not move.
+- **Errors are values.** `ReadFrom` returns `([]LogRecord, error)`; the error is a `*LogTruncatedError` carrying `Requested` and `OldestAvailable` (unwrap with `errors.As`) that also matches the sentinel `ErrLogTruncated` through `errors.Is`. `Poll`, `PollWithCrash` and `Snapshot` propagate it. `Transaction.Put` and `Delete` keep chaining (`db.Begin().Put(...).Put(...).Commit()`), so a use after `Commit`/`Rollback` is remembered and reported by the next `Commit` as `ErrTxnFinished`. `Sink.Apply` returns `error`, because a sink that parses `amount_minor` with `strconv.ParseInt` can meet a value that is not an integer and must refuse it rather than guess.
+- **Numeric model.** Amounts travel as strings of minor units and are parsed with `strconv.ParseInt`; `Money.Plus` uses a hand-written checked add in place of `Math.addExact` and returns `(Money, error)`, so `NaiveTotalsSink` and `IdempotentTotalsSink` surface overflow as an error from `Apply`.
+- **Ordering and concurrency.** `Scan` returns a key-sorted `[]KeyedRow` (Java's `TreeMap`) so snapshot events are emitted in the same order; `formatBalances` sorts keys to print the view the way Java does. Everything is single-threaded; a port that runs `Poll` in a goroutine beside writers must guard `CommitLog` and the tables with a mutex and pass `go test -race`, and the LSN guard in `BalanceViewSink` is then what keeps the view correct across the snapshot seam.
+
+```bash
+cd phases/07-storage-and-transactions/11-change-data-capture/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same five sections as the Java version, line for line.
 
 ## Use It
 

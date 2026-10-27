@@ -3,7 +3,7 @@
 > A ring buffer is the data structure inside every message broker.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 03 (Dynamic Arrays), Phase 1, Lesson 04 (Linked Lists)
 **Time:** ~60 minutes
 
@@ -363,9 +363,35 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go's `%` behaves like Java's, so `rebase` stays; `pollFirst` returns `(T, bool)` rather than a nullable, since a zero value is a legal element. The model-based test uses a slice-backed reference deque in place of `ArrayDeque`. None of the sequence arithmetic changes.
+```go
+// PollFirst dequeues the oldest element; ok is false when empty.
+func (r *RingBuffer[T]) PollFirst() (T, bool) {
+    var zero T
+    if r.IsEmpty() {
+        return zero, false
+    }
+    i := r.IndexOf(r.head)
+    v := r.slots[i]
+    r.slots[i] = zero
+    r.head++
+    return v, true
+}
+```
+
+`code/go/main.go` keeps `ArrayStack`, `OverflowPolicy`, and the sequence-numbered `RingBuffer`. What differs:
+
+- **`(T, bool)` instead of a nullable.** A Go zero value (`0`, `""`) is a legal element, so `PollFirst`, `PollLast`, `PeekFirst`, and `PeekLast` return a second `ok` result rather than a sentinel. The same reasoning applies to `SlotsView`: a vacated slot holding `0` is indistinguishable from a live `0`, so the debug view asks the sequence range which physical slots are live instead of testing for `null`.
+- **`%` truncates like Java.** `-1 % 4` is `-1` in Go, so `rebase` stays exactly as written; sequences never go negative and `HeadSequence` reports the same offsets as Java after an `OfferFirst` at sequence 0.
+- **Errors are values.** `Pop` and `Peek` return `(T, error)` with `ErrEmpty`; `Get` returns `ErrIndexOutOfBounds`; the constructors return `ErrCapacity` for a capacity below 1. `OfferLast` and `OfferFirst` keep the Java `bool`, because a rejected offer is backpressure, not a failure.
+- **The model is a slice-backed deque.** The model-based test replays the same 2,000 operations as Java by porting `java.util.Random(11)` exactly, then compares against a small `modelDeque` in the test file in place of `ArrayDeque`.
+
+```bash
+cd phases/01-complexity-and-core-structures/05-stacks-queues-and-deques/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > The downstream call that outlives its caller.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 07 (RPC, Framing, and Serialization Over Raw Sockets); Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks)
 **Time:** ~60 minutes
 
@@ -363,9 +363,31 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go has this mechanism in the standard library: `context.WithDeadline` and `context.WithTimeout` implement `withTimeout` with the same min rule, `ctx.Deadline()` returns the absolute instant, and `ctx.Done()` is a channel the work can select on, which gives in-process cancellation this Java version lacks. A Go port would make `Service.Call` take a `context.Context` and return `(string, error)`, with `context.DeadlineExceeded` as the sentinel. The wire format and the `requireBudget` admission check port unchanged.
+`code/go/main.go` has the same `Deadline`, `Context`, `RemoteService`, `Client`, `DeadlineAwareRetrier`, and hedging study, and prints the same demo line for line, including `p50=41 ms p99=919 ms; hedged p99=113 ms` from the ported `java.util.Random` (`javarandom.go`). Go is the language this `Context` was modelled on, which raises the obvious question: why not `context.Context`? Because `context.WithDeadline` reads the real clock, and the whole lesson runs on a `FakeClock` so that a 620 ms chain costs 0 ms of test time. The lesson's `Context` keeps the same three operations (`WithTimeout` tightens with the min rule, `Deadline`, `RequireBudget`); `ctx.Done()` is the one thing it lacks, and the in-process cancellation it enables is the subject of Phase 4, Lesson 11. Three things differ.
+
+- **`Service.Call` returns `(string, error)`.** `*DeadlineExceededError` carries the message and the remaining budget and matches `ErrDeadlineExceeded` under `errors.Is`; `*UnavailableError` matches `ErrUnavailable`. `Client.Invoke` sorts the outcome by `errors.Is`, and the retrier's `switch` on the error class replaces the two `catch` blocks. `FromWire` returns `ErrBadHeader` for a malformed header instead of throwing.
+- **Overflow is explicit.** Go's `int64` wraps silently like Java's `long`, so `SaturatingAdd` uses the same sign test; `math.MaxInt64` is `DeadlineNone`. The `u` and `n` units divide with `/`, which truncates toward zero exactly as Java does.
+- **Two programming errors panic.** A negative timeout and a clock moved backwards are bugs in the caller, not conditions a payment flow can handle, so `DeadlineAfter` and `FakeClock.Advance` panic where every other failure is a returned error. `ToWireTimeout` returns `""` for "no header" because Go has no `null` string.
+
+```go
+func (c Context) RequireBudget(clock Clock, neededMs int64, where string) error {
+    remaining := c.RemainingMs(clock)
+    if remaining < neededMs {
+        return &DeadlineExceededError{fmt.Sprintf("%s needs %d ms but only %d ms remain", where, neededMs, remaining), remaining}
+    }
+    return nil
+}
+```
+
+In production Go, `context.WithTimeout(parent, d)` is `WithTimeout`, `ctx.Deadline()` is the absolute instant, gRPC-Go writes the `grpc-timeout` header from it, and `select { case <-ctx.Done(): ... }` is the checkpoint the fake-clock version calls by hand.
+
+```bash
+cd phases/05-distributed-foundations/08-timeouts-and-deadlines/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

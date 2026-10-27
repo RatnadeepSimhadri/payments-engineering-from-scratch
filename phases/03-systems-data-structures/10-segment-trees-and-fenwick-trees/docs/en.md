@@ -3,7 +3,7 @@
 > Range sums over balances with O(log n) updates.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 03 (Dynamic Arrays), Phase 1, Lesson 08 (Binary Search Trees), Phase 1, Lesson 11 (Bit Manipulation), Phase 2, Lesson 05 (Divide and Conquer)
 **Time:** ~90 minutes
 
@@ -395,9 +395,30 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go, use `[]int64`, write a small `addChecked` since there is no `Math.addExact`, and return `error` from the range-checked methods instead of panicking; the lazy tree's recursion is unchanged. Keep `rangeSum` bottom-up with separate `left` and `right` accumulators so the same code serves non-commutative operations later.
+`code/go/main.go` has the same types (`FenwickTree`, `SegmentTree`, `LazySegmentTree`, `BalanceHistory`, plus `Currency` and `Money`) with the same methods in exported CamelCase (`PrefixSum`, `RangeSum`, `FirstIndexWithPrefixAtLeast`, `RangeAdd`, `DivideHalfEven`). The 1-indexed Fenwick layout ports unchanged: `i & -i` isolates the lowest set bit of a Go `int` exactly as it does for a Java `int`, and `/` and `%` truncate toward zero like Java's, so `DivideHalfEven(-25, 10)` is `-2` without any helper. Three things differ:
+
+- **Overflow is checked by hand.** Go's `int64` wraps silently and there is no `Math.addExact`, so `addChecked`, `subChecked`, and `mulChecked` reproduce the `Math.*Exact` family and return `ErrOverflow`. Every sum in every tree goes through them, which is why the overflow tests assert an error rather than a wrapped total:
+
+```go
+func addChecked(a, b int64) (int64, error) {
+    r := a + b
+    if (a >= 0) == (b >= 0) && (r >= 0) != (a >= 0) {
+        return 0, ErrOverflow
+    }
+    return r, nil
+}
+```
+
+- **Every range-checked method returns an error.** `Add`, `Set`, `RangeAdd`, and `Post` return `error`; `PrefixSum`, `RangeSum`, `Get`, `BalanceOn`, and the constructors return `(value, error)`. `checkIndex` reproduces `Objects.checkIndex` with `ErrIndexOutOfBounds`, `lo > hi` and empty inputs give `ErrInvalidArgument`, and the tests check each with `errors.Is`. The Java test that wraps three Fenwick calls in one `checkThrows` becomes an `errors.Join` of the three results, because in Go the overflow surfaces from whichever call hits it.
+- **The bottom-up `RangeSum` keeps two accumulators.** `left` and `right` are added in order and only combined at the end, so the same loop serves a non-commutative operation later. The lazy tree's recursion is unchanged; its depth is `log2 n`. The randomized demo uses `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random` including `NextBoolean`), so the 20,000 operations are the same as in Java and the demo output is identical.
+
+```bash
+cd phases/03-systems-data-structures/10-segment-trees-and-fenwick-trees/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

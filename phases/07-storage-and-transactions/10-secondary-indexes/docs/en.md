@@ -3,7 +3,7 @@
 > Find all payments for a customer across shards.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 7, Lesson 01 (Partitioning Strategies and Rebalancing), Phase 7, Lesson 02 (Write-Ahead Logs), Phase 3, Lesson 06 (Consistent Hashing and Virtual Nodes)
 **Time:** ~75 minutes
 
@@ -412,12 +412,47 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-- **Hashing.** Go's map hashing is per-process randomised; the port must implement FNV-1a 64 over UTF-8 bytes by hand. Go uses `uint64` so the wrap is free and `% uint64(n)` needs no `floorMod`.
-- **Ordered sets.** `TreeSet<Locator>` and `TreeMap` give deterministic iteration. Go uses `map` plus `sort.Slice` on a comparable `Locator` struct. Do not rely on map iteration order.
-- **Errors.** The constructor guards become `error` returns from `NewPartitionedStore` in Go. `Shard.getMany` skipping missing ids is a filter, not an error, in all three.
-- **Concurrency.** This lesson is single-threaded by design. A Go port that drains the queue from a goroutine must guard the index partitions with a mutex and pass `go test -race`; the staleness tests then need the drain to be externally triggered, exactly as here, or they become timing-dependent.
+```go
+// Fnv1a64 returns the hash as a signed int64, the same bits Java's long holds.
+func Fnv1a64(key string) int64 {
+    h := fnvOffset
+    for i := 0; i < len(key); i++ {
+        h ^= uint64(key[i])
+        h *= fnvPrime
+    }
+    return int64(h)
+}
+
+// floorMod is Java's Math.floorMod: the result has the sign of the divisor.
+func floorMod(x int64, n int64) int {
+    r := x % n
+    if r < 0 {
+        r += n
+    }
+    return int(r)
+}
+
+func PartitionFor(key string, partitions int) int {
+    return floorMod(Fnv1a64(key), int64(partitions))
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **The hash is made signed on purpose, and the remainder is `floorMod`.** The multiply runs in `uint64` so the wrap is free, but the result is converted to `int64` and the shard is `floorMod(hash, n)`, exactly `Math.floorMod` on Java's signed `long`. Taking `uint64(hash) % uint64(n)` instead looks natural and is wrong: for `n = 3` every negative hash lands on a different shard than Java (`2**64 % 3 == 1`), so `cust_alice` would move from index partition 1 to 2. A Go-only test pins the difference. The two agree only when `n` is a power of two, which is why the four-shard demo cannot reveal the bug.
+- **Errors are values; absence is a `bool`.** `NewPartitionedStore`, `NewGlobalIndex` and `NewPayment` return `(T, error)` with sentinels `ErrNoShards`, `ErrNoIndexPartition` and `ErrMissingField` (the `NullPointerException` from the record constructor). `Shard.Get`, `Shard.Put` and `PartitionedStore.Get` return `(Payment, bool)` in place of a nullable row. `Money.Plus` returns `(Money, error)`, so `Total` does too. `GetMany` skipping missing ids is a filter, not an error, in all three languages.
+- **Ordered sets by hand.** `TreeSet<Locator>` and `TreeMap` become maps plus `sortedKeys`/`sortedLocators`, with `Locator.Less` as the comparator, so `Lookup`, `Scan`, `LookupCustomer` and the audit visit entries in the same order Java does. `FindByCustomerGlobal` keeps a `shardOrder` slice beside its map to mirror the `LinkedHashMap`. Never rely on Go's randomised map iteration.
+- **Concurrency.** This lesson is single-threaded by design, so there is no mutex and `go test -race` passes trivially. A port that drains the queue from a goroutine must guard the index partitions with a mutex; the staleness tests then need the drain to be externally triggered, exactly as here, or they become timing-dependent.
+
+```bash
+cd phases/07-storage-and-transactions/10-secondary-indexes/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same placement, request counts and audits as the Java version, line for line.
 
 ## Use It
 

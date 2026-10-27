@@ -1,0 +1,3 @@
+module pefs/06replicationandconsensus/02replicationlagandreadyourwrites
+
+go 1.22

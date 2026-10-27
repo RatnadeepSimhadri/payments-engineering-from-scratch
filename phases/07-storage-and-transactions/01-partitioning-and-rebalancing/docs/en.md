@@ -3,7 +3,7 @@
 > Range vs hash, hot keys, and moving a shard without downtime.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 3, Lesson 06 (Consistent Hashing and Virtual Nodes), Phase 6, Lesson 01 (Replication Strategies)
 **Time:** ~75 minutes
 
@@ -393,12 +393,37 @@ python3 -m unittest -v
 
 The demo prints the same numbers as the Java version (79.8%, 18.9%, 21.2%, 236 keys copied).
 
-### Porting notes
+### In Go
 
-- **Hashing.** Go's map hash is randomised per process; the port must implement FNV-1a and the finaliser by hand on the key's bytes, using `uint64` so that `mod P` needs no unsigned-remainder helper.
-- **Errors.** `WrongOwnerException` becomes a Go error type carrying `Partition` and `CurrentVersion`, checked via `errors.As`; the state-machine guards become `error` returns.
-- **Ordering.** The ring uses `TreeMap.ceilingEntry`; Go uses `sort.Search` on a sorted slice. `partitionsPerNode` uses a `TreeMap` for sorted printing; the port should sort keys explicitly.
-- **Concurrency.** This lesson is single-threaded by design. A Go port that runs migration writes from goroutines must guard the node maps with a mutex and pass `go test -race`.
+```go
+func Fnv1a64(key string) int64 {
+    hash := uint64(0xcbf29ce484222325)
+    for _, unit := range utf16.Encode([]rune(key)) {
+        hash ^= uint64(unit)
+        hash *= 0x100000001b3
+    }
+    return int64(hash)
+}
+
+func (h *HashPartitioner) PartitionOf(key string) int {
+    return remainderUnsigned(Hash64(key), h.partitions) // int(uint64(hash) % uint64(n))
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Wraparound is free, signedness is explicit.** Go's `uint64` multiply wraps exactly like Java's `long`, so `Fnv1a64` and `Hash64` need no masks; they compute in `uint64` and convert to `int64` at the end so the ring sorts the same signed values Java's `TreeMap<Long>` does. `remainderUnsigned` is `Long.remainderUnsigned` written out: cast back to `uint64`, then `%`. The hash iterates UTF-16 code units via `unicode/utf16`, which is what Java's `charAt` sees, so every key lands on the same partition in all three languages.
+- **Errors are values.** Every `IllegalArgumentException`/`IllegalStateException` becomes a sentinel (`ErrSplitPointsUnsorted`, `ErrNodePresent`, `ErrLastNode`, `ErrWrongState`, `ErrKeyNotInPartition`, ...) returned from a constructor or a state-machine method and checked with `errors.Is`. `WrongOwnerException` becomes `*WrongOwnerError` carrying `Partition` and `CurrentVersion`, which callers unwrap with `errors.As`. The one `panic` is `ConsistentHashRing.NodeFor` on an empty ring, a programming error with no caller that could handle it.
+- **Ordered containers by hand.** The ring is a sorted `[]int64` plus a `map[int64]string`; `sort.Search` is `TreeMap.ceilingEntry` with an explicit wrap to index 0. `partitionsPerNode` returns a plain map and `formatLayout` sorts the keys to print `{node-a=13, ...}` the way Java's `TreeMap` does. The rebalancer's `LinkedHashMap` is an `ownedLoad` struct holding an insertion-order slice next to the map, so the donor on a tie is the same node Java picks and the plan is identical.
+- **Map iteration is random.** `StartCopy` sorts the snapshot's keys before copying so the copy order (and the `Copied` count) is deterministic; `DropPartition` deletes during a range loop, which Go permits.
+
+```bash
+cd phases/07-storage-and-transactions/01-partitioning-and-rebalancing/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same numbers as the Java version (79.8%, 18.9%, 21.2%, 236 keys copied).
 
 ## Use It
 

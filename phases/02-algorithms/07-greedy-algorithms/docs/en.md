@@ -3,7 +3,7 @@
 > When taking the best local step is provably optimal, and when it is a bug.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 09 (Heaps and Priority Queues from Scratch), Phase 2, Lesson 01 (Sorting), Phase 2, Lesson 04 (Recursion and Backtracking)
 **Time:** ~60 minutes
 
@@ -370,9 +370,36 @@ python3 -m unittest -v
 
 The demo output is identical to the Java run, and the suite runs the same 41 checks.
 
-### Porting notes
+### In Go
 
-Go's `container/heap` requires implementing `Len/Less/Swap/Push/Pop` on a slice type, which is where the deterministic tie-break on `order` must live; `sort.Slice` with a two-key less function replaces the sort. Amounts stay integers in minor units, and the port should include the DP oracle alongside the greedy so `isCanonical` works unchanged.
+```go
+// nodeHeap orders by weight, then by creation order: a total order, so the tree is deterministic.
+type nodeHeap []*Node
+
+func (h nodeHeap) Len() int { return len(h) }
+func (h nodeHeap) Less(i, j int) bool {
+    return cmp.Or(cmp.Compare(h[i].Weight, h[j].Weight), cmp.Compare(h[i].Order, h[j].Order)) < 0
+}
+func (h nodeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *nodeHeap) Push(x any)   { *h = append(*h, x.(*Node)) }
+func (h *nodeHeap) Pop() any     { old := *h; v := old[len(old)-1]; *h = old[:len(old)-1]; return v }
+```
+
+Same types, same algorithms, same tests; three things differ, all in `code/go/main.go`:
+
+- **Heaps are `container/heap` over a slice type.** The package supplies the sift operations; the slice type supplies `Len/Less/Swap/Push/Pop`, which is where the `(weight, order)` tie-break lives. Because `order` is unique the ordering is total, so the tree is the same whatever heap implementation builds it, and the demo's codes match Java's bit for bit. `MinResources` uses the same pattern over `[]int64` end times. Sorting uses `slices.SortStableFunc` with `cmp.Or(cmp.Compare(a.End, b.End), cmp.Compare(a.Start, b.Start))` in place of the `Comparator` chain.
+- **Maps have no order.** Java iterates a `TreeMap` so the leaves receive `order` in ascending symbol order; Go's `Build` collects the keys, sorts them with `sort.Ints`, and then assigns `order`. Skip that step and the tie-break depends on map iteration order, which Go randomizes on purpose; the "deterministic across builds" test would fail intermittently.
+- **Errors and absence are values.** `NewInterval`, `Build`, `Decode`, and `OptimalTable` return `(T, error)` with the sentinels `ErrBadInterval`, `ErrNoSymbols`, `ErrBadFrequency`, `ErrInvalidBits`, `ErrTruncated`, and `ErrNegative`; `Greedy` returns `(counts, ok)` instead of `null`, and `Impossible` is `math.MaxInt64`, the same sentinel as `Long.MAX_VALUE`. `OptimalCount` panics on a negative amount because the Java method cannot fail there either; the caller already validated.
+
+The test file replays `java.util.Random(21)` through `javarandom.go`, so the 300 interval instances and 200 USD amounts are the same random inputs as the Java run.
+
+```bash
+cd phases/02-algorithms/07-greedy-algorithms/code/go
+go run .
+go test ./...
+```
+
+The demo output is identical to the Java run; the suite runs the Java's 41 checks plus 3 that pin the demo's codes and the two new error sentinels.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Linking accounts, merging entities, and detecting fraud rings.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 02 (Amortized Analysis), Phase 1, Lesson 06 (Hash Maps from Scratch)
 **Time:** ~60 minutes
 
@@ -349,9 +349,40 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `[]int32` and the same loops; `union` and `find` would return `(int, error)` for the index check, or panic, since an out-of-range element is a programming error not a runtime condition. The algorithm does not change; the only numeric concern is that `rank` fits in a byte (it never exceeds 64) if memory matters. In Go a concurrent version would wrap the arrays in a `sync.Mutex`; compression's writes make `sync.RWMutex` useless because every read is also a write.
+```go
+func (d *DisjointSet) Find(x int) int {
+    d.checkIndex(x) // panics, like a slice index: an out-of-range element is a programming error
+    root := int32(x)
+    for d.parent[root] != root {
+        root = d.parent[root]
+        d.hops++
+    }
+    if d.pathCompression {
+        cur := int32(x)
+        for d.parent[cur] != root {
+            next := d.parent[cur]
+            d.parent[cur] = root
+            cur = next
+        }
+    }
+    return int(root)
+}
+```
+
+`code/go/main.go` keeps `DisjointSet` (three `[]int32` slices), `EntityLinker`, and both switchable heuristics. What differs:
+
+- **Panics for programming errors, errors for runtime conditions.** `Find`, `Union`, `Depth`, and friends panic on an out-of-range element, exactly as indexing a Go slice would; there is no honest `(int, error)` shape for a function every other method calls in a tight loop. Conditions a caller can hit at runtime are errors: `NewDisjointSetWith` returns `ErrNegativeSize`, and `EntityLinker.Link` returns `(bool, error)` with `ErrCapacityExceeded` when the identifier slots run out.
+- **`int32` arrays.** `parent`, `rank`, and `size` are `[]int32`, matching Java's `int[]` byte for byte; `rank` never exceeds 64, and the hop counter is `int64` because the naive chain follows 200 million pointers in the demo.
+- **Sorting by hand.** `Ring` and `RingsOfAtLeast` use `sort.Strings` and `sort.Slice` with the same comparator (size descending, then smallest member) instead of `TreeMap` and `Comparator.comparingInt`, so the flagged rings print in the same order as Java.
+- **Same random workloads.** `JavaRandom` reproduces `java.util.Random(seed).nextInt(bound)`, so seeds 3, 11, and 99 drive identical unions and every section prints the same numbers as Java. The test suite pins the heuristics table at n = 2,000, the same size the Python test uses, so `go test -race` stays fast.
+
+```bash
+cd phases/01-complexity-and-core-structures/10-disjoint-sets/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Context in Go, virtual threads in Java, task groups in Python.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 4, Lesson 06 (Executors, Goroutines, and asyncio); Phase 4, Lesson 01 (Threads and the Memory Model); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
@@ -404,10 +404,33 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-- **Go** already has the token: `context.Context`. `context.WithCancelCause` gives the first-reason-wins rule, `WithDeadline` takes the minimum against the parent automatically, and `AfterFunc` (Go 1.21) is `onCancel`. The scope is what the standard library lacks: build it from `sync.WaitGroup` plus a `sync.Once` around `cancel`, and make `Wait` the join. Bodies select on `ctx.Done()`; there is no interrupt, so a blocking call that does not take a context cannot be cancelled, which is why every network API in Go takes one. Run the tests with `go test -race ./...`.
-- As in the Java and Python versions, the deadline stays an absolute instant on an injectable clock, and the tests advance the clock instead of sleeping.
+`code/go/main.go` keeps the same names (`Deadline`, `CancellationToken`, `Subtask`, `StructuredScope`, `Authorize`) but this is the language the lesson was describing all along, so three things get simpler and one needs care.
+
+- **The token is a `context.Context`.** `CancellationToken` implements `Done()`, `Err()`, `Deadline()` and `Value()`, so a body can hand it to any API that takes a `ctx`, and `context.WithCancel(token)` derives a standard child that follows it (the tests prove this). `Err()` returns `context.DeadlineExceeded` or `context.Canceled` exactly as the standard package would; `Reason()` keeps the first-reason-wins string. The lesson builds its own token instead of calling `context.WithDeadline` for one reason: the deadline lives on the injected clock, so the tests advance a `ManualClock` instead of sleeping.
+- **There is no interrupt, and nothing is lost.** A body ends because `<-token.Done()` fires. That is why `ManualClock.Advance` notifies every token with a deadline (eager expiry closes `Done()`), while a deadline on the `SystemClock` arms a `time.AfterFunc`. `Subtask.interrupt()` has no counterpart; the Java comment about non-interruptible calls becomes the Go rule that a blocking call without a `ctx` cannot be cancelled.
+- **The scope is a `sync.WaitGroup` plus goroutines.** `Fork` is a generic function (`Fork[T](scope, name, body)`) because Go methods cannot have type parameters; each body gets its own goroutine, the equivalent of the virtual-thread-per-task executor, and `Join` is `wg.Wait()`. A body's `panic` is recovered and recorded as a `FAILED` subtask. `defer scope.Close()` is the try-with-resources.
+- **Errors are values.** Bodies return `(T, error)`; `ErrCancelled` (via `*CancelledError`) marks a cooperative exit, anything else is a failure that cancels the siblings. `scope.Err()` returns an `*ExecutionError` whose `Unwrap` is the body's error, or an error matching `context.DeadlineExceeded`. Because `Advance` cancels eagerly, the slow-bank demo waits (`holdPlaced`) until the balance check has registered its cleanup before the FX task moves the clock, so the cleanup log is identical to Java's.
+
+```go
+func WaitForSignalOrCancel(token *CancellationToken) error {
+    <-token.Done()
+    return token.CheckCancelled()
+}
+
+func (s *StructuredScope) Join() {
+    s.joined.Store(true)
+    s.wg.Wait()
+    // every subtask has settled; anything still UNAVAILABLE is marked CANCELLED
+}
+```
+
+```bash
+cd phases/04-concurrency/11-structured-concurrency-and-cancellation/code/go
+go run .
+go test -race ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Velocity checks are sliding-window problems.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 2, Lesson 01 (Sorting)
 **Time:** ~60 minutes
 
@@ -373,9 +373,36 @@ python3 -m unittest -v
 
 The demo output is identical to the Java run; the suite covers the Java's 50 checks plus one for the overflow guard.
 
-### Porting notes
+### In Go
 
-Go has no deque in the standard library: a slice used as a queue with `q = q[1:]` leaks the backing array until reallocation, so the port should implement a ring buffer (Phase 1, Lesson 05) or use `container/list`; `int64` arithmetic needs the explicit overflow check from Phase 10, Lesson 01; `record` returns `(Decision, error)` for the out-of-order case rather than panicking. The algorithms themselves are identical.
+```go
+func (vc *VelocityChecker) evictOlderThan(cutoffExclusive int64) error {
+    for !vc.window.IsEmpty() && vc.window.PeekFirst().TimestampMs <= cutoffExclusive {
+        total, err := vc.total.Minus(vc.window.PollFirst().Amount)
+        if err != nil {
+            return err
+        }
+        vc.total = total
+    }
+    return nil
+}
+```
+
+The types, method names, and every test case are the same; three things differ, all in `code/go/`:
+
+- **The deque is hand-built.** Go's standard library has no deque, and a slice used as a queue with `q = q[1:]` keeps the whole backing array alive until it is reallocated. `deque.go` is a small generic ring buffer, `Deque[T]`, with `AddLast`, `PeekFirst`, `PeekLast`, `PollFirst`, and `PollLast`, the five `ArrayDeque` calls the lesson uses; `MaxOfEachWindow` and `VelocityChecker` call it exactly as the Java calls `ArrayDeque`. A test pushes past its initial capacity so `grow()` runs with a wrapped head.
+- **Errors are values.** `MaxSumFixed`, `ShortestRunWithSumAtLeast`, `MaxOfEachWindow`, `NewVelocityChecker`, and `Record` return `(T, error)` where the Java throws `IllegalArgumentException`; the sentinels `ErrBadWindow`, `ErrNegative`, `ErrOutOfOrder`, and `ErrBadVelocity` support `errors.Is`. `PairWithSum` returns `([2]int, bool)` instead of `null`.
+- **`int64` wraps, so `Money` checks by hand.** `Plus` and `Minus` call `addChecked` and `subChecked` in `money.go`, which return `ErrOverflow` where `Math.addExact` would throw; a currency mismatch is `ErrCurrencyMismatch`. `LongestWithoutRepeat` ranges over runes with a `map[rune]int`, so it counts code points rather than UTF-16 units; for the Basic Multilingual Plane the answers are identical, and a test with `"ééa"` shows it is not counting bytes.
+
+The test file replays `java.util.Random(11)` through `javarandom.go`, so the 600 brute-force oracle trials are the same random arrays as the Java run.
+
+```bash
+cd phases/02-algorithms/03-two-pointers-and-sliding-windows/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same numbers as the Java run (Go formats slices as `[3 5]` rather than `[3, 5]`); the suite covers the Java's 50 checks plus 8 for the deque's growth, the code-point count, the `k=0` sentinel, and the two overflow guards.
 
 ## Use It
 

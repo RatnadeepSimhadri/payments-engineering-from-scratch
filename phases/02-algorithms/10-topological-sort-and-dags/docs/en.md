@@ -3,7 +3,7 @@
 > Settlement dependencies and build graphs.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 2, Lesson 08 (Graph Traversal: BFS, DFS, and Connected Components), Phase 1, Lesson 05 (Stacks, Queues, and Deques)
 **Time:** ~60 minutes
 
@@ -420,9 +420,38 @@ python3 -m unittest -v
 
 The demo output is identical to the Java run; the suite covers the Java's 41 checks plus 2.
 
-### Porting notes
+### In Go
 
-The Go port uses a `[]string` for node order beside a `map[string][]string` for adjacency, because Go maps iterate in deliberately randomized order and a scheduler built on bare map iteration would produce a different valid order on every run. Go returns `(order, cycle, err)` rather than throwing; `errors.As` recovers the cycle. Durations stay `int64`, and Go's addition needs the hand-written overflow check from Phase 10, Lesson 01.
+```go
+// CycleError is returned when a graph that must be a DAG contains a cycle.
+type CycleError struct {
+    Cycle []string // one cycle, in edge order, without repeating the first node
+}
+
+func (e *CycleError) Error() string {
+    return "cycle detected: " + strings.Join(e.Cycle, " -> ") + " -> " + e.Cycle[0]
+}
+
+order, err := Kahn(g)
+var ce *CycleError
+if errors.As(err, &ce) {
+    fmt.Println("rejected:", ce.Cycle)
+}
+```
+
+`Digraph`, `Kahn`, `DFS`, and `DagScheduler` keep their names and their algorithms; three things differ, all in `code/go/main.go`:
+
+- **Insertion order is kept by hand.** Go maps iterate in deliberately randomized order, so `Digraph` holds a `[]string` of nodes beside the `map[string][]string` adjacency, and every loop that Java runs over `LinkedHashMap` keys runs over that slice. The Kahn order, the DFS order, the levels, and every slack value match the Java run; drop the slice and a scheduler built on bare map iteration would print a different valid order on every run, which the lesson's audit argument forbids. `Schedule.Slots` is a plain map; the demo iterates `g.Nodes()` to print it in order.
+- **A cycle is an error value with data.** `CycleError` carries the cycle and implements `error`; `Kahn`, `DFS`, `Levels`, and `Schedule` return it, and `errors.As` recovers the slice where Java's `catch (CycleException e)` reads `e.cycle()`. Argument problems are the sentinels `ErrUnknownNode`, `ErrNoDuration`, and `ErrNegativeDuration`, so a caller can tell a bad graph from a bad argument with `errors.Is`.
+- **The iterative DFS stays, and `int64` needs the overflow check.** A goroutine stack grows to 1 GB, so a recursive DFS would survive the 100,000-node chain, but the explicit `frame` stack is the same code as the Java and the test keeps it honest. Go's `+` wraps, so the forward pass adds durations with `addChecked`, which returns `ErrOverflow` where `Math.addExact` throws; a test schedules two `1 << 62`-minute tasks to see it fire. Kahn's FIFO ready queue is a slice with a moving head index rather than an `ArrayDeque`.
+
+```bash
+cd phases/02-algorithms/10-topological-sort-and-dags/code/go
+go run .
+go test ./...
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 41 checks plus 7 for insertion order, the DFS order, the error-kind distinction, levelling a cyclic graph, and the overflow guard.
 
 ## Use It
 

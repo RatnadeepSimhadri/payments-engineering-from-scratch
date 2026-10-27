@@ -3,7 +3,7 @@
 > JIT warm-up, GC pauses, and the GIL make naive timing meaningless.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 0, Lesson 03 (Testing from the Standard Library)
 **Time:** ~75 minutes
 
@@ -365,9 +365,35 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go's compiler is ahead-of-time, so there is no warm-up tier, but the compiler does eliminate dead stores and fold constants; `testing.B` with `b.N` and `b.ReportAllocs()` is the standard-library harness, `time.Now()` is monotonic in Go 1.9+, and the blackhole is a package-level `var sink`. The port keeps nearest-rank percentiles, the per-fork spread, and the coordinated-omission back-fill unchanged, since none of that is language-specific.
+```go
+func (h *Harness) timeIteration(body BenchmarkBody) (int64, error) {
+    start := h.ticker.NanoTime()
+    for op := 0; op < h.config.OpsPerIteration; op++ {
+        body(&h.blackhole)
+    }
+    end := h.ticker.NanoTime()
+    elapsed := end - start
+    if elapsed < 0 {
+        return 0, fmt.Errorf("%w: %d -> %d", ErrTickerBackwards, start, end)
+    }
+    return elapsed / int64(h.config.OpsPerIteration), nil
+}
+```
+
+`code/go/main.go` keeps every type and the scripted-ticker invariant (two readings per iteration). What differs:
+
+- **Errors are values.** `Harness.Run`, `Percentile`, `LatencyRecorder.Record`, and `SampleProfile.Record` return an `error` instead of throwing; `ErrTickerBackwards` and `ErrNoSamples` are sentinels the tests match with `errors.Is`. The one deliberate panic is `FakeTicker` running out of script: that is a harness bug, not a runtime condition, so it fails as loudly as Java's `IllegalStateException`.
+- **The ticker is `time.Since(origin)`.** Go's `time.Now()` carries a monotonic reading since 1.9, and `time.Since` subtracts on it, so the harness never sees a wall-clock jump. There is no JIT, so section 1's warm-up drop is small; the compiler still eliminates dead stores, which is why the `Blackhole` XOR fold stays.
+- **Different structures, same question.** Go has no `LinkedList` or `TreeMap` in the standard library, so section 2 compares a slice with `container/list` (the index read walks `Front()` and `Next()`, the O(n) pointer chase) and section 3 compares `map` with a `SortedMap` built on `sort.SearchInts`, the same stand-in the Python port uses.
+- **Seeded data matches Java.** `JavaRandom` reproduces `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so all three languages benchmark the same index sequence; the test pins the first five values of `SeededInts(100, 42)`. Sections 4 and 5 print the same numbers as Java.
+
+```bash
+cd phases/00-setup-and-tooling/05-benchmarking-and-profiling/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

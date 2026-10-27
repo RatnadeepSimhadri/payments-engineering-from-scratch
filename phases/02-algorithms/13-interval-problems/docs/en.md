@@ -3,7 +3,7 @@
 > Holds, authorizations, and overlapping settlement windows.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 2, Lesson 01 (Sorting Algorithms), Phase 2, Lesson 07 (Greedy Algorithms and Exchange Arguments), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~60 minutes
 
@@ -377,9 +377,39 @@ python3 -m unittest -v
 
 The demo output is identical to the Java run; the suite covers the Java's 46 checks plus the float guard. The test file carries a port of `java.util.Random` so the 100 random instances match.
 
-### Porting notes
+### In Go
 
-Go has no tuple sort key; `sort.Slice` with a two-clause `less` function does it, and `sort.SliceStable` is not required here because the `(time, delta)` key is total for the events that matter. Go's `Money` arithmetic needs the explicit overflow checks from Phase 10, Lesson 01. Keep intervals half-open and keep the `-1 before +1` rule; it is the single most common porting error for sweep lines.
+```go
+// event is one endpoint of an interval in a sweep: +1 at a start, -1 at an end.
+type event struct {
+    time  int64
+    delta int
+    idx   int
+}
+
+// -1 before +1 at equal times: an interval ending at t does not overlap one starting at t.
+func byTimeThenDelta(a, b event) int {
+    return cmp.Or(cmp.Compare(a.time, b.time), cmp.Compare(a.delta, b.delta))
+}
+...
+slices.SortStableFunc(events, byTimeThenDelta)
+```
+
+`Interval`, `Peak`, `Hold`, `HoldBook`, and `PeakExposure` keep their names and algorithms; three things differ, all in `code/go/main.go`:
+
+- **Ordering is a function, and the event sort is stable on purpose.** `Interval.Compare` is the start-then-end order of the Java `compareTo`, passed as a method expression to `slices.SortFunc(sorted, Interval.Compare)`. Events are a small struct rather than a `long[]`, and `byTimeThenDelta` is the two-key comparator; `MaxOverlap` and `PeakExposure` sort with `slices.SortStableFunc` because Java's `List.sort` is stable and two holds that start at the same instant must be processed in insertion order for `HoldsOpen` to match. Changing `-1`/`+1` to a boolean silently counts touching windows as overlapping; the "touching intervals count as 1" test catches it.
+- **`Money` arithmetic is checked.** Go's `int64` wraps like Java's `long`, so `Plus` and `Minus` in `money.go` go through `addChecked`/`subChecked` and return `ErrOverflow` where `Math.addExact` throws. That makes `Coverage`, `ExposureAt`, and `PeakExposure` return `(T, error)`; a test sums an interval of length `MaxInt64` with another to see `Coverage` report rather than wrap.
+- **Errors are values.** `NewInterval`, `NewHold`, and `HoldBook.Add` return errors with the sentinels `ErrEndBeforeStart`, `ErrNonPositive`, and `ErrWrongBook`; `NewCurrency` rejects a lowercase code as the Java compact constructor does. Structs compare with `==`, so `MaxOverlap(windows) == Peak{2, 900}` reads like the Java record equality.
+
+The test file replays `java.util.Random(13)` through `javarandom.go`, so the 100 random instances are the ones the Java test checks.
+
+```bash
+cd phases/02-algorithms/13-interval-problems/code/go
+go run .
+go test ./...
+```
+
+The demo output is identical to the Java run; the suite covers the Java's 46 checks plus 4 for the overflow guards and the currency-code rule.
 
 ## Use It
 

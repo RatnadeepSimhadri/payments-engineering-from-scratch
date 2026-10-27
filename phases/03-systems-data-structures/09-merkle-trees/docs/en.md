@@ -3,7 +3,7 @@
 > Verify two ledgers agree by comparing one hash.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 3, Lesson 01 (Bloom Filters)
 **Time:** ~75 minutes
 
@@ -372,9 +372,34 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The design ports to Go without structural change. Go's `crypto/sha256` gives `sha256.New()` with `Write` and `Sum(nil)`, and `crypto/subtle.ConstantTimeCompare` for the final check; `levels` becomes `[][][]byte`, `proof` returns `([]ProofStep, error)` for an out-of-range index, and `diff` returns `(Diff, error)` for a leaf-count mismatch instead of panicking. The canonical posting bytes must be identical in every language, so keep the integer-minor-units `|`-separated form and pin the eight-posting root `4d637a9b...` as a constant in the Go tests too.
+`code/go/main.go` has the same records as structs (`Currency`, `Money`, `Posting`, `ProofStep`, `Diff`) and the same `MerkleTree` methods in exported CamelCase (`HashLeaf`, `HashNode`, `Proof`, `Verify`, `Diff`, `OfPostings`). The demo prints the same root, `4d637a9b...`, and the Go tests pin it as a constant. Three things differ:
+
+- **`crypto/sha256` and `crypto/subtle` replace `MessageDigest`.** `sha256.New()` has the same `Write`/`Sum` shape, so the domain-separated hashes read line for line like the Java code. The final root comparison uses `subtle.ConstantTimeCompare`, the constant-time counterpart of `MessageDigest.isEqual`:
+
+```go
+func Verify(leafData []byte, proof []ProofStep, expectedRoot []byte) bool {
+    h := HashLeaf(leafData)
+    for _, step := range proof {
+        if step.SiblingOnLeft {
+            h = HashNode(step.Sibling, h)
+        } else {
+            h = HashNode(h, step.Sibling)
+        }
+    }
+    return subtle.ConstantTimeCompare(h, expectedRoot) == 1
+}
+```
+
+- **Slices alias, so the copies stay.** A `[]byte` handed out of `Root()` or `LeafHash()` shares memory with the tree unless it is cloned, so `bytes.Clone` does what Java's `clone()` did; the test writes into the returned root and checks the tree is unharmed. `levels` is `[][][]byte`.
+- **Errors are values.** `NewMerkleTree` and `Diff` return `ErrInvalidArgument` for an empty tree or a leaf-count mismatch, and `Proof` returns `ErrIndexOutOfBounds` where Java's `Objects.checkIndex` throws; the tests use `errors.Is`. `Money` is the lesson's own `int64` minor units plus `Currency`; the canonical posting bytes are the same `|`-separated integer form, which is why the root matches.
+
+```bash
+cd phases/03-systems-data-structures/09-merkle-trees/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

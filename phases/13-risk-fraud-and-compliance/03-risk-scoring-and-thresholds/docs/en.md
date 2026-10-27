@@ -3,7 +3,7 @@
 > A score is useless without the threshold decision.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 13, Lesson 01 (Fraud Patterns); Phase 13, Lesson 02 (A Rules Engine with Velocity Checks); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -510,9 +510,40 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `math/rand` with `rand.New(rand.NewSource(seed))` produces a different stream from `java.util.Random`, so either port the 48-bit LCG (as the Python version does) or assert properties (positive weights, AUC > 0.95, conservation) rather than exact numbers, which the Java tests already do. Use `sort.SliceStable` for the AUC ranking and `Money` as an `int64` struct with `(Money, error)` returns for overflow. No concurrency is needed; scoring is pure and safe to share across goroutines once trained.
+```go
+func (r *JavaRandom) NextGaussian() float64 {
+    if r.haveNextNextGaussian {
+        r.haveNextNextGaussian = false
+        return r.nextNextGaussian
+    }
+    for {
+        v1 := 2*r.NextDouble() - 1
+        v2 := 2*r.NextDouble() - 1
+        s := v1*v1 + v2*v2
+        if s >= 1 || s == 0 { continue }
+        multiplier := math.Sqrt(-2 * math.Log(s) / s)
+        r.nextNextGaussian = v2 * multiplier
+        r.haveNextNextGaussian = true
+        return v1 * multiplier
+    }
+}
+```
+
+`code/go/main.go` prints the same dataset counts, weights, sweep table, band, calibration bins, and explanations as the Java version, digit for digit. What it took:
+
+- **`java.util.Random` is ported, not replaced.** `math/rand` would generate a different dataset. `JavaRandom` is the 48-bit LCG with `next(bits)`, `NextInt(bound)`, `NextDouble`, and the polar-method `NextGaussian` with its cached second value; `Shuffle` is `Collections.shuffle`. Same seed, same 20,000 rows, same 14,000/6,000 split.
+- **Floating point is kept un-fused.** Go may fuse `a*b + c` into one rounding on some CPUs, which would make the 400-epoch gradient descent drift from Java's two roundings. The hot loops write `z += float64(w[i] * x)`: the explicit conversion forbids fusion, so the weights match to the last bit.
+- **Java's rounding rules are explicit.** `javaRound` is `Math.round` (`floor(x + 0.5)`, so -2.5 gives -2 where `math.Round` gives -3), and `jf` reproduces `String.format("%.Nf")`, which rounds the shortest decimal representation half up; Go's `%f` rounds the binary value half to even, so `0.125` would print `0.12`. A test pins both.
+- **Errors are values; money stays integer.** `NewFeatures`, `NewScorecard`, and `NewDecisionEngine` return sentinel errors (`ErrFeatureCount`, `ErrInvertedBand`) checked with `errors.Is`. `Money.Plus`, `Minus`, and `Times` return `(Money, error)` with `ErrOverflow`/`ErrCurrencyMismatch`; `Compare` panics on a mismatch because it has no error slot. The cost model unwraps with `must`, since no overflow is reachable from the demo's amounts.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Write-optimized storage, built with a sorted map and some files.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 3, Lesson 01 (Bloom Filters from Scratch), Phase 3, Lesson 04 (B-Trees and Why Databases Love Them), Phase 1, Lesson 09 (Merge Sort and k-Way Merge)
 **Time:** ~120 minutes
 
@@ -370,9 +370,30 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go has no ordered map: use a slice kept sorted with `sort.Search` for the memtable or a skip list from Lesson 07, `encoding/binary` for the file format, and `container/heap` for the merge; `[]byte` files in a `map[string][]byte` are the disk. The only sharp edge is that the test for "disk files equal live tables" depends on deleting inputs after writing the output, in that order.
+`code/go/main.go` has the same types (`Entry`, `BloomFilter`, `SimulatedDisk`, `Memtable`, `SSTable`, `LsmTree`) and the same file format byte for byte, so the demo's disk totals, table sizes, and write amplification match Java's exactly. Four things differ:
+
+- **No ordered map in the standard library.** `sortedmap.go` is a small `SortedMap`: a sorted `[]string` of keys found with `sort.SearchStrings` plus a `map[string]Entry`. It stands in for every `TreeMap` the Java passes around (memtable, decoded blocks, compaction output) and offers `Keys`, `FirstKey`, `LastKey`, `SubMap(lo, hi)`, and `Equal`. `fullTier` uses `slices.SortStableFunc` because Java's `List.sort` is stable and the order of same-size tables decides which tier compacts first.
+- **`encoding/binary` replaces `DataOutputStream`.** `writeInt`, `writeLong`, and `writeBoolean` become big-endian appends. `writeUTF` is not plain UTF-8: it writes a 2-byte length and then *modified* UTF-8 (NUL as `C0 80`, characters outside the BMP as two 3-byte surrogates), so `writeUTF` and `readUTF` encode via `unicode/utf16` and a test pins the bytes against Java's output. Reads use `io.ReadFull`, because a `bytes.Reader` reports `EOF` even for a zero-length read when the empty tombstone value is the last thing in the file.
+- **`container/heap` is the k-way merge.** A `cursorHeap` orders cursors by key, then by descending `Seq` so the newest version pops first:
+
+```go
+func (h cursorHeap) Less(i, j int) bool {
+    if h[i].key() != h[j].key() {
+        return h[i].key() < h[j].key()
+    }
+    return h[i].entry().Seq > h[j].entry().Seq // newest first on ties
+}
+```
+
+- **Absence and errors are values.** `Get` returns `(string, bool)` because Go strings cannot be null, which also removes Java's "null value is not a delete" path: `Delete` is the only way to write a tombstone. `SimulatedDisk.Write` returns `ErrIllegalState` for a second write to the same name, `NewLsmTree` returns `ErrInvalidArgument` for bad limits, and `CheckInvariants` returns an error instead of throwing. `Range` returns `[]KV` in key order rather than a `NavigableMap`. The demo uses `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random`), so the payment statuses and every counter match line for line.
+
+```bash
+cd phases/03-systems-data-structures/05-lsm-trees/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Ten deposits of $9,900.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 05 (Sliding Windows and Two Pointers), Phase 13, Lesson 02 (Rules Engine and Velocity Checks), Phase 13, Lesson 03 (Risk Scoring and Thresholds)
 **Time:** ~90 minutes
 
@@ -377,9 +377,38 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go's `rand.New(rand.NewSource(seed))` gives a deterministic population but not the Java one, so the Go tests should either port `java.util.Random`'s LCG (as the Python version does) or assert on properties (planted accounts found, laundromat alerts at 80% and not at 93%) rather than on transaction counts. Go would return `([]Alert, error)` from `Evaluate` and a sentinel `ErrMissingParam` from the scenario; the `Map<String, Long>` becomes `map[string]int64`. Nothing here is concurrent; if accounts were evaluated in parallel goroutines, the alert slice would need a mutex or a channel fan-in, and `go test -race` would confirm it.
+```go
+type paramReader struct {
+    s   Scenario
+    err error
+}
+
+func (p *paramReader) get(name string) int64 {
+    v, err := p.s.Param(name)
+    if err != nil && p.err == nil {
+        p.err = err
+    }
+    return v
+}
+
+func (e *MonitoringEngine) Evaluate(transactions []Transaction) ([]Alert, error) { ... }
+```
+
+`code/go/main.go` has the same scenarios, detectors, merge step, and generator, and its demo prints the same population (1,792 transactions), the same four alerts with the same scores and evidence, and the same first alert in full. What differs:
+
+- **Errors are values.** `Scenario.Param` returns `ErrMissingParam`, and each detector reads its parameters through a small `paramReader` that remembers the first miss, so `Evaluate` returns `([]Alert, error)` instead of throwing mid-sweep. `NewTransaction` returns `ErrNonPositiveAmount`, `NewMonitoringEngine` returns `ErrDuplicateScenario`, and `Money.Plus`/`Minus`/`BasisPoints` return `(Money, error)`; the detectors unwrap them with `must` because every operand there is USD and the sums cannot overflow.
+- **Integer division is already Java's.** Go's `/` and `%` truncate toward zero exactly like Java, so the scores, the half-even `BasisPoints`, and the 96% pass-through split need no helper; the Python port had to write `jdiv` for the same lines.
+- **The generator is `java.util.Random`.** `JavaRandom` ports the 48-bit LCG and `NextInt(bound)`, and `NormalAccount` draws its random numbers into local variables in the order Java evaluates the call's arguments (counterparty, amount, hour, minute). Change that order and every account changes.
+- **Ordering is explicit.** Go maps are unordered, so accounts are evaluated in sorted order (Java's `TreeMap`), transactions sort on `(timestamp, id)` with `sort.SliceStable`, alerts on `(-severity, -score, account, scenario)`, and the generator keeps its planted accounts in a slice beside the map. The one harmless difference is the scenario parameter line: Java prints `Map.of(...)` in an order that changes between JVM runs; Go prints the parameters in declaration order.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

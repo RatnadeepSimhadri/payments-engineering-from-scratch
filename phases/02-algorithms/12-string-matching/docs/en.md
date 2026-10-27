@@ -3,7 +3,7 @@
 > Sanctions screening scans millions of names against thousands of patterns.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 12 (Strings and Encodings), Phase 1, Lesson 13 (Tries), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 2, Lesson 08 (Graph Traversal)
 **Time:** ~90 minutes
 
@@ -382,9 +382,44 @@ python3 -m unittest -v
 
 The demo output is identical to the Java run, and the suite runs the same 38 checks.
 
-### Porting notes
+### In Go
 
-Go strings are bytes; the natural port works on `[]rune` after `[]rune(s)` conversion, or on bytes with `BASE = 256` exactly, and the trie's children map is `map[rune]*node`. Go has no exceptions, so the empty-pattern check returns an error from a constructor function. The automaton's BFS is identical.
+```go
+func (m *KmpMatcher) Search(text string) []int {
+    hits := []int{}
+    j, i := 0, 0
+    for _, c := range text { // ranging a string yields code points, not bytes
+        for j > 0 && c != m.pattern[j] {
+            j = m.fail[j-1]
+        }
+        if c == m.pattern[j] {
+            j++
+        }
+        if j == len(m.pattern) {
+            hits = append(hits, i-j+1)
+            j = m.fail[j-1]
+        }
+        i++
+    }
+    return hits
+}
+```
+
+The five types and the `Match` record keep their names and algorithms; three things differ, all in `code/go/main.go`:
+
+- **Strings are bytes, so the matchers work on runes.** `text[i]` in Go is a byte, and `"ü"` is two of them; indexing bytes would report `müller` matches at offsets 1 and 9 instead of the lesson's 1 and 8. Every matcher converts with `[]rune(s)` or ranges over the string (which yields code points) and keeps its own rune counter, so indices, hashes, and matches equal the Java's for the Basic Multilingual Plane. The trie's children live in a `map[rune]*acNode`, `Hash` widens each rune to `int64` the way Java widens a `char`, and `Normalize` uses `strings.ToUpper` with `unicode.IsLetter`/`IsDigit`.
+- **Map iteration order is random, and the automaton must not care.** Java's `HashMap` has an unspecified but stable order; Go deliberately randomizes it between runs. The Aho-Corasick BFS visits siblings in whatever order the map yields, which is fine because the construction only needs every node at depth *d* linked before depth *d+1*; a test builds the automaton twenty times and checks the matches never change. The failure-link and output-link rules are the same lines as the Java.
+- **Errors are values.** `NaiveSearch`, `NewKmpMatcher`, `NewRabinKarpMatcher`, `NewAhoCorasick`, and `NewSanctionsScreener` return `(T, error)`, and an empty pattern is the sentinel `ErrEmptyPattern`, checked with `errors.Is`. `Failure()` returns `slices.Clone` of the table, and the test mutates the copy to prove it. Go's `%` on a negative `int64` is negative, exactly like Java's, so the `+ Mod` in `Roll` is load-bearing here.
+
+The test file replays `java.util.Random(7)` through `javarandom.go`, so the 300 random strings are the same inputs as the Java run.
+
+```bash
+cd phases/02-algorithms/12-string-matching/code/go
+go run .
+go test ./...
+```
+
+The demo output is identical to the Java run; the suite runs the Java's 38 checks plus 5 for the empty-pattern sentinel, the hash value, build determinism, and the automaton size.
 
 ## Use It
 

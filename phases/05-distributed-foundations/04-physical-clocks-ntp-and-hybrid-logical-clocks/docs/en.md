@@ -3,7 +3,7 @@
 > Clock skew is why your timestamps cannot order transactions.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 03 (Time, Order, and Clocks: Lamport and Vector Clocks), Phase 5, Lesson 02 (Failure Models)
 **Time:** ~75 minutes
 
@@ -389,9 +389,31 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go's `time.Time` carries both a wall and a monotonic reading since Go 1.9, which is why `time.Since` was the Cloudflare fix; an HLC in Go would hold `l` and `c` as `int64`/`uint16` and return `(HlcTimestamp, error)` from `Receive` for the drift bound instead of throwing. Keep the same type names (`DriftingClock`, `NtpSample`, `HybridLogicalClock`) and the same 40 test cases. `math/rand` is a different generator from `java.util.Random`, so either port the 48-bit LCG as the Python version does or document the seed and accept that the jittery-sample values in the demo differ; the invariants the tests check will not.
+`code/go/main.go` keeps every type and method (`TrueTime`, `DriftingClock`, `NtpSample`, `NtpClient`, `HlcTimestamp`, `HybridLogicalClock`, `Node`, `Trace`) and prints the same demo, digit for digit, including the jittery NTP samples. Three things differ.
+
+- **The drift bound is an error value.** `HybridLogicalClock.Now` and `Receive` return `(HlcTimestamp, error)`. A remote timestamp beyond the bound comes back as a `*ClockDriftError` (matching `ErrClockDrift` under `errors.Is`) and the clock is left exactly as it was, because `commit` validates before it mutates. A 65,536th event in one millisecond is `ErrCounterOverflow`, and `NewHlcTimestamp` returns `ErrCounterOutOfRange` or `ErrLogicalOutOfRange` where the Java compact constructor throws. `Node.Local`, `Trace.Record` and `PaymentTrace` propagate the error instead of letting it escape as an exception.
+- **Integer semantics match, rounding does not.** Go's `/` truncates toward zero like Java's, so `NtpSample.Offset` needs no helper (the test pins a client-ahead sample at `-160`). `Math.round` is `floor(x + 0.5)`, which Go's `math.Round` is not (`math.Round(-2.5)` is `-3`), so `DriftingClock.Now` uses `javaRound`. `Unpack` shifts with `uint64` to get Java's `>>>`.
+- **The generator is ported, not substituted.** `javarandom.go` reproduces `java.util.Random`'s 48-bit LCG and the JDK 17+ `nextLong(bound)` rejection loop, so seed 7 draws `33, 16, 8, 7` and the best-of-8 correction is 146 ms in all three languages. `math/rand` would have given different jitter and a different residual.
+
+```go
+func (h *HybridLogicalClock) commit(newL int64, newC int, pt int64) (HlcTimestamp, error) {
+    if newL-pt > h.maxDriftMs {
+        return HlcTimestamp{}, &ClockDriftError{newL, pt, h.maxDriftMs}
+    }
+    h.l, h.c = newL, newC
+    return HlcTimestamp{h.l, h.c}, nil
+}
+```
+
+For real clocks, Go's `time.Time` carries both a wall and a monotonic reading since Go 1.9, which is why `time.Since` was the Cloudflare fix; the lesson reads neither, because every clock derives from the injected `TrueTime`.
+
+```bash
+cd phases/05-distributed-foundations/04-physical-clocks-ntp-and-hybrid-logical-clocks/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Commit the row and the event in one transaction or lose one of them.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs), Phase 7, Lesson 11 (Change Data Capture), Phase 7, Lesson 12 (The Saga Pattern)
 **Time:** ~90 minutes
 
@@ -391,9 +391,48 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The design ports directly. In Go, `Tx.Commit()` and `Broker.Publish()` return `error`, `BrokerUnavailable` is a sentinel for `errors.Is`, and the injected crash is a returned `ErrCrash` rather than a panic so `poll()` can be tested without `recover()`. A Go relay that runs as a goroutine with a ticker is the natural next step, and its tests then need `-race`; the single-threaded version here needs neither.
+```go
+func (r *OutboxRelay) Poll() (int, error) {
+    r.Polls++
+    marked := 0
+    for _, e := range r.store.Unpublished(r.BatchSize) {
+        if _, err := r.broker.Publish(e.EventID, e.AggregateID, e.Type, e.Payload); err != nil {
+            if errors.Is(err, ErrBrokerUnavailable) {
+                r.FailedAttempts++
+                return marked, nil // leave the row pending; retry next poll
+            }
+            return marked, err
+        }
+        r.Published++
+        if r.CrashPoint == AfterPublishBeforeMark {
+            r.CrashPoint = NoCrash
+            return marked, &CrashError{"after publish of " + e.EventID + ", before mark"}
+        }
+        if err := r.store.Begin().MarkPublished(e.Seq).Commit(); err != nil {
+            return marked, err
+        }
+        marked++
+    }
+    return marked, nil
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Errors are values, and the two failures are different values.** `Broker.Publish` returns `(offset, error)` with the sentinel `ErrBrokerUnavailable`; the relay treats it as the expected, transient outcome (count it, keep the row pending, return `nil`). The injected crash is a `*CrashError` that matches `ErrCrash` through `errors.Is` and is *returned* from `Poll`, `Drain` and `DualWritePaymentService.Accept` rather than thrown, so tests assert on it without `recover()` and the demo prints `err.Error()`. `Tx.Commit`/`Rollback` return `ErrTxClosed` on reuse; a duplicate payment id is remembered by the chaining `InsertPayment` and reported by `Tx.Err()` and `Commit` as `ErrDuplicatePayment`, so the transaction fails as a whole.
+- **Chaining without exceptions.** `store.Begin().InsertPayment(p).InsertOutbox(...).Commit()` reads exactly like the Java, because `InsertPayment`, `InsertOutbox` and `MarkPublished` keep returning `*Tx` and stash the first error for `Commit` to surface. The nested `Store.Tx` becomes a top-level `Tx` holding a `*Store`.
+- **Ordered data without `LinkedHashMap`.** The outbox is a `map[int64]OutboxEvent` keyed by `Seq`, and `OutboxRows` walks `1..nextSeq-1` so commit order is the iteration order; `Unpublished(limit)` builds on it. `OutboxEvent.MarkPublished` returns a modified copy of a value struct, the Go spelling of the Java record's `markPublished()`.
+- **Money and payloads.** `Money.Plus` returns `(Money, error)`; `ParseMoney` returns `(Money, error)` from `strconv.ParseInt`, so `LedgerConsumer.Consume` returns `(applied, error)` instead of silently accepting a malformed payload. No goroutines: the relay is a polling loop driven by the test, so `go test -race` passes without a mutex. A relay goroutine with a `time.Ticker` is the natural next step, and then the store needs one.
+
+```bash
+cd phases/07-storage-and-transactions/13-transactional-outbox/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same six sections as the Java version, line for line.
 
 ## Use It
 

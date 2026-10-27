@@ -3,7 +3,7 @@
 > Serializable the old way: hold every lock you take until you commit, and when two transactions each wait for the other, pick one and kill it.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 7, Lesson 04 (Isolation Levels and Their Anomalies), Phase 4, Lesson 07 (Deadlocks, Lock Ordering, and Detection), Phase 2, Lesson 08 (Graph Traversal: BFS and DFS), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -436,9 +436,40 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port uses `map[int]LockMode` for holders and a slice for the queue, returns `(granted bool)` from `Acquire` and `error` from the two-phase check with a sentinel `ErrTwoPhaseViolation`; `sealed interface Op` becomes an interface with a type switch. The port needs no goroutines: concurrency is modelled by the scheduler's interleaving, which is what makes every deadlock replayable. A port that does add real goroutines must run `acquire`, `releaseAll`, and the detector under one mutex, since the lock table is itself shared state, and should run detection on a timer rather than on every wait.
+```go
+// Op is Java's sealed interface; the scheduler dispatches with a type switch.
+type Op interface{ isOp() }
+
+type OpRead struct{ Key string }
+type OpAdd struct {
+    Key   string
+    Delta Money
+}
+
+func (s *Scheduler) lock(t *Txn, key string, mode LockMode) (bool, error) {
+    if t.Phase == Shrinking && !containsString(s.Locks.KeysHeldBy(t.ID), key) {
+        return false, fmt.Errorf("%w: T%d requested %s(%s) after releasing a lock", ErrTwoPhaseViolation, t.ID, mode, key)
+    }
+    return s.Locks.Acquire(t.ID, key, mode), nil
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Two kinds of "no".** `Acquire` returns a plain `bool` (granted now, or queued), exactly as in Java, because waiting is a normal outcome. The two-phase rule is a programming error in the script, so `Step`, `Run`, `Abort` and `DetectAndResolve` return an `error` that wraps the sentinel `ErrTwoPhaseViolation` (checked with `errors.Is`) instead of throwing; `Money.Plus` returns `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow`, so an in-place `OpAdd` can never silently wrap an `int64`. `DetectAndResolve` returns `(victim, found, err)` in place of `Optional<Integer>`.
+- **Sealed interface to type switch.** `Op` is an interface with an unexported marker method; `OpRead`, `OpAdd`, `OpUnlock`, `OpCommit` are the four permitted structs, and `execute` is a `switch o := op.(type)`. The compiler does not check exhaustiveness the way Java's `switch` over a sealed type does, so the switch has no `default` on purpose: an unknown `Op` would simply be treated as a no-op step.
+- **Ordered maps by hand.** `TreeMap` iteration becomes `sortedKeys`/`sortedIntKeys` wherever order is observable (`ReleaseAll`, `KeysHeldBy`, the wait-for graph's DFS start order, `Txns` in round-robin). The `LinkedHashMap` undo log is a key slice plus a map so `Abort` can replay it in reverse. The lock manager appends to the scheduler's log through a `*[]string`, mirroring the shared `List<String>` in Java.
+- **No goroutines.** Concurrency is modelled by the scheduler's interleaving, which is what makes every deadlock replayable, so there is no mutex and `go test -race` passes trivially. A port that drives transactions from goroutines must run `Acquire`, `ReleaseAll` and the detector under one mutex, and should run detection on a timer rather than on every wait.
+
+```bash
+cd phases/07-storage-and-transactions/05-two-phase-locking/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same four traces as the Java version, line for line.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Sloppy quorums, hinted handoff, and read repair.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 6, Lesson 01 (Replication: Leader-Based, Multi-Leader, Leaderless); Phase 6, Lesson 02 (Replication Lag and Read-Your-Writes); Phase 5, Lesson 05 (Consistency Models)
 **Time:** ~75 minutes
 
@@ -371,9 +371,36 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The design is three maps and a predicate, and ports directly to Go. `Versioned` is a comparable struct so it can be a map value and a set element without further work; `Put` returns `bool` as here, and `QuorumNotReached` becomes a sentinel error checked with `errors.Is`. Keep the SplitMix64 generator and the order in which `reachable` consumes it identical, because the experiment table's numbers depend on it. A real implementation sends the N requests concurrently and waits for the first W or R; that changes latency, not the intersection argument, and in Go is a `sync.WaitGroup` plus a channel.
+```go
+func JavaStringHash(s string) int32 {
+    var h int32
+    for _, u := range utf16.Encode([]rune(s)) {
+        h = 31*h + int32(u)
+    }
+    return h
+}
+
+func (s *QuorumStore) HomeNodes(key string) []int {
+    start := floorMod(JavaStringHash(key), len(s.Nodes))
+    ...
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Placement needs Java's `String.hashCode`.** Go has no object hash, so `JavaStringHash` runs `31*h + c` over UTF-16 code units on an `int32`, which wraps exactly like Java's `int`; `floorMod` then does what `Math.floorMod` does, because Go's `%` keeps the sign of the dividend. The test pins the same three known values as the Python port, including the one that lands on `math.MinInt32`.
+- **Errors are values.** `Put` returns `(acks, error)` and `Get` returns `(ReadResult, error)`; both wrap the sentinel `ErrQuorumNotReached`, which tests check with `errors.Is`. `NewQuorumConfig` and `NewQuorumStore` return `ErrBadConfig`; `MustConfig`/`MustStore` panic on it and exist only so the demo can pass literals. `Experiment.run` is `RunExperiment`, and a failed write is `if _, err := store.Put(...); err != nil { continue }`.
+- **Absence is a flag, not `null`.** `None` is a `Versioned` with timestamp -1 and `IsNone()`; `ReadResult.Value()` returns `(string, bool)`. `Versioned` is a comparable struct, so `ReplicasAgree` can use it as a `map` key the way the Java uses a `HashSet`.
+- **Map order is made explicit.** `Handoff` sorts hint targets and keys before delivering, because the Java `TreeMap` iterates in order and `Network.Reachable` consumes the RNG in that order; `AntiEntropy` sorts the key set so the event log is stable. With that, the experiment table matches the Java numbers exactly.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Last-writer-wins loses data by design.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 03 (Lamport and Vector Clocks), Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks), Phase 6, Lesson 01 (Replication Strategies), Phase 6, Lesson 08 (CRDTs)
 **Time:** ~75 minutes
 
@@ -362,9 +362,37 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `map[string]int64` for the vector, a `Dot` struct, `Versioned[V any]` generic struct, and `MergeFunc[V any] func([]V) V`; record equality becomes a hand-written `Equal` because struct equality on a map field does not compile; map iteration must be sorted before printing. The port needs no concurrency primitives: the stores are single-threaded by design, and a production port would wrap each key's sibling list in a mutex or an actor.
+```go
+type MergeFunction[V any] func(siblings []V) V
+
+func Maximal[V any](all []Versioned[V]) []Versioned[V] {
+    out := []Versioned[V]{}
+    for i, candidate := range all {
+        obsolete := false
+        for j, other := range all {
+            if j != i && candidate.ObsoletedBy(other) { obsolete = true; break }
+        }
+        if !obsolete && !containsVersioned(out, candidate) { out = append(out, candidate) }
+    }
+    return out
+}
+```
+
+`code/go/main.go` keeps every type and method name; the demo prints the same lines as the Java. What differs:
+
+- **Identity versus equality.** Java's `maximal` compares `other != candidate` by reference and `out.contains(candidate)` by `equals`. Go has no reference identity for struct values, so the slice index plays the first role and a hand-written `Equal` the second. `Versioned.Equal` compares the dot and the context: a dot is minted once and always carries the same value, so this is the record equality without demanding `V comparable`, which `CaseFile` (a map of notes) could not satisfy.
+- **Generics carry the value type.** `Versioned[V]`, `LWWStore[V]`, `SiblingStore[V]`, `ReadResult[V]` and `MergeFunction[V]` are generic; `UnionMax` and `UnionNotesStrictestStatus` are package-level `MergeFunction` values, called as plain functions.
+- **Absence and errors are values.** `LWWStore.Get` and `SiblingStore.Resolve` return `(V, bool)` where the Java returns `null`; `Entry.Beats` takes a found flag instead of a nullable argument; `CaseFile.WithStatus` returns `ErrUnknownStatus` and `MustStatus` panics on it for literals in the demo.
+- **Maps have no order and no `==`.** `VersionVector`, `Cart` and `CaseFile` wrap maps and define `Equal`; `fmtMap` and `fmtSet` sort keys to reproduce `{A=1, B=1}` and `[a, b]`, and `MergeFrom` walks the other replica's keys in sorted order so the result is the same every run.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

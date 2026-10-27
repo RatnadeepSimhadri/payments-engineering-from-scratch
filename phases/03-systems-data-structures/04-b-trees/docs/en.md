@@ -3,7 +3,7 @@
 > Pages, fan-out, and the disk access pattern behind every index.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 3, Lesson 03 (Balanced Trees: AVL and Red-Black), Phase 1, Lesson 03 (Binary Search), Phase 0, Lesson 09 (Memory, Caches, and Why Arrays Win)
 **Time:** ~120 minutes
 
@@ -383,9 +383,29 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The design ports to Go without change. Go uses slices with `append` and `copy` for the split and merge bookkeeping and needs care that the right sibling gets a fresh backing array rather than aliasing the left's; generics (`[K cmp.Ordered, V any]`) replace `Comparable`. It needs no concurrency. The `PageStats` counters are plain integers, and the tests assert the same read counts, which is a useful cross-language check that the implementations visit the same pages.
+`code/go/main.go` keeps the same names: `PageStats`, `BTree[K cmp.Ordered, V any]` with `LowerBound`, `Put`, `Remove`, `Range`, `CheckInvariants`, `HeightBound`, and an unexported `split` struct in place of the Java record. Three things differ:
+
+- **Slices replace `ArrayList`, and the right page must not alias the left.** `slices.Insert` and `slices.Delete` do the in-page shifts that `add(i, x)` and `remove(i)` did. A split re-slices the left page down to the median and gives the right page a `slices.Clone` of the upper half; without the clone both pages would share one backing array and a later `slices.Insert` into the left would overwrite the right's keys:
+
+```go
+right := &Node[K, V]{
+    Keys:   slices.Clone(n.Keys[mid+1:]),
+    Values: slices.Clone(n.Values[mid+1:]),
+}
+n.Keys = n.Keys[:mid]
+n.Values = n.Values[:mid]
+```
+
+- **Absence and violations are values.** `Get` returns `(V, bool)` because a `V` of `int` has no `null`; `NewBTree(order)` returns `(*BTree, error)` with `ErrInvalidArgument` for an order below 3; `CheckInvariants` returns an `error` wrapping `ErrInvariantViolated` instead of throwing `IllegalStateException`. `verify` carries `*K` separator bounds so "no bound" is `nil`. The `Stats` field is a pointer so `sequential.Stats.Reset()` mutates the tree's counters, as the Java field does.
+- **Same random keys, same page counts.** The demo's random ids come from `JavaRandom` (`javarandom.go`), a bit-exact port of `java.util.Random`, with `NextLong() & math.MaxInt64` standing in for `nextLong() & Long.MAX_VALUE`, and `Shuffle` reproducing `Collections.shuffle`. The node, split, read, write, and merge counts are identical to Java's, which is a strong check that both versions touch the same pages.
+
+```bash
+cd phases/03-systems-data-structures/04-b-trees/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Enumerating settlement allocations is a constrained search.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 2, Lesson 01 (Sorting)
 **Time:** ~75 minutes
 
@@ -375,9 +375,34 @@ python3 -m unittest -v
 
 Apart from the depth line, the demo output matches the Java run line for line. The suite covers the Java's 41 checks plus 4 for the recursion-limit behaviour.
 
-### Porting notes
+### In Go
 
-Go has growable goroutine stacks (up to 1 GB by default), so recursion depth is rarely the limit, but the same explicit-stack conversion applies and the `Frame` record becomes a struct; slices used as the `chosen` path must be copied at the leaf (`append([]Money(nil), chosen...)`) for the same reason the Java code copies `current`. `Money` stays integer minor units in `int64`.
+```go
+func SumRecursiveBounded(n, maxDepth int64) (int64, error) {
+    if maxDepth <= 0 {
+        return 0, ErrDepthBudget
+    }
+    if n == 0 {
+        return 0, nil
+    }
+    rest, err := SumRecursiveBounded(n-1, maxDepth-1)
+    return n + rest, err
+}
+```
+
+The enumerations, the allocator (recursive and explicit-stack), and N-Queens are the same code, and every count in the demo matches the Java run. Three things differ, all in `code/go/main.go`:
+
+- **The stack is not where the limit is.** A goroutine starts with a few kilobytes of stack and the runtime copies it to a larger one on demand, up to `debug.SetMaxStack` (1,000,000,000 bytes on 64-bit targets). The demo's probe, which overflows a JVM thread at roughly 10,000 trivial frames, runs to 1,000,000 frames in Go and stops because it is told to. When the ceiling *is* reached, the runtime prints `fatal error: stack overflow` and exits; it is not a panic, so `recover` never sees it. There is no Go equivalent of catching `StackOverflowError`. Code that recurses over untrusted depth carries its own budget: `SumRecursiveBounded` returns `ErrDepthBudget` where the Java test expects the error. No test depends on the depth the runtime allows; they assert that the budget fires and that the probe reaches a depth the JVM cannot.
+- **Slices alias.** `append` to the `current` path may write into a backing array an earlier frame still references, so every leaf copies with `slices.Clone` before saving it, exactly where the Java copies `current`. The iterative version clones `f.Chosen` before appending the taken item for the same reason; a test checks that no two subsets share storage.
+- **Errors are values.** `Combinations` and `Allocations` return `(T, error)` where the Java throws; `ErrKOutOfRange`, `ErrMixedCurrency`, and `ErrNonPositive` support `errors.Is`. Generics (`Permutations[T any]`) replace Java's erased `<T>`, and `[][]T` replaces `List<List<T>>`; a small `jstr` helper prints slices as `[A, B, C]` so the demo reads like the Java.
+
+```bash
+cd phases/02-algorithms/04-recursion-and-backtracking/code/go
+go run .
+go test ./...
+```
+
+Apart from the depth lines, the demo output matches the Java run line for line. The suite covers the Java's 41 checks (the stack-overflow check becomes the depth-budget check) plus 7 that pin the demo's node counts, the aliasing rule, and the probe.
 
 ## Use It
 

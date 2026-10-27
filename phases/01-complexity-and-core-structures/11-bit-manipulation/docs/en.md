@@ -3,7 +3,7 @@
 > Flags, bitmaps, and the bit tricks in ISO 8583 and Snowflake IDs.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes), Phase 1, Lesson 06 (Hash Maps from Scratch)
 **Time:** ~60 minutes
 
@@ -397,9 +397,38 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go has `uint64`, which is the honest type for a bitmap word and an ISO bitmap; `>>` on `uint64` is logical and on `int64` arithmetic, so the two shifts are one operator chosen by type. Go's `math/bits` provides `OnesCount64`, `TrailingZeros64`, and `Len64`. Go does not reduce the shift count mod 64: it panics or yields zero for an oversized shift.
+```go
+// IsSet tests one bit; the uint64 view is Java's >>>.
+func IsSet(v int64, bit int) bool { return (uint64(v)>>bit)&1 != 0 }
+
+// Extract reads width bits starting at shift as an unsigned value.
+func Extract(v int64, shift, width int) (int64, error) {
+    if err := checkField(shift, width); err != nil {
+        return 0, err
+    }
+    return int64(uint64(v)>>shift) & Mask(width), nil
+}
+
+func (b *Bitmap) NextSetBit(from int) int {
+    // ...
+    word := b.words[w] & (math.MaxUint64 << (from & 63)) // drop bits below from
+    idx := (w << 6) + bits.TrailingZeros64(word)
+```
+
+`code/go/main.go` keeps `Bits` (as package-level functions), `AccountFlags`, `Bitmap`, ISO 8583 encode/decode, and the Snowflake generator with the same layouts. What differs:
+
+- **One shift operator, chosen by type.** Go has no `>>>`: `>>` on a signed integer is arithmetic and on an unsigned integer is logical, so every place Java writes `v >>> n` the port writes `uint64(v) >> n`. `Bitmap` words are `[]uint64`, the honest type for a bit set, and the ISO 8583 bitmaps are built as `uint64` and parsed with `strconv.ParseUint`, which plays `Long.parseUnsignedLong`. `math/bits` supplies `OnesCount64`, `TrailingZeros64`, and `Len64` where Java has `Long.bitCount`, `numberOfTrailingZeros`, and `highestOneBit`.
+- **The shift-count trap is different, not absent.** Java reduces the count mod the width, so `1 << 32` on an `int` is `1`. Go does not: a shift by the width or more yields zero for an unsigned or positive value, and a constant shift that overflows is a compile error. The demo prints Go's answer (`0`) with a note, and the test pins it; every other row of the two's-complement section prints the same numbers as Java, including the `int8(0x80)` widening, the `int32` midpoint overflow, and `-7 / 2` versus `-7 >> 1`.
+- **Errors are values, panics for programming errors.** `Extract`, `Insert`, `Compose`, `Decompose`, `Iso8583Encode`, `Iso8583Decode`, `NewAccountFlags`, `Bitmap.And`/`Or`, and `Generator.Next` return `error`, with sentinels such as `ErrFieldOverflow`, `ErrBadBitmapHex`, and `ErrClockBackwards`. `Mask` with a width outside 0..64 and a `Bitmap` index out of range panic, the same way Go treats an impossible shift count or a bad slice index.
+- **Same random inputs.** The test file carries a `javaRandom` with `nextLong` and `nextBoolean`, so the 10,000 popcount inputs and the 2,000 bitmap operations are the ones the Java test draws; the reference bit set is a `[]bool`.
+
+```bash
+cd phases/01-complexity-and-core-structures/11-bit-manipulation/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

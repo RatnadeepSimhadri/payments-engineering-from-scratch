@@ -3,7 +3,7 @@
 > A customer pays, refreshes, and sees no payment.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 6, Lesson 01 (Replication: Leader-Based, Multi-Leader, Leaderless); Phase 5, Lesson 05 (Consistency Models); Phase 5, Lesson 03 (Lamport and Vector Clocks)
 **Time:** ~75 minutes
 
@@ -360,9 +360,40 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The design ports to Go without change: a slice for the log, a heap for in-flight records, a map for the reorder buffer. In Go, `container/heap` needs the boilerplate `Len/Less/Swap/Push/Pop` type, `map[int64]LogRecord` is the buffer, and `Read` should return `(string, bool)` rather than a nullable string. Keep the SplitMix64 generator byte-for-byte identical so the seeded lag pattern, and therefore the demo output, matches across languages. The single-threaded tick loop needs no locks; a real replica would run `receive` and `tick` on different threads and would protect `arrived` and `appliedLsn` with one mutex or an atomic watermark.
+```go
+func (r *Replica) Tick(now int) {
+    for len(r.inbox) > 0 && r.inbox[0].arriveAt <= now {
+        p := heap.Pop(&r.inbox).(pending)
+        r.arrived[p.lsn] = p.record
+    }
+    if r.ApplyInOrder {
+        for {
+            rec, ok := r.arrived[r.AppliedLsn+1]
+            if !ok {
+                break
+            }
+            delete(r.arrived, rec.Lsn)
+            r.apply(rec)
+        }
+    } else { /* sort the keys, then apply in LSN order */ }
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **The in-flight queue is `container/heap`.** `pendingHeap` implements `Len/Less/Swap/Push/Pop`; `Less` orders by `(arriveAt, lsn)`, the Java comparator. The reorder buffer is a `map[int64]LogRecord`; in-order mode only asks "is `AppliedLsn + 1` here?", and on-arrival mode sorts the keys because Go maps have no order and `TreeMap.pollFirstEntry` does.
+- **Absent values are `(string, bool)`.** `Leader.Read` and `Replica.Read` return a found flag instead of a nullable string, `ReadResult` carries `Found`, and `AnomalyDetector.ObservePair` takes the two flags. The demo prints `<nothing>` exactly where Java prints it.
+- **Errors are values.** `Leader.Since`, `NewReplica`, `NewReplicatedStore`, and `Money.Plus` return errors (`ErrLsnOutOfRange`, `ErrBadDelay`, `ErrDelayRanges`, `ErrCurrencyMismatch`) that tests check with `errors.Is`. `Of(...)` panics on a bad delay because it is a demo helper whose inputs are literals.
+- **SplitMix64 on `uint64`.** The multiplications wrap for free; `int64(seed)*7919 + 1000003*int64(i+1)` wraps exactly like Java's `long`, so every replica gets the same delay stream and the demo output matches line for line. `write(Session, ...)` is `WriteSession` because Go has no overloads.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

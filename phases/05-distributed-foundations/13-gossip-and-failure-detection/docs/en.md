@@ -3,7 +3,7 @@
 > SWIM-style membership without a coordinator.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 02 (Failure Models); Phase 5, Lesson 08 (Timeouts and Deadline Propagation); Phase 5, Lesson 12 (Leases, Fencing Tokens, and Distributed Locks)
 **Time:** ~75 minutes
 
@@ -357,9 +357,30 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `Update` is a comparable struct usable as a map key; map iteration is randomised, so sort the gossip queue by `(sent, member)` before taking from it or the piggyback order (and therefore convergence time) will differ run to run; the `Network`'s priority queue is `container/heap`. The port needs no goroutines: the simulation is single-threaded by design, and a production port would run `tick` from a timer and `handle` from a UDP read loop with one mutex around the view.
+`code/go/main.go` ports the simulation type for type (`Update`, `SwimNode`, `Network`, `Cluster`) and reproduces the Java run exactly: the same event trace, `DEAD everywhere by t=188`, `36` indirect acks, and `79`/`104` ticks over the 20 lossy seeds. As in Python, that only works because every source of ordering was made explicit, and Go adds one more.
+
+- **Go maps iterate in random order.** `view` is a `TreeMap` in Java, so every iteration that can change behaviour (probe candidates, indirect-probe helpers, expiring suspicions, the network visiting nodes) goes through a sorted key slice. The gossip queue is the opposite case: `LinkedHashMap` order matters, so it is a slice of `(update, sent)` entries in insertion order, `takeGossip` copies it and uses `sort.SliceStable` (ties keep queue order, like `List.sort`), and the in-flight queue is a `container/heap` keyed by `(deliverAt, seq)`. Skip any one of these and the piggyback order, and with it every detection time in the demo, differs run to run.
+- **The generator and the shuffle are ported, not borrowed.** `Rng` is SplitMix64 on a `uint64` (so `>>>` is a plain `>>`), and `Shuffle` is the same Fisher-Yates loop as a generic function. `math/rand` would draw a different probe order.
+- **`null` becomes a `bool`.** `Overrides(current, ok)` takes the "is there an entry" flag that Java encodes as `null`; `StateOf` returns an extra `Unknown` state for a member not in the view; `AliveMembers` and `DeadMembers` return sorted slices in place of `TreeSet`. `NewConfig` returns `ErrBadConfig` where the compact constructor throws. `Update` is a comparable struct, so it can key the `retired` and `bumped` maps in `takeGossip` just as the record keys the Java map.
+
+```go
+func Shuffle[T any](r *Rng, list []T) {
+    for i := len(list) - 1; i > 0; i-- {
+        j := r.NextInt(i + 1)
+        list[i], list[j] = list[j], list[i]
+    }
+}
+```
+
+The port needs no goroutines: the simulation is single-threaded by design, and a production port would run `Tick` from a `time.Ticker` and `Handle` from a UDP read loop with one mutex around the view.
+
+```bash
+cd phases/05-distributed-foundations/13-gossip-and-failure-detection/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

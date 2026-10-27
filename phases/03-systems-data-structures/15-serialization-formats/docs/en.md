@@ -3,7 +3,7 @@
 > Hand-encode a varint and never fear a wire format again.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 11 (Bit Manipulation), Phase 1, Lesson 12 (Strings and Encodings), Phase 0, Lesson 06 (Reading a Spec)
 **Time:** ~90 minutes
 
@@ -359,9 +359,26 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `[]byte` with `append` for the sink, a `struct{ buf []byte; pos int }` for the source, `encoding/binary.PutUvarint` exists but write your own to match the lesson's error handling, and return `error` instead of throwing (`errors.Is(err, ErrMalformed)`). Keep the spec vectors (`08 96 01`, `12 07 74 65 73 74 69 6e 67`, `1a 03 08 96 01`) as tests: they are the cross-language contract.
+`code/go/main.go` has the same types (`ByteSink`, `ByteSource`, the `Varint` functions, `WireType`, `Encoder`, `Decoder`, `PostingV1`, `Audit`, `PostingV2`, and the `Json` functions) and produces the same 94 bytes for the sample posting and the same totals over the 10,000 seeded postings. The spec vectors (`08 96 01`, `12 07 74 65 73 74 69 6e 67`, `1a 03 08 96 01`) are pinned in `main_test.go` as the cross-language contract. Three things differ:
+
+- **Unsigned is a type, not a view.** Java carries unsigned varints in a `long` and reads them with `>>>`; Go gives them their own type, so `WriteUnsigned` takes a `uint64` and `ZigzagEncode(int64) uint64` has no sign bit to misread. Java's `writeUnsigned(-1)` is `WriteUnsigned(math.MaxUint64)` here, and the ZigZag table's "all ones" is `math.MaxUint64` instead of `-1L`:
+
+```go
+func ZigzagEncode(n int64) uint64 { return uint64((n << 1) ^ (n >> 63)) }
+
+func ZigzagDecode(n uint64) int64 { return int64(n>>1) ^ -int64(n&1) }
+```
+
+- **Malformed input is an error value.** Every read on `ByteSource` and `Decoder` returns `(value, error)`, and every failure wraps `ErrMalformed`, so the decode loops check `err` after each field and the tests use `errors.Is(err, ErrMalformed)`. The `Encoder` keeps the Java builder chain by remembering the first invalid field number and reporting it from `ToByteArray() ([]byte, error)`; the constant field numbers in `Encode` cannot fail, so those discard the error.
+- **No overloading, no null.** `ByteSink.Write` takes a byte and `WriteBytes` a slice; `NewDecoder` takes bytes and `NewDecoderFrom` a `*ByteSource` view, which is a bounded window over the same buffer so a nested decoder cannot read past its length prefix. `PostingV2.Audit` is a `*Audit` so that "absent" is `nil`, which is why `PostingV2` has an `Equal` method instead of relying on `==`. `0.1 + 0.2` is computed from variables because Go folds constant expressions exactly and would print `0.3`. The 10,000 random postings come from `JavaRandom` (`javarandom.go`), with each draw in Java's left-to-right argument order, so the binary and JSON byte totals match.
+
+```bash
+cd phases/03-systems-data-structures/15-serialization-formats/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Detect the dangerous structure instead of locking.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 7, Lesson 06 (MVCC and Snapshot Isolation), Phase 7, Lesson 05 (Two-Phase Locking), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -352,9 +352,41 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port returns `error` from `Read`, `Write`, `Delete`, and `Commit` with sentinel `ErrSerializationFailure` and `ErrWriteConflict`; because `Read` can now fail, its signature becomes `(V, bool, error)`, which is the honest shape of a serializable read. The event counter and the conflict sets must be protected by the store's single mutex if goroutines are introduced; the detection logic itself is sequential by design. Go needs nothing beyond maps and slices.
+```go
+// AbortError carries the abort reason verbatim; errors.Is matches its Kind.
+type AbortError struct {
+    Kind   error // ErrWriteConflict or ErrSerializationFailure
+    Reason string
+}
+
+func (e *AbortError) Error() string        { return e.Reason }
+func (e *AbortError) Is(target error) bool { return target == e.Kind }
+
+func (s *SsiStore[V]) Write(txn *Transaction[V], key string, value V) error {
+    if err := s.requireActive(txn); err != nil {
+        return err
+    }
+    txn.put(key, pendingWrite[V]{Value: value})
+    return s.checkReadersOf(txn, key) // may abort txn on the spot and return the reason
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Every operation can fail, so every operation returns an error.** `Read` is `(V, bool, error)`: the `bool` is Java's `Optional`, the `error` is an `*AbortError` when the read itself closed a dangerous structure, or `ErrNotActive` on a finished transaction. `Write`/`Delete` return `error`, `Commit` returns `(int64, error)`. One `AbortError` type serves both rules; its `Is` method lets `errors.Is(err, ErrSerializationFailure)` and `errors.Is(err, ErrWriteConflict)` tell them apart while `err.Error()` is exactly the `AbortReason` the Java exception carried.
+- **Ordered sets by hand.** `InConflicts`/`OutConflicts` are an `idSet` (slice plus map) standing in for `LinkedHashSet<Long>`, so `First()` is the same transaction Java's `iterator().next()` names in the abort message. The store keeps `txnOrder` beside its map so the rw-edge sweep in `Read` visits transactions in begin order, as the `LinkedHashMap` does. `ReadersOf` returns a sorted `[]int64` because Java's `HashSet<Long>` happens to print small ids ascending.
+- **Generics with an explicit tombstone.** `SsiStore[V any]`, `Transaction[V]` and `Version[V]` are type parameters; a deleted key is `Version{Tombstone: true}` and a buffered delete is `pendingWrite{Delete: true}`, since Go has no `null` for an arbitrary `V`. `BeginSeq`/`EndSeq` are `int64` with `math.MaxInt64` for "still open".
+- **No goroutines.** The detection logic is sequential by design; the port has no mutex and `go test -race` passes trivially. If goroutines are introduced, the event counter `seq`, the SIREAD table and every conflict set must be protected by one store-wide mutex.
+
+```bash
+cd phases/07-storage-and-transactions/07-serializable-snapshot-isolation/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same four sections as the Java version, line for line (commits = 8, aborts = 2).
 
 ## Use It
 

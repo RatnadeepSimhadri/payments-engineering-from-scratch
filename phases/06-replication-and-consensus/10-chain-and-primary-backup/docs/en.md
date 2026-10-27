@@ -3,7 +3,7 @@
 > Strong consistency with high read throughput.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 6, Lesson 01 (Replication Strategies); Phase 6, Lesson 02 (Replication Lag and Read-Your-Writes); Phase 5, Lesson 13 (Gossip Protocols and Failure Detection); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
@@ -372,9 +372,40 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: one `Message` struct with a `Kind` and nil-able fields; `Sent` is a `map[int64]Update` plus a slice to keep order, since Go maps are unordered; the FIFO network's per-link map keys on a `[2]int`. The simulation stays single-threaded; a real deployment runs each replica's `handle` on a TCP read loop, and TCP's ordering is what makes the FIFO assumption hold.
+```go
+func (w *Network) Send(m Message) {
+    w.Sent++
+    if w.down[m.To] || (m.From >= 0 && w.down[m.From]) {
+        w.Dropped++
+        return
+    }
+    link := [2]int{m.From, m.To}
+    earliest := w.now + 1
+    if last := w.lastDeliveryPerLink[link]; last > earliest {
+        earliest = last
+    }
+    at := earliest + w.rng.NextInt(w.maxDelay)
+    w.lastDeliveryPerLink[link] = at
+    heap.Push(&w.inFlight, envelope{at, w.seq, m})
+    w.seq++
+}
+```
+
+`code/go/main.go` is the same design, and the demo output matches the Java line for line, including the per-replica message counts in the load table. What differs:
+
+- **The FIFO link key is a `[2]int`.** Java packs `(from, to)` into one `long`; an array of two ints is a comparable map key with the same meaning and no bit arithmetic. The in-flight queue is `container/heap` ordered by `(deliverAt, seq)`.
+- **`Sent` is an ordered map written by hand.** Go maps have no insertion order, so `orderedUpdates` keeps a `[]int64` of sequence numbers beside the `map[int64]Update`; a SYNC after a reconfiguration resends updates in the order they were forwarded, as `LinkedHashMap` does. The client keeps `pendingOrder` for the same reason, so retries draw network delays in the same order as the Java.
+- **One `Message` struct with zero values for unused fields.** Java's nulls are Go zero values: an ACK's `Update` with `Seq: -1` (`historyReceived`) is the "history received" signal, `Note` is `""` where Java has `null`. `Request`, `Update` and `Money` are comparable structs, so `==` on history entries is structural, which the Update Propagation check needs.
+- **Errors and absence are values.** `Money.Plus` returns `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow`; `ChainClient.ReplyFor` returns `(Money, bool)` where Java returns `null`; `Update`/`Query` return the request and the messages to send instead of appending to an `out` list. An unexpected message kind and an empty chain are programming errors and panic.
+
+Run it from `code/go/`:
+
+```bash
+go run .
+go test ./...
+```
 
 ## Use It
 

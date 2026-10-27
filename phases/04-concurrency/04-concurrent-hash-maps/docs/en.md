@@ -3,7 +3,7 @@
 > How ConcurrentHashMap and sync.Map avoid a global lock.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch); Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 03 (Compare-and-Swap and Lock-Free Structures)
 **Time:** ~90 minutes
 
@@ -385,9 +385,40 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `sync.Mutex` per segment for striping; for lock-free reads use `atomic.Pointer[node]` per bucket and `atomic.Pointer[[]*node]` for the table, with immutable node structs. `go test -race` must pass, and it will flag any plain field read that races with a write, which is a good check that every shared read is through an atomic. Compare the result with `sync.Map`, which is designed for the write-once-read-many case and uses a read-only map promoted from a dirty map.
+```go
+type LockFreeReadMap[V any] struct {
+    table       atomic.Pointer[lfTable[V]]   // replaced wholesale on resize
+    stripeLocks []sync.Mutex                 // writers only
+    count       atomic.Int64
+}
+
+func (m *LockFreeReadMap[V]) Get(key string) (V, bool) {
+    t := m.table.Load()                                     // one atomic read
+    n := t.buckets[BucketIndex(key, len(t.buckets))].Load() // one atomic read
+    for ; n != nil; n = n.next {                            // immutable fields: no further synchronization
+        if n.key == key {
+            return n.value, true
+        }
+    }
+    var zero V
+    return zero, false
+}
+```
+
+`code/go/main.go` keeps `ConcurrentStore`, `GlobalLockMap`, `StripedHashMap` (one `sync.Mutex` per segment), `LockFreeReadMap`, and the barrier-forced races. What differs:
+
+- **`atomic.Pointer` plays `volatile` and `final`.** Go has neither keyword. Each bucket is an `atomic.Pointer[lfNode]` and the whole table sits behind another; a writer publishes a rebuilt chain with `Store`, a reader takes it with `Load`, and the Go memory model makes everything the writer did before the store visible after the load. The nodes are never mutated after publication, which is what the walk relies on. `go test -race ./...` is the proof: the race detector flags any plain read that is not ordered by an atomic or a lock, and the suite passes with two readers hammering 64 keys while two writers churn and resize.
+- **The hash is rebuilt in 32-bit arithmetic.** `StableHash` computes `String.hashCode` over UTF-16 code units and `Spread` runs the MurmurHash3 finaliser on a `uint32`, so every key lands in the same stripe and bucket as in Java (`acct-1->s8 acct-2->s4 ... acct-8->s5`); a test pins those placements. Java's `>>>` becomes a shift on the `uint32` view.
+- **`(V, bool)` instead of `null`.** `Get`, `Put`, `PutIfAbsent`, and `Remove` return a second result that says whether a value existed, and `Compute` takes a `ComputeFn` that receives `(current, present)` and returns `(next, absent)`, because a zero `int64` is a legal value. The constructors return `ErrBadShape` for stripe or bucket counts that are not powers of two.
+- **A hand-written `Barrier`.** The standard library has no `CyclicBarrier`, so the port carries a small reusable one built on `sync.Cond`; it holds all eight goroutines in the gap between `Get` and `Put`, so all eight still believe they created the record and `PutIfAbsent` still produces exactly one winner. `CountDownLatch` becomes `sync.WaitGroup`. The throughput table measures real parallelism; Go's built-in `map` under one mutex is fast enough that on a small machine the global lock can win, which is a reason to measure rather than assume.
+
+```bash
+cd phases/04-concurrency/04-concurrent-hash-maps/code/go
+go run .
+go test -race ./...
+```
 
 ## Use It
 

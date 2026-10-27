@@ -3,7 +3,7 @@
 > Stability matters when you sort transactions by amount and need time order preserved.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays from Scratch), Phase 1, Lesson 09 (Heaps and Priority Queues from Scratch)
 **Time:** ~120 minutes
 
@@ -373,9 +373,38 @@ python3 -m unittest -v
 
 The demo numbers are identical to the Java run; the test suite runs the same 66 checks (insertion sort on 4096 elements makes the run take a couple of seconds in CPython).
 
-### Porting notes
+### In Go
 
-Go's `sort.Sort` is pattern-defeating quicksort since Go 1.19 and is not stable; `sort.Stable` and `slices.SortStableFunc` are the stable calls, and the port's stability test would need to show `sort.Slice` scrambling the ledger the way `heapSort` does here. Go generics (`[T any]`) express the `Sorts` signatures directly; `*rand.Rand` is injected in place of `java.util.Random`. Go does not need the `(T[]) new Object[]` cast, which exists only because Java generics are erased.
+```go
+type Comparator[T any] func(a, b T) int
+
+func InsertionSortRange[T any](a []T, from, to int, cmp Comparator[T]) {
+    for i := from + 1; i < to; i++ {
+        key := a[i]
+        j := i - 1
+        for j >= from && cmp(a[j], key) > 0 { // strict >: equal keys keep their order
+            a[j+1] = a[j]
+            j--
+        }
+        a[j+1] = key
+    }
+}
+```
+
+The design is the same; four things differ, all in `code/go/main.go`:
+
+- **Generics replace erasure.** `InsertionSort[T any]`, `MergeSort`, `QuickSort`, and `HeapSort` take a `[]T` and a `Comparator[T]` (a `func(a, b T) int`). There is no `(T[]) new Object[]` cast: `make([]T, len(a))` allocates the merge buffer with the right element type. `NaturalOrder[T cmp.Ordered]()` is `Comparator.naturalOrder()`; `ThenComparing` is `Comparator.thenComparing`.
+- **The counting comparator is a method value.** `CountingComparator[T]` keeps `Comparisons` and exposes `Func()`, which returns the bound method `c.Compare` so the sorts can call it like any other comparator while the struct keeps the count.
+- **The same seed gives the same numbers.** `javarandom.go` is a bit-for-bit port of `java.util.Random` (48-bit LCG, `next(bits)`, `nextInt(bound)` with its rejection loop), so the pivots, the random arrays, and every comparison count in the demo match the Java output exactly. `math/rand` seeded with 42 would give different counts.
+- **Compare panics; constructors return errors.** `Money.Compare` cannot return an error, so a currency mismatch panics, as in the Phase 10 Money type; `NewCurrency` returns `(Currency, error)` where Java's compact constructor throws.
+
+```bash
+cd phases/02-algorithms/01-sorting-algorithms/code/go
+go run .
+go test ./...
+```
+
+The demo numbers are identical to the Java run; the closing library note names `slices.SortStableFunc` and `slices.Sort` (pattern-defeating quicksort, unstable) in place of the two `Arrays.sort` overloads. The test file ports all 66 Java checks and adds a handful that pin the demo's comparison counts.
 
 ## Use It
 

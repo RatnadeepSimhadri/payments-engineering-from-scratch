@@ -3,7 +3,7 @@
 > Reserve funds, capture, ship, and undo in the right order when step three fails.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs), Phase 7, Lesson 08 (Two-Phase Commit), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
@@ -443,9 +443,50 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The design ports without structural change. In Go, `execute` and `compensate` return `error`; distinguish a step refusal from a crash with two sentinel errors (`ErrStepFailed`, `ErrCrash`) and `errors.Is`, and have the orchestrator return the crash error up to the caller rather than panicking so tests can assert on it. The log's `records()` copy becomes a slice copy to keep callers from mutating it. The Go port needs no concurrency: the saga runs one step at a time by design, and the semantic-lock demo is about visibility between sagas, not about threads.
+```go
+// Two sentinels tell a refusal from a death; both error types carry their message verbatim.
+var (
+    ErrStepFailed = errors.New("step failed")
+    ErrCrash      = errors.New("crash")
+)
+
+func (s *SagaOrchestrator) forward(order Order, from int) (SagaOutcome, error) {
+    for i := from; i < len(s.steps); i++ {
+        step := s.steps[i]
+        s.log.Append(order.SagaID, StepStarted, step.Name(), "", nil)
+        s.clock.Advance(s.stepLatencyMs)
+        if err := step.Execute(order); err != nil {
+            if !errors.Is(err, ErrStepFailed) {
+                return SagaOutcome{}, err // not the saga's business
+            }
+            s.log.Append(order.SagaID, StepFailed, step.Name(), err.Error(), nil)
+            return s.backward(order, i-1, step.Name(), err.Error())
+        }
+        if s.CrashPoint == AfterExecute(step.Name()) {
+            return SagaOutcome{}, &CrashError{"after " + step.Name() + " executed, before STEP_COMPLETED logged"}
+        }
+        s.log.Append(order.SagaID, StepCompleted, step.Name(), "", nil)
+    }
+    // ...
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Two kinds of error, told apart with `errors.Is`.** `SagaStep.Execute` and `Compensate` return `error`. A `*StepFailedError` (matching `ErrStepFailed`) is the saga's business and ends in a `COMPENSATED` outcome, exactly as the Java `catch (StepFailedException)`; a `*CrashError` (matching `ErrCrash`) is returned from `Run` and `Recover` to the caller instead of being thrown, so tests assert on it with `errors.Is` and the demo prints `err.Error()`. Both types implement `Is`, so the message stays verbatim (`out of stock: widget has 3, need 4`) while the sentinel still matches.
+- **Money is checked.** `Plus` and `Minus` return `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow`; `Compare` panics on a mismatch like the reference lesson. Inside the wallet, where the Java version relies on unchecked `Math.subtractExact`, `mustMoney` turns an impossible overflow into a panic rather than a silent wrap.
+- **Structs where Java had records and nested types.** `CrashPoint` is a comparable struct (`==` replaces `equals`), `NoCrash` is its zero value, and `SagaRecord.Order` is a `*Order` that is non-nil only on `SAGA_STARTED`. The log kinds are untyped string constants; `SagaLog.Records()` and `SagaIDs()` return copies, and `SagaIDs` preserves first-appearance order as the `LinkedHashSet` did.
+- **No concurrency.** The saga runs one step at a time by design, and the semantic-lock demo is about visibility between sagas, not threads; `go test -race` passes without a mutex.
+
+```bash
+cd phases/07-storage-and-transactions/12-saga-pattern/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same five sections as the Java version, line for line (clock=250 ms, log records=42).
 
 ## Use It
 

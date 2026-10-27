@@ -3,7 +3,7 @@
 > A lock-free stack and the ABA problem that breaks it.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model); Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 1, Lesson 05 (Stacks, Queues, and Deques)
 **Time:** ~90 minutes
 
@@ -400,9 +400,46 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `sync/atomic.Pointer[Node]` provides `CompareAndSwap`, so the Treiber stack and the Michael-Scott queue port line for line; for the stamp, pack a pointer and counter into a single struct behind `atomic.Pointer[stamped]` (allocate a new stamped pair per CAS) since Go has no double-word CAS. The port keeps the `beforeCas` hook so the ABA test stays deterministic, and the Go tests must pass under `go test -race`.
+```go
+type TreiberStack[T any] struct {
+    head       atomic.Pointer[treiberNode[T]]
+    casRetries atomic.Int64
+}
+
+func (s *TreiberStack[T]) Push(value T) {
+    node := &treiberNode[T]{value: value}
+    for {
+        current := s.head.Load()
+        node.next = current // link before publishing
+        if s.head.CompareAndSwap(current, node) {
+            return
+        }
+        s.casRetries.Add(1)
+    }
+}
+
+// stamped is a (pointer, stamp) pair behind one atomic.Pointer: Go has no double-word CAS,
+// so every successful CAS installs a freshly allocated pair, as AtomicStampedReference does internally.
+type stamped struct {
+    node  *PooledNode
+    stamp int
+}
+```
+
+`code/go/main.go` keeps `TreiberStack`, `PooledStack`, `StampedPooledStack`, `MichaelScottQueue`, and `Progress`, with every CAS loop written line for line. What differs:
+
+- **The CAS is real.** `sync/atomic.Pointer[T]` has `Load`, `Store`, and `CompareAndSwap`, which compile to the processor's compare-exchange instruction and compare pointer identity exactly as `AtomicReference` does, so the Treiber stack and the Michael-Scott queue are genuinely lock-free. `atomic.Int64` replaces `AtomicLong` for the retry counters. Only the free lists in the pooled stacks take a `sync.Mutex`, where Java used `synchronized`.
+- **The stamp is a pair behind a pointer.** Go has no `AtomicStampedReference`, so `StampedPooledStack.head` is an `atomic.Pointer[stamped]`; `compareAndSet` checks that the pair read earlier still holds the expected node and stamp, then CASes the pointer to a new pair. The ABA test shows exactly one rejected stale CAS and a final stamp of 8, the same numbers as Java.
+- **`(T, bool)` instead of `Optional`.** `Pop`, `Peek`, and `Dequeue` return a second result that says whether a value existed; a zero value is a legal element. Java's `requireNonNull` checks have no counterpart for a generic `T`, so the test instead pushes the empty string and reads it back with `ok == true`.
+- **Goroutines, channels, and `sync.WaitGroup`.** `CountDownLatch` becomes a closed channel for the start signal and a `WaitGroup` for completion; `Thread.onSpinWait()` becomes `runtime.Gosched()`. The stress tests run four goroutines against the stack and four producers against four consumers on the queue, and the whole suite passes under `go test -race ./...`, which is the proof that the publish-before-CAS ordering is right: the race detector treats `atomic` operations as synchronization and would flag a node field read without one.
+
+```bash
+cd phases/04-concurrency/03-compare-and-swap-and-lock-free-structures/code/go
+go run .
+go test -race ./...
+```
 
 ## Use It
 

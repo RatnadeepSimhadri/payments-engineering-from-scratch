@@ -3,7 +3,7 @@
 > Lower bound, upper bound, and search over answer spaces.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays from Scratch), Phase 2, Lesson 01 (Sorting)
 **Time:** ~75 minutes
 
@@ -377,9 +377,35 @@ python3 -m unittest -v
 
 The demo output matches the Java run line for line; the suite runs the Java's 45 checks plus 3 for the 32-bit wraparound helpers.
 
-### Porting notes
+### In Go
 
-Go's `sort.Search(n, f)` *is* `firstTrue` for `int`, and `slices.BinarySearchFunc` returns `(index, found)` instead of an encoded negative; the overflow concern applies to `int` on 32-bit targets and to `int64` answer spaces, so `lo + (hi-lo)/2` stays. The port does not change the design: one primitive, predicates as closures, `Money` as integer minor units.
+```go
+func FirstTrue(lo, hi int, predicate func(int) bool) int {
+    for lo < hi {
+        mid := lo + (hi-lo)/2
+        if predicate(mid) {
+            hi = mid // mid is a candidate: keep it in the range
+        } else {
+            lo = mid + 1 // mid is false: the answer is strictly to the right
+        }
+    }
+    return lo
+}
+```
+
+The loop, the predicates, and the `CappedBatch` search are line-for-line the same; three things differ, all in `code/go/main.go`:
+
+- **Errors are values.** `RotationPoint`, `IntegerSqrt`, `TotalWithCap`, and `LargestCapWithin` return `(T, error)` where the Java throws; the sentinels `ErrEmpty`, `ErrNegative`, `ErrNoItems`, `ErrCurrencyMismatch`, and `ErrOverflow` support `errors.Is`. The predicate inside `LargestCapWithin` cannot return an error, so it records the first overflow and returns `true` to stop the search; the caller then reports the error.
+- **Checked addition is a helper.** Go's `+` on `int64` wraps like Java's primitive `+`, and there is no `Math.addExact`; `addChecked` in `money.go` returns `ErrOverflow` instead of a wrapped total. `Money.Compare` panics on a currency mismatch because a comparison has no error channel, as in the Phase 10 `Money`.
+- **The midpoint bug needs a 32-bit type to show.** Go's `int` is 64 bits on every platform the course targets, so `(lo + hi) / 2` on the demo's indices does not wrap; the demo declares `lo` and `hi` as `int32` to reproduce Java's `-397483648`, and Go's `>>` on a `uint32` plays the role of Java's `>>>`. The search functions still use `lo + (hi-lo)/2`, because the `int64` answer space of `IntegerSqrt` and 32-bit targets make the overflow real again.
+
+```bash
+cd phases/02-algorithms/02-binary-search-and-its-variants/code/go
+go run .
+go test ./...
+```
+
+The demo output matches the Java run line for line. The standard library has the primitive: `sort.Search(n, f)` *is* `FirstTrue` over `[0, n)`, and `slices.BinarySearch` returns `(index, found)` instead of the JDK's encoded negative; one test checks the two agree. The suite runs the Java's 45 checks plus 6 for the int32 wraparound, the empty-slice error, the empty-batch error, and the overflow sentinel.
 
 ## Use It
 
