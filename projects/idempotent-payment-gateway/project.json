@@ -8,10 +8,12 @@
   "youWillBuild": "An in-memory payment gateway where the same request can be sent any number of times and money moves exactly once.",
   "hours": 10,
   "languages": [
-    "Java"
+    "Java",
+    "Python"
   ],
   "languageWhy": {
-    "Java": "Records, sealed-style enums and EnumMap give the state machine and the transition table a compact, type-checked shape; javax.crypto.Mac and MessageDigest.isEqual are the production HMAC tools."
+    "Java": "Records, sealed-style enums and EnumMap give the state machine and the transition table a compact, type-checked shape; javax.crypto.Mac and MessageDigest.isEqual are the production HMAC tools.",
+    "Python": "hashlib, hmac.compare_digest and frozen dataclasses are the production-grade pieces in the standard library; the xorshift64* Rng is ported bit-for-bit, so a retry schedule drawn in Python is the one the Java tests expect."
   },
   "status": "ready",
   "skills": [

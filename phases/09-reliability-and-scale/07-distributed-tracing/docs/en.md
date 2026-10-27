@@ -3,7 +3,7 @@
 > Follow one payment across six services.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 9, Lesson 06 (Metrics: Counters, Gauges, and Histograms Without Averages), Phase 5, Lesson 02 (Time and Clocks), Phase 1, Lesson 07 (Trees and Recursion)
 **Time:** ~90 minutes
 
@@ -337,9 +337,30 @@ total traces in collector: 2 (the notification span became its own root)
 
 The second block is the dropped-header failure: the trace is one span short and a second trace with one span has appeared. In a real collector you would find it by searching for the payment id across traces, which is exactly what Lesson 08's log correlation makes possible.
 
+### In Python
+
+```python
+def start_from_carrier(self, name: str, carrier: dict[str, str]) -> Span:
+    parent = SpanContext.parse_traceparent(carrier.get(SpanContext.HEADER))
+    return self.start_child(name, parent) if parent is not None else self.start_root(name)
+```
+
+Differences, all in `code/python/main.py`:
+
+- **`Optional.empty()` is `None`.** `parse_traceparent` returns `Optional[SpanContext]`, so the fall-back-to-a-new-root decision in `start_from_carrier` is an `is not None` test; the `SpanContext` record is a frozen dataclass whose `__post_init__` raises `ValueError` where Java throws `IllegalArgumentException`, and the two lifecycle guards (`duration_millis` on an open span, `export` of an open span) raise `RuntimeError` for `IllegalStateException`.
+- **Ids come from `java.util.Random.nextBytes`, not `random.randbytes`.** `JavaRandom.next_bytes` consumes each 32-bit draw least-significant byte first, exactly as the JDK does, so seed 42 produces the same trace id `359d41ba...` as the Java demo and `bytes.hex()` gives the lowercase form the spec requires.
+- **Ordered collections are plain `dict` and `list`.** `LinkedHashMap` attributes and `LinkedHashSet` trace ids become insertion-ordered dicts (`dict.fromkeys` for the de-duplicated id list); the span sort is `sorted(..., key=lambda s: (s.start_millis, s.span_id))`, the same two-key order as the Java comparator.
+- **Carrier maps are `dict[str, str]`.** In a real Python service the same dict is `request.headers` or a Kafka record's header list, and the context would travel between `asyncio` tasks in a `contextvars.ContextVar`, which is the same loss-across-an-executor trap as Java's `ThreadLocal`.
+
+```bash
+cd phases/09-reliability-and-scale/07-distributed-tracing/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `random.Random(seed).randbytes(16).hex()` produces the id in one call; `str.split("-")` and a compiled `re.fullmatch(r"[0-9a-f]{32}", ...)` replace the hand-rolled `isHex`; return `None` where Java returns `Optional.empty()`. Context propagation across `asyncio` tasks uses `contextvars`, which is the same thread-local-loss trap as Java's `ThreadLocal` across an executor. Go: `crypto/rand` or a seeded `math/rand` into a `[16]byte` with `hex.EncodeToString`; the carrier is `http.Header` or `map[string]string`; context travels in `context.Context`, and a goroutine started without the parent context is the dropped-header failure. `sort.SliceStable` for the deterministic span order.
+Go: `crypto/rand` or a seeded `math/rand` into a `[16]byte` with `hex.EncodeToString`; the carrier is `http.Header` or `map[string]string`; context travels in `context.Context`, and a goroutine started without the parent context is the dropped-header failure. `sort.SliceStable` for the deterministic span order.
 
 ## Use It
 

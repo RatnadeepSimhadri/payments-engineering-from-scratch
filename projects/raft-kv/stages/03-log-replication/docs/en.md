@@ -59,6 +59,22 @@ List<Message> onAppendReply(Message m, int now);     // success -> matchIndex/ne
 int replicatedCount(int index);              // 1 + number of peers with matchIndex >= index
 ```
 
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+class RaftNode:
+    def propose(self, command: str) -> int: ...                     # -1 unless leader; else append and return the new index
+    def append_entries_for(self, peer: int) -> Message: ...         # prev = next_index[peer] - 1; ships storage.entries_from(next)
+    def on_append_reply(self, m: Message, now: int) -> list[Message]: ...
+    def replicated_count(self, index: int) -> int: ...             # 1 + peers with match_index >= index
+
+    # upgraded: become_leader appends LogEntry(current_term, "NOOP"); replicate_all returns append_entries_for(p) per peer;
+    # on_append_entries adds rules 2-4 and replies match_index = prev_log_index + len(entries)
+
+# Cluster additions used by the tests: propose(command) -> int, propose_to(node_id, command) -> int,
+# run_until_logs_converged(max_ticks) -> int, logs_converged() -> bool, Cluster.check_log_matching(a, b, ia, ib) (raises RuntimeError).
+```
+
 Rules:
 
 - **`becomeLeader`**: initialise `nextIndex[p] = lastLogIndex() + 1` and `matchIndex[p] = 0` **first**, then append the no-op `LogEntry(currentTerm, "NOOP")`, then `replicateAll`. The order matters: with `nextIndex` pointing at the no-op's slot, the very first `AppendEntries` carries it. The no-op is section 8 of the paper and becomes essential in stage 4 (a new leader cannot commit older-term entries by counting, so it commits one of its own at once).
@@ -135,12 +151,13 @@ Bugs this stage's tests are built to expose:
 
 What must fail and how: `propose` on a non-leader returns -1 (not an exception; clients are expected to be redirected). A refused `AppendEntries` never modifies the log, and the follower still adopts the sender as leader. `matchIndex` never moves backwards; `nextIndex` never drops below 1 (index 0 is the sentinel and always matches). Two leaders in the same term still throw. The provided `Cluster.checkInvariants` runs after every delivery and throws `IllegalStateException` naming the pair of nodes and the index if Log Matching or Leader Append-Only is violated; the tests also call `Cluster.checkLogMatching` on the final logs. If you see `LOG MATCHING: nodes 1 and 3 agree at index 4 (term 2) but differ at index 2`, a follower appended without a matching prefix: re-read rule 3 of the list above.
 
-Python and Go ports of this project follow later; this pass is Java only.
+The Python port has the same surface in snake_case in one `main.py` (signatures above); Go port follows later.
 
 ## Run the grader
 
 ```bash
 python3 scripts/project_test.py raft-kv --lang java --stage 3 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --stage 3 --path my-raft-kv
 ```
 
 Stages 1 and 2 run again first; stage 2's heartbeat assertions still hold because `appendEntriesFor` on an up-to-date follower *is* a heartbeat. Stage 3 has about 48 assertions: `propose` on followers and leaders, `nextIndex`/`matchIndex` initialisation and the shape of the first `AppendEntries`, every branch of the consistency check, truncation and duplicate handling with exact `describe()` strings, the back-off walk with the `max(1, ...)` floor, convergence on a quiet cluster, a crashed follower catching up, the stale-leader partition from the Raft II lesson (the `PUT alice 999` that must vanish from every log), and 12 lossy seeds with a leader crash where every log must converge with Log Matching intact.

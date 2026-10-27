@@ -3,7 +3,7 @@
 > Sum a million postings in milliseconds without summing a million postings.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 04 (Chart of Accounts)
 **Time:** ~90 minutes
 
@@ -357,9 +357,37 @@ receivable 125347982.56 USD == sum of merchant payables 125347982.56 USD: true
 
 The counts are deterministic because the payment stream is a seeded `Random` with an injected clock. With `--timing` on a laptop the fold takes tens of milliseconds, snapshot replay a couple of milliseconds, and the column tens of microseconds; the ratios matter more than the absolute numbers, and they track the posting counts.
 
+### In Python
+
+The full port is `code/python/main.py` (same `Ledger`, `Snapshot`, `Reading`, `LongList`, `PaymentStream`; tests in `code/python/test_main.py`). Three things differ:
+
+- **The seeded stream reproduces `java.util.Random`.** The demo's numbers (`-116054.22 USD`, `125347982.56 USD`, `14246` postings scanned) come from the seed, so the port ships a `JavaRandom` with the JDK's 48-bit LCG and its `nextInt(bound)` rejection loop. The same seed therefore yields the same ledger in both languages, and the tests assert the JDK's own values for `Random(42)`:
+
+```python
+class JavaRandom:
+    MULTIPLIER, ADDEND, MASK = 0x5DEECE66D, 0xB, (1 << 48) - 1
+
+    def __init__(self, seed: int) -> None:
+        self._seed = (seed ^ self.MULTIPLIER) & self.MASK
+
+    def next(self, bits: int) -> int:
+        self._seed = (self._seed * self.MULTIPLIER + self.ADDEND) & self.MASK
+        r = self._seed >> (48 - bits)
+        return r - (1 << 32) if r >= (1 << 31) else r  # Java's (int) cast
+```
+
+- **Memory and speed.** `LongList` wraps `array('q')` (8 bytes per value, not a 28-byte `int` object each), and the record types are `@dataclass(frozen=True, slots=True)` so a million postings do not each carry a `__dict__`. `Math.addExact` disappears because `int` never overflows. Pure Python is still 5-10x slower than the JVM on this demo: posting 500,000 entries takes about six seconds, and the cyclic garbage collector accounts for a third of that. The three read paths have the same complexity and the same scan counts; only the wall-clock numbers behind `--timing` differ.
+- **The column search is written out, not `bisect`ed.** `bisect.bisect_right(seqs, seq) - 1` returns the same index, but the hand-written loop is kept so `Reading.postings_scanned` reports the same probe count as Java (9 for the demo's lookup). `LedgerError` extends `ValueError`, and `Snapshot.__post_init__` copies the dict for the same reason Java's canonical constructor calls `Map.copyOf`: the copy is the snapshot.
+
+```bash
+cd phases/10-money-and-ledgers/05-balances-and-snapshots/code/python
+python3 main.py            # add --timing for wall-clock numbers
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python has no `long` overflow, so `Math.addExact` disappears, but the fold over a million postings in pure Python is roughly 50 times slower; use `bisect.bisect_right` on a per-account `array('q')` for the column and keep the snapshot replay loop tight. Go maps iterate in random order, so `verify` and any printed snapshot must sort account ids first; use `sort.Search` for both binary searches and `[]int64` for the column. Neither port needs a lock in this lesson; Lesson 11 is where Java's `synchronized`, Python's GIL, and Go's `sync.Mutex` start to differ.
+Go maps iterate in random order, so `verify` and any printed snapshot must sort account ids first; use `sort.Search` for both binary searches and `[]int64` for the column. The Go port needs no lock in this lesson; Lesson 11 is where Java's `synchronized` and Go's `sync.Mutex` start to differ.
 
 ## Use It
 

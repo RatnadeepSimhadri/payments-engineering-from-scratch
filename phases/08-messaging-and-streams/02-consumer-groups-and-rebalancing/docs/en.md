@@ -3,7 +3,7 @@
 > Who owns partition 7 after a consumer dies?
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 5, Lesson 13 (Gossip Protocols and Failure Detection)
 **Time:** ~90 minutes
 
@@ -342,9 +342,33 @@ Expected output, abbreviated:
   sticky      ... moved=2
 ```
 
+### In Python
+
+```python
+# 2. orphans go to whoever has the fewest (ties: lowest member id, because members are sorted)
+for p in sorted(unassigned):
+    out[self._least_loaded(members, out)].append(p)
+# 3. level: move one partition at a time from the heaviest to the lightest while the spread exceeds one
+while True:
+    most, least = self._most_loaded(members, out), self._least_loaded(members, out)
+    if len(out[most]) - len(out[least]) <= 1:
+        break
+    out[least].append(out[most].pop())
+```
+
+Differences, all in `code/python/main.py`:
+
+- **Ordered maps are plain `dict`s.** Java uses `LinkedHashMap` for the assignment (insertion order = member order) and `TreeMap` for membership and owners. Python's `dict` keeps insertion order, so the assignment needs nothing extra; `members()` returns `sorted(self._last_heartbeat)` and `Assignor.owners` sorts its items before returning, which keeps the demo and history lines byte-identical to Java's.
+- **`TreeSet<Integer> unassigned` is a `set` iterated with `sorted(...)`.** The sticky assignor hands orphans out in ascending partition order; a bare `set` iteration would be unordered and could give partition 7 a different owner than the Java run.
+- **`pop()` is `remove(size - 1)`.** The levelling loop moves the *last* partition of the heaviest member, before the final sort. Keep it as `pop()`, not `pop(0)`; the two choices produce different but equally balanced assignments, and the tests pin the Java one (`moved == 2`).
+- **Exceptions are `UnknownMemberError`, `IllegalGenerationError`, `NotOwnerError`** (plain `Exception` subclasses) and `ValueError` where Java throws `IllegalArgumentException`. `HeartbeatResult` is an `Enum` whose `__str__` prints the bare name so the demo reads `-> REBALANCE_IN_PROGRESS`.
+- **`Assignment.partitions` is a tuple**, the frozen-dataclass equivalent of `List.copyOf`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The output, including the rebalance history, matches the Java run line for line.
+
 ### Porting notes
 
-A Python port keeps `members` as a `sorted(dict)` and uses `dict` insertion order for the assignment; exceptions become `UnknownMemberError`, `IllegalGenerationError`, `NotOwnerError`. A Go port returns `(Assignment, error)` from `Join` and sentinel errors (`ErrUnknownMember`, `ErrIllegalGeneration`, `ErrNotOwner`) for `errors.Is`; the coordinator's maps need a `sync.Mutex` if heartbeats arrive from goroutines, and `go test -race` must pass. The sticky levelling loop and the `<=` deadline comparison port unchanged; those two lines are where cross-language divergence would show up as a different owner for partition 7.
+A Go port returns `(Assignment, error)` from `Join` and sentinel errors (`ErrUnknownMember`, `ErrIllegalGeneration`, `ErrNotOwner`) for `errors.Is`; the coordinator's maps need a `sync.Mutex` if heartbeats arrive from goroutines, and `go test -race` must pass. The sticky levelling loop and the `<=` deadline comparison port unchanged; those two lines are where cross-language divergence would show up as a different owner for partition 7.
 
 ## Use It
 

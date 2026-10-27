@@ -37,6 +37,40 @@ final class Ledger {
 }
 ```
 
+## New signatures (Python)
+
+Keep everything in the one `main.py` the stage-1 starter gave you.
+
+```python
+@dataclass(frozen=True)
+class Posting:                    # account_id: str, side: Side, amount: Money; blank id or non-positive amount -> ValueError
+    def mirrored(self) -> Posting: ...
+
+@dataclass(frozen=True)
+class JournalEntry:               # id: str, date: str, postings: tuple[Posting, ...] (copied from any sequence); blank id/date -> ValueError
+    @staticmethod
+    def of(id: str, date: str, *postings: Posting) -> JournalEntry: ...   # the varargs constructor
+    def currency(self) -> Currency: ...                                    # first posting's; RuntimeError if none
+
+@dataclass(frozen=True)
+class PostedEntry:                # sequence: int, entry: JournalEntry
+    @property
+    def id(self) -> str: ...      # entry.id
+
+class InvalidEntryError(LedgerError):     def __init__(self, entry_id: str, why: str)
+class UnbalancedEntryError(LedgerError):  def __init__(self, entry_id: str, debits: Money, credits: Money)
+class UnknownEntryError(LedgerError):     def __init__(self, entry_id: str)
+
+class Ledger:
+    def __init__(self, accounts: AccountRegistry) -> None: ...   # not a registry -> ValueError
+    def accounts(self) -> AccountRegistry: ...
+    def post(self, entry: JournalEntry) -> PostedEntry: ...
+    def journal(self) -> tuple[PostedEntry, ...]: ...           # sequence order, immutable copy
+    def entry(self, entry_id: str) -> PostedEntry: ...          # UnknownEntryError if absent
+    def has_entry(self, entry_id: str) -> bool: ...
+    def size(self) -> int: ...
+```
+
 ## Validation order inside `post`
 
 1. Id already posted → return the existing `PostedEntry`, change nothing.
@@ -49,4 +83,5 @@ final class Ledger {
 
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 2 --path <workspace>
+python3 scripts/project_test.py ledger-engine --lang python --stage 2 --path <workspace>
 ```

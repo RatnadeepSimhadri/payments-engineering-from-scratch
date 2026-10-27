@@ -55,7 +55,7 @@ Two other payments in the same test: `pay_2` is canceled from `CREATED` (`versio
 
 ## Your task
 
-Add `Payments.java` to the workspace. Nothing from Stage 1 changes shape; the grader runs `Stage01Test` again first. Python and Go ports of this project follow later; this pass is Java only.
+Add `Payments.java` to the workspace. Nothing from Stage 1 changes shape; the grader runs `Stage01Test` again first. The Python port has the same surface in snake_case in one `main.py` (signatures below); Go port follows later.
 
 ```java
 enum PaymentState {
@@ -90,6 +90,34 @@ final class Payment {
     void cancel(String reason);             // CREATED -> CANCELED
     Money refund(Money amount, String reason);   // returns what is still refundable
 }
+```
+
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+class PaymentState(Enum):     # CREATED, PROCESSING, SUCCEEDED, FAILED, CANCELED, REFUNDED
+    def is_terminal(self) -> bool: ...                 # FAILED, CANCELED, REFUNDED
+    def wire(self) -> str: ...                         # self.name.lower(): "succeeded"
+
+class IllegalTransitionError(RuntimeError):
+    def __init__(self, payment_id: str, from_state: PaymentState, to_state: PaymentState) -> None: ...
+
+@dataclass(frozen=True)
+class Transition:             # from_state: PaymentState, to_state: PaymentState, reason: str, at_millis: int
+
+class PaymentStateMachine:
+    TABLE: dict[PaymentState, frozenset[PaymentState]]
+    @staticmethod
+    def can_transition(from_state: PaymentState, to_state: PaymentState) -> bool: ...
+    @staticmethod
+    def next_states(from_state: PaymentState) -> frozenset[PaymentState]: ...
+
+class Payment:
+    def __init__(self, id: str, amount: Money, clock: Clock) -> None: ...   # blank id / non-positive amount -> ValueError
+    def id(self) -> str; amount() -> Money; state() -> PaymentState; captured() -> Money; refunded() -> Money
+    def refundable(self) -> Money; processor_reference() -> str; version() -> int; history() -> tuple[Transition, ...]
+    def start_processing(self) -> None; succeed(reference: str); fail(reason: str); cancel(reason: str)
+    def refund(self, refund_amount: Money, reason: str) -> Money: ...      # returns what is still refundable
 ```
 
 Rules the tests pin down:
@@ -146,6 +174,7 @@ static {
 
 ```bash
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 2 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 2 --path my-gateway
 ```
 
 Stage 1's 43 assertions run again, then Stage 2's 46.

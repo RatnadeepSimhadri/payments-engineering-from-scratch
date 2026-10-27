@@ -3,7 +3,7 @@
 > Who bears FX risk and when the rate is locked.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 08 (Payouts and Balance Management); Phase 12, Lesson 10 (Payment Method Abstraction)
 **Time:** ~60 minutes
 
@@ -358,9 +358,38 @@ effective markup  = 3.4971% after rounding the amount
 
 `MainTest` runs 44 assertions, including the expiry boundary at `expiresAt - 1` and `expiresAt`, P&L at four settlement rates, and every number in the DCC disclosure.
 
+### In Python
+
+```python
+def round_to_long(self, mode: RoundingMode) -> int:
+    q, r = divmod(self.num, self.den)        # floor division: 0 <= r < den
+    if r == 0:
+        return q
+    if mode is RoundingMode.FLOOR:
+        return q
+    if mode is RoundingMode.CEILING:
+        return q + 1
+    ...
+    twice = 2 * r                            # the half-way cases compare 2r with den
+    return q if q % 2 == 0 else q + 1        # HALF_EVEN
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **`Rational` is a frozen dataclass over two `int`s**, normalized in `__post_init__` with `math.gcd` and a positive denominator, exactly as the Java record's compact constructor did; `Rational.parse` borrows `fractions.Fraction(str)` only to read the decimal string exactly, never a float. `BigInteger` is unnecessary because Python ints do not overflow.
+- **`RoundingMode` is a small `Enum` and rounding is integer arithmetic.** There is no `BigDecimal.divide(scale, mode)`, so `round_to_long` implements CEILING, FLOOR, UP, DOWN and the three HALF modes from `divmod` and a `2r` vs `den` comparison; `to_decimal(scale)` is "multiply by 10^scale, round HALF_EVEN, insert the point", which reproduces `toPlainString`. A test pins every mode on 2.5 and -2.5.
+- **Field names avoid keywords:** `FxRate.from_currency`/`to_currency` for `from`/`to`. `ONE` is a module constant (also reachable as `Rational.ONE`).
+- **Exceptions:** a zero denominator raises `ZeroDivisionError` (an `ArithmeticError`, as `ArithmeticException` was); `QuoteExpiredError` is a `RuntimeError`; argument problems raise `ValueError` and `CurrencyMismatchError` is a `ValueError` subclass. `allocate` returns a `list[Money]`.
+
+```bash
+cd phases/12-payment-systems-design/12-currency-conversion-at-checkout/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `fractions.Fraction` is this lesson's `Rational`, built in and normalized; construct it from a string (`Fraction("1.0850")`), never from a float, and round with `decimal` quantization or explicit integer division so the rounding mode is visible (`round()` on a `Fraction` is half-even only). Go: `math/big.Rat` plays the same role (`SetString("1.0850")`), with mutating methods that need care about aliasing; rounding to an integer is done with `big.Int` quotient and remainder, as Go has no rounding-mode enum. In both, the clock is injected as a function returning milliseconds, and expiry stays half-open.
+Go: `math/big.Rat` plays the role of `Rational` (`SetString("1.0850")`), with mutating methods that need care about aliasing; rounding to an integer is done with `big.Int` quotient and remainder, as Go has no rounding-mode enum. The clock is injected as a function returning milliseconds, and expiry stays half-open.
 
 ## Use It
 

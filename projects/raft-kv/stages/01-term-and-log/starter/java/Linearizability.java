@@ -2,7 +2,7 @@
 // Op, History, and CheckResult are PROVIDED (the harness records them); Checker is YOUR CODE (Stage 4).
 // Sources: Herlihy & Wing, "Linearizability: A Correctness Condition for Concurrent Objects" (TOPLAS 1990);
 //          Wing & Gong, "Testing and Verifying Concurrent Objects" (JPDC 1993); Lowe, "Testing for Linearizability" (CCPE 2017).
-// Java 21, standard library only. Python and Go ports follow later.
+// Java 21, standard library only. Python port in solution/python; Go port follows later.
 
 import java.util.ArrayList;
 import java.util.HashSet;

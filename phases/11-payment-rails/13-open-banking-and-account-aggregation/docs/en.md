@@ -3,7 +3,7 @@
 > Consent flows, token refresh, and the aggregator SDK pattern.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 09 (Idempotency Keys), Phase 5, Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 10, Lesson 01 (Representing Money), Phase 11, Lesson 11 (IBAN, BIC, and Account Number Validation)
 **Time:** ~120 minutes
 
@@ -376,9 +376,34 @@ Expected output, abbreviated:
 
 The test harness prints `47 passed, 0 failed`.
 
+### In Python
+
+`code/python/main.py` is the same design class for class: `Pkce`, `AuthorizationServer`, `FdxStyleBank`, `UkObStyleBank`, the two adapters, `Aggregator`, and `Connection`. Four things differ:
+
+- **The seeded generator is `java.util.Random`, reimplemented.** Python's `random.Random` is a Mersenne Twister, so `Random(2026)` would give different tokens and a different demo. The port carries a 20-line `JavaRandom` with the JDK's 48-bit LCG (`next(bits)`, `next_int(bound)` including its rejection loop, `next_bytes`), so the state, verifier, and `at_3_3RC4m...` token in the output are identical in both languages. In production you would use `secrets.token_urlsafe`; the lesson keeps the generator injectable so the tests stay deterministic.
+
+```python
+def next(self, bits: int) -> int:
+    self.seed = (self.seed * self.MULTIPLIER + self.ADDEND) & self.MASK
+    value = self.seed >> (48 - bits)
+    return value - (1 << 32) if value >= (1 << 31) else value  # Java's int is signed
+```
+
+- **PKCE is `hashlib` plus `hmac.compare_digest`.** `challenge_s256` is `base64.urlsafe_b64encode(sha256(verifier)).rstrip(b"=")`, and `Pkce.verify` compares with `hmac.compare_digest`, the constant-time equivalent of `MessageDigest.isEqual`. The RFC 7636 appendix B vector is in the tests.
+- **Payloads are plain dicts.** What the Java casts out of `Map<String, Object>` is what a JSON parser hands you in Python, so the adapters read `r.body["Data"]["Transaction"]` directly and the `@SuppressWarnings("unchecked")` noise disappears. The money path is unchanged: the FDX amount string goes through `Money.parse`, never through `float`.
+- **Scopes are a `frozenset` of an `Enum`.** `EnumSet` iterates in declaration order, so `authorization_url` sorts the set by `list(Scope).index` before joining it, which is what keeps the `scope=` query string byte-identical. `OAuthException` keeps the `.error` attribute the tests inspect, and `ReauthorizationRequiredException` is raised `from` the OAuth error so the cause survives.
+
+```bash
+cd phases/11-payment-rails/13-open-banking-and-account-aggregation/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python tests port every Java check (64 assertions, including one that pins the `JavaRandom` sequence to values taken from the JDK), and the demo output matches the Java run exactly.
+
 ### Porting notes
 
-A Python port uses `hashlib.sha256` and `base64.urlsafe_b64encode(...).rstrip(b"=")` for PKCE, `secrets.token_urlsafe` in production and a seeded `random.Random` in tests, `hmac.compare_digest` for the constant-time comparison, and plain `dict` payloads, which is what a JSON parser gives you anyway; the adapters become functions over dicts and the `@SuppressWarnings("unchecked")` noise disappears. A Go port returns `(TokenResponse, error)` with a typed `*OAuthError{Code, Description}` that callers test with `errors.As`, uses `crypto/sha256`, `base64.RawURLEncoding`, and `crypto/subtle.ConstantTimeCompare`, and decodes payloads into `map[string]any` with type assertions in the adapters. In both, the `Call` functional interface is a closure, and the mutable `Connection` would need a mutex the moment two goroutines or threads sync the same connection, which the Java version also lacks and which Exercise 3 adds.
+A Go port returns `(TokenResponse, error)` with a typed `*OAuthError{Code, Description}` that callers test with `errors.As`, uses `crypto/sha256`, `base64.RawURLEncoding`, and `crypto/subtle.ConstantTimeCompare`, and decodes payloads into `map[string]any` with type assertions in the adapters. The `Call` functional interface is a closure, and the mutable `Connection` would need a mutex the moment two goroutines sync the same connection, which the Java version also lacks and which Exercise 3 adds.
 
 ## Use It
 

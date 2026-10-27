@@ -40,7 +40,7 @@ The fourth operation, `release`, exists for Stage 3: when the processor is unrea
 
 ## Your task
 
-`Money.java`, `Clock.java` and `Rng.java` are complete and must not change. `Idempotency.java` holds the types below with the method bodies stubbed to throw `UnsupportedOperationException`. Python and Go ports of this project follow later; this pass is Java only.
+`Money.java`, `Clock.java` and `Rng.java` are complete and must not change. `Idempotency.java` holds the types below with the method bodies stubbed to throw `UnsupportedOperationException`. (Python: the one `main.py` holds the same given parts, with the same methods stubbed to `raise NotImplementedError`.) The Python port has the same surface in snake_case in one `main.py` (signatures below); Go port follows later.
 
 ```java
 final class Fingerprint {
@@ -68,6 +68,37 @@ final class IdempotencyStore {
     synchronized int purgeExpired();
     synchronized int size();                                                        // given
 }
+```
+
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+class Fingerprint:
+    @staticmethod
+    def sha256_hex(canonical: str) -> str: ...        # hashlib.sha256(...).hexdigest(): 64 lowercase hex chars
+
+@dataclass(frozen=True)
+class ChargeRequest:          # merchant_id, idempotency_key, amount: Money, source, description; guards -> ValueError
+    def canonical(self) -> str: ...                    # f"{amount.minor_units}\n{currency code}\n{source}\n{description}"
+    def fingerprint(self) -> str: ...                  # Fingerprint.sha256_hex(self.canonical())
+
+@dataclass(frozen=True)
+class ApiResponse:            # status: int, body: str, replayed: bool = False; as_replay() -> ApiResponse   (given)
+class KeyState(Enum):  IN_PROGRESS, COMPLETED                                                               (given)
+class Decision(Enum):  NEW, REPLAY, IN_PROGRESS, CONFLICT                                                   (given)
+@dataclass(frozen=True)
+class BeginResult:            # decision: Decision, response: ApiResponse | None = None; BeginResult.of(decision)  (given)
+@dataclass(frozen=True)
+class IdempotencyRecord:      # merchant_id, key, fingerprint, state, response, created_at, expires_at; is_expired(now)  (given)
+
+class IdempotencyStore:
+    def __init__(self, clock: Clock, ttl_millis: int) -> None: ...        # given; ttl <= 0 -> ValueError; holds a threading.Lock
+    def begin(self, merchant_id: str, key: str, fingerprint: str) -> BeginResult: ...
+    def complete(self, merchant_id: str, key: str, response: ApiResponse) -> None: ...   # misuse -> RuntimeError
+    def release(self, merchant_id: str, key: str) -> bool: ...                          # COMPLETED -> RuntimeError
+    def get(self, merchant_id: str, key: str) -> IdempotencyRecord | None: ...         # None instead of Optional.empty()
+    def purge_expired(self) -> int: ...
+    def size(self) -> int: ...                                                          # given
 ```
 
 What each must do:
@@ -154,7 +185,9 @@ return new BeginResult(Decision.REPLAY, existing.response());
 
 ```bash
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --init my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang python --init my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 1 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 1 --path my-gateway
 ```
 
 The stage 1 test makes 43 assertions. A fresh workspace fails the first one with `UnsupportedOperationException: TODO stage 01: Fingerprint.sha256Hex`; that is the expected starting point.

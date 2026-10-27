@@ -3,7 +3,7 @@
 > Every log line carries the payment ID or it is noise.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 9, Lesson 07 (Distributed Tracing and Context Propagation), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~60 minutes
 
@@ -336,9 +336,35 @@ Keep the redaction block. "records written: 9, redactions applied: 4" is the num
 
 The last block is the support ticket answered: two records, two services, and the second one (`hold reversed`, reason `processor_timeout`) is the ledger confirming that the money was released. The `INFO` records that led up to the timeout were sampled out, which is the gap Exercise 2 closes.
 
+### In Python
+
+```python
+@staticmethod
+def fnv1a(s: str) -> int:
+    """FNV-1a over UTF-16 code units, wrapped to a signed 32-bit int exactly as Java's int arithmetic does."""
+    h = 0x811C9DC5
+    for c in s:
+        h ^= ord(c)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return to_int32(h)
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The sampling hash must wrap.** Python ints do not overflow, so `fnv1a` masks every multiply with `& 0xFFFFFFFF` and converts to a signed value at the end; `keep` then uses Python's `%`, which floors like `Math.floorMod`. The same trace id (`1af76519...`) is selected in both languages, so the "records kept: 11 of 37" line matches.
+- **`with` is a keyword**, so the child-logger method is `with_`; `with_trace` reads the same. Varargs `String... kv` become `*kv: str`, and the odd-length check raises `ValueError` where Java throws `IllegalArgumentException`.
+- **The JSON writer is still hand-written.** `json.dumps` would produce the same bytes for these records, but the lesson's point is that the key order and escaping are yours to control; the port builds a list of fragments and joins once, with `f"\\u{ord(c):04x}"` for control characters. `Level` is an `Enum` whose value is `(ordinal, syslog)` so `at_least` compares ordinals as the Java enum does.
+- **The PAN regex is compiled with `re.ASCII`.** Python's `\d` matches any Unicode digit by default; Java's matches only `0-9`, and a redactor that disagrees between services is a compliance gap. `re.finditer` replaces the `Matcher` loop and `LinkedHashMap` is a plain `dict`.
+
+```bash
+cd phases/09-reliability-and-scale/08-structured-logging/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: the `logging` module's `LoggerAdapter` or a `dict` of bound fields replaces `with`; `json.dumps(record, separators=(",", ":"))` replaces the hand-written writer but reorders nothing if you build the `dict` in order; `re.finditer` and `str.translate` for the redactor; `int` hashing with the same FNV constants masked to 32 bits (`& 0xffffffff`) so the sampling decision matches the Java one for the same trace id. Go: `log/slog` (Go 1.21+) is structured logging in the standard library with `With(...)` for bound attributes and a `Handler` interface where redaction and sampling slot in; `encoding/json` with a struct whose field order is the declaration order; a `ReplaceAttr` function on the handler is the idiomatic redaction hook.
+Go: `log/slog` (Go 1.21+) is structured logging in the standard library with `With(...)` for bound attributes and a `Handler` interface where redaction and sampling slot in; `encoding/json` with a struct whose field order is the declaration order; a `ReplaceAttr` function on the handler is the idiomatic redaction hook.
 
 ## Use It
 

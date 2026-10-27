@@ -86,7 +86,7 @@ Finally the scaffolding. With `new Network(clock, 7, 0.0, 5)` (seed 7, no drops,
 
 ## Your task
 
-Implement every method of `Storage` in `Storage.java`. The fields are already declared and must keep their names and visibility: the harness and the tests read them directly.
+Implement every method of `Storage` in `Storage.java`. The fields are already declared and must keep their names and visibility: the harness and the tests read them directly. (Python: the `Storage` class in your `main.py`; the provided parts and the later-stage stubs sit in the same file.)
 
 ```java
 final class Storage {
@@ -105,6 +105,28 @@ final class Storage {
     boolean upToDate(int candidateLastIndex, long candidateLastTerm);
     String describe();                                   // log[1..last].toString(), e.g. "[t1:PUT a 1, t3:NOOP]"
 }
+```
+
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+class Storage:                 # fields keep their names: current_term, voted_for (-1 means null), log (list, slot 0 = sentinel), writes
+    def save(self, term: int, voted_for: int) -> None: ...          # term < current_term -> ValueError; writes += 1
+    def append(self, e: LogEntry) -> None: ...                      # e.term < last_term() -> ValueError; writes += 1
+    def truncate(self, from_index: int) -> None: ...                # from_index < 1 -> ValueError; past the end is a no-op (no write)
+    def last_index(self) -> int: ...                                # len(log) - 1
+    def last_term(self) -> int: ...                                 # 0 when empty
+    def term_at(self, index: int) -> int: ...                       # out of range -> IndexError
+    def entries_from(self, from_index: int) -> list[LogEntry]: ...  # a copy of log[from_index:]; range 1..last_index()+1 else IndexError
+    def up_to_date(self, candidate_last_index: int, candidate_last_term: int) -> bool: ...
+    def describe(self) -> str: ...                                  # "[t1:PUT a 1, t3:NOOP]"
+
+# Provided in the same main.py (do not edit): Clock().now()/advance(); Rng(seed).next_long()/next_int(bound)/next_double();
+# Message.request_vote / vote_reply / append_entries / append_reply (fields from_, to, term, prev_log_index, prev_log_term,
+# entries, leader_commit, success, match_index); Config(election_timeout_min, election_timeout_max, heartbeat_interval) and
+# DEFAULT_CONFIG (also Config.DEFAULT); Network(clock, seed, drop_rate, max_delay) with add / send / send_all / tick / partition /
+# heal / crash / restart / is_down / in_flight and the counters sent / delivered / dropped; a Node is any object with an `id`
+# attribute plus tick(now) and handle(m, now); no_trace is the Python Tracer.NONE.
 ```
 
 Rules, including what must fail and how:
@@ -145,13 +167,15 @@ Common mistakes the tests are designed to catch:
 
 `Sim.java`, `Cluster.java`, `Linearizability.java` (the `Op`, `History`, `CheckResult` types), and the stubbed `RaftNode.java`, `KVStore.java`, and `Checker` are in your workspace from `--init`. Leave `Sim.java` and `Cluster.java` alone; the other stubs are yours in later stages. The starter `Main` only drives the scaffolding; it runs as-is and you may replace it at any time.
 
-Python and Go ports of this project follow later; this pass is Java only.
+The Python port has the same surface in snake_case in one `main.py` (signatures above); Go port follows later.
 
 ## Run the grader
 
 ```bash
 python3 scripts/project_test.py raft-kv --lang java --init my-raft-kv     # once
+python3 scripts/project_test.py raft-kv --lang python --init my-raft-kv     # once
 python3 scripts/project_test.py raft-kv --lang java --stage 1 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --stage 1 --path my-raft-kv
 ```
 
 The stage-1 test has about 70 assertions: fresh state, every `Storage` rule above including the three exception cases, the SplitMix64 stream (`new Rng(1).nextLong() == 0x910A2DEC89025CC1L`, `new Rng(42).nextInt(1000)` gives 451, 953, 371), the `Network` delivery schedule for seed 7, drops at rate 1.0, partitions, crash and restart, and the `Message` and `Config` helpers.

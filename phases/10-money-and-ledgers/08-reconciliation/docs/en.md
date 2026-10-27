@@ -3,7 +3,7 @@
 > The processor says 10,000 transactions; you have 9,998. Find the two.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 07 (Holds and Available Balance)
 **Time:** ~120 minutes
 
@@ -354,9 +354,35 @@ TOTALS
 
 The test harness prints `42 passed, 0 failed`. The determinism test shuffles both inputs with seeded `Random` instances and compares the rendered text of the two reports with `equals`.
 
+### In Python
+
+The full port is `code/python/main.py` (same `Reconciler` with three passes, `ReconciliationReport`, `Match`, `Break`, `BreakKind`; tests in `code/python/test_main.py`). Three things differ:
+
+- **Ordering is a key tuple, not a `Comparator`.** `list.sort` is stable like `Collections.sort`, so `ours.sort(key=lambda p: (p.date, p.reference, p.amount.minor_units))` keeps input order for equal keys exactly as the Java does. `BreakKind` carries its report position as the enum value, and the final `breaks.sort` keys on `(kind.value, date, reference)` because Python enums are not ordered by declaration the way Java's `compareTo` is:
+
+```python
+class BreakKind(Enum):
+    MISSING_OURS = 0
+    MISSING_THEIRS = 1
+    AMOUNT_MISMATCH = 2
+    DUPLICATE_OURS = 3
+    DUPLICATE_THEIRS = 4
+
+breaks.sort(key=lambda b: (b.kind.value, b.date(), b.reference()))
+```
+
+- **Dates and grouping.** `datetime.date` replaces `LocalDate`, and the distance in pass 2 is `abs((l.date - p.date).days)` instead of `ChronoUnit.DAYS.between`. Grouping uses a plain `dict` and iterates `sorted(ours_by_ref)`, which visits references in the same order as Java's `TreeMap`; the output would be identical with insertion order as well, since both inputs are sorted first, but the explicit sort keeps the parity obvious.
+- **Shape checks live in `__post_init__`.** `Match` and `Break` are frozen dataclasses whose `__post_init__` raises `ValueError` (Java's `IllegalArgumentException`) when the amounts differ or the wrong side is present; the tie-out failure raises `RuntimeError` (Java's `IllegalStateException`). `Money` here has no overflow checks because `int` cannot overflow, and the determinism test shuffles with `random.Random(7)` rather than Java's `Random`, since the assertion is that any input order renders the same report.
+
+```bash
+cd phases/10-money-and-ledgers/08-reconciliation/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port would use `int` minor units (no overflow to check), `datetime.date` with `(a - b).days` for the distance, `sorted` with a key tuple (stable, like `Collections.sort`), and a `dict` for grouping, which since Python 3.7 iterates in insertion order; since the input is sorted first, insertion order is deterministic, so a plain `dict` is acceptable where Java needed `TreeMap`. Breaks would be a frozen dataclass with `__post_init__` doing the shape check. A Go port would return `(ReconciliationReport, error)` from `Reconcile` instead of throwing on a foreign currency, use `sort.SliceStable` (not `sort.Slice`) for both input sorts and for the final ordering, and iterate the grouping map over a separately sorted key slice, because Go map iteration order is deliberately randomized. The tie-out failure, which is a programmer error, would be a `panic` in Go rather than a returned error.
+A Go port would return `(ReconciliationReport, error)` from `Reconcile` instead of throwing on a foreign currency, use `sort.SliceStable` (not `sort.Slice`) for both input sorts and for the final ordering, and iterate the grouping map over a separately sorted key slice, because Go map iteration order is deliberately randomized. The tie-out failure, which is a programmer error, would be a `panic` in Go rather than a returned error.
 
 ## Use It
 

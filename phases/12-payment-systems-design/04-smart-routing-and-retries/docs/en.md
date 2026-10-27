@@ -3,7 +3,7 @@
 > Which processor, which retry, and when to stop.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 03 (Payment Orchestration Across Processors); Phase 12, Lesson 02 (The Payment State Machine); Phase 5, Lesson 10 (Retries, Backoff, and Jitter); Phase 11, Lesson 02 (Card Authorization Lifecycle)
 **Time:** ~90 minutes
 
@@ -391,9 +391,37 @@ first attempts: {acq_a=101, acq_b=1899}; approved 1892/2000
 
 The ranked estimates (0.900 and 0.833) are lower than the 93% and 86% the demo fed in because 100 decayed observations are still pulled toward the 0.85 prior with weight 20; that shrinkage is the prior doing its job. The test suite has 52 assertions, covering fee rounding, every class in the table, both overrides, the estimator's arithmetic and decay, ranking and tie-breaks, the cascade rules for every class, the attempt cap, the separation of health and auth-rate signals, every circuit-breaker transition at its exact time boundary, and the budget arithmetic.
 
+### In Python
+
+```python
+class JavaRandom:
+    def __init__(self, seed: int) -> None:
+        self._seed = (seed ^ 0x5DEECE66D) & ((1 << 48) - 1)
+
+    def next(self, bits: int) -> int:
+        self._seed = (self._seed * 0x5DEECE66D + 0xB) & ((1 << 48) - 1)
+        return _to_int32(self._seed >> (48 - bits))
+
+    def next_double(self) -> float:
+        return ((self.next(26) << 27) + self.next(27)) * (1.0 / (1 << 53))
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **`java.util.Random` is ported, not replaced.** `JavaRandom` is the 48-bit LCG with `next_int(bound)` and `next_double()` reproduced exactly, so `JavaRandom(7)` (exploration) and `JavaRandom(42)` (the simulated gateway) produce the same rolls and the learning demo ends on the same numbers: `acq_a 0.803, acq_b 0.929`, first attempts `{acq_a=101, acq_b=1899}`, 1892 approvals. A test pins the first values of both seeds against the JDK.
+- **Integer fees without `multiplyExact`.** Python ints do not overflow, so the fee is `(amount * bps + 5_000) // 10_000`; `//` floors like `Math.floorDiv`, which on these non-negative values is half-up rounding. Estimates and margins are `float`, the same IEEE doubles Java uses, so `f"{rate:.3f}"` prints what `%.3f` printed.
+- **The decline table is a module-level loop** that fills `DeclineCodes.TABLE` (a `dict`, insertion-ordered like `LinkedHashMap`) in place of a `static {}` block; `ProcessorResponse.of(code, mac=None)` covers both Java overloads.
+- **Ranking sorts on a tuple key** `(-expected_margin_minor, processor.id)` instead of a chained `Comparator`; the health factory is a plain callable `(id, clock) -> ProcessorHealth`. `IllegalArgumentException` becomes `ValueError`.
+
+```bash
+cd phases/12-payment-systems-design/04-smart-routing-and-retries/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python and Go ports keep the same types and method names. Python's `int` cannot overflow, so `multiplyExact` becomes plain `*`, but the half-up rounding must use `//` on non-negative values exactly as here; `random.Random(7)` gives deterministic but different sequences from Java, so the learning demo's counts will differ and tests should assert on properties (acq_b leads, estimates within 0.03 of the truth) rather than exact numbers. In Go the classes become a typed `const` block with `iota`, `rank` uses `sort.SliceStable` with the same comparator, and `route` returns `(RouteResult, error)` only for programmer errors. If the router is shared across goroutines, the estimator, breaker, and budget each need a `sync.Mutex` (or the budget an `atomic.Int64` with a compare-and-swap loop), and `go test -race` should cover a concurrent storm test.
+A Go port keeps the same types and method names. The classes become a typed `const` block with `iota`, `rank` uses `sort.SliceStable` with the same comparator, and `route` returns `(RouteResult, error)` only for programmer errors. `math/rand` gives deterministic but different sequences from Java, so the learning demo's counts will differ and tests should assert on properties (acq_b leads, estimates within 0.03 of the truth) rather than exact numbers, unless the 48-bit LCG is ported bit for bit. If the router is shared across goroutines, the estimator, breaker, and budget each need a `sync.Mutex` (or the budget an `atomic.Int64` with a compare-and-swap loop), and `go test -race` should cover a concurrent storm test.
 
 ## Use It
 

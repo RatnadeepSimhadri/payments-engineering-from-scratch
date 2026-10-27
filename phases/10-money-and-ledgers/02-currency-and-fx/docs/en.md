@@ -3,7 +3,7 @@
 > ISO 4217, exponents, and where the rounding residue goes.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -342,9 +342,46 @@ EUR/GBP via USD = EUR/GBP 0.856352 (7893/9217) from ecb-ref+ecb-ref
 rejected: USD/EUR rate from ecb-ref is 3660s old; max 300s
 ```
 
+### In Python
+
+The full port is `code/python/main.py` with the same classes (`CurrencyRegistry`, `FxRate`, `Conversion`, `FxConverter`, `RateTable`) and tests in `code/python/test_main.py`. Four things differ:
+
+- **The rational is still an `int` pair, reduced in `__post_init__`.** `fractions.Fraction` would do the reduction for free, but keeping `numerator`/`denominator` as fields keeps the design identical to Java and makes the "no intermediate rounding" argument visible in `cross()` and `convert()`. A frozen dataclass cannot assign in `__post_init__`, so the reduction uses `object.__setattr__`:
+
+```python
+@dataclass(frozen=True)
+class FxRate:
+    base: Currency
+    quote: Currency
+    numerator: int
+    denominator: int
+    source: str
+    observed_at_epoch_seconds: int
+    spread_bps: int
+
+    def __post_init__(self) -> None:
+        if self.base == self.quote:
+            raise ValueError(f"base and quote must differ: {self.base.code}")
+        if self.numerator <= 0 or self.denominator <= 0:
+            raise ValueError("rate must be positive")
+        g = gcd(self.numerator, self.denominator)
+        object.__setattr__(self, "numerator", self.numerator // g)
+        object.__setattr__(self, "denominator", self.denominator // g)
+```
+
+- **No `multiplyExact`.** `amount * numerator * 10^quoteExp` cannot overflow a Python `int`, so the checked multiplications disappear. The one place integer semantics matter is `divide_rounded`, which (as in Lesson 01) divides magnitudes with `divmod` and reapplies the sign, because `-1842478 // 1000` floors to `-1843` where Java truncates to `-1842`. `-19.99 USD` therefore converts to `-18.42 EUR` in both languages, which the tests check.
+- **Exceptions map to built-ins.** `UnknownCurrencyError` and `CurrencyMismatchError` extend `ValueError` (Java's `IllegalArgumentException`), `StaleRateError` extends `RuntimeError` (Java's `IllegalStateException`), and `NumberFormatException` becomes a plain `ValueError`. `Conversion.from` is spelled `from_` because `from` is a keyword.
+- **Insertion-ordered `dict`** gives the registry and the rate table the same iteration order as Java's `LinkedHashMap` with no extra bookkeeping.
+
+```bash
+cd phases/10-money-and-ledgers/02-currency-and-fx/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port would use `fractions.Fraction` for the rate (it reduces automatically and `Fraction("0.9217")` parses exactly from a string), `int` minor units with no overflow checks, and `divmod` on magnitudes for `divide_rounded` as Lesson 01 does, because `//` floors negative dividends. A Go port would return `(Conversion, error)` from `Convert` and `(FxRate, error)` from `NewFxRate`, with sentinel errors `ErrUnknownCurrency`, `ErrStaleRate`, and `ErrCurrencyMismatch` for `errors.Is`; `math/big.Rat` is available for the rational but an `int64` pair with hand-written `mulChecked` keeps the design identical to Java. In both, the registry's iteration order needs care for deterministic output: Python's `dict` preserves insertion order, Go's `map` does not, so the Go registry keeps a separate ordered slice of codes.
+A Go port would return `(Conversion, error)` from `Convert` and `(FxRate, error)` from `NewFxRate`, with sentinel errors `ErrUnknownCurrency`, `ErrStaleRate`, and `ErrCurrencyMismatch` for `errors.Is`; `math/big.Rat` is available for the rational but an `int64` pair with hand-written `mulChecked` keeps the design identical to Java. The registry's iteration order needs care for deterministic output: Go's `map` does not preserve insertion order, so the Go registry keeps a separate ordered slice of codes.
 
 ## Use It
 

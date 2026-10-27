@@ -3,7 +3,7 @@
 > A hot key expires and ten thousand requests hit the database.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 9, Lesson 03 (Caching Strategies), Phase 5, Lesson 10 (Retries, Backoff, and Jitter), Phase 1, Lesson 09 (Heaps and Priority Queues)
 **Time:** ~75 minutes
 
@@ -349,9 +349,39 @@ single-flight (coalesce)                   loads    3  peak in-flight    1 ...
 
 The test suite has 37 assertions: simulator ordering, store concurrency accounting, the stampede itself (100 loads, peak 100), each fix's load count and latency profile, the XFetch probability at a known gap, stale-while-revalidate's three tiers, invalidation as a cliff, and determinism.
 
+### In Python
+
+```python
+class Simulator:
+    def schedule(self, at_ms: int, action: Action) -> None:
+        if at_ms < self._now_ms:
+            raise ValueError(f"cannot schedule in the past: {at_ms} < {self._now_ms}")
+        heapq.heappush(self._queue, (at_ms, self._seq, action))
+        self._seq += 1
+
+    def run(self) -> None:
+        while self._queue:
+            at_ms, _, action = heapq.heappop(self._queue)
+            self._now_ms = at_ms
+            action()
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The event queue is `heapq` over `(at_ms, seq, action)` tuples.** The sequence number is the tie-breaker that keeps same-instant events in scheduling order, and it also stops Python from ever comparing two callables when the times are equal. `Waiter` and `Runnable` become plain functions; each strategy's load callback is a nested `def loaded(value)` closing over `started`, `key`, and `w`.
+- **Both RNGs are `java.util.Random`, not `random.Random`.** The jitter in `Scenario.run` and the XFetch draw in `should_recompute` port the 48-bit LCG (`next_int(2)` takes the power-of-two path, `next_double` is `(next(26) << 27 + next(27)) / 2**53`), so the loads, peak in-flight, and stale columns match the Java table digit for digit. `Double.MIN_VALUE` is spelled as the literal subnormal `5e-324`.
+- **Integer division is explicit.** `average_lead_ms` uses `//` on non-negative totals, and `gap_micros = 1_000_000 // requests_per_second`; the `now + gap >= fresh_until` comparison mixes `int` and `float` exactly as the Java `long + double` does.
+- **Closures in a loop.** The beta sweep binds the loop variable with a default argument (`lambda sim, st, b=beta: ...`) so each factory keeps its own beta; the request-scheduling loops are safe because `key` and `s` do not change.
+
+```bash
+cd phases/09-reliability-and-scale/04-cache-invalidation-and-stampedes/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `heapq` with `(at_ms, seq, action)` tuples for the simulator, `random.Random(seed)` for jitter and XFetch, `math.log`. Closures over mutable counters need `nonlocal` or a small stats object; the Java callbacks become plain functions. Go: `container/heap` for the event queue, `math/rand` with a fixed source, and the `Waiter` interface becomes `func(Money)`. A Go port that replaces the simulator with real goroutines must guard `inFlight`, `locks`, and `refreshing` with a `sync.Mutex` and pass `go test -race ./...`; `golang.org/x/sync/singleflight` is the production version of Step 5 and is worth reading alongside the port. In all three languages, `rand` in `(0, 1]` versus `[0, 1)` is the detail that decides whether `ln(0)` can occur.
+Go: `container/heap` for the event queue, `math/rand` with a fixed source, and the `Waiter` interface becomes `func(Money)`. A Go port that replaces the simulator with real goroutines must guard `inFlight`, `locks`, and `refreshing` with a `sync.Mutex` and pass `go test -race ./...`; `golang.org/x/sync/singleflight` is the production version of Step 5 and is worth reading alongside the port. In all three languages, `rand` in `(0, 1]` versus `[0, 1)` is the detail that decides whether `ln(0)` can occur.
 
 ## Use It
 

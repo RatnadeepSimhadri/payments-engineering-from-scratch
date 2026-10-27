@@ -3,7 +3,7 @@
 > Billing cycles, proration, and the retry schedule that recovers revenue.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 04 (Smart Routing, Cascading, and Retry Policies); Phase 12, Lesson 10 (Payment Method Abstraction); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -365,9 +365,34 @@ gateway calls = 14, approved = 6
 
 The demo calls `runDay()` twice per simulated day for 75 days; the gateway sees 14 charges, not 28. `MainTest` runs 54 assertions.
 
+### In Python
+
+```python
+def add_months(d: date, months: int) -> date:
+    # java.time's plusMonths: the day of month clamps to the target month's last day (Jan 31 + 1 = Feb 28).
+    month_index = d.year * 12 + (d.month - 1) + months
+    year, month = divmod(month_index, 12)
+    month += 1
+    last = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last))
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **`datetime.date` has no `plusMonths`.** `add_months` reproduces the clamping rule with `calendar.monthrange`, and a test pins it against the same table (Jan 31 to Feb 28, Mar 31 minus one month, Feb 29 yearly). Everything else about dates is `timedelta` arithmetic and `(b - a).days` for `ChronoUnit.DAYS.between`.
+- **`allocate` is pure `int` arithmetic**: `//` and `%` on the non-negative magnitude, then a stable `sorted(range(n), key=lambda i: -remainders[i])` hands the leftover minor units to the largest remainders with ties to the lower index, exactly as the Java comparator sort did. It returns a `list[Money]`.
+- **The transition table is `dict[SubscriptionStatus, frozenset[SubscriptionStatus]]`**, `DunningPolicy.retry_offsets_days` is a tuple validated in `__post_init__`, and `Interval.months` is a property over the enum value.
+- **Optionals and exceptions:** `CardUpdater.refresh` returns `Optional[str]` (`None` for no replacement) and `BillingEngine.invoice` returns `None` for an unknown id; `IllegalTransitionError` is a `RuntimeError`, bad arguments raise `ValueError`, and a duplicate subscription or a plan change outside ACTIVE raises `RuntimeError`.
+
+```bash
+cd phases/12-payment-systems-design/11-recurring-and-subscriptions/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `datetime.date` has no `plusMonths`; write `add_months(anchor, n)` with `calendar.monthrange` to clamp the day, and test it against the same table (Jan 31 to Feb 28, Feb 29 yearly). `allocate` uses `int` arithmetic exactly as in Java, and the transition table is a `dict[Status, frozenset[Status]]`. Go: `time.Time.AddDate(0, n, 0)` *normalizes* instead of clamping (Jan 31 plus one month is March 3), so the Go port must clamp explicitly; this is the single most likely porting bug. In both, the engine is single-threaded by design; a sharded production run needs a row lock per subscription.
+Go: `time.Time.AddDate(0, n, 0)` *normalizes* instead of clamping (Jan 31 plus one month is March 3), so the Go port must clamp explicitly; this is the single most likely porting bug. The engine is single-threaded by design; a sharded production run needs a row lock per subscription.
 
 ## Use It
 

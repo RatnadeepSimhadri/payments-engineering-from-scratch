@@ -74,6 +74,30 @@ final class RaftNode implements Node {
 }
 ```
 
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+class RaftNode:                # fields: id, peers, storage, role, leader_id, commit_index, last_applied, state_machine, next_index, match_index,
+                               #         votes_granted, election_deadline, next_heartbeat, elections_started, consistency_rejections
+    def __init__(self, id: int, peers: Sequence[int], storage: Storage, rng: Rng, config: Config, now: int, tracer: Tracer | None = None) -> None
+    current_term, voted_for, log      # read-only properties over storage (no parentheses)
+    def votes(self) -> int; cluster_size() -> int; majority() -> int; last_log_index() -> int; last_log_term() -> int
+
+    def reset_election_timer(self, now: int) -> None: ...          # now + min + rng.next_int(max - min + 1)
+    def tick(self, now: int) -> list[Message]: ...
+    def start_election(self, now: int) -> list[Message]: ...
+    def handle(self, m: Message, now: int) -> list[Message]: ...
+    def become_follower(self, term: int, now: int) -> None: ...
+    def on_request_vote(self, m: Message, now: int) -> list[Message]: ...
+    def on_vote_reply(self, m: Message, now: int) -> list[Message]: ...
+    def become_leader(self, now: int) -> list[Message]: ...
+    def replicate_all(self, now: int) -> list[Message]: ...
+    def on_append_entries(self, m: Message, now: int) -> list[Message]: ...   # a second leader in the same term -> RuntimeError
+
+# Cluster(size, seed, drop_rate, max_delay) is provided: run / run_until_stable_leader / stable_leader / leaders / max_term /
+# partition / heal / crash / restart / expire_timer, plus nodes, storages, events, leaders_by_term and network.
+```
+
 Exact rules, in the paper's words where it has them:
 
 - **`resetElectionTimer(now)`**: draw from `rng`, this node's own stream, uniformly in `[electionTimeoutMin, electionTimeoutMax]`. With `min == max` the deadline is exactly `now + min`. Never read a wall clock.
@@ -153,12 +177,13 @@ Bugs this stage's tests are built to expose:
 | Leader does not re-arm its timer on step-down | after a partition heals the old leader sits as a follower forever, which is harmless here but hides the bug the next scenario needs |
 | `becomeFollower` saves even for an equal term | `writes` climbs on every heartbeat; the restart test still passes, but your `fsync` budget in a real system is gone |
 
-Python and Go ports of this project follow later; this pass is Java only.
+The Python port has the same surface in snake_case in one `main.py` (signatures above); Go port follows later.
 
 ## Run the grader
 
 ```bash
 python3 scripts/project_test.py raft-kv --lang java --stage 2 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --stage 2 --path my-raft-kv
 ```
 
 The grader re-runs stage 1 first. Stage 2 has about 65 assertions: timeout range and determinism, the candidate transition, vote counting with stale and duplicate replies, every RequestVote receiver rule, the up-to-date guard, follower and candidate reactions to `AppendEntries`, leader step-down and heartbeat cadence, the seed-7 election, same-seed-same-trace, 40 lossy seeds with explicit at-most-one-leader-per-term tracking, 20 three-node clusters at 30 % loss, the partition and heal, and the crash-restart vote test. The cluster scenarios run in under two seconds; if yours take much longer, a node is probably starting an election every tick because `resetElectionTimer` was not called.

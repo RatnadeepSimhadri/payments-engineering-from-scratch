@@ -3,7 +3,7 @@
 > A webhook is an unauthenticated HTTP POST from the internet that claims money moved; the signature, the timestamp, and the event id are the only things standing between it and your ledger.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 01 (Idempotent Payment API), Phase 12, Lesson 02 (Payment State Machine), Phase 5, Lesson 03 (Retries, Timeouts, and Backoff)
 **Time:** ~120 minutes
 
@@ -354,9 +354,32 @@ forged signature -> REJECTED (BAD_SIGNATURE) http 400
 
 The test file includes the RFC 4231 test vector for HMAC-SHA256 (`key = 0x0b * 20`, `data = "Hi There"`), so a wrong `Mac` configuration fails on a published constant rather than on a value the lesson itself computed.
 
+### In Python
+
+```python
+def hmac_sha256(key: bytes, message: bytes) -> bytes:
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+def constant_time_equals(a: bytes, b: bytes) -> bool:
+    return hmac.compare_digest(a, b)
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **The crypto is `hmac` + `hashlib`, not `javax.crypto`.** `hmac_sha256`, `hex_of` (`bytes.hex()`) and `unhex` (`bytes.fromhex`) are module-level functions that `WebhookSigner`/`WebhookVerifier` also expose as static methods, so `WebhookSigner.hmac_sha256(...)` reads like the Java. The constant-time comparison is `hmac.compare_digest` rather than a hand-rolled XOR loop, because `==` on `bytes` short-circuits; it returns `False` on a length mismatch, which the test checks.
+- **Header parsing is stricter about what Java took for granted.** `int(v)` accepts underscores and surrounding whitespace, so the timestamp is matched against `[+-]?\d+` first; `str.split(",")` keeps trailing empty strings where Java's `split` drops them, so they are popped before the loop. A missing header arrives as `None` from `headers.get(...)`, exactly as the Java `Map.get` returned `null`.
+- **Overloads become defaults.** `WebhookVerifier(secret, clock, tolerance_seconds=300)` and `WebhookDispatcher(..., backoff_seconds=None)` replace the two-constructor pairs; the backoff schedule is a tuple so nobody can mutate it after construction (the Java cloned the array for the same reason).
+- **`IllegalArgumentException` is `ValueError`** (short secret, negative clock advance, missing JSON field) and `Handled` is a frozen dataclass compared with `assertEqual`, as the Java record was with `equals`.
+
+```bash
+cd phases/12-payment-systems-design/05-webhooks-and-callbacks/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python has `hmac.new(key, msg, hashlib.sha256).hexdigest()` and `hmac.compare_digest` for the constant-time comparison; use the latter rather than hand-rolling the XOR loop, since CPython's `==` on `bytes` short-circuits. Go has `crypto/hmac` with `hmac.Equal`, and the dispatcher's `tick` would take the clock as a `func() int64` or an interface with a `Now()` method; errors from the endpoint come back as `(int, error)` rather than a status alone. In both languages the event id set and the per-object sequence map are plain dictionaries; the Go version should guard them with a `sync.Mutex` if `handle` is called from several goroutines, and the tests should pass under `go test -race`.
+Go has `crypto/hmac` with `hmac.Equal`, and the dispatcher's `tick` would take the clock as a `func() int64` or an interface with a `Now()` method; errors from the endpoint come back as `(int, error)` rather than a status alone. The event id set and the per-object sequence map are plain maps; the Go version should guard them with a `sync.Mutex` if `handle` is called from several goroutines, and the tests should pass under `go test -race`.
 
 ## Use It
 

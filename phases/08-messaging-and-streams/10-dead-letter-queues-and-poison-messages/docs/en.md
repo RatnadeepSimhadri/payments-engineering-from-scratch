@@ -3,7 +3,7 @@
 > One malformed event must not stall every account behind it.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 09 (Backpressure and Flow Control), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 8, Lesson 03 (Delivery Guarantees), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~60 minutes
 
@@ -331,9 +331,33 @@ replayed 2 events; acct-B balance = 39.75 USD  (25.50 + 10.00 + 4.25)
 dead letters remaining: 1 (offset 6, acct-D, awaiting a currency-code fix)
 ```
 
+### In Python
+
+```python
+def handle(self, e: Event) -> None:
+    try:
+        currency = Currency.of(e.currency_code)
+        amount = Money.parse(e.amount_text, currency)
+    except (ValueError, ArithmeticError) as ex:   # NumberFormatException / IllegalArgumentException / ArithmeticException
+        raise HandlerError(FailureKind.PERMANENT, str(ex)) from None
+    if self._faults.should_fail():
+        raise HandlerError(FailureKind.TRANSIENT, "ledger db timeout")
+    if e.offset in self._applied:                  # idempotent replay
+        return
+```
+
+Differences, all in `code/python/main.py`:
+
+- **`HandlerError` carries `kind`** as a `FailureKind` enum attribute, and the consumer checks `ex.kind is FailureKind.PERMANENT`. The multi-catch becomes `except (ValueError, ArithmeticError)`: `Money.parse` raises `ValueError` for garbage (Java's `NumberFormatException`) and `ArithmeticError` for excess precision, and `Currency.of` raises `ValueError` for an unknown code, so the same three poison cases are classified PERMANENT.
+- **The seeded fault injector reproduces `java.util.Random`.** `random.Random(11)` would time out on different ledger calls and the demo would park a different offset. `JavaRandom.next_double()` is the 48-bit LCG, so the second run retries exactly twice and parks offset 5, as in Java; the test file pins the first twelve draws.
+- **`TreeMap` becomes `dict(sorted(...))`** in `LedgerPostingHandler.balances()`, and `LinkedHashMap quarantinedKeys` is a plain `dict` (insertion-ordered). `DeadLetterQueue.clear` rebuilds the list with a comprehension where Java uses `removeIf`; `replay` sorts the letters with `sorted(..., key=lambda d: d.event.offset)`.
+- **`Money` is `int` minor units** and raises `TypeError` on a `float`; `ConsumerStats` is a frozen dataclass with a `__str__` that prints the Java record shape so the final `stats:` line matches.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The dead-letter table and both replays match the Java run line for line.
+
 ### Porting notes
 
-In Python, `HandlerException` carries `kind` as an `enum.Enum` attribute and the handler's `except (ValueError, ArithmeticError)` plays the role of the Java multi-catch (`decimal.InvalidOperation` is an `ArithmeticError`); `DeadLetter` is a frozen dataclass and the DLQ a list with a comprehension for `for_key`. In Go, `HandlerException` becomes an error type with a `Kind` field checked via `errors.As`, `attempt` returns `(bool, error)`, and the per-key quarantine map is a plain `map[string]int64`; `SimClock` is a struct with an `Advance` method and no goroutines are needed because consumption is sequential per partition by design. In all three the handler's `applied` set is the idempotency guard and must be kept; a port that drops it to simplify will double-post on the transient-after-commit case.
+In Go, `HandlerException` becomes an error type with a `Kind` field checked via `errors.As`, `attempt` returns `(bool, error)`, and the per-key quarantine map is a plain `map[string]int64`; `SimClock` is a struct with an `Advance` method and no goroutines are needed because consumption is sequential per partition by design. In every language the handler's `applied` set is the idempotency guard and must be kept; a port that drops it to simplify will double-post on the transient-after-commit case.
 
 ## Use It
 

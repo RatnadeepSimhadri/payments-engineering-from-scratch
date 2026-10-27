@@ -3,7 +3,7 @@
 > Refund more than captured and the ledger must say no.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 10, Lesson 03 (The Double-Entry Ledger); Phase 10, Lesson 06 (Immutability and Reversals); Phase 10, Lesson 10 (Fees and Splits)
 **Time:** ~75 minutes
 
@@ -357,9 +357,37 @@ refused: capture cap_3 on 2026-01-15: refund window of 180 days closed on 2026-0
 
 The demo also prints the full journal for `cap_1`, entry by entry, which is the table in the worked example in posting form. The test suite has 43 assertions: capture postings, multiple partials, the pending-counts boundary at exactly the remainder and one minor unit over, failure and reservation release, contradictory processor messages, the full-refund fee identity, the 0.19/0.20/0.20 shares and the thousand one-cent refunds, both fee policies, idempotent replay and conflict, validation, the window boundary at day 180 and 181, and the ten-thread race.
 
+### In Python
+
+```python
+def request_refund(self, refund_id: str, capture_id: str, amount: Money, reason: str) -> RefundResult:
+    with self._lock:                       # one lock around check + reserve, like `synchronized`
+        ...
+        remaining = self.remaining_refundable(capture_id)
+        if amount.compare_to(remaining) > 0:
+            raise OverRefundError(...)
+        r = Refund(refund_id, capture_id, amount, reason, today)
+        self._ledger.post(JournalEntry(RefundService._reserve_entry_id(refund_id), ..., (
+            Posting.debit(RefundService.MERCHANT, amount),
+            Posting.credit(RefundService.REFUNDS, amount))))
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **`synchronized` becomes one `threading.RLock`.** Every public method runs under `with self._lock:`; it is re-entrant because `request_refund` calls `remaining_refundable`, which takes the same lock, exactly as a Java monitor re-enters. The race test starts ten `threading.Thread`s behind a `threading.Event` and still gets exactly 6 accepted and 4 refused; the GIL does not make the check-then-reserve atomic on its own, the lock does.
+- **Dates are `datetime.date`.** `FakeClock.advance_days` adds a `timedelta`, the window deadline is `captured_on + timedelta(days=window_days)`, and `(today - captured_on).days` replaces `ChronoUnit.DAYS.between`.
+- **Integer arithmetic needs no `multiplyExact`**, but the floor must stay a floor: the fee is `(amount * bps + 5_000) // 10_000` and the cumulative share is `(fee * after) // captured`, both on non-negative operands.
+- **Exceptions:** `RefundError(RuntimeError)` with `OverRefundError`, `RefundWindowClosedError` and `RefundIdempotencyConflictError` as subclasses; argument problems (`IllegalArgumentException`) are `ValueError`, and `CurrencyMismatchError` is a `ValueError` too. `AccountType` members carry their normal side as a tuple value so `ASSET` and `EXPENSE` do not collapse into one `Enum` alias.
+
+```bash
+cd phases/12-payment-systems-design/06-refunds-and-partial-refunds/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port maps `synchronized` to a `threading.Lock` held for the whole of each public method, and the race test to ten `threading.Thread`s with a `threading.Event` as the start gun; `int` is unbounded, so `multiplyExact` is unnecessary but `//` must be used for the floor (all operands are non-negative here). Dates are `datetime.date` with `timedelta(days=...)`. In Go the service holds a `sync.Mutex`; methods return `(Refund, error)` with sentinel errors (`ErrOverRefund`, `ErrWindowClosed`, `ErrIdempotencyConflict`) wrapped with `fmt.Errorf("%w: ...")` so tests use `errors.Is` and still see the message, and the race test with goroutines and a `sync.WaitGroup` must pass under `go test -race`. Dates become `time.Time` truncated to midnight UTC, compared with `After`.
+In Go the service holds a `sync.Mutex`; methods return `(Refund, error)` with sentinel errors (`ErrOverRefund`, `ErrWindowClosed`, `ErrIdempotencyConflict`) wrapped with `fmt.Errorf("%w: ...")` so tests use `errors.Is` and still see the message, and the race test with goroutines and a `sync.WaitGroup` must pass under `go test -race`. Dates become `time.Time` truncated to midnight UTC, compared with `After`.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > A log is not a queue: nothing is removed when it is read, the position belongs to the reader, and the only write is an append.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 7, Lesson 02 (Write-Ahead Logs)
 **Time:** ~120 minutes
 
@@ -398,6 +398,8 @@ Differences, all in `code/python/main.py`:
 - **Integers do not wrap.** FNV-1a depends on 32-bit overflow, so the Python version masks with `& 0xFFFFFFFF` after every multiply. Forget the mask and the hash diverges from Java and Go after the first byte, and every key lands in a different partition than the other two implementations would choose.
 - **Iterating `bytes` yields ints.** `for b in data` already gives `0..255`, so there is no signed-byte problem to fix; Java needed `& 0xFF` for the same reason.
 - **Exceptions are `OffsetOutOfRangeError` and `SegmentFullError`**, subclasses of `Exception`, raised where Java throws.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo prints the same offsets, segment layout, byte counts, and frame hex as the Java version.
 
 ### In Go
 

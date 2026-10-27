@@ -1,7 +1,7 @@
 // Project: projects/raft-kv — test harness (PROVIDED; do not edit).
 // Wires N RaftNodes onto one simulated Network, drives the clock, checks the Figure 3 safety properties after every
 // delivery, and records client operations as a History for the Stage 4 linearizability check.
-// Java 21, standard library only. Python and Go ports follow later.
+// Java 21, standard library only. Python port in solution/python; Go port follows later.
 
 import java.util.ArrayList;
 import java.util.HashMap;

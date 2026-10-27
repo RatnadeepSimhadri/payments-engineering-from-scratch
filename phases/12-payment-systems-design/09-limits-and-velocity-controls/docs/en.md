@@ -3,7 +3,7 @@
 > Per-card, per-merchant, per-day, in a sliding window.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 08 (Payouts and Balance Management); Phase 10, Lesson 01 (Representing Money); Phase 1, Lesson 03 (Queues and Deques)
 **Time:** ~75 minutes
 
@@ -363,9 +363,37 @@ breached limits: 2
 
 The test harness runs 52 assertions, including the half-open boundary, the soft-limit-is-recorded rule, exposure surviving thirty days, idempotent release, the override rules, and a 32-thread race that must admit exactly five.
 
+### In Python
+
+```python
+def check(self, attempt: Attempt) -> Decision:
+    with self._lock:                                  # check-and-record is one critical section
+        now = self._clock.now_millis()
+        reasons: list[Reason] = []
+        outcome = Outcome.ALLOW
+        for limit in self._policy.limits_for(attempt.merchant_id):
+            ...
+        if outcome is not Outcome.DENY:
+            self._record(attempt, now)
+        return Decision(outcome, tuple(reasons))
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **`synchronized` is an explicit `threading.Lock`.** The GIL does not make read-decide-write atomic, so `check`, `release`, `open_exposure` and `window_count` all run under `with self._lock:`; the 32-thread race test still admits exactly 5. `FakeClock` guards its counter with its own lock in place of `AtomicLong`.
+- **The window is a `collections.deque`** of frozen `Entry` dataclasses with `popleft()`/`append()`; `next_expiry_millis` returns `Optional[int]` and `Reason.retry_after_millis` is `Optional[int]`, because zero is a legitimate value and only "no expiry" is `None`.
+- **Money stays integer minor units.** `Money.parse` is the Phase 10 parser; `retry_after_seconds` rounds up with `(best + 999) // 1000` and `explain` prints `window_millis // 1000`, both integer divisions on non-negative values.
+- **Exceptions:** `IllegalArgumentException` becomes `ValueError` (bad limits, zero amounts, clock going backwards, duplicate or unknown limit ids); `CurrencyMismatchError` is a `ValueError` subclass. `LimitPolicy.limits_for` returns a tuple in default-declaration order, as the unmodifiable list did.
+
+```bash
+cd phases/12-payment-systems-design/09-limits-and-velocity-controls/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: the deque is `collections.deque`, the engine's lock is a `threading.Lock` held across `check` (the GIL does not make read-decide-write atomic), and `Money` is the `int` minor-units dataclass from Phase 10 with `Decimal` nowhere near the hot path. Go: `SlidingWindow` is a slice used as a ring or a `container/list`; `LimitEngine` holds a `sync.Mutex` and `check` returns `(Decision, error)` with construction errors as values rather than panics; the 32-goroutine test must pass under `go test -race`. In both, `Reason.retryAfterMillis` becomes an optional (`None` / `*int64`) since zero is a legitimate value.
+Go: `SlidingWindow` is a slice used as a ring or a `container/list`; `LimitEngine` holds a `sync.Mutex` and `check` returns `(Decision, error)` with construction errors as values rather than panics; the 32-goroutine test must pass under `go test -race`. `Reason.retryAfterMillis` becomes a `*int64`, since zero is a legitimate value.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > The XML message format the whole world is migrating to.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 08 (ACH and the NACHA File Format); Phase 11, Lesson 11 (IBAN, BIC, and Account Number Validation)
 **Time:** ~120 minutes
 
@@ -396,9 +396,36 @@ rejected: DOCTYPE (XXE guard)
 
 `MainTest` runs 42 checks: identifier validation, each SEPA rule, both round trips, every totals mismatch, the namespace check, the XXE guard, and the IBAN-only BIC derivation.
 
+### In Python
+
+The port in `code/python/main.py` keeps every class and method (`Iban.is_valid`, `SepaRules.violations`, `Pain001.write`, `Pacs008.from_pain001`) and produces byte-identical XML. Four things differ:
+
+- **The XXE guard is a string check, not a parser feature.** `xml.etree.ElementTree` never fetches external entities, but it still expands internal ones, and it has no `disallow-doctype-decl` switch. The parser therefore refuses any input that contains `<!DOCTYPE` before `ET.fromstring` sees it, which closes both the file-read and the billion-laughs case with one line:
+
+```python
+if Xml.DOCTYPE.search(xml):
+    raise Iso20022Exception("malformed XML: DOCTYPE is disallowed when processing a payment file")
+try:
+    root = ET.fromstring(xml)
+except ET.ParseError as e:
+    raise Iso20022Exception(f"malformed XML: {e}") from e
+```
+
+- **Namespaces live in the tag.** ElementTree spells a namespaced element `{urn:iso:std:iso:20022:tech:xsd:pain.001.001.09}Document`, so `Xml.local_name` and `Xml.namespace_uri` split the tag at `}` where the Java called `getLocalName()` and `getNamespaceURI()`. The `child`/`children` walk is otherwise the same loop over direct children.
+- **Serialization needs a registered default namespace.** `ET.tostring(..., default_namespace=NS)` refuses the unqualified `Ccy` attribute, so `Xml.serialize` calls `ET.register_namespace("", NS)` and `ET.indent(root, space="  ")` to get the same `xmlns="urn:..."` root and two-space layout the Java `Transformer` prints.
+- **Records are frozen dataclasses with tuples.** `PaymentInitiation.transfers` is normalized to a `tuple` in `__post_init__` (the equivalent of `List.copyOf`) so the round-trip equality `Pain001.parse(pain) == p` compares by value. Dates are naive `datetime`/`date`, formatted with `"%Y-%m-%dT%H:%M:%S"` and `isoformat()`; amounts go through the same integer `Money.parse`, and the exception hierarchy is one class, `Iso20022Exception`, raised `from` the underlying `ParseError` or `ArithmeticError`.
+
+```bash
+cd phases/11-payment-rails/09-sepa-and-iso-20022/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python tests port all 42 checks (43 assertions) and the demo output is identical to the Java run, XML included.
+
 ### Porting notes
 
-Python's `xml.etree.ElementTree` does not resolve external entities by default but is still vulnerable to entity expansion; use `defusedxml` in production, or reject any input containing `<!DOCTYPE` before parsing when restricted to the standard library. Namespaced lookups use `{urn:...}Tag` syntax, and amounts should go through `Decimal` into the integer `Money`. Go's `encoding/xml` maps structs with tags such as `xml:"CdtTrfTxInf"`, ignores DTD entities, and makes the namespace check explicit via `XMLName`; return errors for every mismatch instead of throwing.
+Go's `encoding/xml` maps structs with tags such as `xml:"CdtTrfTxInf"`, ignores DTD entities, and makes the namespace check explicit via `XMLName`; return errors for every mismatch instead of throwing.
 
 ## Use It
 

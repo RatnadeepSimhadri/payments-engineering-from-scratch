@@ -3,7 +3,7 @@
 > Validate a card number and route it to the right network.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 2, Lesson 02 (Binary Search and Its Variants), Phase 2, Lesson 15 (Numerical Algorithms: GCD, Modular Arithmetic, and Check Digits), Phase 11, Lesson 01 (How a Card Payment Works)
 **Time:** ~75 minutes
 
@@ -335,9 +335,42 @@ adjacent transposition 4242424242424242 -> 4422424242424242 valid=false
 
 The test harness prints `65 passed, 0 failed`.
 
+### In Python
+
+The full port is `code/python/main.py` (same `Luhn`, `Pan`, `BinRange`, `BinTable`, `CardRouter`; tests in `code/python/test_main.py`). Three things differ:
+
+- **The mask has to cover `repr`, not just `str`.** Java has one `toString`; Python has two rendering paths. A `@dataclass(frozen=True)` generates a `__repr__` that prints every field, so `print([pan])`, an f-string with `!r`, a debugger, or a failing `assertEqual` would all leak the digits even with `__str__` masked. The port overrides both, and the tests assert that `repr(pan)` and a list containing a `Pan` print the mask:
+
+```python
+@dataclass(frozen=True)
+class Pan:
+    digits: str
+
+    def masked(self, prefix: int = 6) -> str:
+        if prefix < 0 or prefix > 8:
+            raise ValueError("may show at most 8 leading digits")
+        if prefix + 4 >= len(self.digits):
+            raise ValueError("mask would reveal the whole PAN")
+        return self.digits[:prefix] + "*" * (len(self.digits) - 4 - prefix) + self.last_four()
+
+    def __str__(self) -> str:
+        return self.masked()
+
+    __repr__ = __str__
+```
+
+- **Keys are plain `int`s and the search is written out.** `int(digits[:8])` replaces `Long.parseLong`, and normalisation is `int(prefix.ljust(8, "0"))`. `bisect.bisect_right` on a list of low bounds would find the same candidate, but the hand-written loop is kept so the lesson's binary search (and the "last range whose low <= key, then check high" argument) reads the same in every language; the 10,000-key comparison against a linear scan replays Java's `Random(7)` sequence, `nextLong(bound)` included, through a small `JavaRandom` in the test file.
+- **`Optional` becomes `None`, overloads become one method.** `BinTable.lookup` accepts either an `int` key or a `Pan` and returns `Optional[BinRange]`; `detect_network` maps a `None` to `Network.UNKNOWN`. `IllegalArgumentException` is `ValueError` throughout, and `RoutingDecision.describe` prints `network.name` so the output matches Java's enum rendering.
+
+```bash
+cd phases/11-payment-rails/04-pan-luhn-and-bin-ranges/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port keeps PANs as `str` throughout and uses `int(digits[:8])` for the key; `bisect.bisect_right` on a list of low bounds replaces the hand-written search, and the overlap check stays. A `@dataclass(frozen=True)` with `__str__` returning the mask reproduces the logging guard, but `__repr__` must be overridden too, because f-strings and debuggers call `repr`. A Go port returns `(Pan, error)` from `ParsePan`, uses `sort.Search` for the lookup, and implements `fmt.Stringer` on `Pan` so `%v` and `%s` print the mask; `%+v` on the struct would still expose the field, so the digits should live in an unexported field accessed through a method. Neither language needs the `>>> 1` midpoint trick, but both need the same boundary tests.
+A Go port returns `(Pan, error)` from `ParsePan`, uses `sort.Search` for the lookup, and implements `fmt.Stringer` on `Pan` so `%v` and `%s` print the mask; `%+v` on the struct would still expose the field, so the digits should live in an unexported field accessed through a method. Go does not need the `>>> 1` midpoint trick, but it needs the same boundary tests.
 
 ## Use It
 

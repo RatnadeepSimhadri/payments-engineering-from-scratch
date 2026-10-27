@@ -3,7 +3,7 @@
 > An account is the sum of its events; a balance is a cache.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
@@ -327,6 +327,8 @@ Differences, all in `code/python/main.py`:
 - **Immutability is `frozen=True` plus `MappingProxyType`.** A frozen dataclass stops attribute assignment but a plain `dict` field is still mutable; wrapping holds in a `MappingProxyType` makes the view read-only. Equality still works because the proxy compares as its underlying mapping, which is what the snapshot-equals-replay test needs.
 - **`handle` takes an optional expected version.** Python has no overloading, so `handle(stream, command, expected_version=None)` covers both Java methods; `None` means "the latest".
 - **Exceptions are `CommandRejectedError` and `ConcurrencyError`**, both plain `Exception` subclasses, so a caller can catch the first and return a 4xx while letting the second drive a retry.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo prints the same versions, balances, and snapshot counts as the Java run.
 
 ### In Go
 

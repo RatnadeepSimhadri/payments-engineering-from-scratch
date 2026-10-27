@@ -3,7 +3,7 @@
 > Metrics that detect a stuck payment before a customer does.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9, Lesson 06 (Metrics and Histograms), Phase 12, Lesson 02 (Payment State Machine), Phase 14, Lesson 04 (Reconciliation at Scale), Phase 14, Lesson 05 (Batch vs Real-Time Settlement)
 **Time:** ~90 minutes
 
@@ -354,9 +354,39 @@ ALERT PAGE auth-rate-drop:proc_b: proc_b approves 74.00% vs fleet 83.50% over 15
 
 `MainTest` runs 39 assertions: exact burn-rate and basis-point arithmetic, the stuck boundary at 15 versus 16 minutes, severity by amount, age reset on transition, exposure by state, histogram bands, windowed auth rates and the minimum sample, declines excluded from the SLI, the ended-spike case where the short window keeps the page quiet, the coverage rule, reconciliation break rate, and the seeded simulation's alert order and determinism.
 
+### In Python
+
+`code/python/main.py` keeps `ManualClock`, `MinuteCounter`, `Ratio`, `Slo`, `BurnRule`, `MoneyMovementMonitor`, and `Simulation`, and prints the same three dashboards. What differs:
+
+- **Time is `datetime` with `timezone.utc` and `timedelta`.** The clock hands out aware datetimes; `MinuteCounter.minute` buckets by `int(at.timestamp()) // 60`, which is `Math.floorDiv(epochSecond, 60)`. `minutes_of` reproduces `Duration.toMinutes` (truncation toward zero), and `iso_z` prints the `2026-03-31T13:10:00Z` form `Instant.toString` uses. A naive `datetime` compared with the clock raises `TypeError`, which is the right failure.
+
+```python
+def sum(self, now: datetime, window: timedelta) -> list[int]:
+    now_minute = self.minute(now)
+    start = now_minute - minutes_of(window) + 1
+    total = [0] * self.width
+    for minute, counts in self.buckets.items():
+        if start <= minute <= now_minute:
+            for i in range(self.width):
+                total[i] += counts[i]
+    return total
+```
+
+- **Dicts replace `TreeMap` and `EnumMap`.** The counter keeps a plain dict of minute buckets and filters by range (a few hundred buckets, so a scan beats a sorted structure); `processors()` returns `sorted(...)` so alerts and the dashboard list processors in the same order as Java; the exposure and histogram maps iterate `PaymentState` in declaration order, which is what `EnumMap` did.
+- **Integer arithmetic is exact and unbounded.** `burn_rate_x100` and `Ratio.bps` use `//`; the inputs are non-negative, so floor division equals Java's truncation, and there is no `multiplyExact` to port because Python integers do not overflow.
+- **The simulation's randomness is `java.util.Random`, reimplemented.** `Simulation` draws from a `JavaRandom` with the JDK's 48-bit LCG (`next_int` with its rejection loop, `next_double` from 53 bits), so seed 42 produces the same amounts, outcomes, first-fired minutes, and dashboards as the Java demo. The scheduled callbacks are closures created inside `_attempt`, one scope per call, so they capture the right payment id without the `final` dance Java needs.
+
+```bash
+cd phases/14-payments-at-scale/06-observability-for-money-movement/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python tests port every Java check (54 assertions) and the demo output is identical to the Java run.
+
 ### Porting notes
 
-Python: use `datetime` with `timezone.utc` and a `Clock` protocol; bucket by `int(ts.timestamp()) // 60`; Python integers do not overflow, so add an explicit bound check where Java uses `multiplyExact`. A `dict` plus `sorted` keys replaces the `TreeMap`; for long windows use `bisect` over a sorted key list. Go: `time.Time` and a `Clock` interface, `int64` everywhere, `sort.Slice` with a tie-break on id for the stuck list. If ingestion and evaluation run on different goroutines, guard the monitor with a `sync.Mutex` and run the tests with `-race`; Prometheus's Go client does the equivalent with atomic counters.
+Go: `time.Time` and a `Clock` interface, `int64` everywhere, `sort.Slice` with a tie-break on id for the stuck list. If ingestion and evaluation run on different goroutines, guard the monitor with a `sync.Mutex` and run the tests with `-race`; Prometheus's Go client does the equivalent with atomic counters.
 
 ## Use It
 

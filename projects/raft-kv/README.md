@@ -1,6 +1,6 @@
 # Raft Key-Value Store
 
-**Level 3, Advanced. About 14 hours. Java (Python and Go ports follow later).**
+**Level 3, Advanced. About 14 hours. Java or Python (Go port follows later).**
 
 Build a Raft-replicated key-value store on the deterministic simulated network from the Raft lessons, then prove its client history linearizable. Five nodes, seeded randomness, explicit partitions and crashes: every run is a pure function of a seed, so the bug you find at seed 17, tick 1203 is the bug you can replay until it is gone.
 
@@ -25,26 +25,33 @@ You should be able to read Figure 2 of the paper and say what each bullet is for
 
 ## Commands
 
-Run everything from the repository root. Java 21, standard library only.
+Run everything from the repository root. Java 21 or Python 3.11+, standard library only; pick one `--lang` and keep it.
 
 ```bash
-# create a workspace with the stage-1 starter (Sim.java, Cluster.java, and the stubs)
+# create a workspace with the stage-1 starter (Java: Sim.java, Cluster.java, and the stubs; Python: one main.py with the same parts)
 python3 scripts/project_test.py raft-kv --lang java --init my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --init my-raft-kv
 
 # grade one stage (stages 1..N all run, so regressions show up)
 python3 scripts/project_test.py raft-kv --lang java --stage 1 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --stage 1 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang java --stage 2 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --stage 2 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang java --stage 3 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --stage 3 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang java --stage 4 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --stage 4 --path my-raft-kv
 
 # grade everything and write a completion report
 python3 scripts/project_test.py raft-kv --lang java --all --path my-raft-kv --report raft-kv-report.json
+python3 scripts/project_test.py raft-kv --lang python --all --path my-raft-kv --report raft-kv-report.json
 
 # run your own demo
-cd my-raft-kv && javac -d .out *.java && java -cp .out Main
+cd my-raft-kv && javac -d .out *.java && java -cp .out Main   # Java
+cd my-raft-kv && python3 main.py                                # Python
 ```
 
-Each stage runs in a fresh temporary directory containing your workspace sources plus that stage's `StageNNTest.java`; your workspace is never modified. The whole suite runs in a few seconds; if a stage takes longer than ten, a node is almost certainly campaigning every tick.
+Each stage runs in a fresh temporary directory containing your workspace sources plus that stage's tests (`StageNNTest.java`, or `test_stage_NN.py` run with `python3 -m unittest -v`); your workspace is never modified. The whole suite runs in a few seconds; if a stage takes longer than ten, a node is almost certainly campaigning every tick.
 
 ## Workspace layout after `--init`
 
@@ -58,7 +65,9 @@ Each stage runs in a fresh temporary directory containing your workspace sources
 | `Linearizability.java` | stage 4 | `Op`, `History`, `CheckResult` provided; `Checker` stubbed |
 | `Main.java` | yours | the starter only exercises the scaffolding; replace it as the stages land |
 
-Later stages ship a `starter/STAGE.md` listing the new signatures; nothing is copied after stage 1. You keep editing the same files.
+In Python the whole workspace is one `main.py` with the same sections in the same order: the provided substrate (`Clock`, `Rng`, `Message`, `Config`, `Network`), `Storage` (stage 1), `KVStore` and `RaftNode` (stages 2 to 4), `Op`/`History`/`CheckResult` (provided) and `Checker` (stage 4), then the provided `Cluster`. Names are the Java ones in snake_case; `current_term`, `voted_for` and `log` are properties on `RaftNode`.
+
+Later stages ship a `starter/STAGE.md` listing the new signatures in both languages; nothing is copied after stage 1. You keep editing the same files.
 
 ## What you keep
 
@@ -69,7 +78,7 @@ Later stages ship a `starter/STAGE.md` listing the new signatures; nothing is co
 
 ## Run with your own inputs
 
-`Main.java` in your workspace is yours. Some things worth trying once the grader is green:
+`Main.java` (or `main()` in `main.py`) in your workspace is yours. Some things worth trying once the grader is green:
 
 - **Hunt for a split vote.** Loop seeds on a 4-node cluster with `new Cluster(4, seed, 0.0, 3)` and print the first seed whose stable leader has `currentTerm() > 1`; then narrow the timeout range in `Config` and watch how many terms it takes.
 - **Break the no-op.** Comment out the `NOOP` append in `becomeLeader`, run the stage-4 grader, and read which scenario catches it and at what tick.

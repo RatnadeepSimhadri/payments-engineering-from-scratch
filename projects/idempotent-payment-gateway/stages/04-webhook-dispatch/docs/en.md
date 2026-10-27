@@ -58,7 +58,7 @@ Every attempt is signed with the clock *at send time* (`t=` differs per attempt)
 
 ## Your task
 
-Add `Webhooks.java`, then extend `Gateway` with `attachWebhooks` and event emission. Stages 1 to 3 are graded again first. Python and Go ports of this project follow later; this pass is Java only.
+Add `Webhooks.java`, then extend `Gateway` with `attachWebhooks` and event emission. Stages 1 to 3 are graded again first. The Python port has the same surface in snake_case in one `main.py` (signatures below); Go port follows later.
 
 ```java
 record WebhookEvent(String id, String type, String paymentId, String data, long createdAt) {
@@ -123,6 +123,52 @@ final class Gateway {
 }
 ```
 
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+@dataclass(frozen=True)
+class WebhookEvent:           # id, type, payment_id, data: str, created_at: int; quotes/backslashes or blank id/type -> ValueError
+    def to_body(self) -> str: ...
+    @staticmethod
+    def parse(body: str) -> WebhookEvent: ...                     # malformed -> ValueError
+
+class WebhookSigner:
+    def __init__(self, secret: str) -> None: ...                  # empty -> ValueError
+    @staticmethod
+    def hmac_sha256_hex(secret: bytes, message: str) -> str: ...   # hmac.new(secret, msg, hashlib.sha256).hexdigest()
+    def signature(self, timestamp_millis: int, body: str) -> str: ...
+    def header(self, timestamp_millis: int, body: str) -> str: ...  # "t=<millis>,v1=<hex>"
+
+class VerifyResult(Enum): OK, MALFORMED_HEADER, STALE_TIMESTAMP, BAD_SIGNATURE
+class WebhookVerifier:
+    def __init__(self, secret: str, tolerance_millis: int, clock: Clock) -> None: ...
+    def verify(self, body: str | None, header: str | None) -> VerifyResult: ...   # hmac.compare_digest
+
+class ReceiveStatus(Enum): ACCEPTED, DUPLICATE, REJECTED
+@dataclass(frozen=True)
+class ReceiveResult:          # status, verification: VerifyResult, event: WebhookEvent | None
+class WebhookConsumer:
+    def __init__(self, verifier: WebhookVerifier) -> None: ...
+    def receive(self, body: str, header: str) -> ReceiveResult: ...
+    def processed(self) -> tuple[WebhookEvent, ...]: ...
+
+class WebhookEndpoint(Protocol): def deliver(self, body: str, header: str) -> bool
+@dataclass(frozen=True)
+class Delivery:               # body, header  (also reachable as ScriptedEndpoint.Delivery)
+class ScriptedEndpoint:       # 'S' succeed, 'F' fail; deliveries() -> tuple[Delivery, ...]
+class ConsumerEndpoint:       # ConsumerEndpoint(consumer).deliver(...) is True unless REJECTED
+
+@dataclass(frozen=True)
+class DeliveryJob:            # event, attempts: int, next_attempt_at: int
+class WebhookDispatcher:
+    def __init__(self, signer: WebhookSigner, endpoint: WebhookEndpoint, clock: Clock, retry_delays_millis: Sequence[int]) -> None: ...
+    def max_attempts(self) -> int; enqueue(event: WebhookEvent) -> None; run_due() -> int
+    def pending(self) -> tuple[DeliveryJob, ...]; delivered() -> tuple[WebhookEvent, ...]; dead_letters() -> tuple[DeliveryJob, ...]
+
+class Gateway:
+    def attach_webhooks(self, dispatcher: WebhookDispatcher) -> None: ...   # charge() then emits payment.succeeded / payment.failed
+```
+
 Rules the tests pin down:
 
 - `verify` order: null body or header → `MALFORMED_HEADER`; header must be exactly two comma-separated parts `t=<long>` and `v1=<hex>`, else `MALFORMED_HEADER`; `|now - t| > tolerance` → `STALE_TIMESTAMP`; then compute the expected signature over `t + "." + body` and compare with `MessageDigest.isEqual` on the UTF-8 bytes → `OK` or `BAD_SIGNATURE`. Tolerance 0 accepts only the exact instant.
@@ -159,7 +205,9 @@ What must fail and how:
 
 ```bash
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 4 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 4 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --all --path my-gateway --report gateway-report.json
+python3 scripts/project_test.py idempotent-payment-gateway --lang python --all --path my-gateway --report gateway-report.json
 ```
 
 Stages 1 to 3 run again (148 assertions), then Stage 4's 50. The `--report` file is what the `build-project` skill reads to mark the project complete.

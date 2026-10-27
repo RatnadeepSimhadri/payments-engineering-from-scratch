@@ -1,5 +1,5 @@
 {
-  "_comment": "Canonical implementation-language registry. Every Build lesson ships code in each language with ci=true; the learner picks one in start-learning and the tutor teaches in it. `dir` is the folder under code/, `run`/`test` are the canonical commands executed from inside that folder, `entry` names the file the tutor walks through first. Add a language by adding an entry and a code/<dir>/ folder to each lesson; scripts/run_lesson.py and scripts/project_test.py read this file. Python and Go are registered but ci=false for now: lessons ship Java first; Python and Go ports are added later and a lesson is Complete when every ci=true language is present.",
+  "_comment": "Canonical implementation-language registry. Every Build lesson ships code in each language with ci=true; the learner picks one in start-learning and the tutor teaches in it. `dir` is the folder under code/, `run`/`test` are the canonical commands executed from inside that folder, `entry` names the file the tutor walks through first. Add a language by adding an entry and a code/<dir>/ folder to each lesson; scripts/run_lesson.py and scripts/project_test.py read this file. Java and Python are complete (ci=true). Go is registered with ci=false until its port is complete; a lesson is Complete when every ci=true language is present.",
   "languages": [
     {
       "id": "java",
@@ -29,7 +29,7 @@
       "id": "python",
       "name": "Python",
       "dir": "python",
-      "ci": false,
+      "ci": true,
       "minVersion": "3.11",
       "versionCommand": [
         "python3",

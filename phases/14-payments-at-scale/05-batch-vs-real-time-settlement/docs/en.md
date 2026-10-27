@@ -3,7 +3,7 @@
 > The nightly job that moves the actual money.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 10, Lesson 10 (Fees and Splits), Phase 11, Lesson 08 (ACH and Nacha), Phase 11, Lesson 15 (Settlement and Clearing), Phase 12, Lesson 08 (Payouts and Balance Management), Phase 14, Lesson 04 (Reconciliation at Scale)
 **Time:** ~90 minutes
 
@@ -417,9 +417,34 @@ payouts 200, total 10451307.57 USD, carried 0, ties out true, file valid true
 
 `MainTest` runs 42 assertions: the fee arithmetic, the worked example, the cutoff, idempotent reruns and rebooking, file validation and tamper detection, a second day that nets the carried deficit (`96.80 - 31.12 = 65.68`), holds and minimum payouts, ledger safety, the liquidity comparison numbers, and a 5,000-event seeded day that ties out.
 
+### In Python
+
+`code/python/main.py` has the same classes (`FeeSchedule`, `Ledger`, `Platform`, `BatchSettler`, `SettlementFile`, `RealTimeSettler`, `LiquidityComparison`) and prints the same demo, down to the 43,711 real-time transfers of the seeded day. What differs:
+
+- **Half-even division works on magnitudes.** `//` floors toward negative infinity, so `divide_rounded` uses `divmod(abs(dividend), abs(divisor))` and reapplies the sign, exactly as Phase 10, Lesson 01 does; otherwise a negative fee would round the wrong way. The fee on 45.50 is 1.62 in both languages because of this.
+- **Instants are aware `datetime`s.** Event times and the cutoff are `datetime` objects with `timezone.utc`; comparing one with a naive `datetime` raises `TypeError`, which is better than the silent offset Java's `LocalDateTime` would give. `instant("2026-03-31T23:00:00Z")` is the port's `Instant.parse`.
+- **Sorted iteration is explicit.** Java's `TreeMap` gives the netting loop and the ledger view their deterministic order for free; the port keeps plain dicts and iterates `sorted(net)` and `sorted(self._balances)` where the order is visible (instruction sequence numbers, the ledger printout).
+
+```python
+for merchant_id in sorted(net):  # TreeMap order: one deterministic sequence per merchant id
+    amount = net[merchant_id]
+    if amount.is_positive() and amount >= self.minimum_payout:
+        instructions.append(PayoutInstruction(len(instructions) + 1, merchant_id, m.routing, m.account, amount))
+```
+
+- **The seeded day uses `java.util.Random`, reimplemented.** `generated_day` draws from a 20-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop), so seed 7 yields the same 50,000 events and the same totals as the Java run. `UnbalancedJournalException` is a `RuntimeError`, `CurrencyMismatchError` a `ValueError`, and the idempotent rerun is checked with `is`, the identity test behind Java's `==` on references.
+
+```bash
+cd phases/14-payments-at-scale/05-batch-vs-real-time-settlement/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python tests port every Java check (51 assertions) and the demo output is identical to the Java run.
+
 ### Porting notes
 
-Python: `Money` as a frozen dataclass over `int`; the half-even division must work on magnitudes because `//` floors toward negative infinity, exactly as in Phase 10, Lesson 01. Use `datetime` with `timezone.utc` for event times and compare aware datetimes only; a naive `datetime` compared with an aware cutoff raises `TypeError`, which is better than the silent offset Java's `LocalDateTime` would give. Go: `int64` minor units, `time.Time` for instants, `sort.Strings` over map keys to get the deterministic instruction order that Java's `TreeMap` gives for free, and errors as values from `Post` and `Run`. Neither port needs concurrency; if you add a concurrent booker, guard the ledger with one mutex and run `go test -race`.
+Go: `int64` minor units, `time.Time` for instants, `sort.Strings` over map keys to get the deterministic instruction order that Java's `TreeMap` gives for free, and errors as values from `Post` and `Run`. The port needs no concurrency; if you add a concurrent booker, guard the ledger with one mutex and run `go test -race`.
 
 ## Use It
 

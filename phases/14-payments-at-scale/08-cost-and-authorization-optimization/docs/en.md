@@ -3,7 +3,7 @@
 > Network tokens, retries, and routing that lifts approvals.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 11, Lesson 02 (Card Authorization Lifecycle), Phase 11, Lesson 03 (ISO 8583), Phase 11, Lesson 05 (Tokenization and PCI Scope), Phase 11, Lesson 07 (Interchange and Scheme Fees), Phase 12, Lesson 04 (Smart Routing and Retries), Phase 14, Lesson 06 (Observability for Money Movement)
 **Time:** ~75 minutes
 
@@ -351,9 +351,37 @@ Seven arms over 100,000 transactions take about a second, so the experiment can 
 
 `MainTest` runs 33 assertions: exact interchange and network fees, the never-retry and fix-data rules, each lever's effect on hand-built transactions at the draw boundaries, the two-attempt cap, reproducibility, monotonicity of every lever, non-additivity, the exact token-uplift identity, and the net-value formula.
 
+### In Python
+
+`code/python/main.py` keeps `PriceList`, `Txn`, `TxnTrace`, `ArmResult`, `AuthExperiment`, and `Uplift`, and prints the same table: 83,737 control approvals, 7,823 extra under ALL, 10,941 as the sum of singles. What differs:
+
+- **The population comes from `java.util.Random`, reimplemented.** `random.Random(seed)` is a Mersenne Twister and would give different draws, so `AuthExperiment.population` uses a 20-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop). Seed 2026 therefore builds the same 100,000 transactions, and every arm's totals match the Java demo to the cent. A test pins the sequence to values taken from the JDK.
+- **Enums carry their data.** `ResponseCode` members are `("05", DeclineClass.GENERIC)` tuples unpacked in `__init__`, so `r.code` and `r.decline_class` read as in Java; lever sets are `frozenset`s of `Lever`, with `levers_str` reproducing `EnumSet.toString` in declaration order for the demo.
+
+```python
+class ResponseCode(Enum):
+    APPROVED = ("00", DeclineClass.NONE)
+    DO_NOT_HONOR = ("05", DeclineClass.GENERIC)
+    ...
+    def __init__(self, code: str, decline_class: DeclineClass) -> None:
+        self.code = code
+        self.decline_class = decline_class
+```
+
+- **Integer arithmetic.** Basis points and minor units are `int`; `//` replaces Java's truncating `/` wherever the operands are non-negative (approval rate, cost per approval), and `divide_rounded` works on magnitudes so `HALF_EVEN` agrees with Java for negative deltas such as the LEVEL3_DATA cost saving. `run` accumulates its six totals as ints over the 700,000 simulated attempts and wraps them in `Money` once, which keeps the seven arms under five seconds on CPython.
+- **Exceptions.** A draw outside `[0, 10000)` raises `ValueError` where Java throws `IllegalArgumentException`; `TxnTrace` equality, which the "same txn, same levers, same trace" test relies on, comes from `@dataclass(frozen=True)`.
+
+```bash
+cd phases/14-payments-at-scale/08-cost-and-authorization-optimization/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python tests port every Java check (41 assertions) and the demo output is identical to the Java run.
+
 ### Porting notes
 
-Python: `random.Random(seed)` produces a different stream from `java.util.Random`, so a port matches the design and the hand-built tests, not the seeded totals; if cross-language equality matters, implement the 48-bit LCG from the `java.util.Random` documentation in both. Use `int` for minor units and basis points and `enum.Enum` for codes and classes. Go: `math/rand` with `rand.New(rand.NewSource(seed))` (or a hand-written LCG for cross-language equality), `int64` minor units, a `map[Lever]bool` or bitmask for the lever set. The experiment is embarrassingly parallel per arm; if you run arms on goroutines, give each its own result struct and run `go test -race`.
+Go: `math/rand` with `rand.New(rand.NewSource(seed))` (or a hand-written LCG for cross-language equality), `int64` minor units, a `map[Lever]bool` or bitmask for the lever set. The experiment is embarrassingly parallel per arm; if you run arms on goroutines, give each its own result struct and run `go test -race`.
 
 ## Use It
 

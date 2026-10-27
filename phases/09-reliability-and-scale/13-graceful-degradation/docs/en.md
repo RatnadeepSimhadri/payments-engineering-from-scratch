@@ -3,7 +3,7 @@
 > Drop the reporting query so the authorization goes through.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 9, Lesson 12 (Incident Response and Blameless Postmortems), Phase 9, Lesson 10 (Capacity Planning and Queueing Theory), Phase 9, Lesson 05 (Distributed Rate Limiting), Phase 1, Lesson 09 (Heaps and Priority Queues)
 **Time:** ~90 minutes
 
@@ -350,9 +350,38 @@ fraud.mode at end: full
 
 The number to carry into the design review is CRITICAL p99: 2,700 ms versus 25 ms, on identical load, differing only in policy.
 
+### In Python
+
+```python
+def _do_dequeue(self, now: int) -> tuple[Optional[Request], bool]:
+    if not self._queue:
+        self._first_above_time = 0
+        return None, False
+    r = self._queue.popleft()
+    sojourn = now - r.enqueued_millis
+    ...
+    return r, now >= self._first_above_time  # above target for a whole interval: ok to drop
+
+def _control_law(self, t: int, c: int) -> int:
+    return t + int(self._interval_millis / math.sqrt(c))
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The `DoDequeue` record is a tuple.** `_do_dequeue` returns `(request, ok_to_drop)` and `dequeue` unpacks it in place, so the RFC 8289 state machine reads line for line like the Java. `(long)(interval / Math.sqrt(c))` is `int(...)`, which also truncates toward zero for the positive values here; `target / 2` becomes `target // 2`.
+- **Enums carry their data.** `Priority` is an `Enum` with an `ordinal` property, and `Level`'s value is `(ordinal, shed_at_or_below, fraud_mode)`, so `sheds` and the one-level-per-window escalation (`LEVELS[level.ordinal + 1]`) are the same ordinal arithmetic. `EnumMap` is a `dict` keyed by the enum members, built in declaration order.
+- **Arrivals come from `java.util.Random`.** `JavaRandom.next_double` reproduces `nextDouble()` so seed 11 offers the same 12,038 requests, the brownout flips at the same milliseconds (2100, 2200, 2900, ...), and both tables match the Java output digit for digit.
+- **`Policy` is an `ABC`**, `null` is `None`, and `deque.popleft()` on an empty queue raises, so `FifoPolicy.next` checks emptiness first where Java's `pollFirst` returns `null`.
+
+```bash
+cd phases/09-reliability-and-scale/13-graceful-degradation/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `collections.deque` for the queues, `math.sqrt`, `enum.IntEnum` for `Priority` so ordinal comparison is `>=` on the members, and `random.Random(seed)` for the arrivals; `statistics.quantiles` can replace the hand-rolled percentile. Go: `container/list` or a slice-backed ring for the deque, `math.Sqrt`, an `int` constant block for `Priority`, and `sort.Slice` for percentiles. A Go port that runs real goroutines as workers must guard every `CoDelQueue` and the controller with a `sync.Mutex` (or one mutex per class) and pass `go test -race ./...`; the deterministic single-threaded simulation is the test oracle for the concurrent version.
+Go: `container/list` or a slice-backed ring for the deque, `math.Sqrt`, an `int` constant block for `Priority`, and `sort.Slice` for percentiles. A Go port that runs real goroutines as workers must guard every `CoDelQueue` and the controller with a `sync.Mutex` (or one mutex per class) and pass `go test -race ./...`; the deterministic single-threaded simulation is the test oracle for the concurrent version.
 
 ## Use It
 

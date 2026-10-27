@@ -1,6 +1,6 @@
 # Python Port Plan (deferred)
 
-**Status (2026-10-13):** Wave 1 (batches A–F, 56 lessons) DONE and merged to main. Wave 2 (batches G–L) remaining.
+**Status (2026-10-26):** COMPLETE. All 143 Build lessons and 3 projects have Python; `ci: true`. This file is kept as the record of how the port was run; the Go port follows the same plan with `docs/porting/go-port-plan.md`.
 **Scope:** 103 Build lessons without `code/python/` + Python versions of the 3 projects. 40 Build lessons already have Python (and Go).
 **Done when:** all 143 Build lessons and 3 projects pass `--lang python`; then set `"ci": true` for Python in `languages.json`.
 

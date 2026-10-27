@@ -65,7 +65,7 @@ The id check (`already posted? return it`) happens *before* all of this: a repla
 
 Keep editing the workspace from stage 1. Add a new file `Journal.java` for the value types and exceptions, and a new file `Ledger.java` for the journal. (Any file layout works as long as the names match; the solution uses these two.) `Money`, `Side`, `Account`, `AccountRegistry`, and `LedgerException` come from stage 1 unchanged.
 
-Signatures (Java 21; Python and Go ports follow later):
+Signatures (Java 21 first, then the same surface in Python; Go port follows later):
 
 ```java
 /** One leg: a positive amount on one side of one account. */
@@ -97,6 +97,38 @@ final class Ledger {
     boolean hasEntry(String id);
     int size();
 }
+```
+
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+@dataclass(frozen=True)
+class Posting:                    # account_id: str, side: Side, amount: Money; blank id or non-positive amount -> ValueError
+    def mirrored(self) -> Posting: ...
+
+@dataclass(frozen=True)
+class JournalEntry:               # id: str, date: str, postings: tuple[Posting, ...] (copied from any sequence); blank id/date -> ValueError
+    @staticmethod
+    def of(id: str, date: str, *postings: Posting) -> JournalEntry: ...   # the varargs constructor
+    def currency(self) -> Currency: ...                                    # first posting's; RuntimeError if none
+
+@dataclass(frozen=True)
+class PostedEntry:                # sequence: int, entry: JournalEntry
+    @property
+    def id(self) -> str: ...      # entry.id
+
+class InvalidEntryError(LedgerError):     def __init__(self, entry_id: str, why: str)
+class UnbalancedEntryError(LedgerError):  def __init__(self, entry_id: str, debits: Money, credits: Money)
+class UnknownEntryError(LedgerError):     def __init__(self, entry_id: str)
+
+class Ledger:
+    def __init__(self, accounts: AccountRegistry) -> None: ...   # not a registry -> ValueError
+    def accounts(self) -> AccountRegistry: ...
+    def post(self, entry: JournalEntry) -> PostedEntry: ...
+    def journal(self) -> tuple[PostedEntry, ...]: ...           # sequence order, immutable copy
+    def entry(self, entry_id: str) -> PostedEntry: ...          # UnknownEntryError if absent
+    def has_entry(self, entry_id: str) -> bool: ...
+    def size(self) -> int: ...
 ```
 
 What each must do:
@@ -138,6 +170,7 @@ The rule is on *sums*, not on pairs. `DEBIT bank 100.00 / CREDIT sellers 96.80 /
 
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 2 --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --stage 2 --path ~/ledger-engine-py
 ```
 
 The grader runs `Stage01Test` and then `Stage02Test` (38 checks). If stage 1 regresses while you edit, you see it immediately.

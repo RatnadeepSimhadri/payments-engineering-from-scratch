@@ -3,7 +3,7 @@
 > A state machine that runs for 120 days.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 06 (Refunds, Partial Refunds, and Refund Windows); Phase 10, Lesson 07 (Holds and Available Balance); Phase 11, Lesson 06 (3-D Secure and Strong Customer Authentication)
 **Time:** ~90 minutes
 
@@ -357,9 +357,32 @@ day   0  arbitration lost                         state LOST              deadli
 
 The demo also prints the reason-code table, the full transition history of `dp_1`, an inquiry that closes with no money moved, and the final ledger, which balances. The test suite has 299 assertions, most of them from the exhaustive enumeration: every one of the 18 rules fires as written with the ledger balancing after it, and every one of the 112 illegal pairs is refused with state, history, and journal unchanged. The rest cover evidence matching and liability shift, the money at each step of the 118-day path, the cost of losing at each stage, the deadline boundary on the day and the day after, sweep idempotency, a forged early deadline event, late responses, and an inquiry escalated to a chargeback.
 
+### In Python
+
+```python
+Requirement = frozenset[EvidenceType]
+
+def format_groups(groups) -> str:
+    # Java's EnumSet prints in declaration order; a frozenset does not, so sort by the enum's position.
+    return "[" + ", ".join("[" + ", ".join(t.name for t in sorted(g, key=lambda t: t.value)) + "]" for g in groups) + "]"
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **Evidence requirements are `frozenset`s, printed in declaration order.** `EvidenceType` members carry their position as the value, and every message or table row goes through `format_groups`, because `frozenset` iteration order changes under hash randomization: the same determinism bug Step 1 fixed in Java with `EnumSet`. `missing_for` returns a `list[frozenset]` that tests compare with `==`.
+- **The rule table is a tuple of frozen dataclasses** on `DisputeService.RULES`, with `from_state`/`to_state` because `from` is a keyword; `resolve` finds the row with `next(...)` and raises `IllegalDisputeTransitionError` (a `RuntimeError`) before any mutation, exactly where the Java threw.
+- **Dates are `datetime.date`.** `deadline_for` adds a `timedelta`, "after the deadline" is `today > deadline`, and `days_between(a, b)` is `(b - a).days`. `DeadlinePolicy.days` is a plain dict keyed by `DisputeState`.
+- **The exhaustive negative test uses `subTest`** over the 112 (state, event) pairs not in the table, so a failure names the pair; `IllegalStateException` (duplicate id) is `RuntimeError` and `IllegalArgumentException` is `ValueError`.
+
+```bash
+cd phases/12-payment-systems-design/07-disputes-and-chargebacks/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port keeps the table as a tuple of frozen dataclasses and the evidence requirements as `frozenset`s, but must sort them when formatting messages (`sorted(req, key=lambda t: t.value)`), because `frozenset` iteration order is not stable across runs with hash randomization: the same bug Step 1 fixed in Java. Dates are `datetime.date`. In Go, evidence types are an `iota` enum and a requirement is a `[]EvidenceType` slice kept in declaration order; `Apply` returns `(ApplyOutcome, error)` with an `ErrIllegalTransition` sentinel wrapped with the precise message; dates are `time.Time` at midnight UTC compared with `After`. The sweep is single-threaded; if it runs alongside webhook handlers, each dispute needs Lesson 02's version check so that a sweep and an issuer event racing on the same dispute cannot both apply.
+In Go, evidence types are an `iota` enum and a requirement is a `[]EvidenceType` slice kept in declaration order; `Apply` returns `(ApplyOutcome, error)` with an `ErrIllegalTransition` sentinel wrapped with the precise message; dates are `time.Time` at midnight UTC compared with `After`. The sweep is single-threaded; if it runs alongside webhook handlers, each dispute needs Lesson 02's version check so that a sweep and an issuer event racing on the same dispute cannot both apply.
 
 ## Use It
 

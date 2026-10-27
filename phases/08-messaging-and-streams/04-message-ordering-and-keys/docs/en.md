@@ -3,7 +3,7 @@
 > Order per account, parallelism across accounts.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 02 (Consumer Groups and Rebalancing), Phase 8, Lesson 03 (Delivery Guarantees)
 **Time:** ~60 minutes
 
@@ -339,9 +339,37 @@ maxInFlight=5 with broker sequence guard: log seqs=[0, 1, 2, 3, 4, 5, 6, 7] retr
 
 Ninety retries produced fifty-nine visible reorderings; the rest happened to be the last send in a window and landed in place. Every one of the fifty-nine would have been a reversal-before-authorization in the Problem section.
 
+### In Python
+
+```python
+class JavaRandom:
+    """java.util.Random: the 48-bit LCG, so a seed yields the same sequence as the Java demo."""
+    _MASK = (1 << 48) - 1
+
+    def __init__(self, seed: int) -> None:
+        self._seed = (seed ^ 0x5DEECE66D) & self._MASK
+
+    def next(self, bits: int) -> int:
+        self._seed = (self._seed * 0x5DEECE66D + 0xB) & self._MASK
+        value = (self._seed >> (48 - bits)) & 0xFFFFFFFF
+        return value - (1 << 32) if value >= 1 << 31 else value
+
+    def next_double(self) -> float:
+        return ((self.next(26) << 27) + self.next(27)) * (1.0 / (1 << 53))
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The seeded run reproduces `java.util.Random`.** `random.Random(42)` is a Mersenne Twister and would pick a different 5% of sends to fail, so the "90 retries, 59 gaps, 151 rejected" line would not match. `JavaRandom` is the JDK's 48-bit linear congruential generator in eight lines; `FaultInjector.random` uses it, and the test file checks its first two doubles against the JDK.
+- **`CommitTracker.done_ahead` is a `heapq` plus a `set`**, not a `TreeSet`. The heap gives the smallest finished offset in O(log n) (`[0]` to peek, `heappop` while it equals the mark); the set is what detects "completed twice", which `TreeSet.add` reported for free.
+- **FNV-1a masks every multiply** with `& 0xFFFFFFFF` because Python integers do not wrap; `for b in data` already yields `0..255`, so no `& 0xFF`.
+- **`Money` is `int` minor units** and rejects a `float` in `__post_init__`. `Verdict` is an `Enum` whose `__str__` prints the bare name; `ValueError` replaces `IllegalArgumentException`, `RuntimeError` replaces `IllegalStateException`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. Every number in the demo, including section 6, matches the Java output.
+
 ### Porting notes
 
-In Python the schedulers are the same loops over a `list[StoredMessage]`; `CommitTracker.done_ahead` is a `heapq` rather than a `TreeSet` (peek at `[0]`, `heappop` while it equals the mark), and `Money` is `int` minor units. In Go, `Message` is a struct with `Seq int64`, the `Verdict` is a typed `int` constant set, and `CommitTracker` can use a `map[int64]bool` plus a `for done[mark] { delete; mark++ }` loop because it only ever needs the minimum when it equals the mark. A concurrent Go port that runs real goroutines per lane must guard `CommitTracker` with a `sync.Mutex` and pass `go test -race`; the deterministic simulation here needs no locks because it is single-threaded by design.
+In Go, `Message` is a struct with `Seq int64`, the `Verdict` is a typed `int` constant set, and `CommitTracker` can use a `map[int64]bool` plus a `for done[mark] { delete; mark++ }` loop because it only ever needs the minimum when it equals the mark. A concurrent Go port that runs real goroutines per lane must guard `CommitTracker` with a `sync.Mutex` and pass `go test -race`; the deterministic simulation here needs no locks because it is single-threaded by design.
 
 ## Use It
 

@@ -79,7 +79,7 @@ flowchart TD
 
 Keep editing the workspace. Put the new value types in `Reconciliation.java`; add `lines` and `reconcile` to `Ledger`.
 
-Signatures (Java 21; Python and Go ports follow later):
+Signatures (Java 21 first, then the same surface in Python; Go port follows later):
 
 ```java
 record StatementLine(String ref, Money amount, String date) {}   // blank ref or date -> IllegalArgumentException
@@ -105,6 +105,37 @@ final class Ledger {
     List<LedgerLine> lines(String accountId);
     ReconciliationReport reconcile(String accountId, List<StatementLine> statement, int windowDays);
 }
+```
+
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+@dataclass(frozen=True)
+class StatementLine:              # ref: str, amount: Money, date: str; blank ref or date -> ValueError
+@dataclass(frozen=True)
+class LedgerLine:                 # ref: str, amount: Money, date: str; ref = entry id, amount signed on the account's normal side
+
+class BreakType(Enum): MISSING_IN_LEDGER, MISSING_IN_STATEMENT, AMOUNT_MISMATCH, DUPLICATE
+class MatchedBy(Enum): REF, AMOUNT_AND_DATE
+
+@dataclass(frozen=True)
+class ReconciliationMatch:        # ledger_ref: str, statement_ref: str, amount: Money, by: MatchedBy
+@dataclass(frozen=True)
+class ReconciliationBreak:        # type: BreakType, ref: str, ledger_amount: Money, statement_amount: Money
+
+@dataclass(frozen=True)
+class ReconciliationReport:       # account_id, currency, matches: tuple[...], breaks: tuple[...], ledger_total: Money, statement_total: Money
+    def matched_total(self) -> Money: ...
+    def ledger_break_total(self) -> Money: ...          # sum of breaks' ledger_amount
+    def statement_break_total(self) -> Money: ...       # sum of breaks' statement_amount
+    def breaks_of(self, type: BreakType) -> list[ReconciliationBreak]: ...
+    def ties_out(self) -> bool: ...
+    def is_clean(self) -> bool: ...                     # not self.breaks
+
+class Ledger:
+    def lines(self, account_id: str) -> list[LedgerLine]: ...
+    def reconcile(self, account_id: str, statement: Sequence[StatementLine], window_days: int) -> ReconciliationReport: ...
+    # window_days < 0 -> ValueError; wrong currency -> CurrencyMismatchError; bad date -> LedgerError (datetime.date.fromisoformat)
 ```
 
 What each must do:
@@ -145,8 +176,10 @@ What each must do:
 
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 4 --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --stage 4 --path ~/ledger-engine-py
 # or everything:
 python3 scripts/project_test.py ledger-engine --lang java --all --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --all --path ~/ledger-engine-py
 ```
 
 Stages 1 to 3 run first, then `Stage04Test` (50 checks). When all four pass, run your own `Main` and feed `reconcile` a statement you wrote yourself (see the README's "Run with your own inputs").

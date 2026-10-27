@@ -2,7 +2,7 @@
 
 > A double-entry ledger that refuses to go out of balance, then reconciles itself against a bank statement.
 
-**Level 2 — Builder.** Four stages, about 8 hours. **Language: Java 21** (standard library only; Python and Go ports follow later).
+**Level 2 — Builder.** Four stages, about 8 hours. **Languages: Java 21 or Python 3.11+** (standard library only; Go port follows later).
 
 ## Overview
 
@@ -36,30 +36,37 @@ Helpful but not required: `04-chart-of-accounts` (why assets grow on the debit s
 All commands run from the repository root. Pick any directory outside the repository for your workspace.
 
 ```bash
-# 1. create a workspace from the stage-1 starter (three files: Money.java, Accounts.java, Main.java)
+# 1. create a workspace from the stage-1 starter (Java: Money.java, Accounts.java, Main.java; Python: one main.py)
 python3 scripts/project_test.py ledger-engine --lang java --init ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --init ~/ledger-engine-py
 
 # 2. read the stage lesson, implement, then grade the stage
 #    (the grader runs every stage up to N, so a regression in stage 1 shows up while you work on stage 3)
 python3 scripts/project_test.py ledger-engine --lang java --stage 1 --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --stage 1 --path ~/ledger-engine-py
 python3 scripts/project_test.py ledger-engine --lang java --stage 2 --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --stage 2 --path ~/ledger-engine-py
 python3 scripts/project_test.py ledger-engine --lang java --stage 3 --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --stage 3 --path ~/ledger-engine-py
 python3 scripts/project_test.py ledger-engine --lang java --stage 4 --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --stage 4 --path ~/ledger-engine-py
 
 # 3. run everything at once
 python3 scripts/project_test.py ledger-engine --lang java --all --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --all --path ~/ledger-engine-py
 
 # run your own Main while you work (from inside the workspace)
-javac -d .out *.java && java -cp .out Main
+javac -d .out *.java && java -cp .out Main   # Java
+python3 main.py                                # Python
 ```
 
-How grading works: for each stage the grader copies your `*.java` files (except `*Test.java`) into a temporary directory, adds that stage's `StageNNTest.java`, compiles everything with `javac`, and runs each test class. A test class exits 1 on the first stage with failures and prints every failing check by name. You never need `solution/`; the `build-project` skill may read it to diagnose, and shows at most one function after two honest attempts.
+How grading works: for each stage the grader copies your sources (`*.java` except `*Test.java`, or `*.py` except `test_*.py`) into a temporary directory, adds that stage's tests (`StageNNTest.java`, or `test_stage_NN.py`), and runs them (`javac` + `java`, or `python3 -m unittest -v`). The run exits 1 on the first stage with failures and prints every failing check by name. You never need `solution/`; the `build-project` skill may read it to diagnose, and shows at most one function after two honest attempts.
 
 Stages 2 to 4 ship no starter files. You keep editing the workspace you created at stage 1; each later stage's `starter/STAGE.md` lists the new types and signatures the tests expect, and the stage lesson explains them.
 
 ## What the learner keeps
 
-- A self-contained, dependency-free double-entry ledger in about 600 lines of Java: `Money`, `Accounts`, `Journal`, `Ledger`, `Reconciliation`, `Main`.
+- A self-contained, dependency-free double-entry ledger in about 600 lines of Java (`Money`, `Accounts`, `Journal`, `Ledger`, `Reconciliation`, `Main`) or one `main.py` of about 550 lines in Python.
 - A `Money` type with explicit rounding and lossless allocation that you can lift into any later project.
 - A worked mental model of the four ledger invariants and the exact exception each violation raises.
 - A reconciliation routine whose report proves, by arithmetic, that no line was dropped: `ledgerTotal == matchedTotal + ledgerBreakTotal` and `statementTotal == matchedTotal + statementBreakTotal`.
@@ -67,7 +74,7 @@ Stages 2 to 4 ship no starter files. You keep editing the workspace you created 
 
 ## Run with your own inputs
 
-`Main.java` is yours; the grader never runs it. Once stage 4 passes, try these from your workspace:
+`Main.java` (or the `main()` of `main.py`) is yours; the grader never runs it. Once stage 4 passes, try these from your workspace:
 
 1. **Your own chart of accounts.** Open the accounts a small marketplace needs (`bank`, `receivable:cards`, `payable:sellers`, `revenue:fees`, `expense:chargebacks`) and post a week of activity: five sales with `times(29, 1000, HALF_EVEN)` fees plus a fixed 30 minor units, two payouts, one refund. Print `trialBalance()` and confirm `isBalanced()` after every entry.
 2. **Split a payout.** Use `Money.allocate(70, 20, 10)` to split one 100.01 USD payout three ways and post it as a four-leg entry (one credit to `bank`, three debits to seller sub-accounts). The ledger accepts it only because `allocate` never loses a minor unit; try building the same entry from three `times(...)` calls and watch `UnbalancedEntryException` catch the missing cent.
@@ -82,9 +89,9 @@ projects/ledger-engine/
   project.json
   README.md
   stages/
-    01-money-and-accounts/           docs/en.md  starter/java/  tests/java/Stage01Test.java
-    02-balanced-journal-entries/     docs/en.md  starter/STAGE.md  tests/java/Stage02Test.java
-    03-balances-and-trial-balance/   docs/en.md  starter/STAGE.md  tests/java/Stage03Test.java
-    04-reconcile-against-statement/  docs/en.md  starter/STAGE.md  tests/java/Stage04Test.java
-  solution/java/                     reference implementation; passes every stage
+    01-money-and-accounts/           docs/en.md  starter/{java,python}/  tests/{java,python}/
+    02-balanced-journal-entries/     docs/en.md  starter/STAGE.md        tests/{java,python}/
+    03-balances-and-trial-balance/   docs/en.md  starter/STAGE.md        tests/{java,python}/
+    04-reconcile-against-statement/  docs/en.md  starter/STAGE.md        tests/{java,python}/
+  solution/java/   solution/python/   reference implementations; each passes every stage
 ```

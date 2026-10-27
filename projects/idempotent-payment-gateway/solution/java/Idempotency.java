@@ -1,7 +1,7 @@
 // Project: projects/idempotent-payment-gateway — Stage 01: idempotency store.
 // Keyed by (merchantId, idempotencyKey); every record carries the SHA-256 fingerprint of the canonical
 // request so a reused key with a different body is detected instead of silently replayed.
-// Java 21, standard library only. Same design as the Python and Go versions.
+// Java 21, standard library only. Same design as the Python port in solution/python; Go port follows later.
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;

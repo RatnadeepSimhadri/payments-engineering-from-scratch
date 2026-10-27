@@ -3,7 +3,7 @@
 > The event happened at 11:59; it arrived at 12:03. Which window?
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 07 (Stream Processing and Windows), Phase 5, Lesson 02 (Clocks and Ordering), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -345,9 +345,37 @@ Expected output, abbreviated:
 every event accounted for exactly once: true
 ```
 
+### In Python
+
+```python
+def current(self) -> Optional[int]:
+    """None before any event has been seen: nothing is known to be complete (Java's Long.MIN_VALUE)."""
+    if self._max_event_time is None:
+        return None
+    return self._max_event_time - self._max_out_of_orderness_millis
+
+def _advance(self, wm: Optional[int]) -> List[WindowResult]:
+    out: List[WindowResult] = []
+    if wm is None:
+        return out
+    for w in sorted(self._open):
+        if w.end > wm:
+            break
+        ...
+```
+
+Differences, all in `code/python/main.py`:
+
+- **`Long.MIN_VALUE` is `None`.** "No watermark yet" is `Optional[int]`; `process` checks `wm_before is not None` before comparing, and `hhmm(None)` prints `-inf`. This removes the sentinel-overflow concern (`Long.MIN_VALUE - bound` would wrap in Java if the guard were missing).
+- **No `TreeMap`.** Open windows live in a `dict[Window, WindowState]`, and `_advance` iterates `sorted(self._open)` twice: once to fire, once to garbage-collect. `Window` is a frozen dataclass with `order=True`, so sorting by `(start, end)` matches the Java `compareTo` on `start`. The number of open windows is tiny (two in the demo), so sorting per advance costs nothing measurable.
+- **`floorDiv` is `//`.** Python's floor division already rounds toward negative infinity, so `assign(-1)` lands in `[-60 min, 0)` exactly as `Math.floorDiv` does; the test pins this.
+- **`Money` is `int` minor units** and raises `TypeError` on a `float`; a currency mix is a `ValueError`, matching the Java `IllegalArgumentException`. `LateReason` and `FiringKind` are `Enum`s whose `__str__` prints the bare name.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The event-by-event watermark trace and the side output match the Java run line for line.
+
 ### Porting notes
 
-In Python, `Event`, `Window`, and `WindowResult` become frozen dataclasses and `TreeMap` has no standard-library equivalent: keep open windows in a `dict` keyed by start and sort the keys inside `advance` (the number of open windows is small, so `sorted(open)` per watermark advance is fine), or maintain a `bisect`-ordered list of starts. `Long.MIN_VALUE` becomes `None` for "no watermark yet", which removes the overflow concern entirely. In Go, `Money.Plus` returns `(Money, error)` and the window state's `add` propagates it; `TreeMap` becomes a sorted slice of `Window` with `sort.Search` for insertion, and the sentinel is `math.MinInt64` with the same explicit check. Neither port needs concurrency: the operator is single-threaded by design, which is also how Flink and Kafka Streams run one operator instance per partition.
+In Go, `Money.Plus` returns `(Money, error)` and the window state's `add` propagates it; `TreeMap` becomes a sorted slice of `Window` with `sort.Search` for insertion, and the sentinel is `math.MinInt64` with the same explicit check. Neither port needs concurrency: the operator is single-threaded by design, which is also how Flink and Kafka Streams run one operator instance per partition.
 
 ## Use It
 

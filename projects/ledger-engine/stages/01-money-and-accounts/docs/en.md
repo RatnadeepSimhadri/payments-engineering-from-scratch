@@ -56,9 +56,9 @@ Opening the chart: `open("bank", ASSET, USD)` returns the account; `open("bank",
 
 ## Your task
 
-Run `--init` to create a workspace; it contains `Money.java`, `Accounts.java`, and `Main.java`. `Currency`, `Rounding`, `CurrencyMismatchException`, `Money.ofMinor`, `negate`, `abs`, `isZero/isNegative/isPositive`, `sum`, `compareTo`, and `toString` are given. The exception classes are given. Everything below throws `UnsupportedOperationException` until you replace it.
+Run `--init` to create a workspace; it contains `Money.java`, `Accounts.java`, and `Main.java`. (In Python the workspace is a single `main.py` holding the same given parts and the same stubs; later stages add to that one file.) `Currency`, `Rounding`, `CurrencyMismatchException`, `Money.ofMinor`, `negate`, `abs`, `isZero/isNegative/isPositive`, `sum`, `compareTo`, and `toString` are given. The exception classes are given. Everything below throws `UnsupportedOperationException` until you replace it.
 
-Signatures (Java 21; Python and Go ports follow later):
+Signatures (Java 21 first, then the same surface in Python; Go port follows later):
 
 ```java
 record Money(long minorUnits, Currency currency) implements Comparable<Money> {
@@ -81,6 +81,37 @@ final class AccountRegistry {
     int size();
     List<Account> all();
 }
+```
+
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+@dataclass(frozen=True)
+class Money:                      # minor_units: int, currency: Currency; a 64-bit bound replaces Math.addExact (OverflowError)
+    @staticmethod
+    def parse(text: str, currency: Currency) -> Money: ...        # excess decimals -> ArithmeticError; not a decimal -> ValueError
+    def plus(self, other: Money) -> Money: ...                   # CurrencyMismatchError on a different currency
+    def minus(self, other: Money) -> Money: ...
+    def times(self, numerator: int, denominator: int, rounding: Rounding) -> Money: ...   # denominator <= 0 -> ArithmeticError
+    @staticmethod
+    def divide_rounded(dividend: int, divisor: int, rounding: Rounding) -> int: ...
+    def allocate(self, *ratios: int) -> list[Money]: ...         # no / negative / all-zero ratios -> ValueError
+
+class Side(Enum):        DEBIT, CREDIT;                              def opposite(self) -> Side
+class AccountType(Enum): ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE; def normal_side(self) -> Side
+
+@dataclass(frozen=True)
+class Account:                    # id: str, type: AccountType, currency: Currency; blank id -> ValueError
+    def normal_side(self) -> Side: ...
+
+class LedgerError(ValueError): ...                 # DuplicateAccountError and UnknownAccountError extend it (given)
+
+class AccountRegistry:
+    def open(self, account_id: str, type: AccountType, currency: Currency) -> Account: ...   # DuplicateAccountError
+    def get(self, account_id: str) -> Account: ...                                          # UnknownAccountError, never None
+    def contains(self, account_id: str) -> bool: ...
+    def size(self) -> int: ...
+    def all(self) -> tuple[Account, ...]: ...                                               # opening order, immutable
 ```
 
 What each must do:
@@ -138,7 +169,9 @@ Nothing in this stage knows about postings or balances yet. Stage 2 will combine
 
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --init ~/ledger-engine-java   # once
+python3 scripts/project_test.py ledger-engine --lang python --init ~/ledger-engine-py   # once
 python3 scripts/project_test.py ledger-engine --lang java --stage 1 --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --stage 1 --path ~/ledger-engine-py
 ```
 
 The stage-1 suite has 64 checks. A failing check prints as `FAIL: <name>`; the names are sentences ("half-even tie goes to even (10.05 * 50%)") so you can find the case without opening the test file. Run your own `Main` with `javac -d .out *.java && java -cp .out Main` from the workspace at any time.

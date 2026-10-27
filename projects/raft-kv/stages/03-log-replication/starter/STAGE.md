@@ -23,3 +23,21 @@ grader runs stages 1 and 2 again before stage 3.
 
 `advanceCommitIndex` and `applyCommitted` stay stubbed; `commitIndex` remains 0 throughout this stage. Read `docs/en.md`
 for the worked traces, the receiver loop, and the failure table.
+
+## New signatures (Python)
+
+Keep everything in the one `main.py` the stage-1 starter gave you; the names below are the Java ones in snake_case.
+
+```python
+class RaftNode:
+    def propose(self, command: str) -> int: ...                     # -1 unless leader; else append and return the new index
+    def append_entries_for(self, peer: int) -> Message: ...         # prev = next_index[peer] - 1; ships storage.entries_from(next)
+    def on_append_reply(self, m: Message, now: int) -> list[Message]: ...
+    def replicated_count(self, index: int) -> int: ...             # 1 + peers with match_index >= index
+
+    # upgraded: become_leader appends LogEntry(current_term, "NOOP"); replicate_all returns append_entries_for(p) per peer;
+    # on_append_entries adds rules 2-4 and replies match_index = prev_log_index + len(entries)
+
+# Cluster additions used by the tests: propose(command) -> int, propose_to(node_id, command) -> int,
+# run_until_logs_converged(max_ticks) -> int, logs_converged() -> bool, Cluster.check_log_matching(a, b, ia, ib) (raises RuntimeError).
+```

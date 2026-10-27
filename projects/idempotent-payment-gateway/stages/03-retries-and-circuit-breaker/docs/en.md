@@ -73,7 +73,7 @@ The OPEN → HALF_OPEN move happens inside `state()` by comparing the clock to `
 
 ## Your task
 
-Add `Resilience.java`. Stages 1 and 2 are graded again first. Python and Go ports of this project follow later; this pass is Java only.
+Add `Resilience.java`. Stages 1 and 2 are graded again first. The Python port has the same surface in snake_case in one `main.py` (signatures below); Go port follows later.
 
 ```java
 enum ProcessorOutcome { APPROVED, DECLINED, UNAVAILABLE }
@@ -124,6 +124,49 @@ final class Gateway {
     Optional<Payment> payment(String id);
     List<Payment> payments();
 }
+```
+
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+class ProcessorOutcome(Enum): APPROVED, DECLINED, UNAVAILABLE
+@dataclass(frozen=True)
+class ProcessorResult:        # outcome: ProcessorOutcome, reference: str
+class Processor(Protocol):    def charge(self, request: ChargeRequest) -> ProcessorResult
+
+class ScriptedProcessor:      # 'A' approve, 'D' decline, 'U' unavailable; last character repeats; bad script -> ValueError
+    def __init__(self, script: str) -> None; charge(request) -> ProcessorResult; calls() -> int
+
+class BackoffPolicy:
+    def __init__(self, base_millis: int, cap_millis: int, max_attempts: int) -> None: ...   # bad settings -> ValueError
+    def max_attempts(self) -> int: ...
+    def ceiling_for(self, retry: int) -> int: ...                 # min(cap, base * 2**(retry-1)); retry < 1 -> ValueError
+    def delay_before(self, retry: int, rng: Rng) -> int: ...      # rng.next_below(ceiling + 1)
+
+class RetryBudget:
+    def __init__(self, initial_tokens: int, max_tokens: int) -> None: ...
+    def tokens(self) -> int; try_withdraw() -> bool; deposit(n: int) -> None
+
+class CircuitState(Enum): CLOSED, OPEN, HALF_OPEN
+class CircuitBreaker:
+    def __init__(self, clock: Clock, failure_threshold: int, open_millis: int, successes_to_close: int) -> None: ...
+    def state(self) -> CircuitState; allow_request() -> bool; record_success() -> None; record_failure() -> None
+    def retry_after_millis(self) -> int: ...
+
+@dataclass(frozen=True)
+class ChargeOutcome:          # outcome, reference, attempts: int, waited_millis: int, reason: str
+
+class RetryingClient:
+    def __init__(self, processor: Processor, policy: BackoffPolicy, budget: RetryBudget, breaker: CircuitBreaker, rng: Rng, clock: Clock) -> None: ...
+    def charge(self, request: ChargeRequest) -> ChargeOutcome: ...
+
+class Gateway:
+    def __init__(self, store: IdempotencyStore, client: RetryingClient, clock: Clock) -> None: ...
+    def charge(self, request: ChargeRequest) -> ApiResponse: ...   # 201 / 402 / 409 / 422 / 503
+    def payment(self, id: str) -> Payment | None: ...
+    def payments(self) -> tuple[Payment, ...]: ...
+
+# Rng (given): Rng(seed).next_long() -> int in [0, 2**64); next_below(bound) -> int; bound <= 0 -> ValueError
 ```
 
 **`RetryingClient.charge` algorithm.** The order of the checks matters and the tests pin the reason strings exactly:
@@ -194,6 +237,7 @@ What must fail and how:
 
 ```bash
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 3 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 3 --path my-gateway
 ```
 
 Stages 1 and 2 run again (89 assertions), then Stage 3's 59.

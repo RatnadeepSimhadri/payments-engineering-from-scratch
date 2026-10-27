@@ -3,7 +3,7 @@
 > One ledger, many currencies, no mixing.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 02 (Currencies and FX Conversion), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 06 (Immutability and Reversals)
 **Time:** ~90 minutes
 
@@ -350,9 +350,41 @@ realized gain/loss: -1.50 USD
 5000 JPY -> 31.80 USD; 31.80 USD -> 5001 JPY
 ```
 
+### In Python
+
+The full port is `code/python/main.py` (same `SubLedger`, `MultiCurrencyLedger` with `exchange`, `revalue`, `realize`, `position_report`, and the two invariants; tests in `code/python/test_main.py`). Three things differ:
+
+- **Rounding negative positions.** `fractions.Fraction` would make `FxRate` exact for free, but the design keeps the `numerator`/`denominator` pair from Lesson 02, and the one place arithmetic can diverge is the final division. Positions are often negative (a short EUR position is `-100.00 EUR`), and Python's `//` floors toward negative infinity where Java's `/` truncates toward zero, so `convert` goes through `divide_rounded`, which works on magnitudes and reapplies the sign. The exponent shift is a single power of ten rather than a `multiplyExact` loop, since `int` cannot overflow:
+
+```python
+def convert(self, amount: Money, rounding: Rounding) -> Money:
+    from_ = amount.currency
+    if from_ == self.base:
+        to, num, den = self.quote, self.numerator, self.denominator
+    elif from_ == self.quote:
+        to, num, den = self.base, self.denominator, self.numerator
+    else:
+        raise CurrencyMismatchError(amount.currency, self.base)
+    shift = to.exponent - from_.exponent
+    if shift > 0:
+        num *= 10 ** shift
+    else:
+        den *= 10 ** (-shift)
+    return Money.of_minor(divide_rounded(amount.minor_units * num, den, rounding), to)
+```
+
+- **`MixedCurrencyError` stays distinct.** It extends `LedgerError` (which extends `ValueError`), so a caller can catch the specific "one entry per currency" violation separately from a generic validation failure, exactly as the Java hierarchy allows. `Transaction.rate` is `Optional[FxRate]` with `None` for single-currency events.
+- **Ordered dictionaries do the bookkeeping.** `dict` preserves insertion order, so the sub-ledger map, the account map, and the balance report iterate in the same order as Java's `LinkedHashMap` without extra lists. `JournalEntry` validates in a hand-written `__init__` and stores its postings as a tuple, and the property test ships a small `JavaRandom` (with `next_boolean`) so it replays the same 500 exchanges as `MainTest.java`.
+
+```bash
+cd phases/10-money-and-ledgers/09-multi-currency-ledgers/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python's `Fraction` makes `FxRate` trivial and exact, but the final rounding must still be explicit (`divide_rounded` from Lesson 01 on magnitudes, because `//` floors negatives and positions are often negative). In Go, use `int64` with the checked helpers from Lesson 01 and keep sub-ledgers in a map plus an ordered slice of currency codes, since map order is random and reports must be deterministic. Both ports should keep the exception or sentinel `MixedCurrency` distinct from a generic validation error.
+In Go, use `int64` with the checked helpers from Lesson 01 and keep sub-ledgers in a map plus an ordered slice of currency codes, since map order is random and reports must be deterministic. The Go port should keep the `ErrMixedCurrency` sentinel distinct from a generic validation error.
 
 ## Use It
 

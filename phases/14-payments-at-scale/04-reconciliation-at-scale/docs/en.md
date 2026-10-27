@@ -3,7 +3,7 @@
 > Match a billion records a day and surface the breaks.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 2, Lesson 03 (Merge Sort and External Sorting), Phase 3, Lesson 01 (Hash Tables), Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 08 (Reconciliation), Phase 14, Lesson 03 (Exactly-Once Money Movement)
 **Time:** ~120 minutes
 
@@ -382,9 +382,37 @@ rejected: INTERNAL feed is not sorted: 2026-03-28/USD/1999 after 2026-03-29/USD/
 
 Half a second for a million records on two cores, and the time is dominated by iterating; the generator's sort takes six times longer than the reconciliation. The test suite asserts that the large run finds exactly as many breaks as the generator injected, which is the property that lets you trust the number on a real file.
 
-### Porting notes
+### In Python
 
-Python: `Rec` and `BucketDigest` as frozen dataclasses; `mix` must mask to 64 bits after every multiply (`& 0xFFFFFFFFFFFFFFFF`) because Python integers do not wrap, and the digest sum must be masked the same way or the two sides' digests will diverge on large buckets. Use `heapq.merge`-style iteration over generators so the feeds stay lazy. Expect roughly 20 to 40 times the Java runtime on the million-record demo; shrink it to 100,000 or run under PyPy.
+`code/python/main.py` keeps the same pieces: `Rec`, `BucketKey`, `BucketDigest`, `StreamingReconciler` with its `Cursor`, `ReconciliationReport`, and `FeedGenerator`. The demo reconciles the same million records with the same seed and prints the same 510 breaks. Four things differ:
+
+- **The digest must be masked.** Java's `mix` relies on `long` overflow and `>>>`; Python integers never wrap, so every multiply is followed by `& 0xFFFFFFFFFFFFFFFF`, the value is kept unsigned so `>>` is a logical shift, and the running sum in `add` is masked the same way. Forget one mask and the two sides' digests diverge on the first large bucket.
+
+```python
+@staticmethod
+def mix(ref: str) -> int:
+    h = 0x9E3779B97F4A7C15
+    for b in ref.encode():
+        h = ((h ^ b) * 0xBF58476D1CE4E5B9) & MASK64
+    h ^= h >> 31
+    h = (h * 0x94D049BB133111EB) & MASK64
+    h ^= h >> 29
+    return h
+```
+
+- **The seeded generator is `java.util.Random`, not `random.Random`.** `FeedGenerator` uses a 25-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop and `nextDouble`), so seed 42 produces the same feeds, the same buckets, and the same first three breaks as the Java run. A test pins the sequence to values taken from the JDK.
+- **Hot-path types are tuples.** `BucketKey` and `BucketDigest` are `NamedTuple`s rather than frozen dataclasses: one of each is built per record, and tuple construction, equality, and ordering run in C. The report accumulates its three totals as plain minor-unit ints and exposes `matched_total`, `internal_total`, and `processor_total` as `Money` properties; a million `Money.plus` calls would otherwise cost more than the merge itself. The cursor also caches `head.bucket()` once per record. With those changes the million-record demo runs in about eight seconds on CPython, roughly ten times the Java figure, most of it in generating and sorting the feeds.
+- **Exceptions.** The unsorted feed raises `RuntimeError` (Java's `IllegalStateException`) and a record on the wrong feed raises `ValueError` (`IllegalArgumentException`); `EnumMap` ordering in the summary is reproduced by iterating `BreakType` and `AgeBand` in declaration order.
+
+```bash
+cd phases/14-payments-at-scale/04-reconciliation-at-scale/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python tests port all 31 Java checks (58 assertions), including the seeded 100,000-record run that must surface exactly the injected number of breaks and tie out.
+
+### Porting notes
 
 Go: `Rec` as a struct with `int64` minor units; the digest arithmetic wraps natively on `uint64`. Feeds as channels or `bufio.Scanner` over sorted files. Return `(Report, error)` from `Reconcile` and make the unsorted-feed check an error value, since there is no exception to throw from inside a cursor. Run the tests under `-race` if the two feeds are drained by separate goroutines.
 

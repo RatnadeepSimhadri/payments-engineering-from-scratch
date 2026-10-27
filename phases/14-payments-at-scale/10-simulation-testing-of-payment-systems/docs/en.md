@@ -3,7 +3,7 @@
 > Run a year of payments in a minute with a seeded network.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 02 (Failure Models), Phase 5, Lesson 09 (Idempotency Keys), Phase 12, Lesson 14 (Testing Payment Systems), Phase 14, Lesson 03 (Exactly-Once Money Movement)
 **Time:** ~120 minutes
 
@@ -436,9 +436,37 @@ RECOVERY_SKIPS_PENDING -> seed 4 breaks [no-stuck-payments]
 
 Twenty virtual days, 11,478 payments, 22 gateway crashes, 120 faults, zero violations, in about two seconds of wall-clock time. The two planted defects are each caught by the first or fourth seed. The test file (`MainTest.java`, 36 checks) asserts the SplitMix64 vectors, event ordering, partition semantics, the ledger's trial balance, processor and gateway idempotency, the crash-when-busy window, the epoch guard on timers, fingerprint equality for equal seeds and inequality for different ones, and that both defects are found with the right invariant named.
 
+### In Python
+
+`code/python/main.py` is the same harness: `Rng`, `Fingerprint`, `Simulator`, `Network`, `FaultSchedule`, `Processor`, `Gateway`, `Client`, `Harness`. Seed 1 over 48 virtual hours produces the same 9,435 events and the same fingerprint `ff8801a677b7abd9` as the Java run, which is the whole point of choosing SplitMix64 and integer probabilities. What differs:
+
+- **SplitMix64 must be masked.** Python integers never wrap, so every addition and multiplication in `next_long` is followed by `& 0xFFFFFFFFFFFFFFFF`, and the state is kept unsigned so that `>>` is the logical shift Java spells `>>>`. The reference vectors (`e220a8397b1dcdaf`, `6e789e6aa1b965f4`) are the check that the masking is right; `next_long_bounded` is then a plain `%` because the value is already unsigned.
+
+```python
+def next_long(self) -> int:
+    self.draws += 1
+    self.state = (self.state + 0x9E3779B97F4A7C15) & MASK64
+    z = self.state
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+    return z ^ (z >> 31)
+```
+
+- **`heapq` is the event queue.** Events are pushed as `(time, seq, Event)` tuples, so ordering is by virtual time with the scheduling sequence as the tie-break and the two `Event` objects themselves are never compared. `hashlib.sha256` replaces `MessageDigest`; `Fingerprint.hex` takes `copy().hexdigest()[:16]` where Java clones the digest.
+- **Closures replace `Runnable` and `Consumer`.** The timer in `_send_auth` and the reply callback in `Client._attempt` are nested functions that close over `p`, `armed_epoch`, and the `answered` list; in `FaultSchedule.arm` the loop variable is bound with a default argument (`lambda f=f: ...`) because a bare lambda in a loop would see the last fault for every event.
+- **Ordering that Java gets from `TreeMap` is explicit.** `approvals_per_payment` and the per-key count in `check_safety` are sorted before iteration so the first violation reported is the same one the Java reports; everything else uses insertion-ordered dicts, which match `LinkedHashMap`. `IllegalArgumentException` becomes `ValueError`, and the quiescence guard raises `RuntimeError`.
+
+```bash
+cd phases/14-payments-at-scale/10-simulation-testing-of-payment-systems/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python tests port every Java check (63 assertions, one of them pinning the seed-1 fingerprint to the Java value) and the demo output is identical to the Java run, fingerprints included.
+
 ### Porting notes
 
-A Python port needs `& 0xFFFFFFFFFFFFFFFF` after every addition and multiplication in `nextLong`, because Python integers do not wrap; the SplitMix64 vectors above are the check that the masking is right. `heapq` with `(time, seq, ...)` tuples replaces `PriorityQueue`; `hashlib.sha256` replaces `MessageDigest`. A Go port gets wrap-around for free with `uint64`, uses `container/heap` for the queue, returns `error` values where the Java throws, and must not use goroutines for any component: the point is that the whole simulation is one sequential loop. In both ports, keep the same four `split()` calls in the same order so a seed means the same universe in every language.
+A Go port gets wrap-around for free with `uint64`, uses `container/heap` for the queue, returns `error` values where the Java throws, and must not use goroutines for any component: the point is that the whole simulation is one sequential loop. Keep the same four `split()` calls in the same order so a seed means the same universe in every language.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > A saga with real compensations and a dead-letter path.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 7, Lesson 08 (Sagas and Compensating Transactions); Phase 10, Lesson 03 (The Double-Entry Ledger)
 **Time:** ~120 minutes
 
@@ -354,9 +354,36 @@ after redrive: saga_7 COMPENSATED v11 [T=C A=C C=P L=P]  dead letters remaining:
 
 The test file runs eleven scenarios in isolated worlds: happy path, decline at each of three steps, outage within and past the budget, crash after commit at the acquirer, at the ledger, and during a compensation, the dead-letter path with redrive, an immediately-refused compensation, and the store's copy semantics. Every scenario asserts on downstream side-effect counts, not just on saga state.
 
+### In Python
+
+```python
+class SagaStep(Enum):
+    TOKENIZE = ("vault", "deleteToken")
+    AUTHORIZE = ("acquirer", "voidAuth")
+    CAPTURE = ("acquirer", "refund")
+    LEDGER_POST = ("ledger", "reverse")
+
+    def __init__(self, system: str, compensation: str) -> None:
+        self.system = system
+        self.compensation = compensation
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **Enums carry their fields.** `SagaStep` members are tuples unpacked by `__init__`, so `step.system` and `step.compensation` read like the Java constants. Iterating `SagaStep` yields declaration order, which is what `next_forward` and `next_compensation` (via `reversed(list(SagaStep))`) rely on; the `EnumMap`s become plain `dict[SagaStep, ...]`.
+- **Exceptions subclass `RuntimeError`.** `ProcessorUnavailableError` and `ProcessCrashError` replace the two Java runtime exceptions; `IllegalStateException` (unknown saga, redrive of a live saga) becomes a bare `RuntimeError`, and the positive-amount check raises `ValueError`. Tests use `assertRaises` with those classes.
+- **The store copies with `copy.deepcopy`.** `SagaRecord.copy()` is one line instead of a field-by-field constructor, and gives the same semantics: a mutation that never reaches `save()` is invisible to `load()`.
+- **`ProcessorResponse.approved` is a field**, so the static factory is `approved_with(reference)` to avoid shadowing it; `declined(code)` is unchanged.
+
+```bash
+cd phases/12-payment-systems-design/03-payment-orchestration/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port keeps `Money` as `int` minor units with a `Currency` dataclass, uses `Enum` for the three enums and relies on `list(SagaStep)` preserving declaration order for the two cursors; `ProcessorUnavailableError` and `ProcessCrashError` subclass `RuntimeError`, and `copy.deepcopy` implements the store's copy semantics. A Go port returns `(ProcessorResponse, error)` from every downstream call with `ErrUnavailable` and `ErrProcessCrash` as sentinels checked by `errors.Is`; the crash cannot be an exception that unwinds the loop, so `run` returns the sentinel and the test asserts on it. Go's `iota` enums need an explicit ordered slice for `nextForward`/`nextCompensation`. Neither port needs goroutines or threads: the orchestrator is single-threaded by design, and concurrency between sagas belongs in the store's version check (Lesson 02).
+A Go port returns `(ProcessorResponse, error)` from every downstream call with `ErrUnavailable` and `ErrProcessCrash` as sentinels checked by `errors.Is`; the crash cannot be an exception that unwinds the loop, so `run` returns the sentinel and the test asserts on it. Go's `iota` enums need an explicit ordered slice for `nextForward`/`nextCompensation`. The port needs no goroutines: the orchestrator is single-threaded by design, and concurrency between sagas belongs in the store's version check (Lesson 02).
 
 ## Use It
 

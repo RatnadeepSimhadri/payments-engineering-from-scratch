@@ -3,7 +3,7 @@
 > Never store the PAN; here is what you store instead.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 11, Lesson 04 (PANs, Luhn, and BIN Range Routing), Phase 0, Lesson 09 (Hashing and Cryptographic Primitives)
 **Time:** ~90 minutes
 
@@ -300,9 +300,38 @@ systems storing PAN after tokenization:  3 [auth-gateway, token-vault, web-check
 
 The last two lines are the business case. Eight systems in scope became three, and the three are the ones that cannot be removed: where the PAN is typed, where it is stored, and where it is sent to the acquirer.
 
+### In Python
+
+The full port is `code/python/main.py` (same `Pan`, `Principal`, `TokenRecord`, `TokenVault`, `SystemInventory`; tests in `code/python/test_main.py`). One substitution and two smaller differences:
+
+- **The standard library has no AES, so the AEAD is built from HMAC-SHA256.** The course is stdlib-only and `cryptography` is not available, so `encrypt`/`decrypt` keep AES-GCM's *shape and properties* with a different primitive: two subkeys are derived from the data key by HMAC with labels; the plaintext is XORed with a PRF keystream `HMAC(enc_key, nonce || block)` (the same construction as CTR mode, with HMAC as the block function); and a 16-byte tag `HMAC(mac_key, nonce || len(aad) || aad || ciphertext)` is appended, encrypt-then-MAC. The stored record is still `nonce` (4 random bytes + counter, identical to Java's) plus `ciphertext || tag`, 32 bytes for a 16-digit PAN. Every property the lesson relies on is kept under test: the ciphertext does not contain the PAN, flipping one bit of the body or the tag fails authentication, the ciphertext is bound to its token through the AAD, a different data key fails, the same PAN under two nonces gives two ciphertexts, and revocation zeroes the bytes. The one visible difference is the ciphertext hex in the demo, which cannot match a real GCM output; tokens, nonces, audit lines and scope counts are byte-identical to Java. In production you would use a real AEAD (an HSM, a KMS, or `cryptography`'s `AESGCM`); the lesson's point is what the vault stores and who may unwrap it, not the block cipher.
+
+```python
+def encrypt(self, plaintext: bytes, nonce: bytes, aad: str) -> bytearray:
+    stream = self._keystream(nonce, len(plaintext))            # HMAC(enc_key, nonce || block), concatenated
+    body = bytes(p ^ k for p, k in zip(plaintext, stream))
+    return bytearray(body + self._tag(nonce, aad.encode("ascii"), body))
+
+def decrypt(self, ciphertext: bytes, nonce: bytes, aad: str) -> bytes:
+    body, tag = bytes(ciphertext[:-16]), bytes(ciphertext[-16:])
+    if not hmac.compare_digest(tag, self._tag(nonce, aad.encode("ascii"), body)):
+        raise SecurityError("ciphertext failed authentication: tampered record or wrong key")
+    stream = self._keystream(nonce, len(body))
+    return bytes(c ^ k for c, k in zip(body, stream))
+```
+
+- **`Pan` masks both `__str__` and `__repr__`**, because f-strings with `!r`, containers, debuggers and failing assertions call `repr`; the digits live in a slot reached only through `digits()`, and equality uses `hmac.compare_digest` like Java's `MessageDigest.isEqual`. `TokenRecord.ciphertext` is a `bytearray` so `revoke` can shred it in place, as `Arrays.fill` does.
+- **Randomness is the JDK's.** `JavaRandom` ports `java.util.Random` including `nextBytes` and the unbounded `nextInt`, so `demo_key(seed)`, the minted tokens (`0384055893221111`) and the nonce (`5e688e99…`) match the Java demo exactly; the test asserts those values. Errors map to `AuthorizationError` and `TokenStateError` (both `RuntimeError`), `SecurityError` for authentication failures, and `ValueError` for bad arguments.
+
+```bash
+cd phases/11-payment-rails/05-tokenization-and-pci-scope/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-A Python port uses `hmac.new(key, pan, "sha256")` and `cryptography` is *not* available (stdlib only), so AES-GCM must come from `ssl`-adjacent code or the lesson's design would shift to HMAC-authenticated AES-CTR built from `hashlib`; the honest stdlib answer is that Python lacks an AEAD and the port should say so and store the mapping in SQLite with the key held by the process. `Pan.__repr__` and `__str__` must both return the mask, because f-strings and debuggers call `repr`. A Go port uses `crypto/aes` + `crypto/cipher.NewGCM` directly, `crypto/hmac`, and `crypto/rand` for production with an injected `io.Reader` for tests; errors are values (`ErrUnauthorized`, `ErrTokenState`), and `Pan` should implement `fmt.Stringer` with the digits in an unexported field so `%+v` cannot print them. The nonce counter needs a mutex if the vault is shared across goroutines.
+A Go port uses `crypto/aes` + `crypto/cipher.NewGCM` directly, `crypto/hmac`, and `crypto/rand` for production with an injected `io.Reader` for tests; errors are values (`ErrUnauthorized`, `ErrTokenState`), and `Pan` should implement `fmt.Stringer` with the digits in an unexported field so `%+v` cannot print them. The nonce counter needs a mutex if the vault is shared across goroutines.
 
 ## Use It
 

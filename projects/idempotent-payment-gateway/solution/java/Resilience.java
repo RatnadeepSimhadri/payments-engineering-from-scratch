@@ -2,7 +2,7 @@
 // circuit breaker, and the Gateway that ties the idempotency store, the state machine, and the processor together.
 // Backoff follows the "full jitter" recipe: sleep = uniform(0, min(cap, base * 2^(retry-1))), drawn from the
 // seeded Rng so every schedule is replayable. Time comes from the injected Clock; nothing here ever blocks.
-// Java 21, standard library only. Same design as the Python and Go versions.
+// Java 21, standard library only. Same design as the Python port in solution/python; Go port follows later.
 
 import java.util.ArrayList;
 import java.util.Collections;

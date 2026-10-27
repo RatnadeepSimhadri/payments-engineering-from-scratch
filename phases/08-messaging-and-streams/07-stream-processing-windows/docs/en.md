@@ -3,7 +3,7 @@
 > Transactions per card per minute, computed as they arrive.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 1, Lesson 05 (Hash Maps)
 **Time:** ~90 minutes
 
@@ -336,9 +336,39 @@ onTimer(0:59) emits 0 windows; onTimer(1:00) emits 1
 a record with an earlier processing time is rejected: processing time went backwards: 30000 < 56000
 ```
 
+### In Python
+
+```python
+@dataclass(frozen=True, order=True)
+class Window:
+    start: int
+    end: int
+
+def on_timer(self, now: int) -> List[WindowResult]:
+    out: List[WindowResult] = []
+    for key in list(self._state.keys()):
+        windows = self._state[key]
+        for w in sorted(windows):
+            if w.end > now:
+                break
+            out.append(WindowResult(key, w, windows.pop(w), now))
+        if not windows:
+            del self._state[key]
+    return _sort_results(out)
+```
+
+Differences, all in `code/python/main.py`:
+
+- **No `TreeMap`; a `dict` scanned in sorted order.** State is `dict[str, dict[Window, Aggregate]]`. Per-key window counts are small (six for the sliding demo), so the trigger sorts each key's windows and pops the closed ones; `Window` gets its ordering from `order=True`, which compares `(start, end)` exactly as the Java `compareTo` does. The results are sorted by `(window, key)` before returning, as in Java, so the demo lines come out in the same order.
+- **`Math.floorMod` is `%`.** Python's `%` already floors toward negative infinity, so `time - time % size` is the window start without a helper; the Go port has to write `floorMod` by hand.
+- **`merge(w, fresh, Aggregate::merge)`** becomes an explicit `fresh if w not in per_key else per_key[w].merge(fresh)`; the session merge loop iterates `sorted(sessions)` and `pop`s overlapping windows, which is the `Iterator.remove()` idiom without an iterator.
+- **`Money` is `int` minor units** (a `float` is a `TypeError`), `Aggregate` and `Txn` are frozen dataclasses, and `ValueError` stands in for `IllegalArgumentException` everywhere, including the "processing time went backwards" check.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The 43 sliding results, 5 breaches, and peak state sizes (2/10/2) match the Java run.
+
 ### Porting notes
 
-In Python the state is `dict[str, dict[Window, Aggregate]]`; since per-key window counts are small, the trigger can scan each key's windows and delete the closed ones rather than relying on a sorted map; `Window` and `Aggregate` are frozen dataclasses, `Money` is `int` minor units, and `Math.floorMod` is Python's `%`, which already floors. In Go, `Window` is a comparable struct usable as a map key, per-key windows live in a slice kept sorted with `sort.Slice` or `slices.SortFunc`, and `floorMod` must be written by hand because Go's `%` truncates toward zero. Both ports keep the same monotonic-time check and the same half-open overlap test; a concurrent Go operator processing keys on goroutines needs a mutex per key's state and must pass `go test -race`.
+In Go, `Window` is a comparable struct usable as a map key, per-key windows live in a slice kept sorted with `sort.Slice` or `slices.SortFunc`, and `floorMod` must be written by hand because Go's `%` truncates toward zero. Both ports keep the same monotonic-time check and the same half-open overlap test; a concurrent Go operator processing keys on goroutines needs a mutex per key's state and must pass `go test -race`.
 
 ## Use It
 

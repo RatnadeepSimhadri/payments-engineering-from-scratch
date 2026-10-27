@@ -8,10 +8,12 @@
   "youWillBuild": "A ledger engine that posts balanced journal entries, derives balances and a zero-sum trial balance, reverses mistakes, and reconciles a bank account against an external statement.",
   "hours": 8,
   "languages": [
-    "Java"
+    "Java",
+    "Python"
   ],
   "languageWhy": {
-    "Java": "Records and sealed-ish exception hierarchies make the value types and the 'ledger said no' contract explicit; Math.addExact shows what overflow-safe money looks like."
+    "Java": "Records and sealed-ish exception hierarchies make the value types and the 'ledger said no' contract explicit; Math.addExact shows what overflow-safe money looks like.",
+    "Python": "Frozen dataclasses and enums give the same value types with far less ceremony; because Python ints never overflow, the port keeps an explicit 64-bit bound so you see what Math.addExact was protecting."
   },
   "status": "ready",
   "skills": [

@@ -1,7 +1,7 @@
 // Project: projects/raft-kv — Stage 1: persistent state and the log. YOUR CODE GOES HERE.
 // Figure 2, "Persistent state on all servers (updated on stable storage before responding to RPCs)":
 // currentTerm, votedFor, log[]. In this simulation a Storage object survives crash(); everything else on the node is lost.
-// Java 21, standard library only. Python and Go ports follow later.
+// Java 21, standard library only. Python port in solution/python; Go port follows later.
 
 import java.util.ArrayList;
 import java.util.List;

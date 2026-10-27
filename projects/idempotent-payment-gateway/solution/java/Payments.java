@@ -2,7 +2,7 @@
 // A Payment moves through CREATED -> PROCESSING -> SUCCEEDED | FAILED (or CREATED -> CANCELED), and a SUCCEEDED
 // payment can be refunded in parts until the refunded total equals the captured amount, when it becomes REFUNDED.
 // Every move is checked against one transition table and appended to an immutable log.
-// Java 21, standard library only. Same design as the Python and Go versions.
+// Java 21, standard library only. Same design as the Python port in solution/python; Go port follows later.
 
 import java.util.ArrayList;
 import java.util.Collections;

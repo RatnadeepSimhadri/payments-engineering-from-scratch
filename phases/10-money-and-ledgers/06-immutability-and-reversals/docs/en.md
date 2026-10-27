@@ -3,7 +3,7 @@
 > You never update a posting; you post its opposite.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 05 (Balances and Snapshots)
 **Time:** ~75 minutes
 
@@ -354,9 +354,42 @@ hash chain intact: true
 after editing record #3 in a copy, first broken seq = 3
 ```
 
+### In Python
+
+The full port is `code/python/main.py` (same `JournalEntry`, `JournalRecord`, `Ledger` with `post`, `reverse`, `reverse_partially`, `correct`, `history`, `audit_view`, `verify_chain`; tests in `code/python/test_main.py`). Three things differ:
+
+- **Immutability is a `tuple`, not `List.copyOf`.** A frozen dataclass holding a list is still mutable through the list, so `JournalEntry` converts its postings to a tuple in a hand-written `__init__` (the validation needs to run before the fields are set, and a frozen class assigns through `object.__setattr__`). `records()` returns a tuple as well; the tests check that `clear()` and `del` fail rather than that an `UnsupportedOperationException` is thrown.
+
+```python
+@dataclass(frozen=True)
+class JournalEntry:
+    id: str
+    description: str
+    postings: Tuple[Posting, ...]
+    kind: EntryKind
+    relates_to: Optional[str]
+    reason: Optional[str]
+
+    def __init__(self, id, description, postings, kind, relates_to, reason) -> None:
+        postings = tuple(postings)
+        if len(postings) < 2:
+            raise LedgerError(f"entry {id} needs at least two postings")
+        ...  # balance per currency, link and reason rules
+        object.__setattr__(self, "postings", postings)
+```
+
+- **The hash chain is byte-identical.** `hashlib.sha256` replaces `MessageDigest`, and the canonical string spells enum members with `.name` (`REVERSAL`, `DEBIT`) and a missing link or reason as the literal `null`, because that is what Java's string concatenation produces. The twelve-character hash prefixes in the demo's audit view are therefore the same in both languages, and a chain written by one implementation verifies in the other.
+- **Identity and errors.** Idempotent replays return the very same object, so the demo and tests use `is` where Java uses `==`. `LedgerError` extends `ValueError`; `IdempotencyConflictError`, `AlreadyReversedError`, and `ExcessiveReversalError` extend it, mirroring the Java hierarchy, and the internal over-reversal guard raises `RuntimeError` (Java's `IllegalStateException`). The property test ships a tiny `JavaRandom` so it draws the same 200 refund sequences as `MainTest.java`.
+
+```bash
+cd phases/10-money-and-ledgers/06-immutability-and-reversals/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-In Python, use `@dataclass(frozen=True)` with a `tuple` of postings instead of a list, since a frozen dataclass holding a list is still mutable through the list; `hashlib.sha256` replaces `MessageDigest`. In Go, keep the postings slice unexported and return copies, because a struct cannot make a slice read-only; `crypto/sha256` and `encoding/hex` produce the same digest as Java if the canonical string is byte-identical, which is worth a cross-language test. Errors become sentinel values (`ErrAlreadyReversed`, `ErrExcessiveReversal`) checked with `errors.Is`.
+In Go, keep the postings slice unexported and return copies, because a struct cannot make a slice read-only; `crypto/sha256` and `encoding/hex` produce the same digest as Java if the canonical string is byte-identical, which is worth a cross-language test. Errors become sentinel values (`ErrAlreadyReversed`, `ErrExcessiveReversal`) checked with `errors.Is`.
 
 ## Use It
 

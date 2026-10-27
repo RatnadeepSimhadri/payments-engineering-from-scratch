@@ -1,7 +1,7 @@
 # Stage 02 starter
 
 Continue editing the workspace created at stage 1 (`--init`). There is nothing to copy: add a new file
-`Payments.java` (no package) next to the Stage 01 code. Python and Go ports follow later; this pass is Java only.
+`Payments.java` (no package) next to the Stage 01 code. The Python port has the same surface in snake_case (signatures below); Go port follows later.
 
 The grader runs the Stage 01 tests again before the Stage 02 tests, so nothing from Stage 01 may change shape.
 
@@ -21,3 +21,33 @@ The grader runs the Stage 01 tests again before the Stage 02 tests, so nothing f
 Transition table: `CREATED -> {PROCESSING, CANCELED}`, `PROCESSING -> {SUCCEEDED, FAILED}`, `SUCCEEDED -> {REFUNDED}`,
 and nothing leaves `FAILED`, `CANCELED`, `REFUNDED`. `version` starts at 1 and bumps once per recorded transition
 (a partial refund records `SUCCEEDED -> SUCCEEDED`). Read `docs/en.md` for the worked example and the failure rules.
+
+## New signatures (Python)
+
+Keep everything in the one `main.py` the stage-1 starter gave you; the names below are the Java ones in snake_case.
+
+```python
+class PaymentState(Enum):     # CREATED, PROCESSING, SUCCEEDED, FAILED, CANCELED, REFUNDED
+    def is_terminal(self) -> bool: ...                 # FAILED, CANCELED, REFUNDED
+    def wire(self) -> str: ...                         # self.name.lower(): "succeeded"
+
+class IllegalTransitionError(RuntimeError):
+    def __init__(self, payment_id: str, from_state: PaymentState, to_state: PaymentState) -> None: ...
+
+@dataclass(frozen=True)
+class Transition:             # from_state: PaymentState, to_state: PaymentState, reason: str, at_millis: int
+
+class PaymentStateMachine:
+    TABLE: dict[PaymentState, frozenset[PaymentState]]
+    @staticmethod
+    def can_transition(from_state: PaymentState, to_state: PaymentState) -> bool: ...
+    @staticmethod
+    def next_states(from_state: PaymentState) -> frozenset[PaymentState]: ...
+
+class Payment:
+    def __init__(self, id: str, amount: Money, clock: Clock) -> None: ...   # blank id / non-positive amount -> ValueError
+    def id(self) -> str; amount() -> Money; state() -> PaymentState; captured() -> Money; refunded() -> Money
+    def refundable(self) -> Money; processor_reference() -> str; version() -> int; history() -> tuple[Transition, ...]
+    def start_processing(self) -> None; succeed(reference: str); fail(reason: str); cancel(reason: str)
+    def refund(self, refund_amount: Money, reason: str) -> Money: ...      # returns what is still refundable
+```

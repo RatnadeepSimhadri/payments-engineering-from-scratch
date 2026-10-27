@@ -3,7 +3,7 @@
 > Pay the merchant out of funds that have actually settled.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 06 (Refunds, Partial Refunds, and Refund Windows); Phase 12, Lesson 07 (Disputes and Chargebacks); Phase 10, Lesson 07 (Holds and Available Balance); Phase 10, Lesson 08 (Reconciliation); Phase 11, Lesson 08 (ACH and NACHA)
 **Time:** ~90 minutes
 
@@ -359,9 +359,40 @@ payout run -> [co_0003 DEBIT m_shoe 483.87 USD IN_TRANSIT]
 
 The test suite has 49 assertions: pending is never paid and time alone settles nothing; each reconciliation failure leaves everything unchanged; reserve and available amounts to the minor unit; the file's header, detail, and control totals; confirmation idempotency; minimums and both schedule kinds; the reserve release boundary on day 89 and day 90; every step of the negative-balance procedure including the day-6 and day-7 boundary and a returned collection; a returned credit pausing and resuming payouts; and conservation of money across twenty captures.
 
+### In Python
+
+```python
+class DayOfWeek(Enum):          # date.weekday(): Monday is 0, Sunday is 6
+    MONDAY = 0
+    ...
+    SUNDAY = 6
+
+    @staticmethod
+    def of(d: date) -> "DayOfWeek":
+        return DayOfWeek(d.weekday())
+
+def due_on(self, d: date) -> bool:
+    dow = DayOfWeek.of(d)
+    business_day = dow is not DayOfWeek.SATURDAY and dow is not DayOfWeek.SUNDAY
+    return business_day and (self.frequency is PayoutFrequency.DAILY or dow is self.weekly_day)
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **Dates are `datetime.date`** and `java.time.DayOfWeek` becomes a small `Enum` over `date.weekday()`, so `PayoutSchedule` keeps the same `weekly_day` field and the same weekend check. `release_on + timedelta(days=hold_days)` replaces `plusDays`, and "not before" is `not today < since + timedelta(...)`.
+- **Integer arithmetic.** Fees and reserves are `(x * bps + 5_000) // 10_000` and `(net * bps) // 10_000` on non-negative values; `//` is the floor `Math.floorDiv` gave, and `int` cannot overflow so `multiplyExact` goes away.
+- **Tranche bookkeeping uses list comprehensions.** `release_reserves` collects the due tranches and keeps `[t for t in tranches if t not in due]` (the semantics of `removeAll`); `cover_from_reserve` sorts the merchant's tranches by `release_on` and `list.remove` finds them by dataclass equality, as `List.remove` did by record equality.
+- **Exceptions:** reconciliation failures, duplicate captures and bad state changes (`IllegalStateException`) raise `RuntimeError`; unknown ids and bad arguments (`IllegalArgumentException`) raise `ValueError`. `confirm` on an already-PAID payout still returns silently.
+
+```bash
+cd phases/12-payment-systems-design/08-payouts-and-balance-management/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python ports `LocalDate` to `datetime.date` and `DayOfWeek` to `date.weekday()` (Monday is 0, so Saturday and Sunday are 5 and 6); `//` floors correctly for the non-negative reserve computation, and `int` needs no overflow guard. The tranche list can stay a list sorted on demand, or become a `heapq` keyed by release date. In Go, accounts are `map[string]int64`, `time.Time` values must be truncated to UTC midnight before comparison, `Weekday()` gives the schedule check, and `Settle` returns an `error` (`ErrReportDoesNotReconcile`) rather than throwing. None of this is concurrent as written; a Go port that runs the payout job in a goroutine alongside webhook handlers needs a per-merchant `sync.Mutex` around the read-available-then-post sequence, and `go test -race` should cover it.
+In Go, accounts are `map[string]int64`, `time.Time` values must be truncated to UTC midnight before comparison, `Weekday()` gives the schedule check, and `Settle` returns an `error` (`ErrReportDoesNotReconcile`) rather than throwing. None of this is concurrent as written; a Go port that runs the payout job in a goroutine alongside webhook handlers needs a per-merchant `sync.Mutex` around the read-available-then-post sequence, and `go test -race` should cover it.
 
 ## Use It
 

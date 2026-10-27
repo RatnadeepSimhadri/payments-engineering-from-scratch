@@ -3,7 +3,7 @@
 > Money is conserved; let the computer try to break that.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 12, Lesson 02 (Payment State Machine), Phase 12, Lesson 01 (Idempotent Payment API)
 **Time:** ~120 minutes
 
@@ -355,9 +355,35 @@ truncated fee == rounded fee: FAILED at trial 2 (seed 7)
 
 Notice `[AUTHORIZE 18, CAPTURE 18]` for the unbalanced-fee bug. Why 18 and not 1? Because 2.9% of 17 cents rounds to zero, so the unbalanced fee posting credits nothing and conservation holds by accident. Eighteen cents is the smallest amount whose fee is non-zero, which is also what the integer property at the end finds from the other direction. The shrinker did not know that; it found it.
 
+### In Python
+
+```python
+@staticmethod
+def _safe_check(check, value):
+    try:
+        return check(value)
+    except (ValueError, IllegalStateError):
+        return None            # the system rejected the input on purpose
+    except Exception as crash:
+        return f"crash: {type(crash).__name__}: {crash}"
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **`java.util.Random` is ported, not replaced.** `JavaRandom` reproduces the 48-bit LCG (`next_int`, `next_double`), so seed 42 fails at the same trials as the Java run (12, 53, 5 and 930), shrinks the same originals to the same minimal scenarios, and the integer property shrinks 749170 to 18 in 59 steps. The tests pin both the JDK's first values and the trial numbers.
+- **Exceptions are the contract.** `IllegalStateError(RuntimeError)` stands in for `IllegalStateException` and `ValueError` for `IllegalArgumentException`; `_safe_check` and `ScenarioRunner.run` treat exactly those two as "rejected input", and anything else as a crash the property must report. `ProcessorTimeout` is its own `RuntimeError` subclass caught only inside the service.
+- **`Money.basis_points` truncates toward zero on purpose.** Python's `//` floors, so the HALF_EVEN fee rounding works on `abs(product)` and reapplies the sign; a test checks the negative tie.
+- **Generators are small classes behind a `Gen` Protocol** (`LongGen`, `OneOfGen`, `ListGen`, `CommandGen`) instead of anonymous inner classes; `Scenario.commands` and `ScenarioRun.log` are tuples. `Bugs` prints its snake_case field names, the one cosmetic difference from the Java demo output.
+
+```bash
+cd phases/12-payment-systems-design/14-testing-payment-systems/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python's `random.Random(seed)` and Go's `math/rand.New(rand.NewSource(seed))` give the same determinism guarantee as `java.util.Random(seed)`, though the three streams differ, so seeds are not portable across languages; port the shrunk scenarios, not the seeds. Python's `hypothesis` and Go's `testing/quick` and `rapid` are the production harnesses; the lesson's `Gen` maps to Hypothesis's `SearchStrategy` with its integrated shrinking. In Go, `check` returning `(string, bool)` or an `error` replaces the null-means-ok convention, and the service's rejections would be sentinel errors tested with `errors.Is` rather than exception classes. Money stays `int64` minor units in Go and `int` in Python; the fee rounding must be ported with the sign-and-magnitude care from Phase 10, Lesson 01, because Python's `//` floors.
+Go's `math/rand.New(rand.NewSource(seed))` gives the same determinism guarantee as `java.util.Random(seed)`, though the streams differ, so seeds are not portable unless the 48-bit LCG is ported bit for bit; port the shrunk scenarios, not the seeds. `testing/quick` and `rapid` are the production harnesses. In Go, `check` returning `(string, bool)` or an `error` replaces the null-means-ok convention, and the service's rejections would be sentinel errors tested with `errors.Is` rather than exception classes. Money stays `int64` minor units, and the fee rounding must be ported with the sign-and-magnitude care from Phase 10, Lesson 01.
 
 ## Use It
 

@@ -23,3 +23,27 @@ Continue editing the workspace created at stage 1. There is nothing to copy: fin
 
 The harness's `Cluster.submit(client, command)`, `runUntilSettled`, `completed`, `failed`, and `history()` are already
 there; the tests drive them. Read `docs/en.md` for the Figure 8 trace, the client history, and the checker outline.
+
+## New signatures (Python)
+
+Keep everything in the one `main.py` the stage-1 starter gave you; the names below are the Java ones in snake_case.
+
+```python
+class RaftNode:
+    def advance_commit_index(self, now: int) -> None: ...          # highest N > commit_index with term_at(N) == current_term and a majority
+    def apply_committed(self, now: int) -> None: ...               # while last_applied < commit_index: apply log[last_applied].command
+    # upgraded: on_append_reply calls advance_commit_index; on_append_entries applies rule 5 (min(leader_commit, last_new))
+
+class KVStore:                 # fields: data (dict), applied_commands, results
+    def apply(self, command: str) -> str: ...                      # PUT -> "OK"; GET -> value or ""; NOOP -> ""; malformed -> ValueError, not recorded
+    def get(self, key: str) -> str | None; applied() -> int        # given
+
+class Checker:
+    def check(self, history: History) -> CheckResult: ...         # CheckResult(ok, order: tuple[int, ...], longest_prefix: tuple[int, ...], explored)
+    @staticmethod
+    def step(state: dict[str, str], op: Op) -> dict[str, str] | None: ...   # PUT -> a new dict; GET -> the same `state` object, or None
+
+# Provided: Op(id, client, kind: OpKind, key, value, invoked_at, returned_at) with precedes(other); History().put(...).get(...),
+# ops() / size() / op(id); Cluster.submit(client, command) -> op id, submit_until_accepted, run_until_settled, run_until_applied,
+# pending_count(), completed (list[Op]), failed (list[ClientOp]), history(), state_machines_converged().
+```

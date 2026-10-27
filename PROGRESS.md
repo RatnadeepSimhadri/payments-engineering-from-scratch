@@ -1,6 +1,6 @@
 # Progress Tracker
 
-Generated 2026-10-27T04:24:41+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
+Generated 2026-10-27T05:25:40+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
 
 ## Overall
 
@@ -9,11 +9,11 @@ Generated 2026-10-27T04:24:41+00:00 by `python3 scripts/progress.py` from the re
 | Area | Status |
 |---|---|
 | Java implementations | 143 / 143 Build lessons (primary, gates completion) |
-| Python implementations | 96 / 143 Build lessons (port in progress, not gating) |
+| Python implementations | 143 / 143 Build lessons (primary, gates completion) |
 | Go implementations | 40 / 143 Build lessons (port in progress, not gating) |
-| Projects | 3 ready: `idempotent-payment-gateway` (4 stages, Java), `ledger-engine` (4 stages, Java), `raft-kv` (4 stages, Java) |
+| Projects | 3 ready: `idempotent-payment-gateway` (4 stages, Java/Python), `ledger-engine` (4 stages, Java/Python), `raft-kv` (4 stages, Java/Python) |
 | Skills | 9 / 9 present and mirrored to `.claude/skills/` |
-| Git | HEAD `bb2788a feat(python): port Wave 1 - 56 lessons across Phases 0-7 and 13`; 0 uncommitted files |
+| Git | HEAD `f21997b chore: regenerate PROGRESS.md`; 166 uncommitted files |
 
 ## By track and phase
 

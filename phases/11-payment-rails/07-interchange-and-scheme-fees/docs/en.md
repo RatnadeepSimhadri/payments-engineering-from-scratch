@@ -3,7 +3,7 @@
 > Who gets paid on a $100 transaction, to the cent.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 01 (How a Card Payment Works); Phase 11, Lesson 04 (PANs, Luhn, and BIN Ranges)
 **Time:** ~75 minutes
 
@@ -384,9 +384,34 @@ sum = 25.00 USD
 
 The small-ticket lines are worth a second look. A "low" regulated debit rate of 0.05% + 0.22 is 11% of a 2.00 USD ticket, because the fixed part dominates. That is why coffee shops prefer credit for small tickets in some markets, and why schemes publish separate small-ticket categories.
 
+### In Python
+
+The full port is `code/python/main.py` (same `Rate`, `InterchangeTable`, `SchemeFees`, `FeeBreakdown`, `FeeEngine`; tests in `code/python/test_main.py`). Lessons are self-contained, so `Money` is copied into the same file rather than a second module. Three things differ:
+
+- **The sealed interface becomes two frozen dataclasses and a `match`.** `Pricing` is a plain base class with `IcPlusPlus(markup)` and `Blended(merchant_rate)` as its only subclasses (also reachable as `Pricing.IcPlusPlus` and `Pricing.Blended`, as in Java). Python cannot forbid a third subclass at compile time, so `quote` keeps a `case _` that raises `TypeError`, which is the runtime equivalent of the exhaustiveness check the Java `switch` gets for free:
+
+```python
+match pricing:
+    case IcPlusPlus(markup=markup):
+        merchant_discount = interchange.plus(scheme_fees).plus(markup.apply_to(gross))
+    case Blended(merchant_rate=merchant_rate):
+        merchant_discount = merchant_rate.apply_to(gross)
+    case _:
+        raise TypeError(f"unknown pricing model: {pricing!r}")
+```
+
+- **No overflow, same rounding.** `amount x ppm` cannot overflow an `int`, so `multiplyExact` disappears, but every proportional fee still goes through `divide_rounded` (Phase 10, Lesson 01), which truncates toward zero on magnitudes rather than using `//`; `effective_rate_bps` uses it too. `Rate.of` parses the percent with `str.partition` and `ljust(4, "0")`, never through a float, and `Rate.__str__` reproduces Java's `1.80% + 10` rendering so the demo output is identical line for line.
+- **Messages match Java's record rendering.** `RateKey.__str__` prints `RateKey[cardType=..., region=..., channel=...]` so the `NoRateError` and cap-violation messages read the same in both languages. `NoRateError` extends `RuntimeError`, the `FeeBreakdown` invariant raises `RuntimeError` (Java's `IllegalStateException`), and argument errors are `ValueError`.
+
+```bash
+cd phases/11-payment-rails/07-interchange-and-scheme-fees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python's `int` is unbounded, so `amount x ppm` cannot overflow; keep `divide_rounded` from Phase 10, Lesson 01, which truncates toward zero rather than using `//`. Model `Pricing` as two frozen dataclasses and dispatch with `match`. In Go, `Rate` and `Money` are structs of `int64`, `Pricing` is an interface with an unexported marker method, and `Quote` returns `(FeeBreakdown, error)` so that `NoRateException` and the invariant failure become error values rather than panics. Neither port needs concurrency: the engine is a pure function of the table.
+In Go, `Rate` and `Money` are structs of `int64`, `Pricing` is an interface with an unexported marker method, and `Quote` returns `(FeeBreakdown, error)` so that `NoRateException` and the invariant failure become error values rather than panics. The Go port needs no concurrency: the engine is a pure function of the table.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 // Grade: python3 scripts/project_test.py raft-kv --lang java --stage 1 --path <this workspace>
 // This starter main only exercises the PROVIDED scaffolding (Sim.java). Replace it with your own demo as the stages
 // land: the solution's Main runs an election, replicates client writes, and checks the recorded history.
-// Java 21, standard library only. Python and Go ports follow later.
+// Java 21, standard library only. Python port in solution/python; Go port follows later.
 
 import java.util.ArrayList;
 import java.util.List;

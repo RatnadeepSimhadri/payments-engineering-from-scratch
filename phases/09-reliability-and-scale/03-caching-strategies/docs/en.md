@@ -3,7 +3,7 @@
 > Stale balances are worse than slow balances.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 3, Lesson 08 (LRU and LFU Caches), Phase 5, Lesson 05 (Consistency Models), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -357,9 +357,37 @@ write-behind               hit rate  97.5%  store reads   500  store writes   39
 
 The test suite has 41 assertions: expiry boundaries, each strategy's write path, the stale read and its count, coalescing and loss in write-behind, and the measured ordering of the strategies on the seeded workload.
 
+### In Python
+
+```python
+class JavaRandom:
+    """java.util.Random, bit for bit (48-bit LCG), so the seeded workload matches the Java demo exactly."""
+
+    def next(self, bits: int) -> int:
+        self._seed = (self._seed * self._MULTIPLIER + self._ADDEND) & self._MASK
+        r = self._seed >> (48 - bits)
+        return r - (1 << 32) if r >= (1 << 31) else r
+
+    def next_double(self) -> float:
+        return ((self.next(26) << 27) + self.next(27)) * (1.0 / (1 << 53))
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The workload generator is `java.util.Random`, not `random.Random`.** Python's Mersenne Twister would produce a different 80/20 stream and different hit rates, so `JavaRandom` reproduces the 48-bit LCG (`next`, `next_int(bound)` with its rejection loop, `next_double`) and `java_round` is `floor(x + 0.5)` rather than Python's banker's `round`. The measured table then matches the Java output digit for digit: 6433 store reads and 4686 divergent reads for TTL-only, 399 coalesced writes for write-behind.
+- **No overflow.** `Math.addExact(clock.now(), ttlMs)` becomes plain addition; `NO_EXPIRY` is still `2**63 - 1` so the sentinel comparison reads the same.
+- **`null` becomes `None`, and the interface becomes an `ABC`.** `BalanceCache` is an abstract base class with `read_measured` as the one concrete method; the four strategies share a `_CachedStrategy` helper for the accessors and the miss-then-load path, which the Java code repeats inline. `TtlCache.get` returns `Optional[Money]`, and `read_measured` compares with `!=` on frozen dataclasses where Java uses `Objects.equals`.
+- **Write-behind's `LinkedHashMap` is a plain `dict`.** Python dicts preserve insertion order, so the dirty map alone would do; the port keeps the explicit `_order` list anyway so the flush order is spelled out the same way as in Java and Go.
+
+```bash
+cd phases/09-reliability-and-scale/03-caching-strategies/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `dict` for both maps, `random.Random(seed)` for the generator, and `dataclass(frozen=True)` for `Money` and `Entry`; the TTL comparison and the ordering of `write store, then invalidate` carry over unchanged. Python has no overflow so `Math.addExact` on the expiry becomes plain addition. Go: `map[string]Entry`, `math/rand` with `rand.New(rand.NewSource(seed))`, and `Money` methods returning `(Money, error)`; the `BalanceCache` interface ports directly, and the write-behind dirty queue becomes a `map` plus a `[]string` for order. If the Go port adds goroutines to simulate concurrent readers, every map needs a `sync.Mutex` and the tests must pass under `go test -race ./...`; the single-threaded simulation here deliberately avoids that so the staleness is visible without a data race muddying it.
+Go: `map[string]Entry`, `math/rand` with `rand.New(rand.NewSource(seed))`, and `Money` methods returning `(Money, error)`; the `BalanceCache` interface ports directly, and the write-behind dirty queue becomes a `map` plus a `[]string` for order. If the Go port adds goroutines to simulate concurrent readers, every map needs a `sync.Mutex` and the tests must pass under `go test -race ./...`; the single-threaded simulation here deliberately avoids that so the staleness is visible without a data race muddying it.
 
 ## Use It
 

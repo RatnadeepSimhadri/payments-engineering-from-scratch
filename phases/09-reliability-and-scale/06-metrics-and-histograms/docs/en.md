@@ -3,7 +3,7 @@
 > p99 latency from a histogram you built.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 1, Lesson 01 (Big-O and Measuring), Phase 3, Lesson 02 (Count-Min Sketch and HyperLogLog), Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets)
 **Time:** ~75 minutes
 
@@ -351,9 +351,34 @@ Expected output, abbreviated:
 
 Every exact percentile sits inside the histogram's bracket and every bracket is narrower than 0.78% of its value. That is the whole guarantee, and the test suite checks it on every percentile from p1 to p99.99.
 
+### In Python
+
+```python
+def index_of(self, v: int) -> int:
+    """Which bucket holds ``v``. Exact below 2^precision_bits; log-linear above."""
+    if v < self._linear:
+        return v
+    e = v.bit_length() - 1  # floor(log2 v), e >= precision_bits
+    sub = (v - (1 << e)) >> (e - self.precision_bits)
+    return (e - self.precision_bits + 1) * self._linear + sub
+```
+
+Differences, all in `code/python/main.py`:
+
+- **`floor(log2 v)` is `v.bit_length() - 1`.** Python has no `numberOfLeadingZeros`, but on a non-negative int `bit_length` gives the same exponent and `>>` behaves identically, so `index_of`, `lower_bound`, and `upper_bound` are line-for-line the Java shifts with no casts.
+- **No fixed-width integers.** The `Math.*Exact` checks on counts and sums vanish, and `_min`/`_max` start at `LONG_MAX`/`LONG_MIN` constants only to keep the sentinels the same. `Rng` masks every SplitMix64 step with `& MASK64`, converts to a signed value in `next_long` so the seed-42 assertion matches `-4767286540954276203`, and `next_double` shifts the unsigned form by 11 as `>>>` does.
+- **`Math.round` is `java_round`, not `round`.** Python's `round` is banker's rounding; `java_round` is round-half-up computed exactly, which is what turns the log-normal draws into the same microsecond samples (so the histogram sum `3529462222` matches) and renders `_sum` the same way.
+- **Exposition.** `LinkedHashMap` is a plain `dict` (insertion-ordered), `StringBuilder` is a list of strings joined once, and `String.indent(2)` is a three-line helper.
+
+```bash
+cd phases/09-reliability-and-scale/06-metrics-and-histograms/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The layout math is the part to port carefully. Python has arbitrary-precision ints and no `numberOfLeadingZeros`; use `v.bit_length() - 1` for `floor(log2 v)` and the same shifts, and note that `>>` on a non-negative int behaves identically. Go has `bits.Len64(uint64(v)) - 1` and native `int64`; `record` returns an `error` for out-of-range values instead of throwing, and `merge` returns `error` on a layout mismatch. Neither port needs the `Math.*Exact` overflow checks for counts in practice, but Go's `int64` wraps silently like Java's, so keep the checked arithmetic if the histogram might count more than 2^63 observations. The seeded generator must reproduce the same `nextLong` stream so the demo numbers match: mask to 64 bits in Python, use `uint64` in Go.
+The layout math is the part to port carefully. Go has `bits.Len64(uint64(v)) - 1` and native `int64`; `record` returns an `error` for out-of-range values instead of throwing, and `merge` returns `error` on a layout mismatch. The port does not need the `Math.*Exact` overflow checks for counts in practice, but Go's `int64` wraps silently like Java's, so keep the checked arithmetic if the histogram might count more than 2^63 observations. The seeded generator must reproduce the same `nextLong` stream so the demo numbers match: use `uint64` in Go.
 
 ## Use It
 

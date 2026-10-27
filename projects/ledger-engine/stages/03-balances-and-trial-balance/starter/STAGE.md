@@ -32,6 +32,38 @@ final class Ledger {
 }
 ```
 
+## New signatures (Python)
+
+Keep everything in the one `main.py` the stage-1 starter gave you.
+
+```python
+@dataclass(frozen=True)
+class BalanceSnapshot:            # sequence: int, balances: Mapping[str, Money] (wrapped in MappingProxyType: read-only)
+
+@dataclass(frozen=True)
+class TrialBalanceLine:           # account: Account, debit: Money, credit: Money
+
+@dataclass(frozen=True)
+class TrialBalance:               # currency: Currency, lines: tuple[TrialBalanceLine, ...], total_debits: Money, total_credits: Money
+    def difference(self) -> Money: ...        # total_debits.minus(total_credits)
+    def is_balanced(self) -> bool: ...        # difference().is_zero()
+
+class Ledger:
+    DEFAULT_SNAPSHOT_EVERY = 100
+    def __init__(self, accounts: AccountRegistry, snapshot_every: int = DEFAULT_SNAPSHOT_EVERY) -> None: ...   # < 1 -> ValueError
+    def snapshot_every(self) -> int: ...
+
+    def balance(self, account_id: str) -> Money: ...                     # latest snapshot + replay of the tail
+    def balance_at(self, account_id: str, sequence: int) -> Money: ...   # full replay through `sequence` inclusive
+    def snapshots(self) -> tuple[BalanceSnapshot, ...]: ...             # oldest first
+    def trial_balance(self) -> list[TrialBalance]: ...                   # one per currency, ordered by currency code
+
+    @staticmethod
+    def reversal_id(entry_id: str) -> str: ...                           # "rev:" + entry_id
+    def reverse(self, entry_id: str) -> PostedEntry: ...                 # posts the mirror; idempotent
+    def is_reversed(self, entry_id: str) -> bool: ...
+```
+
 ## Rules in one screen
 
 - Signed effect of a posting = `+amount` if `posting.side() == account.normalSide()`, else `-amount`.
@@ -43,4 +75,5 @@ final class Ledger {
 
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 3 --path <workspace>
+python3 scripts/project_test.py ledger-engine --lang python --stage 3 --path <workspace>
 ```

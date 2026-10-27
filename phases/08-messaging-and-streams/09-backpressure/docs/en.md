@@ -3,7 +3,7 @@
 > The fast producer, the slow consumer, and the queue in between.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 08 (Watermarks, Event Time, and Late Data), Phase 4, Lesson 03 (Bounded Buffers and Producer-Consumer), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
@@ -293,9 +293,35 @@ BLOCK        offered= 23969 produced= 23969 throttled=    0 delivered= 23969 dro
 
 Read down the `delivered` column first: every strategy delivers 18,150, because the consumer is the bottleneck and no queueing policy changes that. Then read across: the 5,800-odd events the consumer could not handle are in the heap (`UNBOUNDED`), destroyed (`DROP_*`), or never admitted (`BLOCK`, `PULL`). The second table is the argument for always using backpressure: when the consumer keeps up, the bounded strategies behave identically to the unbounded one.
 
+### In Python
+
+```python
+class BoundedQueue(Generic[T]):
+    def __init__(self, capacity: int, policy: OverflowPolicy) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self._items: Deque[T] = deque()      # never deque(maxlen=n): that drops oldest silently
+        ...
+
+class DemandSubscription:
+    def request(self, n: int) -> None:
+        if n <= 0:
+            raise ValueError("request(n) requires n > 0 (Reactive Streams rule 3.9)")
+        self._demand = min(self._demand + n, LONG_MAX)  # saturate, never wrap
+```
+
+Differences, all in `code/python/main.py`:
+
+- **`collections.deque` without `maxlen`.** `deque(maxlen=n)` is a built-in `DROP_OLDEST` that evicts silently and never reports it; the whole point of `BoundedQueue` is that the policy is explicit and counted, so the deque is unbounded and the capacity check lives in `offer`.
+- **Saturation is kept on purpose.** Python `int` cannot overflow, so `demand + n` would never wrap; `request` still clamps to `LONG_MAX` (`2**63 - 1`) because "demand is effectively unbounded at `Long.MAX_VALUE`" is the Reactive Streams contract (rule 3.17), not an accident of 64-bit arithmetic, and `try_consume_one` leaves saturated demand untouched exactly as the Java does.
+- **The seeded run reproduces `java.util.Random`.** `random.Random(42)` would pick different jitter, amounts, and stalls and the table would not match. `JavaRandom` implements the 48-bit LCG including `nextInt(bound)`'s power-of-two fast path and rejection loop (the `bits - val + (bound - 1) < 0` overflow test becomes `> INT_MAX`), so every count in the demo, down to `rejectedOffers=1977`, is identical in both languages; the test file pins those counts.
+- **`Integer.MAX_VALUE` is the constant `INT_MAX`** for the "unbounded" capacity, `OverflowPolicy`, `OfferResult`, and `Strategy` are `Enum`s, `Stats` is a frozen dataclass (so `==` gives the determinism check for free), and `ValueError`/`TypeError` replace `IllegalArgumentException`/`NullPointerException`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. Both tables match the Java output number for number.
+
 ### Porting notes
 
-In Python, `BoundedQueue` wraps `collections.deque` (do not use `deque(maxlen=n)`, which silently drops oldest and would hide the policy the lesson makes explicit); `OfferResult` and `Strategy` are `enum.Enum`; `DemandSubscription` has no overflow to saturate because `int` is unbounded, so the test for rule 3.17 becomes a test that demand is additive. In Go, `BoundedQueue` is a slice-backed ring or a `container/list`; `request(n)` with `n <= 0` returns an error value; and the natural production analogue is a buffered channel, where `select` with a `default` case is `DROP_NEWEST` and a plain send is `BLOCK`. Both ports keep the simulation single-threaded with a seeded generator (`random.Random(42)`, `rand.New(rand.NewSource(42))`); only the demo is deterministic across languages if the generators differ, so the ports assert the invariants and the qualitative ordering, not the exact counts.
+In Go, `BoundedQueue` is a slice-backed ring or a `container/list`; `request(n)` with `n <= 0` returns an error value; and the natural production analogue is a buffered channel, where `select` with a `default` case is `DROP_NEWEST` and a plain send is `BLOCK`. The Go port keeps the simulation single-threaded with a seeded generator (`rand.New(rand.NewSource(42))`); because Go's generator differs from `java.util.Random`, that port asserts the invariants and the qualitative ordering, not the exact counts.
 
 ## Use It
 

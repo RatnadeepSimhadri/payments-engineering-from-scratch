@@ -3,7 +3,7 @@
 > One interface, nine rails, no leaking of processor quirks.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 04 (Smart Routing, Cascading, and Retry Policies); Phase 12, Lesson 05 (Webhooks); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -411,9 +411,39 @@ wallet     21 checks  [SEPARATE_CAPTURE, REFUND, PARTIAL_REFUND, CUSTOMER_ACTION
 
 `MainTest` runs 51 assertions: the suite against all three adapters, the suite failing against the two broken adapters, every row of the mapping table, the wire format of each vendor, and the event-application rules.
 
+### In Python
+
+```python
+PaymentMethod = Union[CardMethod, BankDebitMethod, WalletMethod]   # the sealed interface
+
+class PaymentProcessor(Protocol):                                   # the port
+    def charge(self, request: ChargeRequest) -> PaymentResult: ...
+    def translate_event(self, raw_event: str) -> Optional[PaymentEvent]: ...
+
+def charge(self, request: ChargeRequest) -> PaymentResult:          # inside CardAdapter
+    match request.method:
+        case CardMethod() as card:
+            pass
+        case _:
+            raise ValueError(f"card adapter given {request.method.type().name}")
+```
+
+Differences, all in `code/python/main.py` and `test_main.py`:
+
+- **The sealed interface is a `Union` of frozen dataclasses**, each with a `type()` method, and the adapters narrow it with `match`/`case` where Java used `instanceof` patterns. `PaymentProcessor` is a `typing.Protocol`, so the two deliberately broken adapters in the tests (`LossyCardAdapter`, `NoDedupeBankAdapter`) implement it without inheriting anything.
+- **`Optional<PaymentEvent>` is `Optional[PaymentEvent]`**: `translate_event` returns `None` for foreign or malformed notifications and `PaymentService.on_raw_event`/`lookup` return `None` where Java returned `Optional.empty()`.
+- **Enums carry their data.** `DeclineReason` members are `(label, RetryAdvice)` tuples so `reason.advice()` works as in Java; the vendor `switch` statements on tokens become dict lookups. `Capabilities.flags` is a `frozenset`, printed through `format_flags` in declaration order because `EnumSet` iteration order is what the Java demo shows.
+- **The conformance suite's out-parameter is a tuple.** `_throws_unsupported(action)` returns `(raised, vendor_calls_delta)` instead of filling an `int[]`. `UnsupportedCapabilityError` is a `RuntimeError`; wrong method type and zero amounts raise `ValueError`; a duplicate registration raises `RuntimeError`.
+
+```bash
+cd phases/12-payment-systems-design/10-payment-method-abstraction/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `PaymentMethod` becomes a `typing.Union` of frozen dataclasses matched with `match`/`case`, and `PaymentProcessor` a `typing.Protocol`; the conformance suite is a plain function returning a report dataclass, run from `unittest` with `subTest` per adapter. Go: the port is an `interface`, the instrument is an interface with an unexported marker method (Go has no sealed types, so add a default case that returns an error), `UnsupportedCapabilityException` becomes a sentinel `ErrUnsupported` checked with `errors.Is`, and `translateEvent` returns `(PaymentEvent, bool)`. Money stays integer minor units in both; neither needs concurrency for this lesson.
+Go: the port is an `interface`, the instrument is an interface with an unexported marker method (Go has no sealed types, so add a default case that returns an error), `UnsupportedCapabilityException` becomes a sentinel `ErrUnsupported` checked with `errors.Is`, and `translateEvent` returns `(PaymentEvent, bool)`. Money stays integer minor units; the lesson needs no concurrency.
 
 ## Use It
 

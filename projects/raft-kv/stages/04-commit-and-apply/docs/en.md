@@ -70,6 +70,28 @@ CheckResult check(History history);                       // ok, witness order, 
 static Map<String, String> step(Map<String, String> state, Op op);   // PUT -> new map with the write; GET -> same map if value matches, else null
 ```
 
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+class RaftNode:
+    def advance_commit_index(self, now: int) -> None: ...          # highest N > commit_index with term_at(N) == current_term and a majority
+    def apply_committed(self, now: int) -> None: ...               # while last_applied < commit_index: apply log[last_applied].command
+    # upgraded: on_append_reply calls advance_commit_index; on_append_entries applies rule 5 (min(leader_commit, last_new))
+
+class KVStore:                 # fields: data (dict), applied_commands, results
+    def apply(self, command: str) -> str: ...                      # PUT -> "OK"; GET -> value or ""; NOOP -> ""; malformed -> ValueError, not recorded
+    def get(self, key: str) -> str | None; applied() -> int        # given
+
+class Checker:
+    def check(self, history: History) -> CheckResult: ...         # CheckResult(ok, order: tuple[int, ...], longest_prefix: tuple[int, ...], explored)
+    @staticmethod
+    def step(state: dict[str, str], op: Op) -> dict[str, str] | None: ...   # PUT -> a new dict; GET -> the same `state` object, or None
+
+# Provided: Op(id, client, kind: OpKind, key, value, invoked_at, returned_at) with precedes(other); History().put(...).get(...),
+# ops() / size() / op(id); Cluster.submit(client, command) -> op id, submit_until_accepted, run_until_settled, run_until_applied,
+# pending_count(), completed (list[Op]), failed (list[ClientOp]), history(), state_machines_converged().
+```
+
 Rules:
 
 - **`advanceCommitIndex`** scans from the top so one call commits the highest eligible index; everything below it commits implicitly. It never commits an index whose term is not `currentTerm`, however many replicas hold it. Call it only after `matchIndex` moved forward; calling it on a non-leader must do nothing.
@@ -142,13 +164,15 @@ Bugs this stage's tests are built to expose:
 
 What must fail and how: counting replicas of an older-term entry must not advance `commitIndex` (the standalone 5.4.2 test, three replicas, term-2 entries under a term-5 leader). Three crashed nodes out of five must leave a proposal uncommitted and unapplied everywhere until one comes back. A write accepted by a partitioned stale leader must end in `Cluster.failed`, never in any `KVStore`. `KVStore.apply` on garbage throws and records nothing. `Checker.check` on a stale read returns `ok == false` with an empty `order` and a two-op `longestPrefix`; the empty history is linearizable.
 
-Python and Go ports of this project follow later; this pass is Java only.
+The Python port has the same surface in snake_case in one `main.py` (signatures above); Go port follows later.
 
 ## Run the grader
 
 ```bash
 python3 scripts/project_test.py raft-kv --lang java --stage 4 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang python --stage 4 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang java --all --path my-raft-kv --report raft-kv-report.json
+python3 scripts/project_test.py raft-kv --lang python --all --path my-raft-kv --report raft-kv-report.json
 ```
 
 All four stages run. Stage 4 has about 66 assertions: `KVStore` semantics and rejections, leader commit by majority with ordered apply, the section 5.4.2 scenario, follower commit capping and monotonicity, four client ops with a read of 75 and a linearizable history, commit blocked by three crashes and released by one restart, a restart that rebuilds the store from the log, the stale leader whose write fails and is never applied, the checker's specification and six hand-built histories, and 12 lossy seeds with a leader crash where every history must be linearizable and every state machine must converge on the same applied prefix.

@@ -3,7 +3,7 @@
 > Ten thousand payments into one merchant account per second.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 05 (Balances and Snapshots), Phase 10, Lesson 07 (Holds and Available Balance), Phase 4, Lesson 02 (Locks and Atomic Counters)
 **Time:** ~90 minutes
 
@@ -350,9 +350,43 @@ sharded: rejected; merchant still 100.00 USD, bank 0.00 USD
 
 With `--stats`, expect the sharded ledger to report far fewer lock waits than the pessimistic one, and the optimistic ledger to report retries that grow with thread count. On a two-core laptop the elapsed times are close because the critical sections are tiny; the contention counters are the signal.
 
+### In Python
+
+The full port is `code/python/main.py` (same `InterleavingChecker`, `PessimisticLedger`, `OptimisticLedger`, `ShardedLedger`, `Workload`; tests in `code/python/test_main.py`). Three things differ, and the first one is the lesson:
+
+- **The GIL hides the race; the checker reproduces it.** CPython runs one thread's bytecode at a time and only switches every few milliseconds, so a naive read-modify-write on a Python `int` attribute almost never loses an update under the stress workload: the race is real but not observable on demand. That is why Part 1 is the teaching tool here. `InterleavingChecker` is an explicit scheduler that enumerates every interleaving of the step machines, so the 76 violating schedules out of 90 for `NAIVE` are reproduced deterministically on every run, in every language. The real-thread ledgers in Part 2 are still exercised by 8 threads and an auditor taking consistent cuts, because lock ordering, atomic rejection, and conservation hold or fail regardless of the GIL.
+- **Primitives map one to one.** `ReentrantLock` becomes `threading.Lock` (no reentrancy is needed: the two locks taken in a transfer are different cells), `tryLock()` is `acquire(blocking=False)`, `CountDownLatch` is a `threading.Event`, and `AtomicLong` is a tiny class with its own lock because `+=` on a shared attribute is not atomic across threads. `AtomicReference<AccountState>` is a plain attribute that is only ever replaced, never mutated, so the optimistic validate step compares identity with `is`, exactly as Java compares references with `==`. Round-robin routing uses `itertools.count()`, whose `next()` is atomic under the GIL.
+
+```python
+while True:
+    sa, sb = a.state, b.state                                   # read phase: no locks
+    insufficient = not a.overdraft_allowed and sa.balance < m
+    first.commit.acquire()
+    second.commit.acquire()
+    try:
+        if a.state is sa and b.state is sb:                      # validate: nothing changed since the read
+            if insufficient:
+                raise InsufficientFundsError(a.id, sa.balance, m)
+            a.state = AccountState(sa.version + 1, sa.balance - m)
+            b.state = AccountState(sb.version + 1, sb.balance + m)
+            return
+    finally:
+        second.commit.release()
+        first.commit.release()
+    self._retries.increment_and_get()                           # stale read: go again
+```
+
+- **Same scripts, same balances.** `Workload.script` seeds a `JavaRandom` (the JDK's 48-bit LCG) with `seed * 31 + thread`, so the per-thread scripts, the expected balances, and the demo's `merchant 27204989.39 USD` are identical to Java's. Contention counters and elapsed times behind `--stats` are the only numbers that differ. `InsufficientFundsError` extends `RuntimeError`; argument errors are `ValueError`.
+
+```bash
+cd phases/10-money-and-ledgers/11-ledger-concurrency/code/python
+python3 main.py            # add --stats for contention counters and timings
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python threads share the GIL, so the stress test will rarely expose races in pure-Python code but the anomalies are still real (the interleaving checker ports unchanged and is the better teaching tool there); use `threading.Lock` with the same sorted acquisition order, and `itertools.count` for round-robin shard routing. Go has true parallelism: use `sync.Mutex` per account, `atomic.Pointer[AccountState]` for the optimistic version, and run the tests under `go test -race`, which detects unsynchronized access the stress assertions might miss. In both, keep the expected-state computation separate from the concurrent run, exactly as `Workload.expected()` does.
+Go has true parallelism: use `sync.Mutex` per account, `atomic.Pointer[AccountState]` for the optimistic version, and run the tests under `go test -race`, which detects unsynchronized access the stress assertions might miss. Keep the expected-state computation separate from the concurrent run, exactly as `Workload.expected()` does.
 
 ## Use It
 

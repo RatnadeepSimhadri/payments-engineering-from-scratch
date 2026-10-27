@@ -3,7 +3,7 @@
 > Token buckets across nodes without a coordinator.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 9, Lesson 04 (Cache Invalidation, Stampedes, and Request Coalescing), Phase 5, Lesson 10 (Retries, Backoff, and Jitter), Phase 1, Lesson 06 (Hash Maps from Scratch)
 **Time:** ~90 minutes
 
@@ -346,9 +346,35 @@ sliding-log              4024      1000      3024        100       -100       2.
 
 Read the skewed table row by row. The centralized bucket admits 1,099 of an ideal 1,100 (ten seconds at 100 plus one burst of 100) and pays 2 ms on every one of 4,024 requests. The log admits exactly 1,000: 100 in every window, no burst, same latency. Local buckets syncing once a second admit 1,052, under by 48 (4.4%), for a mean latency that rounds to zero; syncing ten times a second recovers 20 of those 48 at ten times the store traffic. Under even load the local strategy is within 2% of exact, because the initial `L / N` split happens to be right.
 
+### In Python
+
+```python
+def refill(self, now_millis: int) -> None:
+    """Lazy refill: add rate * elapsed, clamp to capacity. Called before every decision."""
+    if now_millis <= self._last_refill_millis:
+        return
+    elapsed = now_millis - self._last_refill_millis
+    added = elapsed * self._rate_per_second
+    self._tokens_milli = min(self._capacity_milli, self._tokens_milli + added)
+    self._last_refill_millis = now_millis
+```
+
+Differences, all in `code/python/main.py`:
+
+- **No overflow, same integers.** `Math.multiplyExact` and `Math.addExact` become plain `*` and `+` because Python ints never wrap; the milli-token representation stays an `int` throughout (never `float`), and every division in `sync` and `available_tokens` is `//` on non-negative operands, so it matches Java's truncation.
+- **The load generator is `java.util.Random`, not `random.Random`.** `JavaRandom.next_double` reproduces `nextDouble()` from the 48-bit LCG, so seed 7 offers the same 3,893 even-load and 4,024 skewed requests and every row in the three tables matches the Java output.
+- **Collections.** `ArrayDeque<Long>` is `collections.deque` with `popleft`; the `long[]` demand and usage arrays are `list[int]`; `computeIfAbsent` is `setdefault` or an explicit `if key not in` check where the constructor needs `now_millis`.
+- **`IllegalArgumentException` is `ValueError`**, and the `Clock`/`RateLimiter` interfaces are `abc.ABC` classes with one abstract method each.
+
+```bash
+cd phases/09-reliability-and-scale/05-distributed-rate-limiting/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python: `int` has no overflow, so the `multiplyExact` guards disappear, but keep the milli-token integer representation rather than reaching for `float`; `random.Random(seed).random()` replaces `nextDouble()` and `collections.deque` replaces `ArrayDeque`. Go: `int64` wraps silently like Java's `long`, so port the checked multiply from Phase 10, Lesson 01; the `RateLimiter` interface is a one-method Go interface and `Decision` a struct. A Go port that lets real goroutines call `SharedStore` concurrently must put a `sync.Mutex` around each bucket's read-modify-write (that is the race Step 3 warns about) and pass `go test -race ./...`.
+Go: `int64` wraps silently like Java's `long`, so port the checked multiply from Phase 10, Lesson 01; the `RateLimiter` interface is a one-method Go interface and `Decision` a struct. A Go port that lets real goroutines call `SharedStore` concurrently must put a `sync.Mutex` around each bucket's read-modify-write (that is the race Step 3 warns about) and pass `go test -race ./...`.
 
 ## Use It
 

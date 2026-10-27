@@ -3,7 +3,7 @@
 > Exactly-once delivery is impossible; exactly-once effects are engineering.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 02 (Consumer Groups), Phase 7, Lesson 02 (Write-Ahead Logs), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -335,9 +335,37 @@ Read the table as finance would. 115.84 USD is 149.65 minus the two captures at 
 
 Two things to try before moving on. Change the crash offset in `Main` to 7 (the last record of the second batch) and watch at-most-once become correct while at-least-once duplicates all four records of the batch. Then remove the `processed.add` line from `postIfNew` and watch the idempotent strategy collapse into plain at-least-once; the test named "idempotent consumer absorbs the redelivery" is the one that fails.
 
+### In Python
+
+```python
+class Transaction:
+    def commit(self) -> None:
+        self._require_open()
+        self._store._postings.extend(self._buffered_postings)
+        for p in self._buffered_postings:
+            self._store._processed.add(p.payment_id)
+        if self._buffered_offset >= 0:
+            self._store._committed_offset = self._buffered_offset
+        self._done = True
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is None:
+            self.commit()
+        return False
+```
+
+Differences, all in `code/python/main.py`:
+
+- **The transaction is also a context manager.** The consumer calls `tx.commit()` explicitly, exactly as the Java does, so the four strategies read the same in both languages. `__enter__`/`__exit__` are an addition: `with store.begin() as tx:` commits on a clean exit and discards the buffer when a `CrashError` propagates, which turns the crash-discards-the-buffer rule into a language feature. The test file exercises both paths.
+- **`Money` is `int` minor units** and `__post_init__` raises `TypeError` on a `float` (or `bool`); there is no overflow, so `Math.addExact` has no counterpart. `Money.parse` raises `ArithmeticError` for too many decimals, as the Java raises `ArithmeticException`.
+- **Exceptions:** `CrashError` for `CrashException`, `CurrencyMismatchError`, `ValueError` for `IllegalArgumentException`, `RuntimeError` for the reused-transaction `IllegalStateException`. `Simulation.run` catches `CrashError` and restarts, like the Java `catch`.
+- **`Strategy` is an `Enum`** iterated in declaration order (`for s in Strategy`), the same order `Strategy.values()` gives; the `postIfNew` check-and-insert is still a single `if ... in` followed by `add`, never split across calls.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The table (8/12/10/10 posted, 3/0/10/10 correct runs out of 10) matches the Java output exactly.
+
 ### Porting notes
 
-In Python, `Store.Transaction` is naturally a context manager (`with store.begin() as tx:`) whose `__exit__` applies the buffer only when no exception propagated, which makes the crash-discards-the-buffer rule a language feature rather than a convention; `Money` uses `int` minor units and raises on `float` construction. In Go, `CrashException` becomes a sentinel `ErrCrash` returned up the call stack rather than thrown, so `RunToEnd` returns `error` and the simulation loop checks `errors.Is(err, ErrCrash)`; the store needs no mutex because the simulation is single-threaded, but a `-race` run should still pass. The `postIfNew` check-and-insert must remain one operation in both ports; splitting it is the degradation the Step 3 prediction asks about.
+In Go, `CrashException` becomes a sentinel `ErrCrash` returned up the call stack rather than thrown, so `RunToEnd` returns `error` and the simulation loop checks `errors.Is(err, ErrCrash)`; the store needs no mutex because the simulation is single-threaded, but a `-race` run should still pass. The `postIfNew` check-and-insert must remain one operation in both ports; splitting it is the degradation the Step 3 prediction asks about.
 
 ## Use It
 

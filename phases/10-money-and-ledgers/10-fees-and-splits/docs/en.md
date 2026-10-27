@@ -3,7 +3,7 @@
 > Marketplace payouts with fee allocation that always sums.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 06 (Immutability and Reversals)
 **Time:** ~90 minutes
 
@@ -346,9 +346,38 @@ Expected output, abbreviated:
   allocate(1,1,1): [0.04 EUR, 0.03 EUR, 0.03 EUR] sum 0.10 EUR
 ```
 
+### In Python
+
+The full port is `code/python/main.py` (same `FeeSchedule`, `Splitter`, `OrderSplit`, `PayoutCalculator`, `Ledger.capture_entry`; tests in `code/python/test_main.py`). Three things differ:
+
+- **Allocation ties are broken by a stable sort.** `Money.allocate` sorts the line indices by descending remainder with `sorted(..., key=...)`, which is stable like Java's `Arrays.sort` on objects, so equal remainders still go to the lower index and the discount shares come out `3.26, 0.27, 6.47` in both languages. `int` cannot overflow, so the `multiplyExact` in the Java version disappears; `fractions.Fraction` is tempting for the fee math, but the single explicit rounding in `fee_for` is the lesson, so it stays an integer `times(bps, 10_000, rounding)`:
+
+```python
+def fee_for(self, amount: Money) -> Money:
+    if amount.is_negative():
+        raise ValueError(f"fee base must not be negative: {amount}")
+    fee = amount.times(self.bps, 10_000, self.rounding).plus(self.fixed)
+    if self.minimum is not None and fee < self.minimum:
+        fee = self.minimum
+    if self.maximum is not None and fee > self.maximum:
+        fee = self.maximum
+    if fee > amount:  # a fee never exceeds what it is charged on
+        fee = amount
+    return fee
+```
+
+- **Optional bounds and per-party totals.** `minimum` and `maximum` are `Optional[Money]` (`None` where Java has `null`), and `OrderSplit.total` takes any callable, so `s.total(lambda l: l.tax)` replaces `s.total(LineSplit::tax)`. `seller_nets()` and `referral_fees()` return insertion-ordered `dict`s, which gives `capture_entry` the same posting order as Java's `LinkedHashMap`. Money comparisons use the operators (`fee < self.minimum`) that `@total_ordering` derives from `__lt__`, which raise `CurrencyMismatchError` like `compareTo`.
+- **The property test replays Java's randomness.** `MainTest.java` draws 2,000 orders from `Random(23)`, including `nextLong(bound)`; the Python test ships a `JavaRandom` with the same LCG, `nextBoolean`, and the `boundedNextLong` rejection loop, so it exercises exactly the same orders rather than a different seeded stream.
+
+```bash
+cd phases/10-money-and-ledgers/10-fees-and-splits/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-Python's arbitrary-precision `int` removes the overflow concern in `allocate`, but `sorted(..., key=...)` must be used (it is stable) to keep tie-breaking identical to Java's; `Fraction` is tempting for fee math but the single explicit rounding must stay. In Go, the per-party aggregation in `captureEntry` iterates a map, so collect and sort party ids before building postings or the entry's posting order (and any hash of it) will differ run to run. Property tests port directly with a seeded `random.Random(23)` or `rand.New(rand.NewSource(23))`, though the sequences will differ from Java's.
+In Go, the per-party aggregation in `captureEntry` iterates a map, so collect and sort party ids before building postings or the entry's posting order (and any hash of it) will differ run to run. The property test ports directly with `rand.New(rand.NewSource(23))`, though the sequence will differ from Java's.
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Kill the processor connection on purpose, in test.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 5, Lesson 01 (Failure Models), Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9, Lesson 06 (Metrics and Histograms)
 **Time:** ~75 minutes
 
@@ -341,9 +341,33 @@ GameDay summary
 
 Read the five verdicts as five findings. The first is evidence that 300 ms of extra latency is absorbed. The second says the retry works but the timeout is too long for the latency SLO. The third says the abort tripwire works. The fourth says a partition for one merchant in ten doubles that merchant's latency to 4 seconds, because retry-on-timeout against a dead link is a second timeout, not a second chance. The fifth is the incident from The Problem reproduced in a test: six minutes of processor clock skew is total failure, which argues for monitoring the processor's `Date` header against your own clock and for treating `STALE_REQUEST` as a page, not a decline.
 
+### In Python
+
+```python
+for f in self._injector.faults_for(self.LINK_GATEWAY_TO_PROCESSOR, request):
+    match f:
+        case Fault.Latency(added_millis=added):
+            latency += added
+        case Fault.Partition():
+            partitioned = True
+```
+
+Differences, all in `code/python/main.py`:
+
+- **Sealed interfaces become a base class plus frozen dataclasses.** `Fault` and `BlastRadius` are plain classes; `Latency`, `Error`, `Partition`, `ClockSkew` and `PercentOfRequests`, `Merchants`, `Everyone` are `@dataclass(frozen=True)` subclasses attached as `Fault.Latency` and so on, so call sites read like the Java. The network uses `match` with class patterns where Java uses `instanceof` pattern matching. Nothing stops a third party adding a fifth `Fault` in Python; the "sealed" part is a convention here, not a compiler guarantee.
+- **Every RNG is `java.util.Random`, not `random.Random`.** `JavaRandom.next_int` ports the 48-bit LCG and its rejection loop, so seeds 7, 11, 13, 17 produce the same blast-radius draws, declines, latencies, and merchant ids as the Java demo, and the GameDay numbers (488/12 baseline, p99 417 ms, 298 faults applied) match exactly rather than approximately.
+- **Exceptions and the `finally`.** `ProcessorErrorException` and `StaleRequestException` subclass `RuntimeError`; `SimNetwork.call` keeps the same `try`/`except`/`finally` so the processor's clock skew is always reset, and every `IllegalArgumentException` is a `ValueError`.
+- **The abort index is a return value.** Java smuggles `stoppedAt` out of `drive` through a one-element `int[]`; Python returns `(metrics, stopped_at)` as a tuple. `Money.__post_init__` additionally rejects floats, since nothing else in Python would.
+
+```bash
+cd phases/09-reliability-and-scale/09-chaos-engineering/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
 ### Porting notes
 
-The design ports directly. In Python, `Fault` and `BlastRadius` become a `@dataclass(frozen=True)` family with `match` statements in the network; `random.Random(seed)` replaces `java.util.Random` (different sequences, so expected counts in tests should be checked as ranges, not exact values); `Money.minor_units` is an `int` and must reject floats in `__post_init__`. In Go, the faults are a small interface with four struct types and a type switch in `call`; errors return as values (`Outcome, error`) rather than exceptions; the injector needs a `sync.Mutex` if experiments ever run concurrently, and the tests then must pass `go test -race`. In both languages the clock stays a manual `SimClock`; the moment a port calls `time.sleep` or `time.Now()` the experiments stop being replayable.
+The design ports directly. In Go, the faults are a small interface with four struct types and a type switch in `call`; errors return as values (`Outcome, error`) rather than exceptions; the injector needs a `sync.Mutex` if experiments ever run concurrently, and the tests then must pass `go test -race`. The clock stays a manual `SimClock`; the moment a port calls `time.Now()` the experiments stop being replayable.
 
 ## Use It
 

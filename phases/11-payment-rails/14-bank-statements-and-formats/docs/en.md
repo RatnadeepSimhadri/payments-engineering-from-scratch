@@ -3,7 +3,7 @@
 > Parse what the bank sends you before you can reconcile it.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 08 (ACH and the NACHA File Format); Phase 11, Lesson 09 (SEPA, Wires, and ISO 20022)
 **Time:** ~90 minutes
 
@@ -391,9 +391,36 @@ OFX [-150000, 325075, -1250] closing 1423825
 
 `MainTest` runs 49 checks across detection, normalization, each format's traps, the continuity and chain invariants, and the rejections.
 
+### In Python
+
+`code/python/main.py` keeps the four parser classes, `Statement`, `StatementChain`, `Parse`, and `Samples`, and prints the same demo. What differs:
+
+- **Regexes use `fullmatch`, and the `:61:` match object is kept.** Java's `Matcher.matches()` anchors both ends; the Python port drops the `^`/`$` and calls `re.fullmatch` with `re.DOTALL`, then carries the `re.Match` for the pending line exactly as the Java carries the `Matcher`, so the group numbers in `_line` (1 value date, 2 entry date, 3 mark, 5 amount, 7 customer reference, 8 bank reference, 9 supplementary) are unchanged.
+
+```python
+LINE = re.compile(r"(\d{6})(\d{4})?(RC|RD|C|D)([A-Z])?(\d+,\d{0,2})([NFS][A-Z0-9]{3})([^\n]*?)"
+                  r"(?://([^\n]{1,16}))?(?:\n(.*))?", re.DOTALL)
+pending_line = Mt940Parser.LINE.fullmatch(f.value)
+if pending_line is None:
+    raise StatementParseException(f"MT940: bad :61: {f.value}")
+```
+
+- **camt.053 is parsed with `xml.etree.ElementTree`, with the DOCTYPE refused up front.** ElementTree has no `disallow-doctype-decl` feature, so `_parse_root` rejects any input containing `<!DOCTYPE` before `ET.fromstring`, then checks the root's namespace by splitting the `{urn:...}Document` tag. `text()` joins `itertext()` to match `getTextContent()`.
+- **`split` semantics.** Java's `line.split(",", -1)` keeps trailing empty fields, which Python's `str.split(",")` does by default; Java's `split(",", fixed + 1)` (a limit on the number of parts) becomes `split(",", fixed)` (a limit on the number of splits). Getting this one wrong shifts every BAI2 `16` field by one.
+- **Amounts never pass through `float`.** `Parse.decimal` replaces the MT940 comma with a dot and hands the string to the same integer `Money.parse`; BAI2 amounts are `int(...)` directly. `Currency.of` raises `ValueError` for a code the lesson does not know rather than inventing an exponent, the same choice the Java makes with `IllegalArgumentException`.
+- **Samples use `textwrap.dedent`** to reproduce the indentation stripping that Java text blocks do, so the camt.053 sample has the same eight-space indentation the reversal test relies on.
+
+```bash
+cd phases/11-payment-rails/14-bank-statements-and-formats/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python tests port every Java check (55 assertions, the four-format loop running under `subTest`), and the demo output is identical to the Java run.
+
 ### Porting notes
 
-Python's `re` and `xml.etree.ElementTree` cover MT940 and camt.053 directly (use namespaced tags, and refuse input containing `<!DOCTYPE` or use `defusedxml`); `Decimal` converts amounts exactly before they become integer minor units. In Go, `encoding/xml` handles camt.053 with struct tags, and the BAI2 and MT940 parsers map naturally onto `bufio.Scanner`, which also gives streaming for free. Return `(Statement, error)` from each parser and keep `ContinuityErrors` returning a slice, matching the Java split between structural errors (exceptions) and balance problems (data).
+In Go, `encoding/xml` handles camt.053 with struct tags, and the BAI2 and MT940 parsers map naturally onto `bufio.Scanner`, which also gives streaming for free. Return `(Statement, error)` from each parser and keep `ContinuityErrors` returning a slice, matching the Java split between structural errors (exceptions) and balance problems (data).
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Rebuild a read model from the log in one command.
 
 **Type:** Build
-**Languages:** Java
+**Languages:** Java, Python
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 03 (Delivery Guarantees), Phase 8, Lesson 05 (Event Sourcing)
 **Time:** ~75 minutes
 
@@ -355,9 +355,31 @@ IdempotentBalanceView: projector for balances@v2 died after applying 2 events, b
 same, polling every 10 ms but batchSize=1 (projector slower than the producer): staleness mean=308 max=607 ms
 ```
 
+### In Python
+
+```python
+class IdempotentBalanceView(BalanceView):
+    def apply(self, env: EventEnvelope) -> None:
+        seen = self._applied_through.get(env.stream_id, 0)
+        if env.position <= seen:
+            self._skipped += 1
+            return
+        super().apply(env)
+        self._applied_through[env.stream_id] = env.position
+```
+
+Differences, all in `code/python/main.py`:
+
+- **Sealed interfaces are `Union` aliases plus `match`.** `Event = Union[AccountOpened, Deposited, Withdrawn]` documents the closed set and `match env.event: case Deposited(amount, _):` destructures it (frozen dataclasses provide `__match_args__`), but nothing stops a stranger at compile time; `apply` and `decide` end in `raise TypeError` as the runtime stand-in for Java's exhaustiveness check.
+- **`TreeMap` and `LinkedHashMap` are `dict`.** `BalanceView.all()` and `DailyActivityView.all()` return `dict(sorted(...))` so the demo prints accounts and days in key order as Java's `TreeMap` does; `ReadSide` relies on insertion order, which `dict` already keeps. `CheckpointStore` is a `dict[str, int]` keyed by `"name@vN"`.
+- **`Money` is `int` minor units** with a `TypeError` on `float`; subtraction cannot overflow, so there is no `subtractExact`.
+- **Exceptions:** `CommandRejectedError`, `ConcurrencyError`, `CrashError`; `ValueError` where Java throws `IllegalArgumentException` (bad batch size, unknown live projection, `read_all` out of range) and `RuntimeError` where it throws `IllegalStateException` (promotion refused, checkpoint moving backwards). `Projector.last_run_at()` is `None` instead of `Long.MIN_VALUE` before the first run.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The staleness table in section 6 (mean 24/4/0 ms, overloaded mean 308 max 607) matches the Java output because both are driven by the same SimClock, not by wall time.
+
 ### Porting notes
 
-In Python, `Event` and `Command` are frozen dataclasses dispatched with `match`/`case` on class, `Money` is `int` minor units, and `CheckpointStore` is a `dict[str, int]`; the projector loop is identical. In Go, events are structs implementing a marker interface and `apply` uses a type switch; `decide` and `append` return `error` values (`ErrCommandRejected`, `ErrConcurrency`, `ErrCrash` as sentinels) instead of throwing, and `Projector.RunOnce` returns `(int, error)`. If the Go port runs projectors on goroutines, `CheckpointStore` and each projection need a `sync.Mutex`, and the tests must pass under `go test -race`; the Java version is single-threaded by design and needs none.
+In Go, events are structs implementing a marker interface and `apply` uses a type switch; `decide` and `append` return `error` values (`ErrCommandRejected`, `ErrConcurrency`, `ErrCrash` as sentinels) instead of throwing, and `Projector.RunOnce` returns `(int, error)`. If the Go port runs projectors on goroutines, `CheckpointStore` and each projection need a `sync.Mutex`, and the tests must pass under `go test -race`; the Java version is single-threaded by design and needs none.
 
 ## Use It
 

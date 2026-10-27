@@ -78,7 +78,7 @@ Nothing on the right can disagree with the journal for long: the next `balanceAt
 
 Keep editing the workspace. Everything new goes in `Ledger.java` (the records can sit above the `Ledger` class). Stage 2's `post` gains one line: take a snapshot when the new sequence number is a multiple of K.
 
-Signatures (Java 21; Python and Go ports follow later):
+Signatures (Java 21 first, then the same surface in Python; Go port follows later):
 
 ```java
 /** Every account's signed balance after the entry with this sequence number. */
@@ -106,6 +106,36 @@ final class Ledger {
     PostedEntry reverse(String entryId);                    // posts the mirror; idempotent
     boolean isReversed(String entryId);
 }
+```
+
+The same surface in Python (one `main.py` module; methods and fields are snake_case, exceptions end in `Error`, read-only views are tuples):
+
+```python
+@dataclass(frozen=True)
+class BalanceSnapshot:            # sequence: int, balances: Mapping[str, Money] (wrapped in MappingProxyType: read-only)
+
+@dataclass(frozen=True)
+class TrialBalanceLine:           # account: Account, debit: Money, credit: Money
+
+@dataclass(frozen=True)
+class TrialBalance:               # currency: Currency, lines: tuple[TrialBalanceLine, ...], total_debits: Money, total_credits: Money
+    def difference(self) -> Money: ...        # total_debits.minus(total_credits)
+    def is_balanced(self) -> bool: ...        # difference().is_zero()
+
+class Ledger:
+    DEFAULT_SNAPSHOT_EVERY = 100
+    def __init__(self, accounts: AccountRegistry, snapshot_every: int = DEFAULT_SNAPSHOT_EVERY) -> None: ...   # < 1 -> ValueError
+    def snapshot_every(self) -> int: ...
+
+    def balance(self, account_id: str) -> Money: ...                     # latest snapshot + replay of the tail
+    def balance_at(self, account_id: str, sequence: int) -> Money: ...   # full replay through `sequence` inclusive
+    def snapshots(self) -> tuple[BalanceSnapshot, ...]: ...             # oldest first
+    def trial_balance(self) -> list[TrialBalance]: ...                   # one per currency, ordered by currency code
+
+    @staticmethod
+    def reversal_id(entry_id: str) -> str: ...                           # "rev:" + entry_id
+    def reverse(self, entry_id: str) -> PostedEntry: ...                 # posts the mirror; idempotent
+    def is_reversed(self, entry_id: str) -> bool: ...
 ```
 
 What each must do:
@@ -141,6 +171,7 @@ What each must do:
 
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 3 --path ~/ledger-engine-java
+python3 scripts/project_test.py ledger-engine --lang python --stage 3 --path ~/ledger-engine-py
 ```
 
 Stages 1 and 2 run first, then `Stage03Test` (59 checks).

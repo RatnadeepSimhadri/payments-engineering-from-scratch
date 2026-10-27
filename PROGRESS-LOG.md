@@ -2,6 +2,15 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-10-26 — Python port complete (Wave 2: 47 lessons + 3 projects)
+
+- Ported batches G–L: Phases 8, 9, 10, 11, 12, 14 lessons and the three projects. Python coverage: 96 → **143 / 143** Build lessons; all 3 projects pass 4/4 stages in Python.
+- `languages.json`: Python now `ci: true` — a lesson is Complete only with Java and Python present.
+- Parity: every Java assertion ported (Python counts ≥ Java), demo output identical to Java in every lesson except documented cosmetic lines; bit-exact `java.util.Random`/SplitMix64/xorshift ports wherever a lesson seeds randomness.
+- Substitutions: 11/05 AES-GCM → HMAC-SHA256 keystream + tag (no stdlib AES); 06/03 String.hashCode port; several `Rational`/`RoundingMode` reimplementations of BigDecimal behaviour.
+- Verification: audit 199/199, 0 issues; Python 143/143; Java 143/143; projects 6/6 (java+python).
+- Next: Go port (103 lessons + 3 projects), two waves.
+
 ## 2026-10-13 — Python port Wave 1 complete (Phases 0–7 + Phase 13 Build lessons)
 
 - Ported 56 lessons to Python (batches A–F of `docs/porting/python-port-plan.md`), including the 8 partial ports from `wip/python-port`, which were verified and finished. Python coverage: 40 → 96 of 143 Build lessons.
