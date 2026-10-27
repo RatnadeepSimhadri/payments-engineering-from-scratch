@@ -1,6 +1,6 @@
 // Project: projects/raft-kv — Stage 4: the replicated state machine.
 // Commands are "PUT key value", "GET key", or "NOOP". Applying the same log in the same order on every node yields
-// the same store (State Machine Safety, Figure 3). Java 21, standard library only. Python port in solution/python; Go port follows later.
+// the same store (State Machine Safety, Figure 3). Java 21, standard library only. Python port in solution/python; Go port in solution/go.
 
 import java.util.ArrayList;
 import java.util.List;

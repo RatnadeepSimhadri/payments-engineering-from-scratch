@@ -3,7 +3,7 @@
 > One ledger, many currencies, no mixing.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 02 (Currencies and FX Conversion), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 06 (Immutability and Reversals)
 **Time:** ~90 minutes
 
@@ -382,9 +382,26 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go, use `int64` with the checked helpers from Lesson 01 and keep sub-ledgers in a map plus an ordered slice of currency codes, since map order is random and reports must be deterministic. The Go port should keep the `ErrMixedCurrency` sentinel distinct from a generic validation error.
+The full port is `code/go/main.go` (same `SubLedger`, `MultiCurrencyLedger`, `FxRate`, `Transaction`, `Position`; `Exchange`, `Revalue`, `Realize`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go` for the seeded property test. Tests are in `code/go/main_test.go`. Three things differ:
+
+- **`ErrMixedCurrency` is its own sentinel, wrapped around `ErrLedger`.** Every ledger rule returns an error that wraps `ErrLedger`; the one the lesson is about, a EUR posting inside a USD entry, wraps `ErrMixedCurrency`, which itself wraps `ErrLedger`, so `errors.Is` matches either. The demo's `rejected:` line branches on the specific one:
+
+```go
+if _, err := NewJournalEntry("bad", USD, postings); errors.Is(err, ErrMixedCurrency) {
+    fmt.Println("rejected:", err)
+}
+```
+
+- **Checked arithmetic everywhere `Math.*Exact` was.** `FxRate.Convert` scales by `10^(exp(to) - exp(from))` with `mulChecked`, `SubLedger.Append` checks every running total before mutating any of them, and `Exchange` only moves the basis after `Post` reports a genuinely new transaction. `int64 / %` truncate toward zero exactly like Java, so `DivideRounded` is shared with Lesson 01 and the tie-to-even cases (`1572.5 -> 1572 JPY`) agree.
+- **Insertion order is kept by hand.** Java's `LinkedHashMap` gives `accounts()`, `currencies()`, and the sub-ledger's trial balance a stable order; Go's `map` does not, so each map has a companion slice (`accountOrder`, `currencyOrder`) and `Position`-style reports iterate the slice. `Transaction.Rate` is a `*FxRate` because single-currency transactions have no rate (Java's `null`); `Equal` methods stand in for record equality in the idempotent-replay checks.
+
+```bash
+cd phases/10-money-and-ledgers/09-multi-currency-ledgers/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -53,7 +53,7 @@
       "id": "go",
       "name": "Go",
       "dir": "go",
-      "ci": false,
+      "ci": true,
       "minVersion": "1.22",
       "versionCommand": [
         "go",

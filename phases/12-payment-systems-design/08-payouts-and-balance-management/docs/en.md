@@ -3,7 +3,7 @@
 > Pay the merchant out of funds that have actually settled.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 06 (Refunds, Partial Refunds, and Refund Windows); Phase 12, Lesson 07 (Disputes and Chargebacks); Phase 10, Lesson 07 (Holds and Available Balance); Phase 10, Lesson 08 (Reconciliation); Phase 11, Lesson 08 (ACH and NACHA)
 **Time:** ~90 minutes
 
@@ -390,9 +390,36 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go, accounts are `map[string]int64`, `time.Time` values must be truncated to UTC midnight before comparison, `Weekday()` gives the schedule check, and `Settle` returns an `error` (`ErrReportDoesNotReconcile`) rather than throwing. None of this is concurrent as written; a Go port that runs the payout job in a goroutine alongside webhook handlers needs a per-merchant `sync.Mutex` around the read-available-then-post sequence, and `go test -race` should cover it.
+```go
+func (s PayoutSchedule) DueOn(d time.Time) bool {
+    wd := d.Weekday()
+    businessDay := wd != time.Saturday && wd != time.Sunday
+    return businessDay && (s.Frequency == DAILY || wd == s.WeeklyDay)
+}
+
+func (s *BalanceService) Settle(report SettlementReport) error {
+    ...
+    if sum != report.TotalGross {
+        return fmt.Errorf("%w: report %s does not reconcile: total %v but captures sum to %v",
+            ErrIllegalState, report.ID, report.TotalGross, sum)
+    }
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+
+- **Every mutation returns an `error`, and nothing is written until every check passes.** `Settle` reconciles, builds the full posting list, posts once, and only then marks captures settled and appends tranches; `RunPayouts` returns `([]*Payout, error)`; `Confirm` and `Returned` return `error`. Two sentinels cover the Java exceptions: `ErrIllegalState` (a report that does not reconcile, a double settlement, a line that cannot be confirmed) and `ErrInvalidArgument` (unknown merchant, zero debit, a reserve over 100%), and the tests match them with `errors.Is`.
+- **`null` is `(T, bool)` or the zero value.** `NegativeSince` returns `(time.Time, bool)` instead of a nullable date; `Payout.ReturnCode` is `""` until the bank returns the line; a `DAILY` schedule simply ignores its `WeeklyDay` field where Java passed `null`.
+- **Record equality becomes an explicit method.** Java's `tranches.remove(t)` removes the first element `equals` to a record; `removeTranche` does the same with `ReserveTranche.equal`, comparing the date with `time.Time.Equal` rather than `==`, and `ReleaseReserves` filters into a kept slice instead of `removeAll`. `LinkedHashMap`s (merchants, files, net-by-merchant in `Settle`) are a map plus an order slice so files and payouts come out in the Java order.
+- **Dates and days.** `Date(2026, time.March, 2)` is `LocalDate.of`, `AddDate(0, 0, n)` is `plusDays`, `Weekday()` replaces `getDayOfWeek()`, and the demo prints `MON`/`TUE` with `strings.ToUpper(wd.String()[:3])`. Everything is midnight UTC, so `Before`/`After` compare whole days.
+- **Integer fees without `multiplyExact`.** The fee and the reserve share use `mulChecked` and `floorDiv` from `money.go`, so an overflow is an error rather than a silent wrap and the floor is a floor (Go's `/` truncates toward zero).
+
+```bash
+cd phases/12-payment-systems-design/08-payouts-and-balance-management/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

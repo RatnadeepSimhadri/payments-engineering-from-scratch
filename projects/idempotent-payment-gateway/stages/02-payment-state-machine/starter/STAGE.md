@@ -1,7 +1,7 @@
 # Stage 02 starter
 
 Continue editing the workspace created at stage 1 (`--init`). There is nothing to copy: add a new file
-`Payments.java` (no package) next to the Stage 01 code. The Python port has the same surface in snake_case (signatures below); Go port follows later.
+`Payments.java` (no package) next to the Stage 01 code. The Python and Go ports have the same surface in snake_case and exported CamelCase (signatures below).
 
 The grader runs the Stage 01 tests again before the Stage 02 tests, so nothing from Stage 01 may change shape.
 
@@ -51,3 +51,28 @@ class Payment:
     def start_processing(self) -> None; succeed(reference: str); fail(reason: str); cancel(reason: str)
     def refund(self, refund_amount: Money, reason: str) -> Money: ...      # returns what is still refundable
 ```
+
+## New signatures (Go)
+
+Add `payments.go` next to the Stage 01 files; same `package main`.
+
+```go
+type PaymentState int
+const ( Created PaymentState = iota; Processing; Succeeded; Failed; Canceled; Refunded )
+func (s PaymentState) IsTerminal() bool
+func (s PaymentState) Wire() string                             // "succeeded"
+
+var ErrIllegalTransition = fmt.Errorf("%w: illegal transition", ErrIllegalState)
+var ErrInvalidRefund = errors.New("invalid refund")              // non-positive, or more than refundable
+type Transition struct{ From, To PaymentState; Reason string; AtMillis int64 }
+func CanTransition(from, to PaymentState) bool                  // the table is a package-level map
+func NextStates(from PaymentState) []PaymentState               // a copy
+
+func NewPayment(id string, amount Money, clock Clock) (*Payment, error)   // blank id / non-positive amount -> error
+func (p *Payment) ID() string; Amount() Money; State() PaymentState; Captured() Money; Refunded() Money
+func (p *Payment) Refundable() Money; ProcessorReference() string; Version() int64; History() []Transition   // a copy
+func (p *Payment) StartProcessing() error; Succeed(reference string) error; Fail(reason string) error; Cancel(reason string) error
+func (p *Payment) Refund(refundAmount Money, reason string) (Money, error)   // ErrIllegalTransition / ErrInvalidRefund / ErrCurrencyMismatch
+```
+
+`Money.Compare` panics on a currency mismatch (a programming error in the lesson's Money), so `Refund` checks `refundAmount.Currency != remaining.Currency` itself and returns `ErrCurrencyMismatch` before comparing.

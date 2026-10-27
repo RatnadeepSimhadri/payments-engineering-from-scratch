@@ -65,7 +65,7 @@ The id check (`already posted? return it`) happens *before* all of this: a repla
 
 Keep editing the workspace from stage 1. Add a new file `Journal.java` for the value types and exceptions, and a new file `Ledger.java` for the journal. (Any file layout works as long as the names match; the solution uses these two.) `Money`, `Side`, `Account`, `AccountRegistry`, and `LedgerException` come from stage 1 unchanged.
 
-Signatures (Java 21 first, then the same surface in Python; Go port follows later):
+Signatures (Java 21 first, then the same surface in Python and in Go):
 
 ```java
 /** One leg: a positive amount on one side of one account. */
@@ -131,6 +131,35 @@ class Ledger:
     def size(self) -> int: ...
 ```
 
+The same surface in Go (exported CamelCase; constructors validate and return `error`; every rejection wraps `ErrLedger`):
+
+```go
+type Posting struct{ AccountID string; Side Side; Amount Money }
+func NewPosting(accountID string, side Side, amount Money) (Posting, error)   // blank id or non-positive amount -> error
+func (p Posting) Mirrored() Posting
+
+type JournalEntry struct{ ID, Date string; Postings []Posting }
+func NewJournalEntry(id, date string, postings ...Posting) (JournalEntry, error)   // blank id/date -> error; clones the postings
+func (e JournalEntry) Currency() (Currency, error)                                 // first posting's; ErrNoPostings if none
+func (e JournalEntry) Equal(other JournalEntry) bool                               // record equality (a struct holding a slice cannot use ==)
+
+type PostedEntry struct{ Sequence int64; Entry JournalEntry }
+func (p PostedEntry) ID() string
+func (p PostedEntry) Equal(other PostedEntry) bool
+
+var ErrInvalidEntry, ErrUnbalancedEntry, ErrUnknownEntry, ErrNoPostings error   // the first three wrap ErrLedger
+
+func NewLedger(accounts *AccountRegistry) (*Ledger, error)   // nil -> error
+func (l *Ledger) Accounts() *AccountRegistry
+func (l *Ledger) Post(entry JournalEntry) (PostedEntry, error)
+func (l *Ledger) Journal() []PostedEntry                     // sequence order, a fresh slice
+func (l *Ledger) Entry(id string) (PostedEntry, error)       // ErrUnknownEntry if absent
+func (l *Ledger) HasEntry(id string) bool
+func (l *Ledger) Size() int
+```
+
+Go has no unmodifiable collections: "read-only" means `Journal()` returns `slices.Clone(l.journal)` and `Post` stores a clone of the entry's postings, so neither the caller's slice nor the returned one aliases the journal. The grader edits what it is given and checks the ledger did not move.
+
 What each must do:
 
 - `Posting` compact constructor: blank or null `accountId` → `IllegalArgumentException`; null `side` or `amount` → `NullPointerException`; a zero or negative amount → `IllegalArgumentException`. A posting's direction is its `Side`; its amount is always positive. `mirrored()` flips the side and nothing else; stage 3 builds reversals from it.
@@ -171,6 +200,7 @@ The rule is on *sums*, not on pairs. `DEBIT bank 100.00 / CREDIT sellers 96.80 /
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 2 --path ~/ledger-engine-java
 python3 scripts/project_test.py ledger-engine --lang python --stage 2 --path ~/ledger-engine-py
+python3 scripts/project_test.py ledger-engine --lang go --stage 2 --path ~/ledger-engine-go
 ```
 
 The grader runs `Stage01Test` and then `Stage02Test` (38 checks). If stage 1 regresses while you edit, you see it immediately.

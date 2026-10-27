@@ -1,0 +1,3 @@
+module pefs/08messagingandstreams/10deadletterqueuesandpoisonmessages
+
+go 1.22

@@ -3,7 +3,7 @@
 > Follow one payment across six services.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 9, Lesson 06 (Metrics: Counters, Gauges, and Histograms Without Averages), Phase 5, Lesson 02 (Time and Clocks), Phase 1, Lesson 07 (Trees and Recursion)
 **Time:** ~90 minutes
 
@@ -358,9 +358,30 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `crypto/rand` or a seeded `math/rand` into a `[16]byte` with `hex.EncodeToString`; the carrier is `http.Header` or `map[string]string`; context travels in `context.Context`, and a goroutine started without the parent context is the dropped-header failure. `sort.SliceStable` for the deterministic span order.
+```go
+// StartFromCarrier starts a span from a carrier; if the header is missing or malformed, a new trace begins.
+func (t *Tracer) StartFromCarrier(name string, carrier map[string]string) *Span {
+    if parent, ok := ParseTraceparent(carrier[Header]); ok {
+        return t.StartChild(name, parent)
+    }
+    return t.StartRoot(name)
+}
+```
+
+Differences, all in `code/go/main.go` and `javarandom.go`:
+
+- **`Optional` is a second return value.** `ParseTraceparent` returns `(SpanContext, bool)`; a missing header is the empty string a `map[string]string` lookup yields, so the fall-back-to-a-new-root decision is one `if ... ok` and no `null` is ever handled. `NewSpanContext` returns `(SpanContext, error)` where the Java record constructor throws; `Span.Context` builds the struct directly because its ids are already known-good. A root span's parent is `""` rather than `null`, so `IsRoot` is a string comparison.
+- **Lifecycle guards are errors.** `DurationMillis` returns `(int64, error)` and `Collector.Export` returns `error`, both wrapping the sentinel `ErrSpanOpen` so tests use `errors.Is`. Inside `TraceTree` every span came from the collector and is therefore ended, so `mustDuration` panics on an open one: that would be a bug in the tree, not a condition for a caller.
+- **Ids come from `java.util.Random.nextBytes`.** `JavaRandom.NextBytes` consumes each 32-bit draw least-significant byte first, exactly as the JDK does, and `hex.EncodeToString` gives the lowercase form the spec requires, so seed 42 produces the same trace id `359d41ba...` as the Java demo and the whole timeline matches character for character. `TestIds` pins that id.
+- **Ordered collections are explicit.** `LinkedHashMap` attributes become a `map` plus an `attrKeys` slice (`AttributeKeys()` exposes the order); `LinkedHashSet` trace ids become a first-seen `[]string`; the span sort is `sort.SliceStable` on `(StartMillis, SpanId)`, the same two-key order as the Java comparator. In a real Go service the carrier is `http.Header` and the context travels in a `context.Context`; a goroutine started with `context.Background()` instead of the request's context is the dropped-header failure the demo shows.
+
+```bash
+cd phases/09-reliability-and-scale/07-distributed-tracing/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Refund more than captured and the ledger must say no.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 10, Lesson 03 (The Double-Entry Ledger); Phase 10, Lesson 06 (Immutability and Reversals); Phase 10, Lesson 10 (Fees and Splits)
 **Time:** ~75 minutes
 
@@ -385,9 +385,37 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go the service holds a `sync.Mutex`; methods return `(Refund, error)` with sentinel errors (`ErrOverRefund`, `ErrWindowClosed`, `ErrIdempotencyConflict`) wrapped with `fmt.Errorf("%w: ...")` so tests use `errors.Is` and still see the message, and the race test with goroutines and a `sync.WaitGroup` must pass under `go test -race`. Dates become `time.Time` truncated to midnight UTC, compared with `After`.
+```go
+func (s *RefundService) RequestRefund(refundID, captureID string, amount Money, reason string) (RefundResult, error) {
+    s.mu.Lock()                            // one mutex around check + reserve, like `synchronized`
+    defer s.mu.Unlock()
+    ...
+    remaining, _ := s.remainingLocked(captureID)
+    if amount.Compare(remaining) > 0 {
+        return RefundResult{}, newRefundError(ErrOverRefund, fmt.Sprintf("refund %v exceeds remaining refundable %v ...", amount, remaining))
+    }
+    r := NewRefund(refundID, captureID, amount, reason, today)
+    if err := s.post(reserveEntryID(refundID), "refund "+refundID+" requested on "+captureID,
+        Debit(MERCHANT, amount), Credit(REFUNDS, amount)); err != nil {
+        return RefundResult{}, err
+    }
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+
+- **`synchronized` becomes a `sync.Mutex`, and the mutex is not re-entrant.** Every exported method does `s.mu.Lock(); defer s.mu.Unlock()` and then calls unexported `*Locked` helpers (`remainingLocked`, `sumLocked`, `feeReturnedLocked`) that assume the lock is held. A Java monitor would let `requestRefund` call the public `remainingRefundable`; in Go that is a deadlock, so the split is the lesson. The race test starts ten goroutines behind a closed channel, counts with `atomic.Int32`, and still gets exactly 6 accepted and 4 refused under `go test -race`.
+- **One error type, four sentinels.** `refundError` carries the full message and implements `Is` so that `errors.Is(err, ErrOverRefund)` and `errors.Is(err, ErrRefund)` are both true, which is how the Java subclass hierarchy (`OverRefundException extends RefundException`) is expressed with values. Argument problems wrap `ErrInvalidArgument`, the wrong currency wraps `ErrCurrencyMismatch`, and `Succeed` returns `(bool, error)`: `false, nil` for a redelivered confirmation, an error for a `FAILED` refund.
+- **Dates are `time.Time` at midnight UTC.** `Date(2026, time.January, 10)` stands in for `LocalDate.of`, `AddDate(0, 0, days)` for `plusDays`, `After` for `isAfter`, and the window message formats with `"2006-01-02"` so the demo prints the same text as Java.
+- **Integer arithmetic is explicit about floors and overflow.** `floorDiv` reproduces `Math.floorDiv` (Go's `/` truncates toward zero), and the cumulative fee share uses `mulChecked` so `fee * after` cannot wrap silently where Java's `multiplyExact` would throw. Same-currency aggregates inside the service use `mustPlus`/`mustMinus`, because a mismatch there is a bug, not a request error.
+- **`JournalEntry` validates in a constructor function.** `NewJournalEntry` returns `(JournalEntry, error)` for fewer than two postings, a non-positive posting, or an imbalance; `Debit`/`Credit` are plain struct literals, so the entry is the unit that is checked.
+
+```bash
+cd phases/12-payment-systems-design/06-refunds-and-partial-refunds/code/go
+go run .
+go test -race ./...
+```
 
 ## Use It
 

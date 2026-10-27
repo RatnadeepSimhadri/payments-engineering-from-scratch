@@ -3,7 +3,7 @@
 > The nightly job that moves the actual money.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 10, Lesson 10 (Fees and Splits), Phase 11, Lesson 08 (ACH and Nacha), Phase 11, Lesson 15 (Settlement and Clearing), Phase 12, Lesson 08 (Payouts and Balance Management), Phase 14, Lesson 04 (Reconciliation at Scale)
 **Time:** ~90 minutes
 
@@ -442,9 +442,31 @@ python3 -m unittest -v
 
 The Python tests port every Java check (51 assertions) and the demo output is identical to the Java run.
 
-### Porting notes
+### In Go
 
-Go: `int64` minor units, `time.Time` for instants, `sort.Strings` over map keys to get the deterministic instruction order that Java's `TreeMap` gives for free, and errors as values from `Post` and `Run`. The port needs no concurrency; if you add a concurrent booker, guard the ledger with one mutex and run `go test -race`.
+`code/go/main.go` has the same types (`FeeSchedule`, `Ledger`, `Platform`, `BatchSettler`, `SettlementFile`, `RealTimeSettler`, `LiquidityComparison`) and prints the same demo, down to the 43,711 real-time transfers of the seeded day (`javarandom.go` is the JDK generator). What differs:
+
+- **Errors are values, identity is a pointer.** `Ledger.Post` returns `(bool, error)` with `ErrUnbalancedJournal`; `Platform.Book` returns `ErrUnknownMerchant` or `ErrCurrencyMismatch`; `BatchSettler.Run` returns `(*SettlementBatch, error)`, and because the batch is a pointer the idempotent rerun check is the same `again == batch` the Java writes. `NewMerchant` and `NewSettlementEvent` validate where the Java compact constructors threw. Inside `Run` a `need(...)` helper panics on an error and a deferred `catch` converts it to the return value, so the netting loop stays readable.
+- **Sorted iteration is explicit.** Java's `TreeMap` orders the netting loop, the carried-forward map, and the ledger printout for free; Go maps are unordered, so `Run` sorts the merchant ids before assigning instruction sequence numbers and `BalancesView` returns a sorted slice:
+
+```go
+sort.Strings(merchantIds) // TreeMap order: one deterministic sequence per merchant id
+for _, merchantId := range merchantIds {
+    amount := net[merchantId]
+    if amount.IsPositive() && amount.Compare(s.minimumPayout) >= 0 {
+        instructions = append(instructions, PayoutInstruction{len(instructions) + 1, merchantId, m.Routing, m.Account, amount})
+```
+
+- **Half-even division needs no sign dance.** Go's `/` and `%` truncate toward zero like Java's, so `DivideRounded` is a line-for-line port and the fee on 45.50 is 1.62; `Times` and `Plus` go through `mulChecked`/`addChecked` where Java used `Math.multiplyExact`/`addExact`.
+- **Instants are UTC `time.Time`.** `e.At.Before(cutoff)` is `Instant.isBefore`, and the seeded day's timestamps come from `time.Unix(dayStart+int64(i)*86_400/int64(count), 0)`, the same integer arithmetic as the Java. The file validator returns `false` on a malformed number instead of throwing `NumberFormatException`.
+
+```bash
+cd phases/14-payments-at-scale/05-batch-vs-real-time-settlement/code/go
+go run .
+go test ./...
+```
+
+The Go tests port every Java check (47 assertions) and the demo output is identical to the Java run.
 
 ## Use It
 

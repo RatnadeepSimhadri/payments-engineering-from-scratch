@@ -5,7 +5,7 @@ description: >
   One-time onboarding for the Payments Engineering from Scratch curriculum
   (data structures and algorithms, distributed systems, payments engineering;
   16 phases). Interviews the learner, records their implementation language
-  (Java now; Python and Go when their ports land), runs the placement quiz,
+  (Java, Python, or Go), runs the placement quiz,
   and writes LEARNING.md, the persistent study plan the learn skill drives.
   Trigger phrases: "start learning", "set up the course", "begin the
   curriculum", "onboard me", "create my learning plan", "start the payments course"

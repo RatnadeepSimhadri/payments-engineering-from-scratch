@@ -1,7 +1,7 @@
 // Project: projects/raft-kv — deterministic simulation substrate (PROVIDED; do not edit).
 // Clock, seeded Rng, message types, Config, Node interface, and the Network with drop/delay/partition/crash.
 // Sources: Ongaro & Ousterhout, "In Search of an Understandable Consensus Algorithm" (USENIX ATC 2014), Figure 2.
-// Java 21, standard library only. Python port in solution/python; Go port follows later.
+// Java 21, standard library only. Python port in solution/python; Go port in solution/go.
 
 import java.util.ArrayList;
 import java.util.Comparator;

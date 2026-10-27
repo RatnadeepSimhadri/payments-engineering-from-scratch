@@ -3,7 +3,7 @@
 > Parse what the bank sends you before you can reconcile it.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 08 (ACH and the NACHA File Format); Phase 11, Lesson 09 (SEPA, Wires, and ISO 20022)
 **Time:** ~90 minutes
 
@@ -418,9 +418,31 @@ python3 -m unittest -v
 
 The Python tests port every Java check (55 assertions, the four-format loop running under `subTest`), and the demo output is identical to the Java run.
 
-### Porting notes
+### In Go
 
-In Go, `encoding/xml` handles camt.053 with struct tags, and the BAI2 and MT940 parsers map naturally onto `bufio.Scanner`, which also gives streaming for free. Return `(Statement, error)` from each parser and keep `ContinuityErrors` returning a slice, matching the Java split between structural errors (exceptions) and balance problems (data).
+`code/go/main.go` keeps the four parsers (`Mt940Parser`, `Camt053Parser`, `Bai2Parser`, `OfxParser`), `Statement`, `StatementChain`, and `StatementParsers`; the samples live in `samples.go` and the Phase 10 `Money` in `money.go`. What differs:
+
+- **Structural errors are values, balance problems stay data.** Every `Parse` returns `(Statement, error)`; the error is a `*StatementParseError` that `errors.Is(err, ErrStatementParse)` matches, with the same messages as the Java (`BAI2: account 0001234567 control total 3150151 != computed 3150150`). `ContinuityErrors` and `StatementChain.Gaps` still return `[]string`, because a statement that does not add up is a finding, not a failure. Inside the camt and OFX parsers a `need(...)` helper panics and a deferred `catch` turns it back into the returned error, so forty nested field reads do not each need an `if err != nil`.
+- **Regexes keep Java's groups.** Go's RE2 has no `matches()`, so the `:61:` pattern is anchored with `^...$` and `(?s)` stands in for `DOTALL`; the group numbers in `line` (1 value date, 2 entry date, 3 mark, 5 amount, 7 customer reference, 8 bank reference, 9 supplementary) are unchanged. The `[]string` from `FindStringSubmatch` is carried as the pending line exactly as the Java carries the `Matcher`.
+- **camt.053 is a token stream, not a DOM.** `encoding/xml` yields `StartElement`/`CharData` tokens, so `decodeXml` builds a small `Element` tree, appending text to every open ancestor to reproduce `getTextContent()`. There is no `disallow-doctype-decl`, so a `<!DOCTYPE` prescan refuses the input before decoding and `Strict = true` makes an undefined `&x;` a parse error:
+
+```go
+if doctype.MatchString(doc) {
+    return nil, errors.New("DOCTYPE is disallowed when processing a statement file")
+}
+d := xml.NewDecoder(strings.NewReader(doc))
+d.Strict = true
+```
+
+- **`split` semantics.** `strings.Split(line, ",")` keeps trailing empty fields like Java's `split(",", -1)`, and Java's `split(",", fixed + 1)` is `strings.SplitN(line, ",", fixed+1)`, the same limit on the number of parts. Amounts never touch `float64`: `ParseHelpers.Decimal` swaps the MT940 comma for a dot and calls the integer `Parse`; BAI2 amounts are `strconv.ParseInt`. `CurrencyOf` returns an error for a code the lesson does not know rather than inventing an exponent.
+
+```bash
+cd phases/11-payment-rails/14-bank-statements-and-formats/code/go
+go run .
+go test ./...
+```
+
+The Go tests port every Java check (51 assertions, the four-format loop as subtests, plus Strict-mode and namespace cases), and the demo output is identical to the Java run.
 
 ## Use It
 

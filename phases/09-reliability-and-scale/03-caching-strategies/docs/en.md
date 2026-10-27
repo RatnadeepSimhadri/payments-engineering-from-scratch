@@ -3,7 +3,7 @@
 > Stale balances are worse than slow balances.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 3, Lesson 08 (LRU and LFU Caches), Phase 5, Lesson 05 (Consistency Models), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -385,9 +385,34 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `map[string]Entry`, `math/rand` with `rand.New(rand.NewSource(seed))`, and `Money` methods returning `(Money, error)`; the `BalanceCache` interface ports directly, and the write-behind dirty queue becomes a `map` plus a `[]string` for order. If the Go port adds goroutines to simulate concurrent readers, every map needs a `sync.Mutex` and the tests must pass under `go test -race ./...`; the single-threaded simulation here deliberately avoids that so the staleness is visible without a data race muddying it.
+```go
+// ReadMeasured counts a read as stale when the value handed to the caller differs from the store's truth.
+// It is the Java interface's default method, written as a function because Go interfaces carry no bodies.
+func ReadMeasured(c BalanceCache, account string) (Money, bool) {
+    seen, seenOk := c.Read(account)
+    truth, truthOk := c.Store().Peek(account)
+    if seenOk != truthOk || (seenOk && seen != truth) {
+        c.Stats().StaleReads++
+    }
+    return seen, seenOk
+}
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `javarandom.go`:
+
+- **Absence is a second return value, not `null`.** `TtlCache.Get`, `BackingStore.Read`, and every strategy's `Read` return `(Money, bool)`. A missing account is `false`, never a zero `Money`, so the staleness meter compares presence first and value second; a `Money` struct compares with `==` because both fields are comparable.
+- **The interface has no default method.** Go interfaces declare behaviour only, so `readMeasured` becomes the package function `ReadMeasured(c BalanceCache, account)`. The four strategies embed one small `cached` struct that supplies `Stats()`, `Store()`, `Cache()` and the shared miss-then-load path, which the Java code repeats in each class.
+- **`Money` returns errors instead of throwing.** `Plus` and `Minus` return `(Money, error)` with `ErrCurrencyMismatch` and `ErrOverflow` sentinels (`errors.Is` in the tests), and `addChecked` stands in for `Math.addExact` both in `Money` and in `TtlCache.Put`. `Compare` panics on a currency mismatch, exactly as the Phase 10 reference `Money` does. The workload driver uses `must(...)` because a debit that fails to subtract is a bug in the demo, not a condition to handle.
+- **The workload generator is `java.util.Random`, not `math/rand`.** `javarandom.go` reproduces the 48-bit LCG (`next`, `NextInt(bound)` with its power-of-two fast path and rejection loop, `NextDouble`), and `javaRound` is `math.Floor(x + 0.5)`. The measured table matches the Java output digit for digit: 6433 store reads and 4686 divergent reads for TTL-only, 399 coalesced writes for write-behind; `TestJavaRandomMatchesJava` pins those numbers.
+- **Write-behind's `LinkedHashMap` is a `map` plus a `[]string`.** Go maps have no iteration order, so the first-dirtied order lives in an explicit slice, exactly the pair the Python port keeps too.
+
+```bash
+cd phases/09-reliability-and-scale/03-caching-strategies/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

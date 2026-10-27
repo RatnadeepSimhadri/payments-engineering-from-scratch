@@ -40,7 +40,7 @@ The fourth operation, `release`, exists for Stage 3: when the processor is unrea
 
 ## Your task
 
-`Money.java`, `Clock.java` and `Rng.java` are complete and must not change. `Idempotency.java` holds the types below with the method bodies stubbed to throw `UnsupportedOperationException`. (Python: the one `main.py` holds the same given parts, with the same methods stubbed to `raise NotImplementedError`.) The Python port has the same surface in snake_case in one `main.py` (signatures below); Go port follows later.
+`Money.java`, `Clock.java` and `Rng.java` are complete and must not change. `Idempotency.java` holds the types below with the method bodies stubbed to throw `UnsupportedOperationException`. (Python: the one `main.py` holds the same given parts, with the same methods stubbed to `raise NotImplementedError`. Go: `money.go`, `clock.go`, `rng.go` are given and `idempotency.go` holds the same stubs as `panic("not implemented: ...")`.) The Python port has the same surface in snake_case in one `main.py`, and the Go port the same surface in exported CamelCase (signatures below).
 
 ```java
 final class Fingerprint {
@@ -100,6 +100,36 @@ class IdempotencyStore:
     def purge_expired(self) -> int: ...
     def size(self) -> int: ...                                                          # given
 ```
+
+The same surface in Go (`package main`, one file per Java file; exported CamelCase; constructors return `(value, error)`; `Optional` becomes `(value, ok)`; `IllegalStateException` becomes the sentinel `ErrIllegalState` tested with `errors.Is`):
+
+```go
+func Sha256Hex(canonical string) string                       // crypto/sha256 + encoding/hex, lowercase
+
+type ChargeRequest struct{ MerchantID, IdempotencyKey string; Amount Money; Source, Description string }
+func NewChargeRequest(merchantID, idempotencyKey string, amount Money, source, description string) (ChargeRequest, error)   // given
+func (r ChargeRequest) Canonical() string                     // "1999\nUSD\ntok_visa\norder-42"
+func (r ChargeRequest) Fingerprint() string                   // Sha256Hex(Canonical())
+
+type ApiResponse struct{ Status int; Body string; Replayed bool }   // given, with AsReplay()
+type KeyState int; const ( KeyInProgress KeyState = iota; KeyCompleted )
+type Decision int; const ( DecisionNew Decision = iota; DecisionReplay; DecisionInProgress; DecisionConflict )
+type BeginResult struct{ Decision Decision; Response *ApiResponse }   // Response is nil unless DecisionReplay
+type IdempotencyRecord struct{ MerchantID, Key, Fingerprint string; State KeyState; Response *ApiResponse; CreatedAt, ExpiresAt int64 }
+func (r IdempotencyRecord) IsExpired(now int64) bool
+
+var ErrIllegalState = errors.New("illegal state")
+func NewIdempotencyStore(clock Clock, ttlMillis int64) (*IdempotencyStore, error)   // given; ttl <= 0 -> error
+func (s *IdempotencyStore) TTLMillis() int64
+func (s *IdempotencyStore) Begin(merchantID, key, fingerprint string) BeginResult
+func (s *IdempotencyStore) Complete(merchantID, key string, response ApiResponse) error   // ErrIllegalState
+func (s *IdempotencyStore) Release(merchantID, key string) (bool, error)                 // false if absent; ErrIllegalState if completed
+func (s *IdempotencyStore) Get(merchantID, key string) (IdempotencyRecord, bool)
+func (s *IdempotencyStore) PurgeExpired() int
+func (s *IdempotencyStore) Size() int
+```
+
+The store holds a `sync.Mutex` and every method locks it: that is Java's `synchronized` written out, and it is what makes two concurrent `Begin` calls with the same key admit exactly one. `FakeClock` is `NewFakeClock(start)` with `Advance`, `Set`, `NowMillis`, `Sleep`; `Rng` is `NewRng(seed)` with `NextLong()` and `NextBelow(bound)` on a `uint64` state so the shifts are logical like Java's `>>>`.
 
 What each must do:
 
@@ -186,11 +216,13 @@ return new BeginResult(Decision.REPLAY, existing.response());
 ```bash
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --init my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --init my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --init my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 1 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 1 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --stage 1 --path my-gateway
 ```
 
-The stage 1 test makes 43 assertions. A fresh workspace fails the first one with `UnsupportedOperationException: TODO stage 01: Fingerprint.sha256Hex`; that is the expected starting point.
+The stage 1 test makes 43 assertions. A fresh workspace fails the first one with `UnsupportedOperationException: TODO stage 01: Fingerprint.sha256Hex` (Go: a panic `not implemented: TODO stage 01 Sha256Hex`); that is the expected starting point.
 
 ## Check yourself
 

@@ -3,7 +3,7 @@
 > Marketplace payouts with fee allocation that always sums.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 06 (Immutability and Reversals)
 **Time:** ~90 minutes
 
@@ -375,9 +375,27 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go, the per-party aggregation in `captureEntry` iterates a map, so collect and sort party ids before building postings or the entry's posting order (and any hash of it) will differ run to run. The property test ports directly with `rand.New(rand.NewSource(23))`, though the sequence will differ from Java's.
+The full port is `code/go/main.go` (same `FeeSchedule`, `Splitter`, `OrderSplit`, `PayoutCalculator` as `ComputePayout`, `CaptureEntry`, `PayoutEntry`) with `money.go` (the Lesson 01 `Money`, whose `Allocate` does every split) and `javarandom.go` so the 2,000-order property test generates the same orders as Java (including `Random.nextLong(bound)`, pinned against JDK values). Tests are in `code/go/main_test.go`. Three things differ:
+
+- **Optional bounds are pointers.** `FeeSchedule.Minimum` and `Maximum` are `*Money`, nil meaning "no bound" (Java's `null`), and `WithBounds` sets both. `LineSplit.Referrer` is `""` for a seller without a partner. Every constructor that validates (`NewFeeSchedule`, `NewOrder`, `NewSplitPolicy`, `NewJournalEntry`) returns `(T, error)`; `FeeFor` and `Split` return errors too, because `Money.Times`/`Plus` can overflow.
+- **Party aggregation keeps first-seen order by hand.** Java's `LinkedHashMap` makes `sellerNets()` and the capture entry's credits deterministic for free; Go's map does not, so `MoneyByParty` is a key slice plus a map, and `CaptureEntry` walks `Keys`. Its `String()` renders `{seller-A=44.84 EUR, seller-B=82.91 EUR}` exactly as Java prints a map, so the demo output matches:
+
+```go
+sellers := s.SellerNets()
+for _, seller := range sellers.Keys {               // insertion order, never map order
+    ps = addCredit(ps, "2100 Seller Payable "+seller, sellers.Values[seller])
+}
+```
+
+- **`Total` takes a function.** `OrderSplit.Total(func(l LineSplit) Money { return l.Tax })` replaces Java's method references (`LineSplit::tax`); Go has no implicit getter functions, so the field accessor is written out. `Compare` is used for the clamps exactly as `compareTo` is, and it panics on a currency mismatch for the same reason the Java throws.
+
+```bash
+cd phases/10-money-and-ledgers/10-fees-and-splits/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

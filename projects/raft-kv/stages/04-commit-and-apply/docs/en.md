@@ -92,6 +92,29 @@ class Checker:
 # pending_count(), completed (list[Op]), failed (list[ClientOp]), history(), state_machines_converged().
 ```
 
+The same surface in Go (`raftnode.go`, `kvstore.go`, `linearizability.go`; errors are values where the Java throws for input a caller can check):
+
+```go
+// RaftNode
+func (n *RaftNode) AdvanceCommitIndex(now int)     // highest N > CommitIndex with TermAt(N) == CurrentTerm and a majority
+func (n *RaftNode) ApplyCommitted(now int)         // for LastApplied < CommitIndex: LastApplied++; StateMachine.Apply(Log[LastApplied].Command)
+// upgraded: OnAppendReply calls AdvanceCommitIndex; OnAppendEntries applies rule 5 (min(LeaderCommit, lastNew))
+
+// KVStore: fields Data map[string]string, AppliedCommands, Results []string
+var ErrBadCommand = errors.New("bad command")
+func (kv *KVStore) Apply(command string) (string, error)   // PUT -> "OK"; GET -> value or ""; NOOP -> ""; malformed -> error wrapping ErrBadCommand, not recorded
+func (kv *KVStore) Get(key string) (string, bool); Applied() int   // given; the bool is Java's null check
+
+// Checker
+func NewChecker() *Checker
+func (c *Checker) Check(history *History) CheckResult               // CheckResult{OK, Order, LongestPrefix []int, Explored}
+func Step(state map[string]string, op Op) (map[string]string, bool) // PUT -> maps.Clone + the write, true; GET -> the same map, value == op.Value
+
+// Provided: Op{ID, Client, Kind OpKind, Key, Value, InvokedAt, ReturnedAt} with Precedes(other); NewHistory().Put(...).Get(...),
+// Ops() / Size() / Op(id); Cluster.Submit(client, command) int (op id), SubmitUntilAccepted(...) (int, error), RunUntilSettled,
+// RunUntilApplied, PendingCount(), Completed []Op, Failed []ClientOp, History() (*History, error), StateMachinesConverged().
+```
+
 Rules:
 
 - **`advanceCommitIndex`** scans from the top so one call commits the highest eligible index; everything below it commits implicitly. It never commits an index whose term is not `currentTerm`, however many replicas hold it. Call it only after `matchIndex` moved forward; calling it on a non-leader must do nothing.
@@ -164,15 +187,17 @@ Bugs this stage's tests are built to expose:
 
 What must fail and how: counting replicas of an older-term entry must not advance `commitIndex` (the standalone 5.4.2 test, three replicas, term-2 entries under a term-5 leader). Three crashed nodes out of five must leave a proposal uncommitted and unapplied everywhere until one comes back. A write accepted by a partitioned stale leader must end in `Cluster.failed`, never in any `KVStore`. `KVStore.apply` on garbage throws and records nothing. `Checker.check` on a stale read returns `ok == false` with an empty `order` and a two-op `longestPrefix`; the empty history is linearizable.
 
-The Python port has the same surface in snake_case in one `main.py` (signatures above); Go port follows later.
+The Python port has the same surface in snake_case in one `main.py`, and the Go port the same surface in exported CamelCase (signatures above). In Go the rejected GET is the `false` of `Step`'s second return, `KVStore.Apply` returns `ErrBadCommand` instead of throwing, and `ApplyCommitted` panics if the state machine rejects a committed command, because a corrupt log is a bug.
 
 ## Run the grader
 
 ```bash
 python3 scripts/project_test.py raft-kv --lang java --stage 4 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --stage 4 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --stage 4 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang java --all --path my-raft-kv --report raft-kv-report.json
 python3 scripts/project_test.py raft-kv --lang python --all --path my-raft-kv --report raft-kv-report.json
+python3 scripts/project_test.py raft-kv --lang go --all --path my-raft-kv --report raft-kv-report.json
 ```
 
 All four stages run. Stage 4 has about 66 assertions: `KVStore` semantics and rejections, leader commit by majority with ordered apply, the section 5.4.2 scenario, follower commit capping and monotonicity, four client ops with a read of 75 and a linearizable history, commit blocked by three crashes and released by one restart, a restart that rebuilds the store from the log, the stale leader whose write fails and is never applied, the checker's specification and six hand-built histories, and 12 lossy seeds with a leader crash where every history must be linearizable and every state machine must converge on the same applied prefix.

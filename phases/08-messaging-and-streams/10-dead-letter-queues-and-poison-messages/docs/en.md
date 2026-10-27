@@ -3,7 +3,7 @@
 > One malformed event must not stall every account behind it.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 09 (Backpressure and Flow Control), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 8, Lesson 03 (Delivery Guarantees), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~60 minutes
 
@@ -355,9 +355,44 @@ Differences, all in `code/python/main.py`:
 
 Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The dead-letter table and both replays match the Java run line for line.
 
-### Porting notes
+### In Go
 
-In Go, `HandlerException` becomes an error type with a `Kind` field checked via `errors.As`, `attempt` returns `(bool, error)`, and the per-key quarantine map is a plain `map[string]int64`; `SimClock` is a struct with an `Advance` method and no goroutines are needed because consumption is sequential per partition by design. In every language the handler's `applied` set is the idempotency guard and must be kept; a port that drops it to simplify will double-post on the transient-after-commit case.
+```go
+// HandlerError is the handler's one way to say no; the consumer recovers it with errors.As.
+type HandlerError struct {
+    Kind FailureKind
+    Msg  string
+}
+
+func (e *HandlerError) Error() string { return e.Msg }
+
+func (h *LedgerPostingHandler) Handle(e Event) error {
+    currency, err := CurrencyOf(e.CurrencyCode)
+    if err != nil {
+        return newHandlerError(Permanent, err.Error())
+    }
+    amount, err := ParseMoney(e.AmountText, currency)
+    if err != nil {
+        return newHandlerError(Permanent, err.Error())
+    }
+    if h.faults.ShouldFail() {
+        return newHandlerError(Transient, "ledger db timeout")
+    }
+    if h.applied[e.Offset] { // idempotent replay
+        return nil
+    }
+    ...
+}
+```
+
+Differences, all in `code/go/main.go`, `code/go/money.go`, and `code/go/javarandom.go`:
+
+- **Failures are error values, not exceptions.** `Handler.Handle` returns `error`; the consumer does `var he *HandlerError; errors.As(err, &he)` and branches on `he.Kind`. Anything that is not a `*HandlerError` is a programming error and panics, which is what an uncaught non-`HandlerException` does to the Java consumer. `CurrencyOf` and `ParseMoney` return `(T, error)` with sentinels (`ErrUnknownCurrency`, `ErrNotDecimal`, `ErrExcessPrecision`, `ErrCurrencyMismatch`, `ErrOverflow`) that still answer `errors.Is`, while `Error()` prints the Java message verbatim so the dead-letter table reads `12.345 has more decimals than USD allows (2)` in both languages. `NewResilientConsumer` returns `ErrMaxAttempts` and `SimClock.Advance` returns `ErrNegativeAdvance` where Java throws `IllegalArgumentException`.
+- **Overflow is checked by hand.** `ParseMoney` uses `mulChecked` and `addChecked` in place of `Math.multiplyExact` / `Math.addExact`, because `int64` wraps silently like Java's `long` would without them. Amounts stay integer minor units; there is no `float64` anywhere.
+- **The seeded fault injector reproduces `java.util.Random`.** `math/rand` would time out on different ledger calls and the demo would park a different offset. `JavaRandom.NextDouble` is the 48-bit LCG, so the second run retries exactly twice and parks offset 5 as in Java; the test pins the first twelve draws and the whole run's `ConsumerStats{4, 6, 3, 2, 10}`.
+- **`TreeMap`, `LinkedHashMap`, and `null` have no direct equivalent.** `Balances()` returns the keys sorted plus the map, and `formatBalances` prints the Java `{acct-A=100.00 USD, ...}` shape; `quarantinedKeys` is a plain `map[string]int64` (the demo never iterates it, so insertion order is not needed); `Balance` returns `(Money, bool)` and `StuckOn` returns `*Event`, nil when the partition finished. `DeadLetterQueue.Clear` filters the slice in place where Java uses `removeIf`, and `Replay` sorts with `sort.SliceStable` on the offset.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...` (the tests also pass under `go test -race ./...`). The dead-letter table, both replays, and the final `stats:` line are identical to the Java run.
 
 ## Use It
 

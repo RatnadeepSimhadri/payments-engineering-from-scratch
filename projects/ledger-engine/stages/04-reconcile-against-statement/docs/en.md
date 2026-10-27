@@ -79,7 +79,7 @@ flowchart TD
 
 Keep editing the workspace. Put the new value types in `Reconciliation.java`; add `lines` and `reconcile` to `Ledger`.
 
-Signatures (Java 21 first, then the same surface in Python; Go port follows later):
+Signatures (Java 21 first, then the same surface in Python and in Go):
 
 ```java
 record StatementLine(String ref, Money amount, String date) {}   // blank ref or date -> IllegalArgumentException
@@ -138,6 +138,35 @@ class Ledger:
     # window_days < 0 -> ValueError; wrong currency -> CurrencyMismatchError; bad date -> LedgerError (datetime.date.fromisoformat)
 ```
 
+The same surface in Go:
+
+```go
+type StatementLine struct{ Ref string; Amount Money; Date string }
+func NewStatementLine(ref string, amount Money, date string) (StatementLine, error)   // blank ref/date -> error
+type LedgerLine struct{ Ref string; Amount Money; Date string }
+
+type BreakType int; const ( MissingInLedger BreakType = iota; MissingInStatement; AmountMismatch; Duplicate )
+type MatchedBy int; const ( ByRef MatchedBy = iota; ByAmountAndDate )
+type ReconciliationMatch struct{ LedgerRef, StatementRef string; Amount Money; By MatchedBy }
+type ReconciliationBreak struct{ Type BreakType; Ref string; LedgerAmount, StatementAmount Money }
+type ReconciliationReport struct{ AccountID string; Currency Currency; Matches []ReconciliationMatch; Breaks []ReconciliationBreak; LedgerTotal, StatementTotal Money }
+func (r ReconciliationReport) MatchedTotal() Money
+func (r ReconciliationReport) LedgerBreakTotal() Money
+func (r ReconciliationReport) StatementBreakTotal() Money
+func (r ReconciliationReport) BreaksOf(kind BreakType) []ReconciliationBreak
+func (r ReconciliationReport) TiesOut() bool
+func (r ReconciliationReport) IsClean() bool
+
+var ErrBadDate error   // wraps ErrLedger
+func ParseDate(text string) (time.Time, error)                        // time.Parse("2006-01-02", text); ErrBadDate otherwise
+func WithinWindow(a, b string, windowDays int) (bool, error)
+func (l *Ledger) Lines(accountID string) ([]LedgerLine, error)
+func (l *Ledger) Reconcile(accountID string, statement []StatementLine, windowDays int) (ReconciliationReport, error)
+// windowDays < 0 -> error; wrong currency -> ErrCurrencyMismatch; bad date -> ErrBadDate (which errors.Is ErrLedger)
+```
+
+`time.Parse` with the layout `2006-01-02` is the strict ISO-8601 date parser; the day difference is `b.Sub(a).Hours() / 24` because both values are midnight UTC. Build the statement with struct literals in tests and demos (`StatementLine{"sale-1", amount, "2026-10-01"}`); `NewStatementLine` is the validating constructor for input you do not trust.
+
 What each must do:
 
 - `lines(accountId)`: `accounts.get` (unknown → `UnknownAccountException`), then one `LedgerLine` per journal entry that has at least one posting on this account, in journal order, with `ref = entry id`, `amount = sum of the signed effects` of that entry's postings on the account (reuse the stage-3 helper), `date = entry date`. Entries that never touch the account produce no line; an untouched account produces an empty list.
@@ -177,9 +206,11 @@ What each must do:
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 4 --path ~/ledger-engine-java
 python3 scripts/project_test.py ledger-engine --lang python --stage 4 --path ~/ledger-engine-py
+python3 scripts/project_test.py ledger-engine --lang go --stage 4 --path ~/ledger-engine-go
 # or everything:
 python3 scripts/project_test.py ledger-engine --lang java --all --path ~/ledger-engine-java
 python3 scripts/project_test.py ledger-engine --lang python --all --path ~/ledger-engine-py
+python3 scripts/project_test.py ledger-engine --lang go --all --path ~/ledger-engine-go
 ```
 
 Stages 1 to 3 run first, then `Stage04Test` (50 checks). When all four pass, run your own `Main` and feed `reconcile` a statement you wrote yourself (see the README's "Run with your own inputs").

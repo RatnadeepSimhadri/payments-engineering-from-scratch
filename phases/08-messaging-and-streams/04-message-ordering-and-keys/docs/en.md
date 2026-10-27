@@ -3,7 +3,7 @@
 > Order per account, parallelism across accounts.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 02 (Consumer Groups and Rebalancing), Phase 8, Lesson 03 (Delivery Guarantees)
 **Time:** ~60 minutes
 
@@ -367,9 +367,33 @@ Differences, all in `code/python/main.py`:
 
 Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. Every number in the demo, including section 6, matches the Java output.
 
-### Porting notes
+### In Go
 
-In Go, `Message` is a struct with `Seq int64`, the `Verdict` is a typed `int` constant set, and `CommitTracker` can use a `map[int64]bool` plus a `for done[mark] { delete; mark++ }` loop because it only ever needs the minimum when it equals the mark. A concurrent Go port that runs real goroutines per lane must guard `CommitTracker` with a `sync.Mutex` and pass `go test -race`; the deterministic simulation here needs no locks because it is single-threaded by design.
+```go
+func (c *CommitTracker) Complete(offset int64) (int64, error) {
+    if offset < c.committable {
+        return c.committable, fmt.Errorf("%w: %d", ErrAlreadyCommitted, offset)
+    }
+    if c.doneAhead[offset] {
+        return c.committable, fmt.Errorf("%w: %d", ErrCompletedTwice, offset)
+    }
+    c.doneAhead[offset] = true
+    for c.doneAhead[c.committable] {
+        delete(c.doneAhead, c.committable)
+        c.committable++
+    }
+    return c.committable, nil
+}
+```
+
+Differences, all in `code/go/main.go` and `code/go/javarandom.go`:
+
+- **`CommitTracker` is a `map[int64]bool`, not a `TreeSet`.** It only ever needs the minimum finished offset when that minimum equals the mark, so a membership map plus the `for c.doneAhead[c.committable]` loop replaces the ordered set; the same map detects "completed twice". `Complete` returns `(mark, error)` with the sentinels `ErrAlreadyCommitted` and `ErrCompletedTwice` where Java throws `IllegalStateException`.
+- **The seeded run reproduces `java.util.Random`.** `math/rand` would pick a different 5% of sends to fail, so section 6 would not match. `JavaRandom` in `javarandom.go` is the JDK's 48-bit LCG: `next(bits)` and `NextDouble`; the test checks its first two doubles against the JDK.
+- **Errors are values; programming errors panic.** `Deliver`, `NewKeyedLaneScheduler`, and `NewMessage` return `error` for bad arguments. `PartitionFor` with a non-positive count and `Partition.Get` outside the log `panic`, matching the Java `IllegalArgumentException` / `IndexOutOfBoundsException` for conditions no caller can handle; the test uses `recover`.
+- **Unsigned hashing.** `Fnv1a32` returns `uint32`, so the multiply wraps the way Java's `int` does; `PartitionFor` masks with `0x7FFFFFFF` before the modulo, exactly as the Java does. `Verdict` is a typed `int` with a `String()` that prints `IN_ORDER`, `DUPLICATE`, `GAP`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. Every number in the demo, including section 6, matches the Java output.
 
 ## Use It
 

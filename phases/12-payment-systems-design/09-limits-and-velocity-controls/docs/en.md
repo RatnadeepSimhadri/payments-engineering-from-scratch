@@ -3,7 +3,7 @@
 > Per-card, per-merchant, per-day, in a sliding window.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 08 (Payouts and Balance Management); Phase 10, Lesson 01 (Representing Money); Phase 1, Lesson 03 (Queues and Deques)
 **Time:** ~75 minutes
 
@@ -391,9 +391,37 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `SlidingWindow` is a slice used as a ring or a `container/list`; `LimitEngine` holds a `sync.Mutex` and `check` returns `(Decision, error)` with construction errors as values rather than panics; the 32-goroutine test must pass under `go test -race`. `Reason.retryAfterMillis` becomes a `*int64`, since zero is a legitimate value.
+```go
+func (e *LimitEngine) Check(attempt Attempt) Decision {
+    e.mu.Lock()                                   // check-and-record is one critical section
+    defer e.mu.Unlock()
+    now := e.clock.NowMillis()
+    reasons := []Reason{}
+    outcome := ALLOW
+    for _, limit := range e.policy.LimitsFor(attempt.MerchantID) {
+        ...
+    }
+    if outcome != DENY {
+        e.record(attempt, now)
+    }
+    return Decision{outcome, reasons}
+}
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+
+- **`synchronized` is a `sync.Mutex`.** `Check`, `Release`, `OpenExposure`, and `WindowCount` each take `e.mu`; the 32-goroutine race test releases every goroutine on one closed channel and must admit exactly 5 under `go test -race`. `FakeClock` uses `atomic.Int64` in place of `AtomicLong`.
+- **Construction errors are values.** `CountLimit`, `AmountLimit`, `ExposureLimit`, `NewAttempt`, and `NewSlidingWindow` return `(T, error)`, and `LimitPolicy.AddDefault`/`Override` return `error`, all wrapping the sentinel `ErrInvalidArgument` so tests use `errors.Is`. `standardPolicy()` unwraps them with a generic `must[T]`, because a typo in a literal policy is a bug, not a runtime condition.
+- **Null becomes an explicit absence.** `SlidingWindow.NextExpiryMillis` returns `(int64, bool)` and `Reason.RetryAfterMillis` is a `*int64`, since zero milliseconds is a legitimate value and only "no expiry" is `nil`.
+- **The window is a slice used as a queue.** Eviction re-slices from the front (`w.entries = w.entries[1:]`), append grows the tail; the half-open `(now - W, now]` rule is the same `<= cutoff` comparison. `LinkedHashMap` order in `LimitPolicy` and `ExposureTracker` is kept with an explicit key slice beside the map.
+
+```bash
+cd phases/12-payment-systems-design/09-limits-and-velocity-controls/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Who owns partition 7 after a consumer dies?
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 5, Lesson 13 (Gossip Protocols and Failure Detection)
 **Time:** ~90 minutes
 
@@ -366,9 +366,35 @@ Differences, all in `code/python/main.py`:
 
 Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The output, including the rebalance history, matches the Java run line for line.
 
-### Porting notes
+### In Go
 
-A Go port returns `(Assignment, error)` from `Join` and sentinel errors (`ErrUnknownMember`, `ErrIllegalGeneration`, `ErrNotOwner`) for `errors.Is`; the coordinator's maps need a `sync.Mutex` if heartbeats arrive from goroutines, and `go test -race` must pass. The sticky levelling loop and the `<=` deadline comparison port unchanged; those two lines are where cross-language divergence would show up as a different owner for partition 7.
+```go
+func (g *GroupCoordinator) CommitOffset(memberID string, memberGeneration, partition int, nextOffset int64) error {
+    if _, known := g.lastHeartbeat[memberID]; !known {
+        return unknownMember(memberID)
+    }
+    if memberGeneration != g.generation {
+        return illegalGeneration(memberID, memberGeneration, g.generation)
+    }
+    owner, err := g.OwnerOf(partition)
+    if err != nil {
+        return err
+    }
+    if memberID != owner {
+        return notOwner(memberID, partition, owner)
+    }
+    ...
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **Errors are values.** `Leave`, `OwnerOf`, and `CommitOffset` return `error`; the three fences wrap the sentinels `ErrUnknownMember`, `ErrIllegalGeneration`, and `ErrNotOwner`, so the demo and the tests match them with `errors.Is` where Java catches by exception class. `NewGroupCoordinator` returns an error for a non-positive partition count or session timeout. `Join` and `Heartbeat` cannot fail and return plain values, as in Java.
+- **Go maps have no order, so every ordered view sorts.** Java leans on `TreeMap` (members, owners) and `LinkedHashMap` (assignment). The Go coordinator stores plain maps and sorts where order is observable: `Members()` returns sorted ids, `ExpireSessions` walks `Members()` so the evicted list and the rebalance reason are deterministic, and `FormatAssignment` prints members in sorted order so the history lines are byte-identical to Java's. The sticky assignor collects `unassigned` into a slice and `sort.Ints` it before handing orphans out, the stand-in for `TreeSet`.
+- **Static interface methods become package functions.** Java's `Assignor.moved` and `Assignor.owners` are `Moved` and `Owners`; Go interfaces cannot carry static members. `Owners` panics on a partition assigned twice, because that is a bug in an assignor, not a condition a caller can handle.
+- **Enums are typed constants.** `HeartbeatResult` is an `int` type with `OK`, `RebalanceInProgress`, `UnknownMember` and a `String()` method that prints the Java names, so the demo still reads `-> REBALANCE_IN_PROGRESS`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The output, including the rebalance history and `moved=` counts, matches the Java run.
 
 ## Use It
 

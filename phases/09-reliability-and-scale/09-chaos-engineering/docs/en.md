@@ -3,7 +3,7 @@
 > Kill the processor connection on purpose, in test.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 01 (Failure Models), Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9, Lesson 06 (Metrics and Histograms)
 **Time:** ~75 minutes
 
@@ -365,9 +365,32 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The design ports directly. In Go, the faults are a small interface with four struct types and a type switch in `call`; errors return as values (`Outcome, error`) rather than exceptions; the injector needs a `sync.Mutex` if experiments ever run concurrently, and the tests then must pass `go test -race`. The clock stays a manual `SimClock`; the moment a port calls `time.Now()` the experiments stop being replayable.
+```go
+for _, f := range n.injector.FaultsFor(LinkGatewayToProcessor, request) {
+    switch f := f.(type) {
+    case Latency:
+        latency += f.AddedMillis
+    case Partition:
+        partitioned = true
+    }
+}
+```
+
+Differences, all in `code/go/main.go` and `javarandom.go`:
+
+- **Sealed interfaces become interfaces with an unexported method.** `Fault` declares `fault()` and `String()`; `Latency`, `Error`, `Partition`, and `ClockSkew` are the only types in the package that can implement it, which is as close to `sealed ... permits` as Go gets. `BlastRadius` works the same way with `Includes`. The network's `instanceof` chain is a type switch. Each type has a `String()` that renders the Java record form (`Latency[addedMillis=300]`, `Merchants[merchantIds=[m-3]]`), so the report text is identical.
+- **Exceptions become `(Outcome, error)`.** `Processor.Handle` returns `ErrStaleRequest` (wrapped with the age) instead of throwing; `SimNetwork.Call` maps it to `STALE_REQUEST` with `errors.Is`, and the Java `finally` that resets the clock skew is a `defer processor.SetClockSkew(0)`. Constructor checks (`NewLatency`, `NewPercentOfRequests`) return `error` where Java throws `IllegalArgumentException`; `SimClock.Advance` panics on a negative step because that is a bug in the simulation, not a condition.
+- **The abort index is a return value.** Java smuggles `stoppedAt` out of `drive` through a one-element `int[]`; Go returns `(*Metrics, int)` with `-1` for "ran to completion".
+- **Every RNG is `java.util.Random`.** `JavaRandom.NextInt` ports the 48-bit LCG with its rejection loop, so seeds 7, 11, 13, 17 produce the same blast-radius draws, declines, latencies, and merchant ids as the Java demo, and the GameDay numbers (488/12 baseline, p99 417 ms, 298 faults applied) match exactly; `TestDemoParity` pins them. The processor's 2% decline and the 80..120 ms baseline both come from `NextInt`, which is why `math/rand` would have changed every row.
+- **Sets and ordered maps.** `Set<String>` is `map[string]bool` built by `NewMerchants(ids...)`, printed sorted; the `LinkedHashMap<Outcome, Integer>` of counts is a plain `map[Outcome]int` because nothing iterates it in order.
+
+```bash
+cd phases/09-reliability-and-scale/09-chaos-engineering/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -3,7 +3,7 @@
 > Validate a card number and route it to the right network.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 2, Lesson 02 (Binary Search and Its Variants), Phase 2, Lesson 15 (Numerical Algorithms: GCD, Modular Arithmetic, and Check Digits), Phase 11, Lesson 01 (How a Card Payment Works)
 **Time:** ~75 minutes
 
@@ -368,9 +368,29 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port returns `(Pan, error)` from `ParsePan`, uses `sort.Search` for the lookup, and implements `fmt.Stringer` on `Pan` so `%v` and `%s` print the mask; `%+v` on the struct would still expose the field, so the digits should live in an unexported field accessed through a method. Go does not need the `>>> 1` midpoint trick, but it needs the same boundary tests.
+The full port is `code/go/main.go` (same `Luhn*` functions, `Pan`, `BinRange`, `BinTable`, `CardRouter`; tests in `code/go/main_test.go`). Three things differ:
+
+- **The digits live in an unexported field.** `fmt.Stringer` covers `%v` and `%s`, but `%+v` on a struct with an exported `Digits` field would still print it. The port keeps `digits` unexported, reaches it through `Digits()`, and the test asserts that `%v`, `%s` and `%+v` all render the mask:
+
+```go
+type Pan struct {
+	digits string // unexported: %+v cannot reach it, so every fmt verb prints the mask
+}
+
+// String is the mask on purpose: a Pan that ends up in a log line is masked.
+func (p Pan) String() string { return p.Masked() }
+```
+
+- **`IllegalArgumentException` becomes an `error` return.** `ParsePan`, `NewPan`, `LuhnValid`, `MaskedPrefix`, `BinRangeOfPrefixRange` and `NewBinTable` return `(T, error)`; `Masked()` (the 6+4 default) cannot fail for a 12-19 digit PAN, so it panics on the impossible branch instead of forcing an error check at every log site. `Optional<BinRange>` becomes the `(BinRange, bool)` pair from `Lookup`, and a `*BinRange` that is `nil` when the issuer is unknown on `RoutingDecision`.
+- **The binary search is written out, not `sort.Search`.** `sort.Search` would find the same candidate, but the loop stays so the "last range whose low <= key, then check high" argument reads identically in all three languages; `int(uint(lo+hi) >> 1)` is Java's `>>> 1`. The 10,000-key comparison against a linear scan replays Java's `Random(7)`, `nextLong(bound)` included, through `javarandom.go`.
+
+```bash
+cd phases/11-payment-rails/04-pan-luhn-and-bin-ranges/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

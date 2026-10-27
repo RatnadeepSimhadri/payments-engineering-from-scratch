@@ -3,7 +3,7 @@
 > Money is conserved; let the computer try to break that.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 12, Lesson 02 (Payment State Machine), Phase 12, Lesson 01 (Idempotent Payment API)
 **Time:** ~120 minutes
 
@@ -381,9 +381,43 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go's `math/rand.New(rand.NewSource(seed))` gives the same determinism guarantee as `java.util.Random(seed)`, though the streams differ, so seeds are not portable unless the 48-bit LCG is ported bit for bit; port the shrunk scenarios, not the seeds. `testing/quick` and `rapid` are the production harnesses. In Go, `check` returning `(string, bool)` or an `error` replaces the null-means-ok convention, and the service's rejections would be sentinel errors tested with `errors.Is` rather than exception classes. Money stays `int64` minor units, and the fee rounding must be ported with the sign-and-magnitude care from Phase 10, Lesson 01.
+```go
+// Check returns nil when the property holds. An error wrapping ErrInvalidArgument or ErrIllegalState
+// means the system rejected the input on purpose (not a failure); any other error is the violation.
+type Check[T any] func(value T) error
+
+func safeCheck[T any](check Check[T], value T) (reason string, failed bool) {
+    defer func() {
+        if crash := recover(); crash != nil {
+            reason, failed = fmt.Sprintf("crash: %v", crash), true
+        }
+    }()
+    err := check(value)
+    switch {
+    case err == nil:
+        return "", false
+    case errors.Is(err, ErrInvalidArgument), errors.Is(err, ErrIllegalState):
+        return "", false
+    default:
+        return err.Error(), true
+    }
+}
+```
+
+Differences, all in `code/go/main.go`, `javarandom.go`, `money.go`, and `main_test.go`:
+
+- **The seeds are portable.** `javarandom.go` is `java.util.Random` bit for bit (the 48-bit LCG, `nextInt(bound)` with its rejection loop, `nextDouble` from 53 bits), so seed 42 generates the same 500 command sequences, fails at the same trial, and shrinks in the same 67 steps as the Java demo. `math/rand` would have been deterministic too, but its counterexamples would not match the ones printed in this lesson.
+- **Exceptions become classified errors.** The service returns `(bool, error)`; `ErrInvalidArgument` and `ErrIllegalState` are the deliberate rejections, `ErrProcessorTimeout` is caught inside the service and turns into `UNKNOWN`, and a processor 5xx is `ErrProcessorError`, which wraps `ErrIllegalState` so it is skipped by the scenario runner exactly as the Java `IllegalStateException` was. The property `Check` returns an `error` where Java returned a nullable `String`; a `panic` inside a check is the "crash" case, recovered by `safeCheck`.
+- **Generics replace `Gen<T>`.** `Gen[T]` is an interface with `Generate` and `Shrink`; `Longs`, `OneOf[T comparable]`, and `Lists[T]` are small generic structs, and `ForAll[T]` returns a `PropertyResult[T]` whose `Counterexample` is a nil pointer when the property passed. `formatValue` prints slices as `[a, b, c]` so the summaries match Java's `List.toString()`.
+- **Money is the Phase 10 type.** `BasisPoints` is `Times(bps, 10_000, HalfEven)` on the canonical `Money`, so the 2.9 percent fee rounds half-even through the same `DivideRounded` the ledger lessons use, and the ledger's own postings use `mustPlus`/`mustMinus` because every amount in one payment shares a currency by construction.
+
+```bash
+cd phases/12-payment-systems-design/14-testing-payment-systems/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

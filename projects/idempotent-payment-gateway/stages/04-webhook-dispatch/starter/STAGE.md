@@ -2,7 +2,7 @@
 
 Continue editing the same workspace: add a new file `Webhooks.java` (uses `javax.crypto.Mac` and
 `java.security.MessageDigest.isEqual`). Then give `Gateway` an `attachWebhooks(WebhookDispatcher)` method and
-emit `payment.succeeded` / `payment.failed` events from `charge`. The Python port has the same surface in snake_case (signatures below); Go port follows later.
+emit `payment.succeeded` / `payment.failed` events from `charge`. The Python and Go ports have the same surface in snake_case and exported CamelCase (signatures below).
 
 Stages 01 to 03 are graded again first.
 
@@ -69,3 +69,43 @@ class WebhookDispatcher:
 class Gateway:
     def attach_webhooks(self, dispatcher: WebhookDispatcher) -> None: ...   # charge() then emits payment.succeeded / payment.failed
 ```
+
+## New signatures (Go)
+
+Add `webhooks.go`; add `AttachWebhooks` and event emission to `Gateway` in `resilience.go`.
+
+```go
+type WebhookEvent struct{ ID, Type, PaymentID, Data string; CreatedAt int64 }
+func NewWebhookEvent(id, eventType, paymentID, data string, createdAt int64) (WebhookEvent, error)
+func (e WebhookEvent) ToBody() string
+var ErrMalformedBody error
+func ParseWebhookEvent(body string) (WebhookEvent, error)       // inverse of ToBody; ErrMalformedBody otherwise
+
+func HmacSha256Hex(secret []byte, message string) string
+func NewWebhookSigner(secret string) (*WebhookSigner, error)     // empty secret -> error
+func (s *WebhookSigner) Signature(timestampMillis int64, body string) string   // HMAC over "<ts>.<body>"
+func (s *WebhookSigner) Header(timestampMillis int64, body string) string      // "t=<ts>,v1=<hex>"
+
+type VerifyResult int; const ( VerifyOK VerifyResult = iota; MalformedHeader; StaleTimestamp; BadSignature )
+func NewWebhookVerifier(secret string, toleranceMillis int64, clock Clock) (*WebhookVerifier, error)
+func (v *WebhookVerifier) Verify(body, header string) VerifyResult
+
+type ReceiveStatus int; const ( Accepted ReceiveStatus = iota; Duplicate; Rejected )
+type ReceiveResult struct{ Status ReceiveStatus; Verification VerifyResult; Event *WebhookEvent }   // Event nil when Rejected
+func NewWebhookConsumer(verifier *WebhookVerifier) *WebhookConsumer
+func (c *WebhookConsumer) Receive(body, header string) ReceiveResult
+func (c *WebhookConsumer) Processed() []WebhookEvent
+
+type WebhookEndpoint interface{ Deliver(body, header string) bool }
+type Delivery struct{ Body, Header string }
+func NewScriptedEndpoint(script string) (*ScriptedEndpoint, error)   // 'S' 'F'; Deliver, Deliveries() []Delivery
+func NewConsumerEndpoint(consumer *WebhookConsumer) *ConsumerEndpoint
+
+type DeliveryJob struct{ Event WebhookEvent; Attempts int; NextAttemptAt int64 }
+func NewWebhookDispatcher(signer *WebhookSigner, endpoint WebhookEndpoint, clock Clock, retryDelaysMillis []int64) (*WebhookDispatcher, error)
+func (d *WebhookDispatcher) MaxAttempts() int; Enqueue(event WebhookEvent); RunDue() int
+func (d *WebhookDispatcher) Pending() []DeliveryJob; Delivered() []WebhookEvent; DeadLetters() []DeliveryJob   // copies
+func (g *Gateway) AttachWebhooks(dispatcher *WebhookDispatcher)
+```
+
+`RunDue` cannot remove from the slice it is iterating the way Java removes from `pending`; build two new slices (jobs not yet due, in order; then the retries it scheduled) and assign `d.pending = append(remaining, retries...)`. The grader checks the order through `Pending()`.

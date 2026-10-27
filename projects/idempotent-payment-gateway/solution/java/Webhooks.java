@@ -3,7 +3,7 @@
 // "t=<millis>,v1=<hex>". Delivery is at-least-once: a failed attempt is retried on a fixed schedule from the
 // injected clock, then dead-lettered. The consumer verifies the signature inside a tolerance window and
 // dedupes by event id, which is what turns at-least-once delivery into exactly-once processing.
-// Java 21, standard library only (javax.crypto). Same design as the Python port in solution/python; Go port follows later.
+// Java 21, standard library only (javax.crypto). Same design as the Python port in solution/python and the Go port in solution/go.
 
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;

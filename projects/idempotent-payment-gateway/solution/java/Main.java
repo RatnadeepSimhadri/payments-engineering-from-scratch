@@ -2,7 +2,7 @@
 // Run:  javac -d .out *.java && java -cp .out Main
 // Grade: python3 scripts/project_test.py idempotent-payment-gateway --lang java --all --solution
 // Stages: 01 idempotency store, 02 payment state machine, 03 retries + circuit breaker + gateway, 04 webhooks.
-// Java 21, standard library only. Same design as the Python port in solution/python; Go port follows later.
+// Java 21, standard library only. Same design as the Python port in solution/python and the Go port in solution/go.
 
 public final class Main {
     public static void main(String[] args) {

@@ -9,11 +9,13 @@
   "hours": 8,
   "languages": [
     "Java",
-    "Python"
+    "Python",
+    "Go"
   ],
   "languageWhy": {
     "Java": "Records and sealed-ish exception hierarchies make the value types and the 'ledger said no' contract explicit; Math.addExact shows what overflow-safe money looks like.",
-    "Python": "Frozen dataclasses and enums give the same value types with far less ceremony; because Python ints never overflow, the port keeps an explicit 64-bit bound so you see what Math.addExact was protecting."
+    "Python": "Frozen dataclasses and enums give the same value types with far less ceremony; because Python ints never overflow, the port keeps an explicit 64-bit bound so you see what Math.addExact was protecting.",
+    "Go": "Sentinel errors wrapped with %w replace the exception hierarchy, so errors.Is(err, ErrLedger) is the 'ledger said no' check; int64 wraps silently, so the checked addChecked/mulChecked helpers make Math.addExact visible as code you wrote."
   },
   "status": "ready",
   "skills": [

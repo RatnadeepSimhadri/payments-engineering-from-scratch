@@ -3,7 +3,7 @@
 > Match a billion records a day and surface the breaks.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 2, Lesson 03 (Merge Sort and External Sorting), Phase 3, Lesson 01 (Hash Tables), Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 08 (Reconciliation), Phase 14, Lesson 03 (Exactly-Once Money Movement)
 **Time:** ~120 minutes
 
@@ -412,9 +412,36 @@ python3 -m unittest -v
 
 The Python tests port all 31 Java checks (58 assertions), including the seeded 100,000-record run that must surface exactly the injected number of breaks and tie out.
 
-### Porting notes
+### In Go
 
-Go: `Rec` as a struct with `int64` minor units; the digest arithmetic wraps natively on `uint64`. Feeds as channels or `bufio.Scanner` over sorted files. Return `(Report, error)` from `Reconcile` and make the unsorted-feed check an error value, since there is no exception to throw from inside a cursor. Run the tests under `-race` if the two feeds are drained by separate goroutines.
+`code/go/main.go` keeps the same pieces: `Rec`, `BucketKey`, `BucketDigest`, `StreamingReconciler` with its `cursor`, `ReconciliationReport`, and `FeedGenerator`; `javarandom.go` carries the JDK generator. The demo reconciles the same million records with seed 42 and prints the same 510 breaks and the same first three. Four things differ:
+
+- **The digest wraps natively on `uint64`.** Java's `mix` relies on `long` overflow and `>>>`; Go's `uint64` multiply wraps and `>>` is a logical shift, so the SplitMix64 finaliser is written exactly as in the Java with no masks. `BucketDigest` is a comparable struct, so the fast path is `da == db`.
+
+```go
+func Mix(ref string) uint64 {
+    h := uint64(0x9E3779B97F4A7C15)
+    for i := 0; i < len(ref); i++ {
+        h = (h ^ uint64(ref[i])) * 0xBF58476D1CE4E5B9
+    }
+    h ^= h >> 31
+    h *= 0x94D049BB133111EB
+    h ^= h >> 29
+    return h
+}
+```
+
+- **Feeds are iterators, failures are errors.** `Reconcile` takes two `RecIterator` closures (`func() (Rec, bool)`; `SliceIterator` wraps a slice, a production feed would wrap a `bufio.Scanner`) and returns `(*ReconciliationReport, error)`. The unsorted feed is `ErrUnsortedFeed` and a record on the wrong side is `ErrWrongFeed`, both wrapped with `%w` so the tests use `errors.Is`. Inside the merge, a `need(...)` helper panics on an error and a deferred `catch` turns it back into the returned error, so the checked `Money.Plus` calls on the running totals do not each need an `if err != nil`.
+- **Dates are UTC `time.Time`, keys are epoch days.** `EpochDay` is `LocalDate.toEpochDay`, so `BucketKey` holds three integers and compares in a few instructions; `SortFeed` sorts an index with `sort.SliceStable` (Java's `List.sort` is stable too, which decides which of two duplicate lines gets matched).
+- **`EnumMap` order and `%,d`.** `CountByType` returns a plain map, so `Summary` iterates `BreakType` and `AgeBand` in declaration order and skips absent keys to print what the Java `EnumMap` prints; a small `commas` helper stands in for `%,d`. The Go run generates and reconciles the million records in about two seconds.
+
+```bash
+cd phases/14-payments-at-scale/04-reconciliation-at-scale/code/go
+go run .
+go test ./...
+```
+
+The Go tests port all 31 Java checks (35 assertions), including the seeded 100,000-record run that must surface exactly the injected number of breaks and tie out, and pass under `go test -race`.
 
 ## Use It
 

@@ -2,6 +2,15 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-10-27 — Go port complete (Wave 2: 47 lessons + 3 projects) — all three languages done
+
+- Ported batches G–L: Phases 8, 9, 10, 11, 12, 14 lessons and the three projects. Go coverage: 96 → **143 / 143** Build lessons; all 3 projects pass 4/4 stages in Go (ledger-engine, idempotent-payment-gateway, raft-kv), Go starters compile and fail stage 1 as required.
+- `languages.json`: Go now `ci: true` — a lesson is Complete only with Java, Python, and Go present. README, start-learning skill updated: every Build lesson ships all three languages.
+- Parity: every Java assertion ported (Go counts ≥ Java), demo output byte-identical to Java in every lesson; bit-exact `java.util.Random`/SplitMix64 ports; Go-native AES-GCM (11/05) and Ed25519 (13/11); `encoding/xml` Strict + DOCTYPE prescan for ISO 20022/camt lessons; `go vet`, `gofmt`, `go test -race` clean everywhere.
+- Incident: the first Wave 2 run was interrupted twice (session rate limit, then session stop) with 38 of 47 lessons partially on disk; a second set of agents ported the remaining 9 lessons and raft-kv's stage tests and verified every pre-existing file (11/04, 12/09, 14/06 were incomplete and were finished).
+- Verification: audit 199/199, 0 issues; Go 143/143; Java 143/143; Python 143/143; projects 9/9 (3 projects × 3 languages).
+- The course is now fully built in all three languages. Remaining items are polish (fact-checks, glossary refresh, first CI run) and the reference-parity extras (book/PDF, website, practice assessments, manuals, translations).
+
 ## 2026-10-27 — Go port Wave 1 complete (56 lessons, Phases 0–7 + Phase 13)
 
 - Ported batches A–F of `docs/porting/go-port-plan.md`. Go coverage: 40 → **96 / 143** Build lessons; `languages.json` keeps Go `ci: false` until Wave 2.

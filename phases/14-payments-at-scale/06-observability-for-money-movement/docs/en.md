@@ -3,7 +3,7 @@
 > Metrics that detect a stuck payment before a customer does.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9, Lesson 06 (Metrics and Histograms), Phase 12, Lesson 02 (Payment State Machine), Phase 14, Lesson 04 (Reconciliation at Scale), Phase 14, Lesson 05 (Batch vs Real-Time Settlement)
 **Time:** ~90 minutes
 
@@ -384,9 +384,39 @@ python3 -m unittest -v
 
 The Python tests port every Java check (54 assertions) and the demo output is identical to the Java run.
 
-### Porting notes
+### In Go
 
-Go: `time.Time` and a `Clock` interface, `int64` everywhere, `sort.Slice` with a tie-break on id for the stuck list. If ingestion and evaluation run on different goroutines, guard the monitor with a `sync.Mutex` and run the tests with `-race`; Prometheus's Go client does the equivalent with atomic counters.
+`code/go/main.go` keeps `Clock`/`ManualClock`, `MinuteCounter`, `Ratio`, `Slo`, `BurnRule`, `MoneyMovementMonitor`, and `Simulation`; `javarandom.go` carries the JDK generator so seed 42 prints the same first-fired minutes and the same three dashboards. What differs:
+
+- **Time is `time.Time` and `time.Duration`.** The clock hands out UTC times; `epochMinute` reproduces `Math.floorDiv(epochSecond, 60)` with an explicit floor, `minutesOf` is `Duration.toMinutes`, and the dashboard header prints `Format(time.RFC3339)`, which is the `2026-03-31T13:10:00Z` form `Instant.toString` uses. `Advance` returns `ErrTimeBackwards` instead of throwing.
+
+```go
+func (c *MinuteCounter) Sum(now time.Time, window time.Duration) []int64 {
+    nowMinute := epochMinute(now)
+    from := nowMinute - minutesOf(window) + 1
+    total := make([]int64, c.width)
+    for minute, counts := range c.buckets {
+        if minute >= from && minute <= nowMinute {
+            for i := 0; i < c.width; i++ {
+                total[i] += counts[i]
+            }
+        }
+    }
+    return total
+}
+```
+
+- **Maps replace `TreeMap` and `EnumMap`.** The counter keeps a plain map of minute buckets and filters by range; `Processors()` sorts its keys so alerts and the dashboard list processors in Java's `TreeMap` order; `nonTerminalStates` fixes the `EnumMap` iteration order for exposure and the histogram; `Simulation.FiredOrder` records the `LinkedHashMap` insertion order next to the `FirstFired` map.
+- **Overflow is checked, not thrown.** `Money.Plus` and `Ratio.Bps` go through `addChecked`/`mulChecked`, which return `ErrOverflow` where Java's `addExact`/`multiplyExact` throw; a `need` helper panics on the error, since no sum of minor units in this lesson can overflow. `Transition` returns a wrapped `ErrCurrencyMismatch` and the test checks it with `errors.Is`. `AgeOf` returns `(time.Duration, bool)` where Java returned `null` for an untracked payment.
+- **Single-goroutine by design.** Nothing in the monitor is shared across goroutines; if ingestion and evaluation ran concurrently, a `sync.Mutex` around the monitor would be the first change, and `go test -race` would catch the omission.
+
+```bash
+cd phases/14-payments-at-scale/06-observability-for-money-movement/code/go
+go run .
+go test ./...
+```
+
+The Go tests port all 42 Java checks (53 assertions) and the demo output is identical to the Java run.
 
 ## Use It
 

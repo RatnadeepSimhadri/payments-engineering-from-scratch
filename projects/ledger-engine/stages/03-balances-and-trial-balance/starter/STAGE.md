@@ -64,6 +64,32 @@ class Ledger:
     def is_reversed(self, entry_id: str) -> bool: ...
 ```
 
+## New signatures (Go)
+
+Add to `ledger.go`.
+
+```go
+type BalanceSnapshot struct{ Sequence int64; Balances map[string]Money }
+type TrialBalanceLine struct{ Account Account; Debit, Credit Money }
+type TrialBalance struct{ Currency Currency; Lines []TrialBalanceLine; TotalDebits, TotalCredits Money }
+func (tb TrialBalance) Difference() Money
+func (tb TrialBalance) IsBalanced() bool
+
+const DefaultSnapshotEvery = 100
+func NewLedger(accounts *AccountRegistry) (*Ledger, error)                                   // snapshot every 100
+func NewLedgerWithSnapshots(accounts *AccountRegistry, snapshotEvery int) (*Ledger, error)   // snapshotEvery < 1 -> error
+func (l *Ledger) SnapshotEvery() int
+func (l *Ledger) Balance(accountID string) (Money, error)                   // latest snapshot + tail replay; ErrUnknownAccount
+func (l *Ledger) BalanceAt(accountID string, sequence int64) (Money, error) // full replay through sequence inclusive
+func (l *Ledger) Snapshots() []BalanceSnapshot                              // deep copy: the maps are clones
+func (l *Ledger) TrialBalance() []TrialBalance                              // one per currency, sorted by code
+func ReversalID(entryID string) string                                      // "rev:" + entryID
+func (l *Ledger) Reverse(entryID string) (PostedEntry, error)               // posts the mirror; idempotent; ErrUnknownEntry
+func (l *Ledger) IsReversed(entryID string) bool
+```
+
+Java's `TreeMap` gave the trial balance its currency order for free; in Go, collect the currency codes from a map, `sort.Strings` them, and build the result in that order. `Snapshots()` must `maps.Clone` every balance map, because the grader empties the map it receives and expects the ledger's copy to still hold every account.
+
 ## Rules in one screen
 
 - Signed effect of a posting = `+amount` if `posting.side() == account.normalSide()`, else `-amount`.
@@ -76,4 +102,5 @@ class Ledger:
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 3 --path <workspace>
 python3 scripts/project_test.py ledger-engine --lang python --stage 3 --path <workspace>
+python3 scripts/project_test.py ledger-engine --lang go --stage 3 --path <workspace>
 ```

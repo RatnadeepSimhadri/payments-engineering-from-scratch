@@ -3,7 +3,7 @@
 > A saga with real compensations and a dead-letter path.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 7, Lesson 08 (Sagas and Compensating Transactions); Phase 10, Lesson 03 (The Double-Entry Ledger)
 **Time:** ~120 minutes
 
@@ -381,9 +381,43 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port returns `(ProcessorResponse, error)` from every downstream call with `ErrUnavailable` and `ErrProcessCrash` as sentinels checked by `errors.Is`; the crash cannot be an exception that unwinds the loop, so `run` returns the sentinel and the test asserts on it. Go's `iota` enums need an explicit ordered slice for `nextForward`/`nextCompensation`. The port needs no goroutines: the orchestrator is single-threaded by design, and concurrency between sagas belongs in the store's version check (Lesson 02).
+```go
+// downstreamError carries the downstream's own message (what the journal records) and matches a
+// sentinel through errors.Is, so callers branch on the kind without parsing text.
+type downstreamError struct {
+    kind error
+    msg  string
+}
+
+func (e *downstreamError) Error() string        { return e.msg }
+func (e *downstreamError) Is(target error) bool { return target == e.kind }
+
+response, err := o.forward(step, r)
+if errors.Is(err, ErrProcessorUnavailable) {
+    r.Journal = append(r.Journal, fmt.Sprintf("%v attempt %d failed: %v", step, r.ForwardAttempts[step], err))
+    ...
+    continue
+}
+if err != nil {
+    return nil, err // the crash: nothing after this line runs
+}
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+
+- **The crash is an error value, not an unwinding exception.** Every downstream call returns `(ProcessorResponse, error)`. `ErrProcessorUnavailable` is handled inside the loop (journal, maybe compensate, `continue`); any other error, in practice `ErrProcessCrash`, is returned from `Run` immediately, which is the Go spelling of "the process is gone". `Start`, `Recover`, and `Redrive` propagate it, and the tests assert `errors.Is(err, ErrProcessCrash)` where the Java test used `checkThrows`. The `downstreamError` type keeps the message the Java exception carried, so the journal lines are byte-identical across languages.
+- **`iota` enums need an explicit order.** `SagaSteps` is the forward slice that `NextForward` walks and `NextCompensation` walks backwards; `System()` and `Compensation()` read from parallel arrays indexed by the step. `NextForward` returns `(SagaStep, bool)` instead of `null`.
+- **`IllegalStateException` and `IllegalArgumentException` become sentinels.** `SagaStore.Load` and `Redrive` wrap `ErrIllegalState`; `NewSagaRecord` wraps `ErrInvalidAmount`, so a zero amount cannot build a record. The `StepStatus` value for an undone step is `STEP_COMPENSATED`, because `COMPENSATED` is already the saga state in the same package.
+- **`LinkedHashMap` is a map plus an order slice.** `SagaStore` keeps `order []string` so `Unfinished` returns sagas in insertion order and `Recover` resumes them in the order they started, as the Java version does.
+- **No goroutines.** The orchestrator is single-threaded by design; concurrency between sagas belongs in the store's version check (Lesson 02).
+
+```bash
+cd phases/12-payment-systems-design/03-payment-orchestration/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

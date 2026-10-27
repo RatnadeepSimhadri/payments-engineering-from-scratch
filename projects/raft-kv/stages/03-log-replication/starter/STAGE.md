@@ -41,3 +41,19 @@ class RaftNode:
 # Cluster additions used by the tests: propose(command) -> int, propose_to(node_id, command) -> int,
 # run_until_logs_converged(max_ticks) -> int, logs_converged() -> bool, Cluster.check_log_matching(a, b, ia, ib) (raises RuntimeError).
 ```
+
+## New signatures (Go)
+
+Keep editing `raftnode.go` (`package main`); the names below are the Java ones in exported CamelCase.
+
+```go
+func (n *RaftNode) Propose(command string) int               // -1 unless leader; else append and return the new index
+func (n *RaftNode) AppendEntriesFor(peer int) Message        // prev = NextIndex[peer] - 1; ships Storage.EntriesFrom(next)
+func (n *RaftNode) OnAppendReply(m Message, now int) []Message
+func (n *RaftNode) ReplicatedCount(index int) int            // 1 + peers with MatchIndex >= index
+
+// upgraded: BecomeLeader appends LogEntry{CurrentTerm, "NOOP"}; ReplicateAll returns AppendEntriesFor(p) per peer;
+// OnAppendEntries adds rules 2-4 and replies MatchIndex = PrevLogIndex + len(Entries)
+```
+
+Cluster additions used by the tests: `Propose(command) int`, `ProposeTo(nodeID, command) int`, `RunUntilLogsConverged(maxTicks) int`, `LogsConverged() bool`, and `CheckLogMatching(a, b []LogEntry, ia, ib int) error` (nil when Log Matching holds; the error wraps `ErrInvariant`).

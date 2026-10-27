@@ -75,6 +75,22 @@ class RaftNode:
 # run_until_logs_converged(max_ticks) -> int, logs_converged() -> bool, Cluster.check_log_matching(a, b, ia, ib) (raises RuntimeError).
 ```
 
+The same surface in Go (`raftnode.go`):
+
+```go
+func (n *RaftNode) Propose(command string) int              // not leader -> -1; else Append(LogEntry{CurrentTerm, command}), return its index
+func (n *RaftNode) AppendEntriesFor(peer int) Message       // next := NextIndex[peer]; prev := next - 1;
+                                                            // NewAppendEntries(id, peer, CurrentTerm, prev, TermAt(prev), EntriesFrom(next), CommitIndex)
+func (n *RaftNode) OnAppendReply(m Message, now int) []Message   // success -> MatchIndex/NextIndex forward; failure -> NextIndex back, resend
+func (n *RaftNode) ReplicatedCount(index int) int           // 1 + number of peers with MatchIndex >= index
+
+// upgraded: BecomeLeader appends LogEntry{CurrentTerm, "NOOP"} after initialising NextIndex/MatchIndex; ReplicateAll returns
+// AppendEntriesFor(p) per peer; OnAppendEntries adds rules 2-4 and replies MatchIndex = PrevLogIndex + len(Entries).
+
+// Cluster additions used by the tests: Propose(command) int, ProposeTo(nodeID, command) int, RunUntilLogsConverged(maxTicks) int,
+// LogsConverged() bool, and CheckLogMatching(a, b []LogEntry, ia, ib int) error (nil when the property holds; the error wraps ErrInvariant).
+```
+
 Rules:
 
 - **`becomeLeader`**: initialise `nextIndex[p] = lastLogIndex() + 1` and `matchIndex[p] = 0` **first**, then append the no-op `LogEntry(currentTerm, "NOOP")`, then `replicateAll`. The order matters: with `nextIndex` pointing at the no-op's slot, the very first `AppendEntries` carries it. The no-op is section 8 of the paper and becomes essential in stage 4 (a new leader cannot commit older-term entries by counting, so it commits one of its own at once).
@@ -151,13 +167,14 @@ Bugs this stage's tests are built to expose:
 
 What must fail and how: `propose` on a non-leader returns -1 (not an exception; clients are expected to be redirected). A refused `AppendEntries` never modifies the log, and the follower still adopts the sender as leader. `matchIndex` never moves backwards; `nextIndex` never drops below 1 (index 0 is the sentinel and always matches). Two leaders in the same term still throw. The provided `Cluster.checkInvariants` runs after every delivery and throws `IllegalStateException` naming the pair of nodes and the index if Log Matching or Leader Append-Only is violated; the tests also call `Cluster.checkLogMatching` on the final logs. If you see `LOG MATCHING: nodes 1 and 3 agree at index 4 (term 2) but differ at index 2`, a follower appended without a matching prefix: re-read rule 3 of the list above.
 
-The Python port has the same surface in snake_case in one `main.py` (signatures above); Go port follows later.
+The Python port has the same surface in snake_case in one `main.py`, and the Go port the same surface in exported CamelCase in `raftnode.go` (signatures above). In Go `CheckLogMatching` returns an `error` instead of throwing, and `Cluster.CheckInvariants` panics with it after a delivery.
 
 ## Run the grader
 
 ```bash
 python3 scripts/project_test.py raft-kv --lang java --stage 3 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --stage 3 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --stage 3 --path my-raft-kv
 ```
 
 Stages 1 and 2 run again first; stage 2's heartbeat assertions still hold because `appendEntriesFor` on an up-to-date follower *is* a heartbeat. Stage 3 has about 48 assertions: `propose` on followers and leaders, `nextIndex`/`matchIndex` initialisation and the shape of the first `AppendEntries`, every branch of the consistency check, truncation and duplicate handling with exact `describe()` strings, the back-off walk with the `max(1, ...)` floor, convergence on a quiet cluster, a crashed follower catching up, the stale-leader partition from the Raft II lesson (the `PUT alice 999` that must vanish from every log), and 12 lossy seeds with a leader crash where every log must converge with Log Matching intact.

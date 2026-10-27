@@ -9,11 +9,13 @@
   "hours": 14,
   "languages": [
     "Java",
-    "Python"
+    "Python",
+    "Go"
   ],
   "languageWhy": {
     "Java": "Records make messages and log entries immutable by construction, the switch over MessageKind is exhaustive, and the simulated network from the Raft lessons carries over unchanged.",
-    "Python": "One main.py holds the whole cluster; frozen dataclasses stand in for records, heapq is the in-flight queue, and the SplitMix64 Rng is ported bit-for-bit, so seed 7 produces the same election trace as the Java solution and the Raft lessons in Phase 6."
+    "Python": "One main.py holds the whole cluster; frozen dataclasses stand in for records, heapq is the in-flight queue, and the SplitMix64 Rng is ported bit-for-bit, so seed 7 produces the same election trace as the Java solution and the Raft lessons in Phase 6.",
+    "Go": "One package main in six files mirrors the Java classes one to one; LogEntry and Message are plain comparable structs, the message heap is container/heap with the same (deliverAt, seq) tie-break, Storage panics where Java throws for caller bugs while KVStore.Apply and the harness return sentinel errors, and the SplitMix64 Rng runs on uint64 so seed 7 replays the Java election trace byte for byte."
   },
   "status": "ready",
   "skills": [

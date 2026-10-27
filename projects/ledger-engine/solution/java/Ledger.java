@@ -3,7 +3,7 @@
 // Docs: projects/ledger-engine/stages/*/docs/en.md
 // Run:  javac -d .out *.java && java -cp .out Main
 // Test: python3 scripts/project_test.py ledger-engine --lang java --all --solution
-// Java 21, standard library only. Java first; Python port in solution/python; Go port follows later.
+// Java 21, standard library only. Java first; Python port in solution/python; Go port in solution/go.
 
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;

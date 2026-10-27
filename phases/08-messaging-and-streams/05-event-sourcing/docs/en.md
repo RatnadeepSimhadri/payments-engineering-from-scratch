@@ -3,7 +3,7 @@
 > An account is the sum of its events; a balance is a cache.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
@@ -351,7 +351,9 @@ Differences, all in `code/go/main.go`:
 - **Errors are values.** `Decide`, `Append`, and `HandleAt` return `error`. Rejections wrap the sentinel `ErrCommandRejected` so callers use `errors.Is`; the concurrency failure is a `*ConcurrencyError` struct carrying expected and actual versions, matched with `errors.As`. Currency mismatch wraps `ErrCurrencyMismatch`.
 - **Immutability is by convention.** `AccountState` is passed by value, but a Go map is a reference, so `Apply` copies the holds map (`copyHolds`) before changing it. Forgetting this copy is the Go-specific bug: two states that should be independent would share one map.
 - **Maps have no order.** `HoldIDs()` sorts before printing so the demo output is deterministic; `Equal` compares states field by field because a struct containing a map is not comparable with `==`.
-- **Overflow is checked by hand** in `addChecked`, as in the Money lesson; `apply` discards the error because events were validated before being written, and a well-formed stream cannot overflow.
+- **Overflow is checked by hand** in `addChecked` (`code/go/money.go`), as in the Money lesson; `Apply` discards the error because events were validated before being written, and a well-formed stream cannot overflow.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same versions, balances, and snapshot counts as the Java run.
 
 ## Use It
 

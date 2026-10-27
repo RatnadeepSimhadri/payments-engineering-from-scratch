@@ -3,7 +3,7 @@
 > You never update a posting; you post its opposite.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 05 (Balances and Snapshots)
 **Time:** ~75 minutes
 
@@ -387,9 +387,26 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go, keep the postings slice unexported and return copies, because a struct cannot make a slice read-only; `crypto/sha256` and `encoding/hex` produce the same digest as Java if the canonical string is byte-identical, which is worth a cross-language test. Errors become sentinel values (`ErrAlreadyReversed`, `ErrExcessiveReversal`) checked with `errors.Is`.
+The full port is `code/go/main.go` (same `Ledger`, `JournalEntry`, `JournalRecord`, `Post`/`Reverse`/`ReversePartially`/`Correct`, `VerifyChain`), with `money.go` (the Lesson 01 `Money`, whose `Allocate` does the proportional split) and `javarandom.go` for the seeded property test. Tests are in `code/go/main_test.go`. Three things differ:
+
+- **Immutability is by encapsulation, not by type.** Go has no read-only slice, so `JournalEntry` keeps `postings` unexported and `Postings()` returns a copy; `Ledger.Records()` returns a copy of the journal too. The tamper demo edits that copy, which is exactly why `VerifyChain` takes the records as an argument instead of reading the ledger's own slice. Java record equality becomes an explicit `Equal` method, used for idempotent replays and for "the retry returned the same entry".
+- **One root error, three specific sentinels.** Every ledger rule wraps `ErrLedger`; `ErrIdempotencyConflict`, `ErrAlreadyReversed`, and `ErrExcessiveReversal` wrap it in turn, so `errors.Is(err, ErrLedger)` matches any of them and `errors.Is(err, ErrExcessiveReversal)` matches only the refund that was too large. The demo's `rejected:` lines branch on these:
+
+```go
+if _, err := ledger.ReversePartially("pay-100", "ref-100-2", refund, "refund too large"); errors.Is(err, ErrExcessiveReversal) {
+    fmt.Println("rejected:", err)
+}
+```
+
+- **The hash chain is byte-identical.** `crypto/sha256` over the same canonical string gives the same digests as Java's `MessageDigest`, so the twelve-character hash prefixes in the audit view match across languages. The one trap is Java's `null`: an original entry has no `relatesTo` or `reason`, and `StringBuilder.append(null)` writes the four letters `null`, so `Canonical()` writes `null` for an original's empty link and reason. A test pins the canonical string of the first record to make the cross-language guarantee explicit.
+
+```bash
+cd phases/10-money-and-ledgers/06-immutability-and-reversals/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

@@ -1,6 +1,6 @@
 # Idempotent Payment Gateway
 
-**Level 2 · Builder · 4 stages · about 10 hours · Java or Python** (Go port follows later)
+**Level 2 · Builder · 4 stages · about 10 hours · Java, Python or Go**
 
 A charge API that survives client retries, flaky processors, and duplicate webhooks without ever charging twice.
 
@@ -19,7 +19,7 @@ This project builds that middle, in memory, on an injected clock and a seeded ra
 | 03 | `BackoffPolicy`, `RetryBudget`, `CircuitBreaker`, `RetryingClient`, `Gateway` | Retry only `UNAVAILABLE`, capped exponential backoff with full jitter from a seeded `Rng`, a token budget, a `CLOSED / OPEN / HALF_OPEN` breaker, and the HTTP-shaped gateway (201 / 402 / 409 / 422 / 503) | core | 3 |
 | 04 | `WebhookSigner`, `WebhookVerifier`, `WebhookDispatcher`, `WebhookConsumer` | HMAC-SHA256 over `timestamp.body`, verification inside a tolerance window with a constant-time compare, at-least-once delivery on a retry schedule with dead-lettering, consumer dedupe by event id | stretch | 3 |
 
-Each stage's `docs/en.md` has a worked example with real numbers you can predict before coding, the exact Java and Python signatures, a table of what must fail and how, and check-yourself questions. Later stages add files to the same workspace; nothing from an earlier stage changes shape, and the grader re-runs every earlier stage so a regression shows up at once.
+Each stage's `docs/en.md` has a worked example with real numbers you can predict before coding, the exact Java, Python and Go signatures, a table of what must fail and how, and check-yourself questions. Later stages add files to the same workspace; nothing from an earlier stage changes shape, and the grader re-runs every earlier stage so a regression shows up at once.
 
 ## Prerequisites
 
@@ -32,7 +32,7 @@ Read (or at least run) these lessons first; the project assumes their vocabulary
 
 The `Money` type (integer minor units plus an ISO 4217 currency) is copied into the starter from `phases/10-money-and-ledgers/01-representing-money`; you use it, you do not rewrite it.
 
-Tooling: Java 21 (`javac`, `java`) or Python 3.11+, plus Python 3 for the grader script. No build tool, no dependencies beyond the standard library (`java.security.MessageDigest` and `javax.crypto.Mac` in Java; `hashlib` and `hmac` in Python).
+Tooling: Java 21 (`javac`, `java`), Python 3.11+, or Go 1.22+, plus Python 3 for the grader script. No build tool, no dependencies beyond the standard library (`java.security.MessageDigest` and `javax.crypto.Mac` in Java; `hashlib` and `hmac` in Python; `crypto/sha256` and `crypto/hmac` in Go).
 
 ## Commands
 
@@ -42,24 +42,31 @@ All commands run from the repository root.
 # create a workspace from the stage 1 starter
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --init my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --init my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --init my-gateway
 
 # grade stages 1..N against your workspace (earlier stages are re-run every time)
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 1 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 1 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --stage 1 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 2 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 2 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --stage 2 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 3 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 3 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --stage 3 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 4 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 4 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --stage 4 --path my-gateway
 
 # everything, with a completion report
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --all --path my-gateway --report gateway-report.json
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --all --path my-gateway --report gateway-report.json
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --all --path my-gateway --report gateway-report.json
 
 # run your own workspace's demo
 cd my-gateway && javac -d .out *.java && java -cp .out Main   # Java
 cd my-gateway && python3 main.py                                # Python
+cd my-gateway && go run .                                       # Go
 ```
 
 Maintainers verify the reference solution with:
@@ -67,9 +74,10 @@ Maintainers verify the reference solution with:
 ```bash
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --all --solution
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --all --solution
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --all --solution
 ```
 
-The grader copies your sources (`*.java` except `*Test.java`, or `*.py` except `test_*.py`) and the stage's tests (`StageNNTest.java`, or `test_stage_NN.py`) into a temporary directory and runs them (`javac` + `java`, or `python3 -m unittest -v`). A failing run prints every failed assertion by name and exits 1. Assertion counts in both languages: 43, 46, 59, 50.
+The grader copies your sources (`*.java` except `*Test.java`, `*.py` except `test_*.py`, or `*.go` except `*_test.go` plus `go.mod`) and the stage's tests (`StageNNTest.java`, `test_stage_NN.py`, or `stageNN_test.go`) into a temporary directory and runs them (`javac` + `java`, `python3 -m unittest -v`, or `go test ./...`). A failing run prints every failed assertion by name and exits 1. Assertion counts: 43, 46, 59, 50 in Java and Python; 43, 49, 60, 52 in Go.
 
 ## What you keep
 
@@ -81,7 +89,7 @@ The grader copies your sources (`*.java` except `*Test.java`, or `*.py` except `
 
 ## Run with your own inputs
 
-`Main.java` (or `main()` in `main.py`) in your workspace is yours. The reference `Main` prints one trace per stage; you can drive your own scenarios the same way (Python: same names in snake_case, `[60_000, 300_000]` for the delay list, `gateway.payment("pay_1")` returns the payment or `None`):
+`Main.java` (or `main()` in `main.py` / `main.go`) in your workspace is yours. The reference `Main` prints one trace per stage; you can drive your own scenarios the same way (Python: same names in snake_case, `[60_000, 300_000]` for the delay list, `gateway.payment("pay_1")` returns the payment or `None`):
 
 ```java
 FakeClock clock = new FakeClock(1_700_000_000_000L);
@@ -124,12 +132,13 @@ projects/idempotent-payment-gateway/
   project.json
   README.md
   stages/
-    01-idempotency-store/        docs/en.md  starter/java/{Main,Money,Clock,Rng,Idempotency}.java  starter/python/main.py  tests/{java,python}/
-    02-payment-state-machine/    docs/en.md  starter/STAGE.md  tests/{java,python}/
-    03-retries-and-circuit-breaker/  docs/en.md  starter/STAGE.md  tests/{java,python}/
-    04-webhook-dispatch/         docs/en.md  starter/STAGE.md  tests/{java,python}/
+    01-idempotency-store/        docs/en.md  starter/java/{Main,Money,Clock,Rng,Idempotency}.java  starter/python/main.py  starter/go/{go.mod,main,money,clock,rng,idempotency}.go  tests/{java,python,go}/
+    02-payment-state-machine/    docs/en.md  starter/STAGE.md  tests/{java,python,go}/
+    03-retries-and-circuit-breaker/  docs/en.md  starter/STAGE.md  tests/{java,python,go}/
+    04-webhook-dispatch/         docs/en.md  starter/STAGE.md  tests/{java,python,go}/
   solution/java/                 Main, Money, Clock, Rng, Idempotency, Payments, Resilience, Webhooks
   solution/python/               main.py (the same design in one module)
+  solution/go/                   the same eight files as Java, lower-case, in one package main
 ```
 
 You never need `solution/`. The `build-project` skill reads it only to diagnose, and shows at most one function after two honest attempts.

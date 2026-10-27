@@ -3,7 +3,7 @@
 > Rebuild a read model from the log in one command.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 03 (Delivery Guarantees), Phase 8, Lesson 05 (Event Sourcing)
 **Time:** ~75 minutes
 
@@ -377,9 +377,40 @@ Differences, all in `code/python/main.py`:
 
 Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The staleness table in section 6 (mean 24/4/0 ms, overloaded mean 308 max 607) matches the Java output because both are driven by the same SimClock, not by wall time.
 
-### Porting notes
+### In Go
 
-In Go, events are structs implementing a marker interface and `apply` uses a type switch; `decide` and `append` return `error` values (`ErrCommandRejected`, `ErrConcurrency`, `ErrCrash` as sentinels) instead of throwing, and `Projector.RunOnce` returns `(int, error)`. If the Go port runs projectors on goroutines, `CheckpointStore` and each projection need a `sync.Mutex`, and the tests must pass under `go test -race`; the Java version is single-threaded by design and needs none.
+```go
+func (p *Projector) RunOnce(now int64) (int, error) {
+    p.lastRunAt = now
+    batch, err := p.store.ReadAll(p.Position(), p.batchSize)
+    if err != nil {
+        return 0, err
+    }
+    applied := 0
+    for _, env := range batch {
+        p.projection.Apply(env)
+        applied++
+        if p.crashAfterApplies >= 0 && applied >= p.crashAfterApplies {
+            p.crashAfterApplies = -1
+            return applied, fmt.Errorf("%w: projector for %s died after applying %d events, before saving the checkpoint",
+                ErrCrash, CheckpointKey(p.projection), applied)
+        }
+    }
+    if len(batch) > 0 {
+        return applied, p.checkpoints.Save(p.projection, batch[len(batch)-1].Position)
+    }
+    return applied, nil
+}
+```
+
+Differences, all in `code/go/main.go` and `code/go/money.go`:
+
+- **Errors are values.** `Decide`, `Handle`, `Append`, `ReadAll`, `RunOnce`, `CatchUp`, `Promote`, `WaitFor`, and `CheckpointStore.Save` return `error`; the sentinels `ErrCommandRejected`, `ErrConcurrency`, `ErrCrash`, `ErrNotCaughtUp`, `ErrNothingBuilding`, and `ErrCheckpointBackwards` are matched with `errors.Is`. The crash is the interesting one: returning early from `RunOnce` is what leaves the checkpoint unsaved, so the next run redelivers the batch exactly as the Java `throw` does.
+- **Sealed interfaces are marker interfaces plus type switches.** `type Event interface{ isEvent() }` with an unexported method closes the set to this package; `Apply` and `Decide` switch on the concrete type and `panic` in `default` because the compiler does not check exhaustiveness.
+- **Inheritance becomes a flag.** Java's `IdempotentBalanceView extends BalanceView`; Go has no subclassing, so one `BalanceView` struct carries an `idempotent` bool, `NewIdempotentBalanceView` sets it, and `Version()` reports 1 or 2 accordingly. The `appliedThrough` check sits at the top of `Apply` and is the entire difference between the two versions, which is the point of section 5.
+- **Maps have no order.** `BalanceView.All()` and `DailyActivityView.Days()` sort keys so the demo prints accounts and days in `TreeMap` order; `ReadSide` keeps two plain maps keyed by projection name. `Balance` and `Day` return `(value, ok)` where Java returns `null` for a missing row.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The staleness table in section 6 (mean 24/4/0 ms, overloaded mean 308 max 607) matches the Java output because both are driven by the same SimClock, not by wall time.
 
 ## Use It
 

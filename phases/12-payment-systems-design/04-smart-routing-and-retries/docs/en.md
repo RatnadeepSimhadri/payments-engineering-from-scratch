@@ -3,7 +3,7 @@
 > Which processor, which retry, and when to stop.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 03 (Payment Orchestration Across Processors); Phase 12, Lesson 02 (The Payment State Machine); Phase 5, Lesson 10 (Retries, Backoff, and Jitter); Phase 11, Lesson 02 (Card Authorization Lifecycle)
 **Time:** ~90 minutes
 
@@ -419,9 +419,41 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port keeps the same types and method names. The classes become a typed `const` block with `iota`, `rank` uses `sort.SliceStable` with the same comparator, and `route` returns `(RouteResult, error)` only for programmer errors. `math/rand` gives deterministic but different sequences from Java, so the learning demo's counts will differ and tests should assert on properties (acq_b leads, estimates within 0.03 of the truth) rather than exact numbers, unless the 48-bit LCG is ported bit for bit. If the router is shared across goroutines, the estimator, breaker, and budget each need a `sync.Mutex` (or the budget an `atomic.Int64` with a compare-and-swap loop), and `go test -race` should cover a concurrent storm test.
+```go
+// NextDouble is java.util.Random.nextDouble(): 53 random bits scaled by 2^-53.
+func (r *JavaRandom) NextDouble() float64 {
+    return float64((int64(r.next(26))<<27)+int64(r.next(27))) * (1.0 / (1 << 53))
+}
+
+// Fee: amount * bps / 10000 rounded half-up, plus the fixed component. Integer arithmetic only.
+func (c ProcessorConfig) Fee(amount Money) (Money, error) {
+    scaled, err := mulChecked(amount.MinorUnits, c.FeeBps)
+    if err != nil {
+        return Money{}, err
+    }
+    rounded, err := addChecked(scaled, 5_000)
+    if err != nil {
+        return Money{}, err
+    }
+    return OfMinor(floorDiv(rounded, 10_000)+c.FixedFeeMinor, amount.Currency), nil
+}
+```
+
+Differences, all in `code/go/main.go`, `javarandom.go`, `money.go`, and `main_test.go`:
+
+- **`java.util.Random` is ported bit for bit, not swapped for `math/rand`.** `JavaRandom` in `javarandom.go` is the 48-bit LCG with `NextInt(bound)` (rejection loop included) and `NextDouble()`, so seeds 7 (exploration) and 42 (the simulated gateway) roll the same numbers and the learning demo ends on `acq_a 0.803, acq_b 0.929`, `{acq_a=101, acq_b=1899}`, 1892 approvals. `go run .` and the Java demo print identical output.
+- **Checked integer arithmetic.** Go's `*` and `+` wrap silently like Java's primitives, so `Fee` uses `mulChecked`/`addChecked` (returning `ErrOverflow`) in place of `multiplyExact`/`addExact`, and `floorDiv` reproduces `Math.floorDiv`, because Go's `/` truncates toward zero. `Rank` and `Route` therefore return `([]Candidate, error)` and `(RouteResult, error)`; the error is only ever an overflow.
+- **Doubles stay doubles, but multiply-add is kept unfused.** `AuthRateEstimator.Record` wraps `c.approvals*e.decay` in `float64()` so the compiler may not fuse it with the `+ 1` into an FMA, which would change the last bit of the decayed counts on some CPUs and drift from the Java estimates.
+- **Constructor checks become `ErrInvalidArgument`.** `NewPaymentRequest`, `NewProcessorConfig`, `NewAuthRateEstimator`, and `NewRoutingPolicy` return `(T, error)` wrapping one sentinel; the tests check it with `errors.Is`. `ProcessorResponse.of(code, mac)` is `OfMAC` because Go has no overloading, and a missing advice code is `""` rather than `null`.
+- **Ordered maps are slices plus maps.** `DeclineTable` is the ordered rule slice with `declineByCode` as its index; the router keeps processor ids in an `order` slice so `Rank` iterates in registration order before `sort.SliceStable` applies the margin-then-id comparator. The `RouteOutcome` approval is `ROUTE_APPROVED` because `APPROVED` is already the `DeclineClass` in the same package.
+
+```bash
+cd phases/12-payment-systems-design/04-smart-routing-and-retries/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

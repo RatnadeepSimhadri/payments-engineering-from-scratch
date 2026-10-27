@@ -3,7 +3,7 @@
 > Consent flows, token refresh, and the aggregator SDK pattern.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 09 (Idempotency Keys), Phase 5, Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 10, Lesson 01 (Representing Money), Phase 11, Lesson 11 (IBAN, BIC, and Account Number Validation)
 **Time:** ~120 minutes
 
@@ -401,9 +401,35 @@ python3 -m unittest -v
 
 The Python tests port every Java check (64 assertions, including one that pins the `JavaRandom` sequence to values taken from the JDK), and the demo output matches the Java run exactly.
 
-### Porting notes
+### In Go
 
-A Go port returns `(TokenResponse, error)` with a typed `*OAuthError{Code, Description}` that callers test with `errors.As`, uses `crypto/sha256`, `base64.RawURLEncoding`, and `crypto/subtle.ConstantTimeCompare`, and decodes payloads into `map[string]any` with type assertions in the adapters. The `Call` functional interface is a closure, and the mutable `Connection` would need a mutex the moment two goroutines sync the same connection, which the Java version also lacks and which Exercise 3 adds.
+`code/go/main.go` is the same design type for type: `Pkce`, `AuthorizationServer`, `FdxStyleBank`, `UkObStyleBank`, the two adapters, `Aggregator`, and `Connection`, with `javarandom.go` carrying the JDK generator. Four things differ:
+
+- **OAuth errors are a typed value.** Every endpoint returns `(TokenResponse, error)`; the error is `*OAuthError{Code, Description}` and the tests pull the RFC 6749 code out with `errors.As`. The aggregator's "send the user back through consent" case is the sentinel `ErrReauthorizationRequired`, wrapped with `%w` around the connection id and the bank's reason, so `errors.Is` still matches it.
+
+```go
+if r.Status == 401 {
+    fresh, err := c.Auth.Refresh(ClientId, c.RefreshToken)
+    if err != nil {
+        return ApiResponse{}, fmt.Errorf("%w: %s: %v", ErrReauthorizationRequired, c.ConnectionId, err)
+    }
+    c.AccessToken, c.RefreshToken = fresh.AccessToken, fresh.RefreshToken // rotation
+    c.RefreshCount++
+    r = call(c.AccessToken)
+}
+```
+
+- **`java.util.Random` is ported, not replaced.** `math/rand` would give different tokens, so `JavaRandom` implements the 48-bit LCG (`next(bits)`, `NextIntBound` with its rejection loop, `NextBytes` four bytes per draw), and the demo prints the same `77densXCpTK7yGXZ` state and `at_3_3RC4m...` token as the Java run. A test pins four draws to values taken from the JDK.
+- **PKCE is `crypto/sha256` plus `crypto/subtle`.** `ChallengeS256` is `base64.RawURLEncoding` of the digest (no padding by construction), and `Verify` compares with `subtle.ConstantTimeCompare`, the equivalent of `MessageDigest.isEqual`.
+- **Scopes are a bitmask, payloads are `map[string]any`.** `ScopeSet` is a `uint8` with `Contains`, `ContainsAll`, and an `Each` that iterates in declaration order, which keeps the `scope=` query string identical and lets the tests compare consents with `==`. The bank bodies are what `encoding/json` would hand you, so the adapters read them through three small helpers (`str`, `obj`, `list`) instead of Java's unchecked casts; the FDX amount string still goes through `ParseMoney`, never `float64`.
+
+```bash
+cd phases/11-payment-rails/13-open-banking-and-account-aggregation/code/go
+go run .
+go test ./...
+```
+
+The Go tests port every Java check (52 assertions, including the pinned `JavaRandom` sequence), pass under `go test -race`, and the demo output matches the Java run exactly.
 
 ## Use It
 

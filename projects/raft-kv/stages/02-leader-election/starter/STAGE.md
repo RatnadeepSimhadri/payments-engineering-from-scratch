@@ -1,7 +1,7 @@
 # Stage 02 starter
 
 Continue editing the workspace created at stage 1 (`--init`). There is nothing to copy: fill in the election half of
-`RaftNode.java`. `Sim.java` and `Cluster.java` stay as provided; `Storage.java` from stage 1 must not change shape,
+`RaftNode.java` (`raftnode.go` in Go). `Sim.java` and `Cluster.java` stay as provided; `Storage.java` from stage 1 must not change shape,
 because the grader runs the stage 1 tests again before the stage 2 tests.
 
 ## Signatures to implement (all in `RaftNode.java`, all already stubbed)
@@ -48,3 +48,27 @@ class RaftNode:                # fields: id, peers, storage, role, leader_id, co
 # Cluster(size, seed, drop_rate, max_delay) is provided: run / run_until_stable_leader / stable_leader / leaders / max_term /
 # partition / heal / crash / restart / expire_timer, plus nodes, storages, events, leaders_by_term and network.
 ```
+
+## New signatures (Go)
+
+Keep editing the `raftnode.go` the stage-1 starter gave you (`package main`); `sim.go` and `cluster.go` stay as provided.
+
+```go
+func NewRaftNode(id int, peers []int, storage *Storage, rng *Rng, config Config, now int, tracer Tracer) *RaftNode   // given; calls ResetElectionTimer(now)
+// given accessors: ID, CurrentTerm, VotedFor, ClusterSize, Majority, Votes, Log, LastLogIndex, LastLogTerm; NodeName(id)
+// exported fields the harness reads: Peers, Storage, Role, LeaderID, CommitIndex, LastApplied, StateMachine, NextIndex, MatchIndex,
+//                                    VotesGranted (map[int]bool), ElectionDeadline, NextHeartbeat, ElectionsStarted, ConsistencyRejections
+
+func (n *RaftNode) ResetElectionTimer(now int)                   // now + min + rng.NextInt(max - min + 1)
+func (n *RaftNode) Tick(now int) []Message
+func (n *RaftNode) StartElection(now int) []Message
+func (n *RaftNode) Handle(m Message, now int) []Message
+func (n *RaftNode) BecomeFollower(term int64, now int)
+func (n *RaftNode) OnRequestVote(m Message, now int) []Message
+func (n *RaftNode) OnVoteReply(m Message, now int) []Message
+func (n *RaftNode) BecomeLeader(now int) []Message
+func (n *RaftNode) ReplicateAll(now int) []Message
+func (n *RaftNode) OnAppendEntries(m Message, now int) []Message // a second leader in the same term -> panic
+```
+
+An empty reply is `nil`. `NewCluster(size, seed, dropRate, maxDelay)` is provided: `Run` / `RunUntilStableLeader` / `StableLeader` (nil when none) / `Leaders` / `MaxTerm` / `Partition([]int)` / `Heal` / `Crash` / `Restart` / `ExpireTimer`, plus `Nodes`, `Storages`, `Events`, `LeadersByTerm` and `Network`.

@@ -3,7 +3,7 @@
 > A hot key expires and ten thousand requests hit the database.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 9, Lesson 03 (Caching Strategies), Phase 5, Lesson 10 (Retries, Backoff, and Jitter), Phase 1, Lesson 09 (Heaps and Priority Queues)
 **Time:** ~75 minutes
 
@@ -379,9 +379,40 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `container/heap` for the event queue, `math/rand` with a fixed source, and the `Waiter` interface becomes `func(Money)`. A Go port that replaces the simulator with real goroutines must guard `inFlight`, `locks`, and `refreshing` with a `sync.Mutex` and pass `go test -race ./...`; `golang.org/x/sync/singleflight` is the production version of Step 5 and is worth reading alongside the port. In all three languages, `rand` in `(0, 1]` versus `[0, 1)` is the detail that decides whether `ln(0)` can occur.
+```go
+// Schedule queues an action at an absolute time; it panics on time travel because that is a bug in the caller.
+func (s *Simulator) Schedule(atMs int64, action func()) {
+    if atMs < s.nowMs {
+        panic(fmt.Sprintf("cannot schedule in the past: %d < %d", atMs, s.nowMs))
+    }
+    heap.Push(&s.queue, event{atMs, s.seq, action})
+    s.seq++
+}
+
+func (s *Simulator) Run() {
+    for s.queue.Len() > 0 {
+        e := heap.Pop(&s.queue).(event)
+        s.nowMs = e.atMs
+        e.action()
+    }
+}
+```
+
+Differences, all in `code/go/main.go` and `javarandom.go`:
+
+- **The event queue is `container/heap`.** `eventQueue` implements `heap.Interface` with `Less` ordering by `(atMs, seq)`, so same-instant events run in scheduling order exactly as the Java `PriorityQueue` comparator does. `Runnable` becomes `func()`, `Waiter` and `Callback` become `func(Money)`; each strategy's load callback is a closure over `started`, `key`, and the measured waiter, which is the same shape as the Java lambdas.
+- **The abstract class is an interface plus an embedded struct.** `Strategy` declares `Name`, `Get`, `Invalidate`, `Stats`, `Store`; `strategyBase` holds the shared fields and the `freshEntry`, `measured`, and `freshHit` helpers, and the five concrete strategies embed it. `Factory` is `func(*Simulator, *BackingStore) Strategy`, so the beta sweep needs no default-argument trick: Go 1.22 gives each loop iteration its own `beta`.
+- **Both RNGs are `java.util.Random`.** The jitter in `Scenario.Run` and the XFetch draw in `ShouldRecompute` use `JavaRandom` (48-bit LCG; `NextInt(2)` takes the power-of-two path, `NextDouble` is `(next(26)<<27 + next(27)) / 2^53`), so the loads, peak in-flight, and stale columns match the Java table digit for digit; `TestDemoParity` pins 103/102/1099 for naive and 5/3/761 for early expiry. `Double.MIN_VALUE` is `math.SmallestNonzeroFloat64`.
+- **Errors are values, panics are bugs.** `Money.Minus` returns `(Money, error)` with `ErrCurrencyMismatch`; the scenario's debit uses `must(...)` because a failing subtraction there is a programming error. `Simulator.Schedule` panics rather than returning an error for the same reason, and the test recovers it with `defer`/`recover()`.
+- **Integer semantics match.** `AverageLeadMs` and `gapMicros = 1_000_000 / requestsPerSecond` are `int64` division, which truncates like Java `long`; `float64(now) + gap >= float64(freshUntil)` is the Java `long + double` comparison written out.
+
+```bash
+cd phases/09-reliability-and-scale/04-cache-invalidation-and-stampedes/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

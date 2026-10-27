@@ -3,7 +3,7 @@
 > A log is not a queue: nothing is removed when it is read, the position belongs to the reader, and the only write is an append.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 7, Lesson 02 (Write-Ahead Logs)
 **Time:** ~120 minutes
 
@@ -416,10 +416,12 @@ func (s *Segment) Read(offset int64, maxRecords int) ([]StoredRecord, error)
 
 Differences, all in `code/go/main.go`:
 
-- **Errors are values.** `Append`, `Read`, `PositionOf`, `Seek`, and `Commit` return `error`; `outOfRange(...)` builds the message. Tests use `err != nil` where Java uses `checkThrows`.
+- **Errors are values.** `Segment.Append`, `Read`, `PositionOf`, `SeekTo`, and `Commit` return `error`; `outOfRange(...)` wraps the sentinel `ErrOffsetOutOfRange` so tests use `errors.Is` where Java uses `checkThrows`. `SeekTo` is Java's `seek`, renamed because `go vet` reserves the name `Seek` for `io.Seeker`'s signature. `Partition.Append` returns a plain `int64`: a fresh segment accepts any frame, so the roll can never fail.
 - **`binary.BigEndian.AppendUint32`** (Go 1.19+) builds the frame without a bytes.Buffer. `-1` for a null key is written as `uint32(0xFFFFFFFF)` and read back as `int32`, which is the two's-complement round trip Java gets for free.
 - **`nil` versus empty slice.** A nil key means "no key"; an empty `[]byte{}` is a zero-length key with its own partition. `Decode` returns `nil` when `keyLength` is -1 so the partitioner's `key == nil` check agrees with Java's `null`.
 - **`Fnv1a32` returns `uint32`**, so `PartitionFor` casts to `int` after masking the top bit; no negative modulo is possible.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same offsets, segment layout, byte counts, and frame hex as the Java version.
 
 ## Use It
 

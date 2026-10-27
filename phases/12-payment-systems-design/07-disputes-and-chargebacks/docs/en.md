@@ -3,7 +3,7 @@
 > A state machine that runs for 120 days.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 06 (Refunds, Partial Refunds, and Refund Windows); Phase 10, Lesson 07 (Holds and Available Balance); Phase 11, Lesson 06 (3-D Secure and Strong Customer Authentication)
 **Time:** ~90 minutes
 
@@ -380,9 +380,39 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go, evidence types are an `iota` enum and a requirement is a `[]EvidenceType` slice kept in declaration order; `Apply` returns `(ApplyOutcome, error)` with an `ErrIllegalTransition` sentinel wrapped with the precise message; dates are `time.Time` at midnight UTC compared with `After`. The sweep is single-threaded; if it runs alongside webhook handlers, each dispute needs Lesson 02's version check so that a sweep and an issuer event racing on the same dispute cannot both apply.
+```go
+// ErrIllegalTransition is the sentinel every refused transition matches with errors.Is; the error's
+// text is the precise reason, as the Java exception message was.
+var ErrIllegalTransition = errors.New("illegal dispute transition")
+
+type transitionError struct{ msg string }
+
+func (e *transitionError) Error() string        { return e.msg }
+func (e *transitionError) Is(target error) bool { return target == ErrIllegalTransition }
+
+func (s *DisputeService) Apply(disputeID string, e DisputeEvent) (ApplyOutcome, error) {
+    ...
+    rule, err := s.Resolve(d, e) // fails before any mutation
+    if err != nil {
+        return DUPLICATE, err
+    }
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+
+- **Refusals are one sentinel with many messages.** `Resolve` and `Apply` return an error that `errors.Is(err, ErrIllegalTransition)` recognises while `err.Error()` still says exactly why (`"dp_1: evidence for VISA 13.1 is incomplete; missing one of [[PROOF_OF_DELIVERY, SIGNED_DELIVERY]]"`), so the demo prints the same line as Java. `SweepDeadlines` returns `([]string, error)`, `OpenChargeback` and `OpenInquiry` return `(*Dispute, error)`, and duplicate ids wrap `ErrIllegalState`.
+- **`null` is a pointer.** `Dispute.Deadline` is `*time.Time` (a state with no deadline), `DisputeEvent.Evidence` is `*EvidenceBundle` (an event with no bundle, which the `EVIDENCE_COMPLETE_IN_TIME` guard rejects), and the opening `DisputeTransition` has `nil` `Kind` and `From`, printed as `OPENED` and `-`.
+- **`EnumSet` becomes a sorted slice.** A `Requirement` is a `[]EvidenceType` that `OneOf` sorts into declaration order, so `[REFUND_POLICY, REFUND_ISSUED]` prints the way Java's `EnumSet` iterates even though the rule lists them the other way round; `Requirement.Equal` compares two groups element by element where Java used `Set.equals`. `ReasonTable` is an ordered slice indexed by `reasonByKey`, and `RULES` is a slice searched by `findRule`.
+- **Dates are midnight-UTC `time.Time`.** `Date(2026, time.February, 2)` stands in for `LocalDate.of`, `AddDate(0, 0, days)` for `plusDays`, `After` for `isAfter`, and `DaysBetween` for `ChronoUnit.DAYS.between`.
+- **The exhaustive tests are loops over explicit slices.** Go's `iota` has no `values()`, so `DisputeStates` and `DisputeEventKinds` are the slices the test walks to prove that all 18 rules fire and all 112 other pairs are refused without touching the ledger or the history.
+
+```bash
+cd phases/12-payment-systems-design/07-disputes-and-chargebacks/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

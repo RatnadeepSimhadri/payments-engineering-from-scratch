@@ -2,7 +2,7 @@
 // Stage 2 adds election (Figure 2: Followers, Candidates, RequestVote RPC), Stage 3 log replication (AppendEntries RPC,
 // nextIndex/matchIndex), Stage 4 commit and apply (commitIndex, lastApplied, the KV state machine).
 // Sources: Ongaro & Ousterhout, "In Search of an Understandable Consensus Algorithm" (USENIX ATC 2014), Figure 2,
-//          sections 5.2, 5.3, 5.4.1, 5.4.2, 8. Java 21, standard library only. Python port in solution/python; Go port follows later.
+//          sections 5.2, 5.3, 5.4.1, 5.4.2, 8. Java 21, standard library only. Python port in solution/python; Go port in solution/go.
 
 import java.util.ArrayList;
 import java.util.HashMap;

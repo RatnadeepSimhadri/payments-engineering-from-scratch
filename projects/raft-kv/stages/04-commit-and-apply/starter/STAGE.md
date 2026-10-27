@@ -47,3 +47,23 @@ class Checker:
 # ops() / size() / op(id); Cluster.submit(client, command) -> op id, submit_until_accepted, run_until_settled, run_until_applied,
 # pending_count(), completed (list[Op]), failed (list[ClientOp]), history(), state_machines_converged().
 ```
+
+## New signatures (Go)
+
+Finish `raftnode.go`, implement `KVStore.Apply` in `kvstore.go`, and implement `Checker` in `linearizability.go` (`Op`, `History`, `CheckResult` there are provided).
+
+```go
+func (n *RaftNode) AdvanceCommitIndex(now int)      // highest N > CommitIndex with TermAt(N) == CurrentTerm and a majority
+func (n *RaftNode) ApplyCommitted(now int)          // for LastApplied < CommitIndex: LastApplied++; apply Log[LastApplied].Command
+// upgraded: OnAppendReply calls AdvanceCommitIndex; OnAppendEntries applies rule 5 (min(LeaderCommit, lastNew))
+
+// KVStore: fields Data map[string]string, AppliedCommands, Results []string; ErrBadCommand is declared for you
+func (kv *KVStore) Apply(command string) (string, error)   // PUT -> "OK"; GET -> value or ""; NOOP -> ""; malformed -> wraps ErrBadCommand, not recorded
+func (kv *KVStore) Get(key string) (string, bool); Applied() int   // given
+
+func NewChecker() *Checker
+func (c *Checker) Check(history *History) CheckResult               // CheckResult{OK, Order, LongestPrefix []int, Explored}
+func Step(state map[string]string, op Op) (map[string]string, bool) // PUT -> a new map (maps.Clone); GET -> the same map, true iff the value matches
+```
+
+Provided: `Op{ID, Client, Kind, Key, Value, InvokedAt, ReturnedAt}` with `Precedes(other)`; `NewHistory().Put(...).Get(...)`, `Ops()` / `Size()` / `Op(id)`; `Cluster.Submit(client, command) int` (op id), `SubmitUntilAccepted(...) (int, error)`, `RunUntilSettled`, `RunUntilApplied`, `PendingCount()`, `Completed []Op`, `Failed []ClientOp`, `History() (*History, error)`, `StateMachinesConverged()`. The memo key `fmt.Sprintf("%d|%v", done, state)` works because `%v` prints map keys sorted, like Java's `TreeMap.toString()`.

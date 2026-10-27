@@ -56,9 +56,9 @@ Opening the chart: `open("bank", ASSET, USD)` returns the account; `open("bank",
 
 ## Your task
 
-Run `--init` to create a workspace; it contains `Money.java`, `Accounts.java`, and `Main.java`. (In Python the workspace is a single `main.py` holding the same given parts and the same stubs; later stages add to that one file.) `Currency`, `Rounding`, `CurrencyMismatchException`, `Money.ofMinor`, `negate`, `abs`, `isZero/isNegative/isPositive`, `sum`, `compareTo`, and `toString` are given. The exception classes are given. Everything below throws `UnsupportedOperationException` until you replace it.
+Run `--init` to create a workspace; it contains `Money.java`, `Accounts.java`, and `Main.java`. (In Python the workspace is a single `main.py` holding the same given parts and the same stubs; later stages add to that one file. In Go it is `go.mod`, `money.go`, `accounts.go`, and `main.go`, with every stub a `panic("not implemented: ...")`.) `Currency`, `Rounding`, `CurrencyMismatchException`, `Money.ofMinor`, `negate`, `abs`, `isZero/isNegative/isPositive`, `sum`, `compareTo`, and `toString` are given. The exception classes are given. Everything below throws `UnsupportedOperationException` until you replace it.
 
-Signatures (Java 21 first, then the same surface in Python; Go port follows later):
+Signatures (Java 21 first, then the same surface in Python and in Go):
 
 ```java
 record Money(long minorUnits, Currency currency) implements Comparable<Money> {
@@ -113,6 +113,35 @@ class AccountRegistry:
     def size(self) -> int: ...
     def all(self) -> tuple[Account, ...]: ...                                               # opening order, immutable
 ```
+
+The same surface in Go (`package main`, several files in one module; exported CamelCase names, errors are returned values tested with `errors.Is`):
+
+```go
+type Money struct{ MinorUnits int64; Currency Currency }   // == compares both fields, like a Java record
+func Parse(text string, currency Currency) (Money, error)   // excess decimals -> ErrExcessPrecision; not a decimal -> ErrNotDecimal; huge -> ErrOverflow
+func (m Money) Plus(other Money) (Money, error)             // ErrCurrencyMismatch on a different currency; ErrOverflow instead of Math.addExact
+func (m Money) Minus(other Money) (Money, error)
+func (m Money) Times(numerator, denominator int64, rounding Rounding) (Money, error)   // denominator <= 0 -> ErrBadDenominator
+func DivideRounded(dividend, divisor int64, rounding Rounding) int64
+func (m Money) Allocate(ratios ...int64) ([]Money, error)   // no / negative / all-zero ratios -> ErrBadRatios
+
+type Side int;        const ( Debit Side = iota; Credit );                                  func (s Side) Opposite() Side
+type AccountType int; const ( Asset AccountType = iota; Liability; Equity; Revenue; Expense ); func (t AccountType) NormalSide() Side
+
+type Account struct{ ID string; Type AccountType; Currency Currency }
+func NewAccount(id string, accountType AccountType, currency Currency) (Account, error)   // blank id or zero Currency{} -> error
+func (a Account) NormalSide() Side
+
+var ErrLedger = errors.New("ledger rule violated")                 // given; ErrDuplicateAccount and ErrUnknownAccount wrap it with %w
+func NewAccountRegistry() *AccountRegistry
+func (r *AccountRegistry) Open(id string, accountType AccountType, currency Currency) (Account, error)   // ErrDuplicateAccount
+func (r *AccountRegistry) Get(id string) (Account, error)                                               // ErrUnknownAccount, never a zero Account
+func (r *AccountRegistry) Contains(id string) bool
+func (r *AccountRegistry) Size() int
+func (r *AccountRegistry) All() []Account                                                               // opening order, a fresh slice
+```
+
+In Go the exception hierarchy becomes sentinel errors: `ErrDuplicateAccount` is built as `fmt.Errorf("%w: account already exists", ErrLedger)`, so `errors.Is(err, ErrLedger)` is true for every ledger rejection while `errors.Is(err, ErrDuplicateAccount)` still identifies the specific one. Return the sentinel wrapped with the detail (`fmt.Errorf("%w: %s", ErrDuplicateAccount, id)`). `int64` wraps silently, so the given `addChecked` / `mulChecked` helpers are your `Math.addExact`; there is no `null`, so `NewAccount` rejects a blank id and the zero `Currency{}` instead. Go maps have no insertion order: the registry keeps the ids in a slice next to the map so `All()` can return them in opening order.
 
 What each must do:
 
@@ -170,11 +199,13 @@ Nothing in this stage knows about postings or balances yet. Stage 2 will combine
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --init ~/ledger-engine-java   # once
 python3 scripts/project_test.py ledger-engine --lang python --init ~/ledger-engine-py   # once
+python3 scripts/project_test.py ledger-engine --lang go --init ~/ledger-engine-go       # once
 python3 scripts/project_test.py ledger-engine --lang java --stage 1 --path ~/ledger-engine-java
 python3 scripts/project_test.py ledger-engine --lang python --stage 1 --path ~/ledger-engine-py
+python3 scripts/project_test.py ledger-engine --lang go --stage 1 --path ~/ledger-engine-go
 ```
 
-The stage-1 suite has 64 checks. A failing check prints as `FAIL: <name>`; the names are sentences ("half-even tie goes to even (10.05 * 50%)") so you can find the case without opening the test file. Run your own `Main` with `javac -d .out *.java && java -cp .out Main` from the workspace at any time.
+The stage-1 suite has 64 checks. A failing check prints as `FAIL: <name>`; the names are sentences ("half-even tie goes to even (10.05 * 50%)") so you can find the case without opening the test file. Run your own `Main` with `javac -d .out *.java && java -cp .out Main` (or `python3 main.py`, or `go run .`) from the workspace at any time.
 
 ## Check yourself
 

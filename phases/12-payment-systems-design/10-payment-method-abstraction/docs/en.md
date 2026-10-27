@@ -3,7 +3,7 @@
 > One interface, nine rails, no leaking of processor quirks.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 04 (Smart Routing, Cascading, and Retry Policies); Phase 12, Lesson 05 (Webhooks); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -441,9 +441,41 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: the port is an `interface`, the instrument is an interface with an unexported marker method (Go has no sealed types, so add a default case that returns an error), `UnsupportedCapabilityException` becomes a sentinel `ErrUnsupported` checked with `errors.Is`, and `translateEvent` returns `(PaymentEvent, bool)`. Money stays integer minor units; the lesson needs no concurrency.
+```go
+// PaymentMethod is the sealed interface: Go has no sealed types, so the unexported marker
+// method keeps the set of instruments closed to this package.
+type PaymentMethod interface {
+    Type() MethodType
+    Token() string
+    paymentMethod()
+}
+
+func (c *CardAdapter) Charge(request ChargeRequest) (PaymentResult, error) {
+    card, ok := request.Method.(CardMethod)
+    if !ok {
+        return PaymentResult{}, fmt.Errorf("%w: card adapter given %v", ErrInvalidArgument, request.Method.Type())
+    }
+    if err := cardCaps.RequireCurrency(c.Name(), request.Amount.Currency); err != nil {
+        return PaymentResult{}, err
+    }
+    ...
+}
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+
+- **The port returns errors as values.** `Charge`, `Capture`, and `Refund` return `(PaymentResult, error)`; `UnsupportedCapabilityException` is the sentinel `ErrUnsupportedCapability`, wrong instruments and zero amounts wrap `ErrInvalidArgument`, and a duplicate `Register` wraps `ErrIllegalState`, all checked with `errors.Is`. The conformance suite's `throwsUnsupported` becomes `failsUnsupported(action func() error) (bool, int)`, returning the vendor-call delta instead of filling an `int[]`.
+- **`Optional` is a second return value.** `TranslateEvent` returns `(PaymentEvent, bool)`, and `PaymentService.OnRawEvent`/`Lookup` return `(PaymentResult, bool)`; `false` is Java's `Optional.empty()`.
+- **Enums carry their data through parallel tables.** `DeclineReason` is an `int` constant whose `Advice()` indexes a `declineAdvice` array, so the retry advice still travels with the reason; the `RESPONSE_CODES`, `RETURN_CODES`, and `ISSUES` maps are package-level `map[string]DeclineReason` values with a shared `lookupReason` that falls back to `UNKNOWN`. `Capabilities.Flags()` returns the declared flags in declaration order, which is what `EnumSet` iteration printed in the Java demo.
+- **The conformance check count is unchanged.** The suite wraps each port call so an unexpected `error` is recorded as a failure without incrementing `checks`; the card, bank, and wallet adapters still report 19, 19, and 21 checks.
+
+```bash
+cd phases/12-payment-systems-design/10-payment-method-abstraction/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

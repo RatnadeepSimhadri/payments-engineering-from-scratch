@@ -3,7 +3,7 @@
 > The fast producer, the slow consumer, and the queue in between.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 08 (Watermarks, Event Time, and Late Data), Phase 4, Lesson 03 (Bounded Buffers and Producer-Consumer), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
@@ -319,9 +319,38 @@ Differences, all in `code/python/main.py`:
 
 Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. Both tables match the Java output number for number.
 
-### Porting notes
+### In Go
 
-In Go, `BoundedQueue` is a slice-backed ring or a `container/list`; `request(n)` with `n <= 0` returns an error value; and the natural production analogue is a buffered channel, where `select` with a `default` case is `DROP_NEWEST` and a plain send is `BLOCK`. The Go port keeps the simulation single-threaded with a seeded generator (`rand.New(rand.NewSource(42))`); because Go's generator differs from `java.util.Random`, that port asserts the invariants and the qualitative ordering, not the exact counts.
+```go
+type BoundedQueue[T any] struct {
+    items    []T
+    capacity int
+    policy   OverflowPolicy
+    dropped  int64
+    maxDepth int
+}
+
+func (s *DemandSubscription) Request(n int64) error {
+    if n <= 0 {
+        return ErrInvalidDemand
+    }
+    next := s.demand + n
+    if next < 0 { // wrapped: saturate, never wrap
+        next = math.MaxInt64
+    }
+    s.demand = next
+    return nil
+}
+```
+
+Differences, all in `code/go/main.go`, `code/go/javarandom.go`, and `code/go/money.go`:
+
+- **The queue is a generic slice, not a buffered channel.** `BoundedQueue[T any]` keeps the capacity check and the overflow policy explicit and counted; a channel with `select { default: }` is a built-in `DROP_NEWEST` that never reports the drop, and a blocking send hides `BLOCK` inside the scheduler. `Poll` returns `(T, bool)` where Java returns `null`. The Go type system cannot refuse a nil `T`, so the Java `NullPointerException` test has no counterpart.
+- **Saturation uses the same wrap test.** `int64` overflows silently like Java's `long`, so `next < 0` after the addition is exactly the Java check; `TryConsumeOne` leaves `math.MaxInt64` untouched (rule 3.17). `Request(n <= 0)` returns `ErrInvalidDemand` instead of throwing.
+- **The seeded run reproduces `java.util.Random`.** `math/rand` would pick different jitter, amounts, and stalls and the table would not match. `JavaRandom` is the 48-bit LCG with `NextInt(bound)`'s power-of-two fast path and rejection loop (the `bits-val+(bound-1) < 0` overflow test works unchanged on `int32`) and `NextDouble`, so every count in the demo, down to `rejectedOffers=1977`, is identical; the test pins those counts.
+- **Two enums share names in one package.** Java has `OverflowPolicy.BLOCK` and `Strategy.BLOCK` in separate types; Go constants live in one namespace, so the strategies are `Unbounded`, `StrategyDropNewest`, `StrategyDropOldest`, `StrategyBlock`, `Pull` and `String()` prints the Java names. `Stats` is a plain struct of comparable fields, so `==` gives the determinism check for free.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. Both tables match the Java output number for number.
 
 ## Use It
 

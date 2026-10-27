@@ -64,6 +64,37 @@ class Ledger:
     # window_days < 0 -> ValueError; wrong currency -> CurrencyMismatchError; bad date -> LedgerError (datetime.date.fromisoformat)
 ```
 
+## New signatures (Go)
+
+Add `reconciliation.go`; add `Lines` and `Reconcile` to `ledger.go`.
+
+```go
+type StatementLine struct{ Ref string; Amount Money; Date string }
+func NewStatementLine(ref string, amount Money, date string) (StatementLine, error)   // blank ref/date -> error
+type LedgerLine struct{ Ref string; Amount Money; Date string }
+
+type BreakType int; const ( MissingInLedger BreakType = iota; MissingInStatement; AmountMismatch; Duplicate )
+type MatchedBy int; const ( ByRef MatchedBy = iota; ByAmountAndDate )
+type ReconciliationMatch struct{ LedgerRef, StatementRef string; Amount Money; By MatchedBy }
+type ReconciliationBreak struct{ Type BreakType; Ref string; LedgerAmount, StatementAmount Money }
+type ReconciliationReport struct{ AccountID string; Currency Currency; Matches []ReconciliationMatch; Breaks []ReconciliationBreak; LedgerTotal, StatementTotal Money }
+func (r ReconciliationReport) MatchedTotal() Money
+func (r ReconciliationReport) LedgerBreakTotal() Money
+func (r ReconciliationReport) StatementBreakTotal() Money
+func (r ReconciliationReport) BreaksOf(kind BreakType) []ReconciliationBreak
+func (r ReconciliationReport) TiesOut() bool
+func (r ReconciliationReport) IsClean() bool
+
+var ErrBadDate error   // wraps ErrLedger
+func ParseDate(text string) (time.Time, error)                        // time.Parse("2006-01-02", text); ErrBadDate otherwise
+func WithinWindow(a, b string, windowDays int) (bool, error)
+func (l *Ledger) Lines(accountID string) ([]LedgerLine, error)
+func (l *Ledger) Reconcile(accountID string, statement []StatementLine, windowDays int) (ReconciliationReport, error)
+// windowDays < 0 -> error; wrong currency -> ErrCurrencyMismatch; bad date -> ErrBadDate (which errors.Is ErrLedger)
+```
+
+`time.Parse` with the layout `2006-01-02` is the strict ISO-8601 date parser; the day difference is `b.Sub(a).Hours() / 24` because both values are midnight UTC. Build the statement with struct literals in tests and demos (`StatementLine{"sale-1", amount, "2026-10-01"}`); `NewStatementLine` is the validating constructor for input you do not trust.
+
 ## Algorithm in one screen
 
 0. Validate: unknown account → `UnknownAccountException`; `windowDays < 0` → `IllegalArgumentException`; statement currency != account currency → `CurrencyMismatchException`; unparseable date → `LedgerException`. `ledgerTotal` = sum of lines; `statementTotal` = sum of every statement line (duplicates included).
@@ -78,6 +109,8 @@ Matches: pass 1 first, then pass 2. `reconcile` never changes the journal.
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 4 --path <workspace>
 python3 scripts/project_test.py ledger-engine --lang python --stage 4 --path <workspace>
+python3 scripts/project_test.py ledger-engine --lang go --stage 4 --path <workspace>
 python3 scripts/project_test.py ledger-engine --lang java --all --path <workspace>
 python3 scripts/project_test.py ledger-engine --lang python --all --path <workspace>
+python3 scripts/project_test.py ledger-engine --lang go --all --path <workspace>
 ```

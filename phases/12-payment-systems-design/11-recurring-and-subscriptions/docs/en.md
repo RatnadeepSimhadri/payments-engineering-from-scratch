@@ -3,7 +3,7 @@
 > Billing cycles, proration, and the retry schedule that recovers revenue.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 04 (Smart Routing, Cascading, and Retry Policies); Phase 12, Lesson 10 (Payment Method Abstraction); Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -390,9 +390,39 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `time.Time.AddDate(0, n, 0)` *normalizes* instead of clamping (Jan 31 plus one month is March 3), so the Go port must clamp explicitly; this is the single most likely porting bug. The engine is single-threaded by design; a sharded production run needs a row lock per subscription.
+```go
+// plusMonths is LocalDate.plusMonths: the day-of-month is clamped to the target month's length.
+// time.Time.AddDate normalizes instead (Jan 31 + 1 month = Mar 3), which is exactly the drift bug.
+func plusMonths(d time.Time, months int64) time.Time {
+    y, m, day := d.Date()
+    total := int64(y)*12 + int64(m-1) + months
+    ny, nm := total/12, total%12
+    if nm < 0 {
+        nm += 12
+        ny--
+    }
+    last := time.Date(int(ny), time.Month(nm+2), 0, 0, 0, 0, 0, time.UTC).Day() // day 0 of next month
+    if day > last {
+        day = last
+    }
+    return Date(int(ny), time.Month(nm+1), day)
+}
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+
+- **Go has no `LocalDate`, and `AddDate` does not clamp.** Dates are `time.Time` values at midnight UTC; `plusMonths` above does what `LocalDate.plusMonths` does, and `ChainedStarts` calls it too, so the drift it demonstrates is the real month-end drift, not Go's normalization. `daysBetween` is `ChronoUnit.DAYS.between` for midnight dates. The invariant test walks every day of four month lengths through `plusMonths`.
+- **Errors are values.** `PeriodStart`, `ComputeProration`, `NewPlan`, `NewDunningPolicy`, `Subscribe`, and `ChangePlan` return `(T, error)` wrapping `ErrInvalidArgument`, `ErrIllegalState`, or `ErrCurrencyMismatch`; `Subscription.Transition` returns `ErrIllegalTransition`, which wraps `ErrIllegalState` so either sentinel works with `errors.Is`. Inside the engine, transitions the state table guarantees are legal are unwrapped with `mustOK`, because a failure there is a bug in the engine, not a runtime condition.
+- **`null` becomes the zero value.** `Invoice.NextAttempt` and `FirstFailure` are the zero `time.Time` while unset (`IsZero()`); `CardUpdater.Refresh` returns `(string, bool)` for Java's `Optional<String>`; `BillingEngine.Invoice(id)` returns a nil pointer for an unknown id.
+- **Insertion order is explicit.** Java's `LinkedHashMap` for subscriptions and invoices becomes a map plus an order slice, so `RunDay` visits subscriptions and invoices in creation order and the log lines come out in the same order as the Java demo.
+
+```bash
+cd phases/12-payment-systems-design/11-recurring-and-subscriptions/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

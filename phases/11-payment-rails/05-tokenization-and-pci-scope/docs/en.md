@@ -3,7 +3,7 @@
 > Never store the PAN; here is what you store instead.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 11, Lesson 04 (PANs, Luhn, and BIN Range Routing), Phase 0, Lesson 09 (Hashing and Cryptographic Primitives)
 **Time:** ~90 minutes
 
@@ -329,9 +329,34 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port uses `crypto/aes` + `crypto/cipher.NewGCM` directly, `crypto/hmac`, and `crypto/rand` for production with an injected `io.Reader` for tests; errors are values (`ErrUnauthorized`, `ErrTokenState`), and `Pan` should implement `fmt.Stringer` with the digits in an unexported field so `%+v` cannot print them. The nonce counter needs a mutex if the vault is shared across goroutines.
+The full port is `code/go/main.go` (same `Pan`, `Principal`, `TokenRecord`, `TokenVault`, `SystemInventory`; tests in `code/go/main_test.go`). Unlike Python, Go's standard library has real AES-GCM, so there is no substitution: the demo prints the same ciphertext hex as Java, byte for byte. Three things differ:
+
+- **The AEAD is a `cipher.AEAD` built once in the constructor.** `aes.NewCipher` plus `cipher.NewGCM` replaces `Cipher.getInstance("AES/GCM/NoPadding")` on every call; `Seal` appends the 16-byte tag and `Open` verifies it in constant time before returning any plaintext. The token is passed as the additional data, so a record moved to another token fails to open:
+
+```go
+func (v *TokenVault) Encrypt(plaintext, nonce []byte, aad string) []byte {
+	return v.aead.Seal(nil, nonce, plaintext, []byte(aad))
+}
+
+func (v *TokenVault) Decrypt(ciphertext, nonce []byte, aad string) ([]byte, error) {
+	plain, err := v.aead.Open(nil, nonce, ciphertext, []byte(aad))
+	if err != nil {
+		return nil, ErrAuthentication // tampered record, wrong token, or wrong key: GCM does not say which
+	}
+	return plain, nil
+}
+```
+
+- **Exceptions become sentinel errors.** `AuthorizationException` is `ErrUnauthorized`, `TokenStateException` is `ErrTokenState`, `SecurityException` is `ErrAuthentication` and `IllegalArgumentException` is `ErrInvalidArgument`; every path wraps one with `fmt.Errorf("%w: ...")` so callers test `errors.Is` and the tests assert the kind of failure, not just that one happened. `Suspend`, `Reactivate` and `Revoke` return `error` instead of `void`.
+- **The mask has to cover four `fmt` verbs.** `String()` handles `%v` and `%s`, the unexported `digits` field keeps `%+v` honest, and `GoString()` handles `%#v`, which bypasses `Stringer` and would otherwise print the struct in Go syntax with the field. `Equal` uses `crypto/subtle.ConstantTimeCompare` like Java's `MessageDigest.isEqual`. Randomness is the JDK's: `javarandom.go` ports `java.util.Random` including `nextBytes`, so `DemoKey`, the minted tokens and the nonces match the Java demo and the test pins those values.
+
+```bash
+cd phases/11-payment-rails/05-tokenization-and-pci-scope/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

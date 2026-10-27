@@ -1,13 +1,13 @@
 # Payments Engineering from Scratch
 
-Build data structures, distributed systems, and payment systems from first principles, in the language you choose. Every Build lesson ships a from-scratch implementation with tests, a quiz, and an artifact you keep. **Java is the primary language and ships first; Python and Go ports are being added lesson by lesson** (several lessons already have all three), and the tutor teaches in whichever you pick.
+Build data structures, distributed systems, and payment systems from first principles, in the language you choose. Every Build lesson ships a from-scratch implementation with tests, a quiz, and an artifact you keep. **Every Build lesson ships the same design in Java, Python, and Go**, with the same tests and the same demo output, and the tutor teaches in whichever you pick.
 
 **[Start learning](#choose-how-to-learn)** · **[Choose a track](#learning-paths)** · **[Build a project](#projects)** · **[Browse the curriculum](#contents)**
 
 Free, open source, MIT. Learn with a coding agent as your tutor, or by running the code locally.
 
 <!-- COUNTS:START -->
-> 199 lessons. 16 phases. 3 tracks. Java, Python. ~329 hours of guided building.
+> 199 lessons. 16 phases. 3 tracks. Java, Python, Go. ~329 hours of guided building.
 <!-- COUNTS:END -->
 
 ## Why this course exists
@@ -83,7 +83,7 @@ python3 scripts/run_lesson.py phases/10-money-and-ledgers/01-representing-money 
 python3 scripts/run_lesson.py phases/10-money-and-ledgers/01-representing-money --lang java
 ```
 
-You need Java 21+ to run every complete lesson. Python 3.11+ and Go 1.22+ run the lessons that already have those ports (`run_lesson.py` reports `SKIP` for the rest). There are no package managers, build tools, or third-party libraries anywhere in the curriculum: every lesson compiles with `javac`, runs with `python3`, or builds with `go run`.
+You need Java 21+, Python 3.11+, or Go 1.22+, depending on the language you choose; every Build lesson and every project runs in all three. There are no package managers, build tools, or third-party libraries anywhere in the curriculum: every lesson compiles with `javac`, runs with `python3`, or builds with `go run`.
 
 <details>
 <summary>Use every lesson the same way</summary>
@@ -98,7 +98,7 @@ You need Java 21+ to run every complete lesson. Python 3.11+ and Go 1.22+ run th
 
 ## Projects
 
-Staged projects with starters, graders, and reference solutions (Java today; Python and Go ports to follow). The grader runs every earlier stage too, so a regression is reported the moment you introduce it.
+Staged projects with starters, graders, and reference solutions in Java, Python, and Go. The grader runs every earlier stage too, so a regression is reported the moment you introduce it.
 
 ```bash
 python3 scripts/project_test.py --list
@@ -338,16 +338,16 @@ flowchart TB
 
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
-| 01 | [The Append-Only Log: Partitions, Offsets, and Segments](phases/08-messaging-and-streams/01-the-append-only-log/) | Build | Java, Python | ✅ |
-| 02 | [Consumer Groups, Offsets, and Rebalancing](phases/08-messaging-and-streams/02-consumer-groups-and-rebalancing/) | Build | Java, Python | ✅ |
-| 03 | [At-Most-Once, At-Least-Once, and Effectively-Once](phases/08-messaging-and-streams/03-delivery-guarantees/) | Build | Java, Python | ✅ |
-| 04 | [Message Ordering, Keys, and Head-of-Line Blocking](phases/08-messaging-and-streams/04-message-ordering-and-keys/) | Build | Java, Python | ✅ |
-| 05 | [Event Sourcing: State as a Fold Over Events](phases/08-messaging-and-streams/05-event-sourcing/) | Build | Java, Python | ✅ |
-| 06 | [CQRS and Projections](phases/08-messaging-and-streams/06-cqrs-and-projections/) | Build | Java, Python | ✅ |
-| 07 | [Stream Processing: Tumbling, Sliding, and Session Windows](phases/08-messaging-and-streams/07-stream-processing-windows/) | Build | Java, Python | ✅ |
-| 08 | [Watermarks, Event Time, and Late Data](phases/08-messaging-and-streams/08-watermarks-and-late-data/) | Build | Java, Python | ✅ |
-| 09 | [Backpressure and Flow Control](phases/08-messaging-and-streams/09-backpressure/) | Build | Java, Python | ✅ |
-| 10 | [Dead-Letter Queues and Poison Messages](phases/08-messaging-and-streams/10-dead-letter-queues-and-poison-messages/) | Build | Java, Python | ✅ |
+| 01 | [The Append-Only Log: Partitions, Offsets, and Segments](phases/08-messaging-and-streams/01-the-append-only-log/) | Build | Java, Python, Go | ✅ |
+| 02 | [Consumer Groups, Offsets, and Rebalancing](phases/08-messaging-and-streams/02-consumer-groups-and-rebalancing/) | Build | Java, Python, Go | ✅ |
+| 03 | [At-Most-Once, At-Least-Once, and Effectively-Once](phases/08-messaging-and-streams/03-delivery-guarantees/) | Build | Java, Python, Go | ✅ |
+| 04 | [Message Ordering, Keys, and Head-of-Line Blocking](phases/08-messaging-and-streams/04-message-ordering-and-keys/) | Build | Java, Python, Go | ✅ |
+| 05 | [Event Sourcing: State as a Fold Over Events](phases/08-messaging-and-streams/05-event-sourcing/) | Build | Java, Python, Go | ✅ |
+| 06 | [CQRS and Projections](phases/08-messaging-and-streams/06-cqrs-and-projections/) | Build | Java, Python, Go | ✅ |
+| 07 | [Stream Processing: Tumbling, Sliding, and Session Windows](phases/08-messaging-and-streams/07-stream-processing-windows/) | Build | Java, Python, Go | ✅ |
+| 08 | [Watermarks, Event Time, and Late Data](phases/08-messaging-and-streams/08-watermarks-and-late-data/) | Build | Java, Python, Go | ✅ |
+| 09 | [Backpressure and Flow Control](phases/08-messaging-and-streams/09-backpressure/) | Build | Java, Python, Go | ✅ |
+| 10 | [Dead-Letter Queues and Poison Messages](phases/08-messaging-and-streams/10-dead-letter-queues-and-poison-messages/) | Build | Java, Python, Go | ✅ |
 | 11 | [Schema Registries and Compatible Evolution](phases/08-messaging-and-streams/11-schema-registry-and-evolution/) | Learn | — | ✅ |
 
 </details>
@@ -360,17 +360,17 @@ flowchart TB
 |:---:|--------|:----:|------|:------:|
 | 01 | [SLIs, SLOs, and Error Budgets](phases/09-reliability-and-scale/01-slis-slos-and-error-budgets/) | Learn | — | ✅ |
 | 02 | [Load Balancing: Round Robin, Least Connections, Power of Two Choices](phases/09-reliability-and-scale/02-load-balancing-algorithms/) | Build | Java, Python, Go | ✅ |
-| 03 | [Caching Strategies: Cache-Aside, Write-Through, Write-Behind](phases/09-reliability-and-scale/03-caching-strategies/) | Build | Java, Python | ✅ |
-| 04 | [Cache Invalidation, Stampedes, and Request Coalescing](phases/09-reliability-and-scale/04-cache-invalidation-and-stampedes/) | Build | Java, Python | ✅ |
-| 05 | [Distributed Rate Limiting](phases/09-reliability-and-scale/05-distributed-rate-limiting/) | Build | Java, Python | ✅ |
-| 06 | [Metrics: Counters, Gauges, and Histograms Without Averages](phases/09-reliability-and-scale/06-metrics-and-histograms/) | Build | Java, Python | ✅ |
-| 07 | [Distributed Tracing and Context Propagation](phases/09-reliability-and-scale/07-distributed-tracing/) | Build | Java, Python | ✅ |
-| 08 | [Structured Logging and Log Correlation](phases/09-reliability-and-scale/08-structured-logging/) | Build | Java, Python | ✅ |
-| 09 | [Chaos Engineering and Fault Injection](phases/09-reliability-and-scale/09-chaos-engineering/) | Build | Java, Python | ✅ |
+| 03 | [Caching Strategies: Cache-Aside, Write-Through, Write-Behind](phases/09-reliability-and-scale/03-caching-strategies/) | Build | Java, Python, Go | ✅ |
+| 04 | [Cache Invalidation, Stampedes, and Request Coalescing](phases/09-reliability-and-scale/04-cache-invalidation-and-stampedes/) | Build | Java, Python, Go | ✅ |
+| 05 | [Distributed Rate Limiting](phases/09-reliability-and-scale/05-distributed-rate-limiting/) | Build | Java, Python, Go | ✅ |
+| 06 | [Metrics: Counters, Gauges, and Histograms Without Averages](phases/09-reliability-and-scale/06-metrics-and-histograms/) | Build | Java, Python, Go | ✅ |
+| 07 | [Distributed Tracing and Context Propagation](phases/09-reliability-and-scale/07-distributed-tracing/) | Build | Java, Python, Go | ✅ |
+| 08 | [Structured Logging and Log Correlation](phases/09-reliability-and-scale/08-structured-logging/) | Build | Java, Python, Go | ✅ |
+| 09 | [Chaos Engineering and Fault Injection](phases/09-reliability-and-scale/09-chaos-engineering/) | Build | Java, Python, Go | ✅ |
 | 10 | [Capacity Planning and Queueing Theory](phases/09-reliability-and-scale/10-capacity-planning-and-queueing-theory/) | Learn | — | ✅ |
 | 11 | [Multi-Region Architecture and Disaster Recovery](phases/09-reliability-and-scale/11-multi-region-and-disaster-recovery/) | Learn | — | ✅ |
 | 12 | [Incident Response and Blameless Postmortems](phases/09-reliability-and-scale/12-incident-response/) | Learn | — | ✅ |
-| 13 | [Graceful Degradation and Load Shedding](phases/09-reliability-and-scale/13-graceful-degradation/) | Build | Java, Python | ✅ |
+| 13 | [Graceful Degradation and Load Shedding](phases/09-reliability-and-scale/13-graceful-degradation/) | Build | Java, Python, Go | ✅ |
 
 </details>
 
@@ -383,16 +383,16 @@ flowchart TB
 | # | Lesson | Type | Lang | Status |
 |:---:|--------|:----:|------|:------:|
 | 01 | [Representing Money: Minor Units, Currencies, and Rounding](phases/10-money-and-ledgers/01-representing-money/) | Build | Java, Python, Go | ✅ |
-| 02 | [Currencies, Exchange Rates, and FX Conversion](phases/10-money-and-ledgers/02-currency-and-fx/) | Build | Java, Python | ✅ |
+| 02 | [Currencies, Exchange Rates, and FX Conversion](phases/10-money-and-ledgers/02-currency-and-fx/) | Build | Java, Python, Go | ✅ |
 | 03 | [The Double-Entry Ledger from Scratch](phases/10-money-and-ledgers/03-double-entry-ledger/) | Build | Java, Python, Go | ✅ |
 | 04 | [Chart of Accounts and Account Types](phases/10-money-and-ledgers/04-chart-of-accounts/) | Learn | — | ✅ |
-| 05 | [Balances, Running Totals, and Snapshots](phases/10-money-and-ledgers/05-balances-and-snapshots/) | Build | Java, Python | ✅ |
-| 06 | [Immutability, Reversals, and Corrections](phases/10-money-and-ledgers/06-immutability-and-reversals/) | Build | Java, Python | ✅ |
+| 05 | [Balances, Running Totals, and Snapshots](phases/10-money-and-ledgers/05-balances-and-snapshots/) | Build | Java, Python, Go | ✅ |
+| 06 | [Immutability, Reversals, and Corrections](phases/10-money-and-ledgers/06-immutability-and-reversals/) | Build | Java, Python, Go | ✅ |
 | 07 | [Holds, Pending Transactions, and Available Balance](phases/10-money-and-ledgers/07-holds-and-available-balance/) | Build | Java, Python, Go | ✅ |
-| 08 | [Reconciliation: Matching Your Ledger Against Theirs](phases/10-money-and-ledgers/08-reconciliation/) | Build | Java, Python | ✅ |
-| 09 | [Multi-Currency Ledgers and Revaluation](phases/10-money-and-ledgers/09-multi-currency-ledgers/) | Build | Java, Python | ✅ |
-| 10 | [Fees, Splits, and Platform Payments](phases/10-money-and-ledgers/10-fees-and-splits/) | Build | Java, Python | ✅ |
-| 11 | [Ledger Concurrency: Hot Accounts and Balance Checks](phases/10-money-and-ledgers/11-ledger-concurrency/) | Build | Java, Python | ✅ |
+| 08 | [Reconciliation: Matching Your Ledger Against Theirs](phases/10-money-and-ledgers/08-reconciliation/) | Build | Java, Python, Go | ✅ |
+| 09 | [Multi-Currency Ledgers and Revaluation](phases/10-money-and-ledgers/09-multi-currency-ledgers/) | Build | Java, Python, Go | ✅ |
+| 10 | [Fees, Splits, and Platform Payments](phases/10-money-and-ledgers/10-fees-and-splits/) | Build | Java, Python, Go | ✅ |
+| 11 | [Ledger Concurrency: Hot Accounts and Balance Checks](phases/10-money-and-ledgers/11-ledger-concurrency/) | Build | Java, Python, Go | ✅ |
 | 12 | [Audit Trails, Trial Balance, and Financial Close](phases/10-money-and-ledgers/12-audit-trails-and-financial-close/) | Learn | — | ✅ |
 
 </details>
@@ -406,17 +406,17 @@ flowchart TB
 | 01 | [How a Card Payment Works: Issuer, Acquirer, Network, Processor](phases/11-payment-rails/01-how-a-card-payment-works/) | Learn | — | ✅ |
 | 02 | [Authorization, Capture, Void, Refund: The Card Lifecycle State Machine](phases/11-payment-rails/02-card-authorization-lifecycle/) | Build | Java, Python, Go | ✅ |
 | 03 | [ISO 8583: Parsing the Card Network Message](phases/11-payment-rails/03-iso-8583/) | Build | Java, Python, Go | ✅ |
-| 04 | [PANs, Luhn, and BIN Range Routing](phases/11-payment-rails/04-pan-luhn-and-bin-ranges/) | Build | Java, Python | ✅ |
-| 05 | [Tokenization and PCI DSS Scope Reduction](phases/11-payment-rails/05-tokenization-and-pci-scope/) | Build | Java, Python | ✅ |
+| 04 | [PANs, Luhn, and BIN Range Routing](phases/11-payment-rails/04-pan-luhn-and-bin-ranges/) | Build | Java, Python, Go | ✅ |
+| 05 | [Tokenization and PCI DSS Scope Reduction](phases/11-payment-rails/05-tokenization-and-pci-scope/) | Build | Java, Python, Go | ✅ |
 | 06 | [3-D Secure and Strong Customer Authentication](phases/11-payment-rails/06-3ds-and-strong-customer-authentication/) | Learn | — | ✅ |
-| 07 | [Interchange, Scheme Fees, and Merchant Pricing](phases/11-payment-rails/07-interchange-and-scheme-fees/) | Build | Java, Python | ✅ |
+| 07 | [Interchange, Scheme Fees, and Merchant Pricing](phases/11-payment-rails/07-interchange-and-scheme-fees/) | Build | Java, Python, Go | ✅ |
 | 08 | [ACH and the NACHA File Format](phases/11-payment-rails/08-ach-and-nacha/) | Build | Java, Python, Go | ✅ |
-| 09 | [SEPA, Wires, and ISO 20022 (pain.001, pacs.008)](phases/11-payment-rails/09-sepa-and-iso-20022/) | Build | Java, Python | ✅ |
+| 09 | [SEPA, Wires, and ISO 20022 (pain.001, pacs.008)](phases/11-payment-rails/09-sepa-and-iso-20022/) | Build | Java, Python, Go | ✅ |
 | 10 | [Real-Time Payments: RTP, FedNow, UPI, Faster Payments](phases/11-payment-rails/10-real-time-payments/) | Learn | — | ✅ |
 | 11 | [IBAN, BIC, and Account Number Validation](phases/11-payment-rails/11-iban-bic-and-account-validation/) | Build | Java, Python, Go | ✅ |
 | 12 | [Wallets, Stored Value, and E-Money Regulation](phases/11-payment-rails/12-wallets-and-stored-value/) | Learn | — | ✅ |
-| 13 | [Open Banking: OAuth Consent, Account Aggregation, and Data Access](phases/11-payment-rails/13-open-banking-and-account-aggregation/) | Build | Java, Python | ✅ |
-| 14 | [Bank Statement Formats: MT940, CAMT.053, BAI2, OFX](phases/11-payment-rails/14-bank-statements-and-formats/) | Build | Java, Python | ✅ |
+| 13 | [Open Banking: OAuth Consent, Account Aggregation, and Data Access](phases/11-payment-rails/13-open-banking-and-account-aggregation/) | Build | Java, Python, Go | ✅ |
+| 14 | [Bank Statement Formats: MT940, CAMT.053, BAI2, OFX](phases/11-payment-rails/14-bank-statements-and-formats/) | Build | Java, Python, Go | ✅ |
 | 15 | [Settlement and Clearing: Gross, Net, and Deferred](phases/11-payment-rails/15-settlement-and-clearing/) | Learn | — | ✅ |
 
 </details>
@@ -429,18 +429,18 @@ flowchart TB
 |:---:|--------|:----:|------|:------:|
 | 01 | [Designing an Idempotent Payment API](phases/12-payment-systems-design/01-idempotent-payment-api/) | Build | Java, Python, Go | ✅ |
 | 02 | [The Payment State Machine](phases/12-payment-systems-design/02-payment-state-machine/) | Build | Java, Python, Go | ✅ |
-| 03 | [Payment Orchestration Across Processors](phases/12-payment-systems-design/03-payment-orchestration/) | Build | Java, Python | ✅ |
-| 04 | [Smart Routing, Cascading, and Retry Policies](phases/12-payment-systems-design/04-smart-routing-and-retries/) | Build | Java, Python | ✅ |
-| 05 | [Webhooks: Signing, Delivery, Ordering, and Replay](phases/12-payment-systems-design/05-webhooks-and-callbacks/) | Build | Java, Python | ✅ |
-| 06 | [Refunds, Partial Refunds, and Refund Windows](phases/12-payment-systems-design/06-refunds-and-partial-refunds/) | Build | Java, Python | ✅ |
-| 07 | [Disputes and Chargebacks: The Lifecycle and the Evidence](phases/12-payment-systems-design/07-disputes-and-chargebacks/) | Build | Java, Python | ✅ |
-| 08 | [Payouts, Balances, and Negative Balance Handling](phases/12-payment-systems-design/08-payouts-and-balance-management/) | Build | Java, Python | ✅ |
-| 09 | [Limits, Velocity Controls, and Exposure](phases/12-payment-systems-design/09-limits-and-velocity-controls/) | Build | Java, Python | ✅ |
-| 10 | [Payment Method Abstraction and Processor Adapters](phases/12-payment-systems-design/10-payment-method-abstraction/) | Build | Java, Python | ✅ |
-| 11 | [Recurring Payments, Subscriptions, and Dunning](phases/12-payment-systems-design/11-recurring-and-subscriptions/) | Build | Java, Python | ✅ |
-| 12 | [Currency Conversion at Checkout and DCC](phases/12-payment-systems-design/12-currency-conversion-at-checkout/) | Build | Java, Python | ✅ |
+| 03 | [Payment Orchestration Across Processors](phases/12-payment-systems-design/03-payment-orchestration/) | Build | Java, Python, Go | ✅ |
+| 04 | [Smart Routing, Cascading, and Retry Policies](phases/12-payment-systems-design/04-smart-routing-and-retries/) | Build | Java, Python, Go | ✅ |
+| 05 | [Webhooks: Signing, Delivery, Ordering, and Replay](phases/12-payment-systems-design/05-webhooks-and-callbacks/) | Build | Java, Python, Go | ✅ |
+| 06 | [Refunds, Partial Refunds, and Refund Windows](phases/12-payment-systems-design/06-refunds-and-partial-refunds/) | Build | Java, Python, Go | ✅ |
+| 07 | [Disputes and Chargebacks: The Lifecycle and the Evidence](phases/12-payment-systems-design/07-disputes-and-chargebacks/) | Build | Java, Python, Go | ✅ |
+| 08 | [Payouts, Balances, and Negative Balance Handling](phases/12-payment-systems-design/08-payouts-and-balance-management/) | Build | Java, Python, Go | ✅ |
+| 09 | [Limits, Velocity Controls, and Exposure](phases/12-payment-systems-design/09-limits-and-velocity-controls/) | Build | Java, Python, Go | ✅ |
+| 10 | [Payment Method Abstraction and Processor Adapters](phases/12-payment-systems-design/10-payment-method-abstraction/) | Build | Java, Python, Go | ✅ |
+| 11 | [Recurring Payments, Subscriptions, and Dunning](phases/12-payment-systems-design/11-recurring-and-subscriptions/) | Build | Java, Python, Go | ✅ |
+| 12 | [Currency Conversion at Checkout and DCC](phases/12-payment-systems-design/12-currency-conversion-at-checkout/) | Build | Java, Python, Go | ✅ |
 | 13 | [API Design for Money: Versioning, Pagination, and Error Semantics](phases/12-payment-systems-design/13-api-design-for-money/) | Learn | — | ✅ |
-| 14 | [Testing Payment Systems: Simulators, Property Tests, and Invariants](phases/12-payment-systems-design/14-testing-payment-systems/) | Build | Java, Python | ✅ |
+| 14 | [Testing Payment Systems: Simulators, Property Tests, and Invariants](phases/12-payment-systems-design/14-testing-payment-systems/) | Build | Java, Python, Go | ✅ |
 
 </details>
 
@@ -473,13 +473,13 @@ flowchart TB
 | 01 | [Architecture of a High-Availability Payment Gateway](phases/14-payments-at-scale/01-high-availability-payment-gateway/) | Learn | — | ✅ |
 | 02 | [Multi-Region Ledgers and Home-Region Routing](phases/14-payments-at-scale/02-multi-region-ledgers/) | Learn | — | ✅ |
 | 03 | [Exactly-Once Money Movement End to End](phases/14-payments-at-scale/03-exactly-once-money-movement/) | Build | Java, Python, Go | ✅ |
-| 04 | [Reconciliation at Scale: Streams, Buckets, and Breaks](phases/14-payments-at-scale/04-reconciliation-at-scale/) | Build | Java, Python | ✅ |
-| 05 | [Batch vs Real-Time Settlement Pipelines](phases/14-payments-at-scale/05-batch-vs-real-time-settlement/) | Build | Java, Python | ✅ |
-| 06 | [Observability for Money Movement](phases/14-payments-at-scale/06-observability-for-money-movement/) | Build | Java, Python | ✅ |
+| 04 | [Reconciliation at Scale: Streams, Buckets, and Breaks](phases/14-payments-at-scale/04-reconciliation-at-scale/) | Build | Java, Python, Go | ✅ |
+| 05 | [Batch vs Real-Time Settlement Pipelines](phases/14-payments-at-scale/05-batch-vs-real-time-settlement/) | Build | Java, Python, Go | ✅ |
+| 06 | [Observability for Money Movement](phases/14-payments-at-scale/06-observability-for-money-movement/) | Build | Java, Python, Go | ✅ |
 | 07 | [Incident Management for Payments](phases/14-payments-at-scale/07-payment-incident-management/) | Learn | — | ✅ |
-| 08 | [Cost and Authorization-Rate Optimization](phases/14-payments-at-scale/08-cost-and-authorization-optimization/) | Build | Java, Python | ✅ |
+| 08 | [Cost and Authorization-Rate Optimization](phases/14-payments-at-scale/08-cost-and-authorization-optimization/) | Build | Java, Python, Go | ✅ |
 | 09 | [Migrating a Live Ledger](phases/14-payments-at-scale/09-ledger-migrations/) | Learn | — | ✅ |
-| 10 | [Deterministic Simulation Testing of Payment Systems](phases/14-payments-at-scale/10-simulation-testing-of-payment-systems/) | Build | Java, Python | ✅ |
+| 10 | [Deterministic Simulation Testing of Payment Systems](phases/14-payments-at-scale/10-simulation-testing-of-payment-systems/) | Build | Java, Python, Go | ✅ |
 | 11 | [Payments System Design: Interview Patterns](phases/14-payments-at-scale/11-payments-system-design-interviews/) | Learn | — | ✅ |
 
 </details>
@@ -505,7 +505,7 @@ flowchart TB
 
 ## Status and roadmap
 
-The curriculum map is complete: every one of the 199 lessons has a title, hook, time estimate, and objectives. 73 lessons are fully authored (deep docs, Java implementation with tests, quiz, artifact), including every capstone spec, and all three projects grade end to end. The remaining lessons are ⬚ Planned in [`ROADMAP.md`](ROADMAP.md) with outlines on disk; the tutor skips them and `course-guide` tells you what they will cover. Python and Go ports are tracked per lesson in the `Lang` column.
+All 199 lessons are complete: deep docs, the same implementation with tests in Java, Python, and Go, a six-question quiz, and an artifact for every Build lesson, plus every capstone spec. All three projects grade end to end in all three languages. [`ROADMAP.md`](ROADMAP.md) and [`PROGRESS.md`](PROGRESS.md) are generated from the repository state; the `Lang` column shows per-lesson language coverage.
 
 ## Contributing
 

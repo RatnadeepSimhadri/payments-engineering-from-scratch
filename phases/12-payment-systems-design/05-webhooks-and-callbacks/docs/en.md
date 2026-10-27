@@ -3,7 +3,7 @@
 > A webhook is an unauthenticated HTTP POST from the internet that claims money moved; the signature, the timestamp, and the event id are the only things standing between it and your ledger.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 12, Lesson 01 (Idempotent Payment API), Phase 12, Lesson 02 (Payment State Machine), Phase 5, Lesson 03 (Retries, Timeouts, and Backoff)
 **Time:** ~120 minutes
 
@@ -377,9 +377,37 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go has `crypto/hmac` with `hmac.Equal`, and the dispatcher's `tick` would take the clock as a `func() int64` or an interface with a `Now()` method; errors from the endpoint come back as `(int, error)` rather than a status alone. The event id set and the per-object sequence map are plain maps; the Go version should guard them with a `sync.Mutex` if `handle` is called from several goroutines, and the tests should pass under `go test -race`.
+```go
+func HmacSha256(key, message []byte) []byte {
+    mac := hmac.New(sha256.New, key)
+    mac.Write(message)
+    return mac.Sum(nil)
+}
+
+// ConstantTimeEquals: running time does not depend on where the first difference is.
+func ConstantTimeEquals(a, b []byte) bool {
+    return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+// Parse reads "t=123,v1=abc,v1=def"; ok is false when the header is malformed.
+func Parse(header string) (ParsedHeader, bool) {
+```
+
+Differences, all in `code/go/main.go` and `main_test.go`:
+
+- **The crypto is `crypto/hmac` + `crypto/sha256`, and the compare is `crypto/subtle`.** `hmac.New(sha256.New, key)` replaces `Mac.getInstance("HmacSHA256")`; there is no checked exception to swallow because the algorithm is part of the language's standard library, not a provider lookup. `subtle.ConstantTimeCompare` returns `1` on equality and `0` on any difference, including a length mismatch, which the test pins. `encoding/hex` handles `Hex`/`Unhex`.
+- **`null` becomes the zero value or a `bool`.** `Parse` returns `(ParsedHeader, bool)` instead of `null`; a header the consumer never received reads from the `map[string]string` as `""`, which `Parse` rejects as `MALFORMED_HEADER`, so the Java `null` test and the Java empty-string test collapse into the same path. `EventFromJSON` returns `(Event, error)`, and `FakeClock.Advance` returns an `error` for a negative step instead of throwing.
+- **Overloads become two constructors.** `NewWebhookVerifier(secret, clock, tolerance)` and `NewDefaultWebhookVerifier(secret, clock)`; `NewWebhookDispatcher(..., backoff)` and `NewDefaultWebhookDispatcher(...)`. The backoff slice is copied on construction, as the Java cloned the array, so a caller cannot change the schedule after the fact.
+- **`strings.Split` keeps trailing empty strings** where Java's `split` drops them, so `Parse` trims them before the loop; otherwise `"t=1,v1=...,"` would be rejected in Go and accepted in Java. `strconv.ParseInt` is as strict as `Long.parseLong`, so no extra regex is needed for the timestamp.
+- **No mutex, by design.** The consumer's `seenEventIDs` set and `LatestSequence` map are plain maps because the dispatcher is single-threaded here; a server that calls `Handle` from several goroutines wraps it in a `sync.Mutex`, and `go test -race ./...` passes as shipped.
+
+```bash
+cd phases/12-payment-systems-design/05-webhooks-and-callbacks/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

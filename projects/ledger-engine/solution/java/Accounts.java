@@ -2,7 +2,7 @@
 // Docs: projects/ledger-engine/stages/01-money-and-accounts/docs/en.md
 // Run:  javac -d .out *.java && java -cp .out Main
 // Test: python3 scripts/project_test.py ledger-engine --lang java --all --solution
-// Java 21, standard library only. Java first; Python port in solution/python; Go port follows later.
+// Java 21, standard library only. Java first; Python port in solution/python; Go port in solution/go.
 
 import java.util.LinkedHashMap;
 import java.util.List;

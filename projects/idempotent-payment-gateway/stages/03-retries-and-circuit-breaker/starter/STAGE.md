@@ -1,7 +1,7 @@
 # Stage 03 starter
 
 Continue editing the same workspace: add a new file `Resilience.java`. `Rng.java` (xorshift64*, seeded) and
-`Clock.java` are already in your workspace from Stage 01. The Python port has the same surface in snake_case (signatures below); Go port follows later.
+`Clock.java` are already in your workspace from Stage 01. The Python and Go ports have the same surface in snake_case and exported CamelCase (signatures below).
 
 Stages 01 and 02 are graded again first.
 
@@ -69,3 +69,37 @@ class Gateway:
 
 # Rng (given): Rng(seed).next_long() -> int in [0, 2**64); next_below(bound) -> int; bound <= 0 -> ValueError
 ```
+
+## New signatures (Go)
+
+Add `resilience.go`.
+
+```go
+type ProcessorOutcome int; const ( Approved ProcessorOutcome = iota; Declined; Unavailable )
+type ProcessorResult struct{ Outcome ProcessorOutcome; Reference string }
+type Processor interface{ Charge(request ChargeRequest) ProcessorResult }
+func NewScriptedProcessor(script string) (*ScriptedProcessor, error)   // 'A' 'D' 'U'; Charge, Calls()
+
+func NewBackoffPolicy(baseMillis, capMillis int64, maxAttempts int) (*BackoffPolicy, error)
+func (b *BackoffPolicy) MaxAttempts() int
+func (b *BackoffPolicy) CeilingFor(retry int) int64              // min(cap, base * 2^(retry-1)); retry < 1 panics
+func (b *BackoffPolicy) DelayBefore(retry int, rng *Rng) int64   // rng.NextBelow(ceiling + 1)
+
+func NewRetryBudget(initialTokens, maxTokens int) (*RetryBudget, error)
+func (b *RetryBudget) Tokens() int; TryWithdraw() bool; Deposit(n int)   // n < 0 panics
+
+type CircuitState int; const ( CircuitClosed CircuitState = iota; CircuitOpen; CircuitHalfOpen )
+func NewCircuitBreaker(clock Clock, failureThreshold int, openMillis int64, successesToClose int) (*CircuitBreaker, error)
+func (c *CircuitBreaker) State() CircuitState; AllowRequest() bool; RecordSuccess(); RecordFailure(); RetryAfterMillis() int64
+
+type ChargeOutcome struct{ Outcome ProcessorOutcome; Reference string; Attempts int; WaitedMillis int64; Reason string }
+func NewRetryingClient(processor Processor, policy *BackoffPolicy, budget *RetryBudget, breaker *CircuitBreaker, rng *Rng, clock Clock) *RetryingClient
+func (c *RetryingClient) Charge(request ChargeRequest) ChargeOutcome
+
+func NewGateway(store *IdempotencyStore, client *RetryingClient, clock Clock) *Gateway
+func (g *Gateway) Charge(request ChargeRequest) ApiResponse
+func (g *Gateway) Payment(id string) (*Payment, bool)           // Optional -> (value, ok)
+func (g *Gateway) Payments() []*Payment                         // creation order, a fresh slice
+```
+
+Java's `LinkedHashMap` of payments becomes a map plus a slice of ids in creation order. The reason strings (`"approved"`, `"declined"`, `"retries exhausted"`, `"circuit open"`, `"retry budget exhausted"`) and the JSON bodies are byte-identical across the three languages; the tests compare them.

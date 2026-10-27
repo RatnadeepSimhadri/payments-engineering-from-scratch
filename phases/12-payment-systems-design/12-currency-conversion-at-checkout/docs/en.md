@@ -3,7 +3,7 @@
 > Who bears FX risk and when the rate is locked.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 08 (Payouts and Balance Management); Phase 12, Lesson 10 (Payment Method Abstraction)
 **Time:** ~60 minutes
 
@@ -387,9 +387,36 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `math/big.Rat` plays the role of `Rational` (`SetString("1.0850")`), with mutating methods that need care about aliasing; rounding to an integer is done with `big.Int` quotient and remainder, as Go has no rounding-mode enum. The clock is injected as a function returning milliseconds, and expiry stays half-open.
+```go
+// Rational wraps *big.Rat and never mutates a shared value: every operation allocates a result.
+type Rational struct{ r *big.Rat }
+
+func (a Rational) Times(o Rational) Rational { return Rational{new(big.Rat).Mul(a.r, o.r)} }
+
+// RoundToInt64 rounds to an integer with the given mode; ErrOverflow where Java's longValueExact throws.
+func (a Rational) RoundToInt64(mode Rounding) (int64, error) {
+    v := roundBig(a.r.Num(), a.r.Denom(), mode)
+    if !v.IsInt64() {
+        return 0, ErrOverflow
+    }
+    return v.Int64(), nil
+}
+```
+
+Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+
+- **`math/big.Rat` plays `Rational`, behind a value type.** `big.Rat` methods mutate their receiver and alias their arguments, so `Rational` wraps a pointer and every method (`Times`, `Plus`, `Inverse`, ...) allocates a fresh `big.Rat`; a quote's locked rate can never be changed by arithmetic done elsewhere. `SetString("1.0850")` is the exact parse and normalizes to lowest terms with the sign in the numerator, as the Java constructor did. Equality is `Equal`/`Compare`, never `==`.
+- **Go has no `RoundingMode`.** `roundBig` divides with `big.Int.QuoRem` (truncated, like Java) and spells out the six cases this lesson needs: `Down`, `Up`, `HalfUp`, `HalfEven` from the Phase 10 `Money`, plus `Ceiling` and `Floor` declared here. `ToDecimal(scale)` scales by 10^scale, rounds half-even, and pads, which is what `BigDecimal.divide(..., scale, HALF_EVEN).toPlainString()` prints.
+- **Errors are values, with one deliberate panic.** `NewFxRate`, `Convert`, `Quote`, `Confirm`, `Settle`, `Offer`, and `IssuerConversion` return `(T, error)`; `ErrQuoteExpired`, `ErrInvalidArgument`, and `ErrCurrencyMismatch` are checked with `errors.Is`, and the lock window stays half-open. `Of(num, 0)` panics with `ErrZeroDenominator`, because a zero denominator in a rate is a programming error, the same reasoning as `Money.Compare`; the test recovers it.
+- **Round-trip to minor units is checked.** `RoundToInt64` returns `ErrOverflow` instead of silently truncating a `big.Int` that does not fit an `int64`.
+
+```bash
+cd phases/12-payment-systems-design/12-currency-conversion-at-checkout/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

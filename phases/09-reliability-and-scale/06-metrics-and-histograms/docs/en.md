@@ -3,7 +3,7 @@
 > p99 latency from a histogram you built.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 1, Lesson 01 (Big-O and Measuring), Phase 3, Lesson 02 (Count-Min Sketch and HyperLogLog), Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets)
 **Time:** ~75 minutes
 
@@ -376,9 +376,32 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-The layout math is the part to port carefully. Go has `bits.Len64(uint64(v)) - 1` and native `int64`; `record` returns an `error` for out-of-range values instead of throwing, and `merge` returns `error` on a layout mismatch. The port does not need the `Math.*Exact` overflow checks for counts in practice, but Go's `int64` wraps silently like Java's, so keep the checked arithmetic if the histogram might count more than 2^63 observations. The seeded generator must reproduce the same `nextLong` stream so the demo numbers match: use `uint64` in Go.
+```go
+// IndexOf is which bucket holds v. Exact below 2^precisionBits; log-linear above.
+func (h *LogLinearHistogram) IndexOf(v int64) int {
+    if v < int64(h.linear) {
+        return int(v)
+    }
+    e := bits.Len64(uint64(v)) - 1                    // floor(log2 v), e >= precisionBits
+    sub := (v - int64(1)<<e) >> (e - h.PrecisionBits) // which of the 2^precisionBits slices of [2^e, 2^(e+1))
+    return int(int64(e-h.PrecisionBits+1)*int64(h.linear) + sub)
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **`floor(log2 v)` is `bits.Len64(uint64(v)) - 1`.** `math/bits` replaces `Long.numberOfLeadingZeros`; the shifts in `IndexOf`, `LowerBound`, and `UpperBound` are otherwise the Java lines with explicit `int64` casts, because Go will not mix `int` and `int64` silently.
+- **Errors are values.** `NewLogLinearHistogram`, `Record`, `RecordMany`, `Merge`, `Counter.IncBy`, `Rate`, and `Percentile` return `error` where Java throws `IllegalArgumentException`. `Value(p)` panics on a `p` outside 0..100 because the Java `value` has no error channel either and the bad argument is a caller bug. `Counter.IncBy` returns `ErrOverflow` instead of wrapping at `math.MaxInt64`, which `Math.addExact` would have thrown; inside `RecordMany` and `Merge` the same `addChecked`/`mulChecked` helpers panic, since a histogram that has counted 2^63 observations has no sensible caller to inform.
+- **The generator uses `uint64` state.** SplitMix64's multiplications must wrap, so `Rng.state` is unsigned and `NextLong` converts the result to `int64` at the end; the seed-42 assertion `-4767286540954276203` then holds exactly, and `NextDouble` shifts the unsigned form by 11 as `>>>` does. `Math.round` is `javaRound` (`math.Floor(x + 0.5)`), which is what makes the 100,000 log-normal draws land on the same microsecond values and the histogram `_sum` print `3529462222` in both languages.
+- **Formatting and ordering.** `fmt` has no `%,d`, so a nine-line `commas` helper renders thousands separators; `String.indent(2)` is `indent`; `Double.toString` for the percentile label is `Trim` with `strconv.FormatFloat(p, 'f', -1, 64)`. `LinkedHashMap` becomes a `map` plus a `[]string` of names per metric type so the exposition keeps registration order.
+
+```bash
+cd phases/09-reliability-and-scale/06-metrics-and-histograms/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

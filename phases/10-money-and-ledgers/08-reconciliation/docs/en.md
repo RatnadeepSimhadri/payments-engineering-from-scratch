@@ -3,7 +3,7 @@
 > The processor says 10,000 transactions; you have 9,998. Find the two.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 07 (Holds and Available Balance)
 **Time:** ~120 minutes
 
@@ -380,9 +380,32 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port would return `(ReconciliationReport, error)` from `Reconcile` instead of throwing on a foreign currency, use `sort.SliceStable` (not `sort.Slice`) for both input sorts and for the final ordering, and iterate the grouping map over a separately sorted key slice, because Go map iteration order is deliberately randomized. The tie-out failure, which is a programmer error, would be a `panic` in Go rather than a returned error.
+The full port is `code/go/main.go` (same `Reconciler`, `Match`, `Break`, `BreakKind`, `ReconciliationReport`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go` for the shuffled-input determinism test. Tests are in `code/go/main_test.go`. Three things differ:
+
+- **A foreign currency is an error value, not an exception.** `Reconcile` returns `(ReconciliationReport, error)`; the only error it can produce is `Money.Plus` refusing to add a EUR posting into the USD ledger total, and the test checks it with `errors.Is(err, ErrCurrencyMismatch)`. The tie-out check at the end stays a `panic`: a report that does not tie out is a bug in the matcher, not a condition a caller can handle. `NewMatch`, `NewBreak`, and `NewReconciler` carry the record constructors' validation and return errors the same way.
+- **Map order is explicit.** Java groups by reference in a `TreeMap`; Go's map iterates in random order, so pass 1 walks `sortedKeys(oursByRef)`. Every sort is `sort.SliceStable`, which matters: the input sort is by `(date, reference, amount)` and equal keys must keep their input position for duplicates to pair up in the same order they arrived.
+
+```go
+for _, ref := range sortedKeys(oursByRef) {          // TreeMap order
+    o, t := oursByRef[ref], theirsByRef[ref]
+    if len(t) == 0 {                                 // nothing to pair with: try pass 2
+        *oursLeft = append(*oursLeft, o...)
+        continue
+    }
+    pairs := min(len(o), len(t))
+    ...
+}
+```
+
+- **Nullable sides are pointers.** A `Break` has exactly one of `Ours *LedgerPosting` / `Theirs *StatementLine` set for the missing and duplicate kinds and both for `AmountMismatch`; `NewBreak` enforces that. Dates are `time.Time` at UTC midnight (a `Date` alias), and `daysBetween` divides the duration by 24 hours, which is exact for civil dates with no time zone.
+
+```bash
+cd phases/10-money-and-ledgers/08-reconciliation/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

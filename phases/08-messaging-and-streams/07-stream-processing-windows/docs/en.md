@@ -3,7 +3,7 @@
 > Transactions per card per minute, computed as they arrive.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 1, Lesson 05 (Hash Maps)
 **Time:** ~90 minutes
 
@@ -366,9 +366,40 @@ Differences, all in `code/python/main.py`:
 
 Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The 43 sliding results, 5 breaches, and peak state sizes (2/10/2) match the Java run.
 
-### Porting notes
+### In Go
 
-In Go, `Window` is a comparable struct usable as a map key, per-key windows live in a slice kept sorted with `sort.Slice` or `slices.SortFunc`, and `floorMod` must be written by hand because Go's `%` truncates toward zero. Both ports keep the same monotonic-time check and the same half-open overlap test; a concurrent Go operator processing keys on goroutines needs a mutex per key's state and must pass `go test -race`.
+```go
+// floorMod is Java's Math.floorMod: the remainder takes the divisor's sign, so negative timestamps still align.
+func floorMod(x, m int64) int64 {
+    r := x % m
+    if r != 0 && (r < 0) != (m < 0) {
+        r += m
+    }
+    return r
+}
+
+func (a *WindowedAggregator) OnTimer(now int64) []WindowResult {
+    out := []WindowResult{}
+    for _, key := range sortedKeys(a.state) {
+        windows := a.state[key]
+        for _, w := range sortedWindows(windows) {
+            if w.End > now {
+                break
+            }
+            out = append(out, WindowResult{key, w, windows[w], now})
+            delete(windows, w)
+        }
+        ...
+```
+
+Differences, all in `code/go/main.go` and `code/go/money.go`:
+
+- **`Window` is a comparable struct and a map key.** State is `map[string]map[Window]Aggregate`; there is no `TreeMap`, so `sortedWindows` sorts a key's windows by `(Start, End)` with `Window.Less` before the trigger walks them, and `sortedKeys` sorts the card ids so emission order is deterministic. Per-key window counts are small (six for the sliding demo), so the sort costs nothing noticeable.
+- **`floorMod` is written by hand.** Go's `%` truncates toward zero like Java's, so `time - time % size` would misalign a negative timestamp; the helper above is `Math.floorMod` and both assigners use it.
+- **Errors are values.** The constructors (`NewWindow`, `NewTumblingWindows`, `NewSlidingWindows`, `NewSessionAggregator`, `NewStreamRunner`, `NewTxn`) return `error` for the arguments Java rejects with `IllegalArgumentException`; `Process` returns `ErrTimeWentBackwards` and `StreamRunner.Run` propagates it. `Peek` returns `(Aggregate, bool)` where Java returns `null`. `Aggregate.Add` panics on a `Money` error because every record in a stream shares the operator's currency, so a mismatch is a bug, not a condition.
+- **The session merge loop deletes from the map while iterating a sorted snapshot**, which is the `Iterator.remove()` idiom; Go permits deletion during a range over the map itself, but the snapshot keeps the overlap test in the same order as Java's `TreeMap`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The 43 sliding results, 5 breaches, and peak state sizes (2/10/2) match the Java run.
 
 ## Use It
 

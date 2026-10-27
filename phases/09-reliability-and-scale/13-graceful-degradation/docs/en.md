@@ -3,7 +3,7 @@
 > Drop the reporting query so the authorization goes through.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 9, Lesson 12 (Incident Response and Blameless Postmortems), Phase 9, Lesson 10 (Capacity Planning and Queueing Theory), Phase 9, Lesson 05 (Distributed Rate Limiting), Phase 1, Lesson 09 (Heaps and Priority Queues)
 **Time:** ~90 minutes
 
@@ -379,9 +379,39 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `container/list` or a slice-backed ring for the deque, `math.Sqrt`, an `int` constant block for `Priority`, and `sort.Slice` for percentiles. A Go port that runs real goroutines as workers must guard every `CoDelQueue` and the controller with a `sync.Mutex` (or one mutex per class) and pass `go test -race ./...`; the deterministic single-threaded simulation is the test oracle for the concurrent version.
+```go
+// doDequeue is RFC 8289 Section 5.3. The Java DoDequeue record is the pair of return values.
+func (q *CoDelQueue) doDequeue(now int64) (*Request, bool) {
+    if len(q.queue) == 0 {
+        q.firstAboveTime = 0
+        return nil, false
+    }
+    r := q.queue[0]
+    q.queue = q.queue[1:]
+    sojourn := now - r.EnqueuedMillis
+    ...
+    return r, now >= q.firstAboveTime // above target for a whole interval: ok to drop
+}
+
+func (q *CoDelQueue) controlLaw(t int64, c int) int64 {
+    return t + int64(float64(q.intervalMillis)/math.Sqrt(float64(c)))
+}
+```
+
+Differences, all in `code/go/main.go` and `javarandom.go`:
+
+- **The `DoDequeue` record is a pair of return values.** `doDequeue` returns `(*Request, bool)` and `Dequeue` unpacks it in place, so the RFC 8289 state machine reads line for line like the Java. `(long)(interval / Math.sqrt(c))` is `int64(float64(...) / math.Sqrt(...))`, which truncates toward zero exactly as the Java cast does; `target / 2` on `int64` truncates like Java `long`. The deque is a slice (`append` to push, `q.queue[1:]` to pop); `nil` replaces `null` for an empty queue.
+- **Enums are typed integers with lookup tables.** `Priority` and `Level` are `int` constants with `Priorities`/`Levels` arrays standing in for `values()`, `String()` methods for the names, and `levelShedAtOrBelow` using `-1` where the Java `Level.NORMAL` carries `null`. The one-level-per-window escalation is `b.level++` / `b.level--`, the same ordinal arithmetic. `EnumMap<Priority, ...>` becomes fixed-size arrays indexed by `Priority` (`Offered[CRITICAL]`), which is what an `EnumMap` is underneath.
+- **Constructor checks are errors.** `NewCoDelQueue` returns `error` for `target >= interval` and `NewDegradingPolicy` propagates it, where Java throws `IllegalArgumentException`; the demo unwraps with `mustQueue`/`mustPolicy` because its arguments are constants.
+- **Arrivals come from `java.util.Random`.** `JavaRandom.NextDouble` reproduces `nextDouble()`, so seed 11 offers the same 12,038 requests, the brownout flips at the same milliseconds (2100, 2200, 2900, ...), and both tables match the Java output digit for digit; `TestOverloadProtectsCritical` pins 10403/1635 for FIFO and 9212/2814/3 for the degrading policy. A port that let real goroutines act as workers would need a `sync.Mutex` around each `CoDelQueue` and the controller; the single-threaded simulation here is the deterministic oracle such a port would be tested against.
+
+```bash
+cd phases/09-reliability-and-scale/13-graceful-degradation/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

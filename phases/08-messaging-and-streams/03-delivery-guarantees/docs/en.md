@@ -3,7 +3,7 @@
 > Exactly-once delivery is impossible; exactly-once effects are engineering.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 02 (Consumer Groups), Phase 7, Lesson 02 (Write-Ahead Logs), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -363,9 +363,35 @@ Differences, all in `code/python/main.py`:
 
 Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The table (8/12/10/10 posted, 3/0/10/10 correct runs out of 10) matches the Java output exactly.
 
-### Porting notes
+### In Go
 
-In Go, `CrashException` becomes a sentinel `ErrCrash` returned up the call stack rather than thrown, so `RunToEnd` returns `error` and the simulation loop checks `errors.Is(err, ErrCrash)`; the store needs no mutex because the simulation is single-threaded, but a `-race` run should still pass. The `postIfNew` check-and-insert must remain one operation in both ports; splitting it is the degradation the Step 3 prediction asks about.
+```go
+case Transactional:
+    for _, r := range batch {
+        tx := c.store.Begin()
+        if err := tx.Post(Posting{r.PaymentID, r.Amount}); err != nil {
+            return err
+        }
+        if err := tx.CommitOffset(r.Offset + 1); err != nil {
+            return err
+        }
+        if err := c.faults.AfterSideEffect(r.Offset); err != nil {
+            return err // the buffered transaction dies with the process
+        }
+        if err := tx.Commit(); err != nil {
+            return err
+        }
+    }
+```
+
+Differences, all in `code/go/main.go` and `code/go/money.go`:
+
+- **The crash is a returned error, not a thrown one.** `FaultInjector.AfterSideEffect` returns `ErrCrash` wrapped with the offset; every strategy branch in `RunToEnd` returns it immediately, which is the Go spelling of "the process is gone". `Run` restarts a fresh consumer while `errors.Is(err, ErrCrash)` and panics on any other error, because in this single-threaded simulation nothing else can fail. Returning early is also what discards the buffered `Transaction`: the struct is simply never committed.
+- **Errors are values elsewhere too.** `Log.Read`, `Store.CommitOffset`, `NewConsumer`, and the three `Transaction` methods return `error`; a reused transaction returns the sentinel `ErrTransactionDone` where Java throws `IllegalStateException`. `PostIfNew` keeps the check-and-insert as one method on one map, never split across calls.
+- **`Money` is `int64` minor units** (the Phase 10, Lesson 01 Go `Money`, in `money.go`): `Parse` and `Plus` return `(Money, error)`, overflow is checked by `addChecked`, and a currency mix wraps `ErrCurrencyMismatch`. `Store.Balance` panics on a mismatch because every posting in this lesson carries the same currency, so it is a bug, not a condition.
+- **`Strategy` is a typed constant** with a `String()` method printing the Java names, and the `Strategies` slice stands in for `Strategy.values()` so the demo iterates in the same order.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The table (8/12/10/10 posted, 3/0/10/10 correct runs out of 10) and the ledger totals match the Java output exactly.
 
 ## Use It
 

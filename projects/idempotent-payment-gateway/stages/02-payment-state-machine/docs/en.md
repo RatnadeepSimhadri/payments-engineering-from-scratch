@@ -55,7 +55,7 @@ Two other payments in the same test: `pay_2` is canceled from `CREATED` (`versio
 
 ## Your task
 
-Add `Payments.java` to the workspace. Nothing from Stage 1 changes shape; the grader runs `Stage01Test` again first. The Python port has the same surface in snake_case in one `main.py` (signatures below); Go port follows later.
+Add `Payments.java` to the workspace. Nothing from Stage 1 changes shape; the grader runs `Stage01Test` again first. The Python port has the same surface in snake_case in one `main.py`, and the Go port the same surface in exported CamelCase (signatures below).
 
 ```java
 enum PaymentState {
@@ -120,6 +120,29 @@ class Payment:
     def refund(self, refund_amount: Money, reason: str) -> Money: ...      # returns what is still refundable
 ```
 
+The same surface in Go (`payments.go`; moves return `error`, and `ErrIllegalTransition` wraps `ErrIllegalState` the way `IllegalTransitionException extends IllegalStateException`):
+
+```go
+type PaymentState int
+const ( Created PaymentState = iota; Processing; Succeeded; Failed; Canceled; Refunded )
+func (s PaymentState) IsTerminal() bool
+func (s PaymentState) Wire() string                             // "succeeded"
+
+var ErrIllegalTransition = fmt.Errorf("%w: illegal transition", ErrIllegalState)
+var ErrInvalidRefund = errors.New("invalid refund")              // non-positive, or more than refundable
+type Transition struct{ From, To PaymentState; Reason string; AtMillis int64 }
+func CanTransition(from, to PaymentState) bool                  // the table is a package-level map
+func NextStates(from PaymentState) []PaymentState               // a copy
+
+func NewPayment(id string, amount Money, clock Clock) (*Payment, error)   // blank id / non-positive amount -> error
+func (p *Payment) ID() string; Amount() Money; State() PaymentState; Captured() Money; Refunded() Money
+func (p *Payment) Refundable() Money; ProcessorReference() string; Version() int64; History() []Transition   // a copy
+func (p *Payment) StartProcessing() error; Succeed(reference string) error; Fail(reason string) error; Cancel(reason string) error
+func (p *Payment) Refund(refundAmount Money, reason string) (Money, error)   // ErrIllegalTransition / ErrInvalidRefund / ErrCurrencyMismatch
+```
+
+`Money.Compare` panics on a currency mismatch (a programming error in the lesson's Money), so `Refund` checks `refundAmount.Currency != remaining.Currency` itself and returns `ErrCurrencyMismatch` before comparing.
+
 Rules the tests pin down:
 
 - The table is a `Map<PaymentState, Set<PaymentState>>` (an `EnumMap` of `EnumSet`s is the natural shape) and `canTransition` is a lookup, not a chain of `if`s. `nextStates(PROCESSING).size()` is 2; `nextStates(FAILED).isEmpty()` is true.
@@ -175,6 +198,7 @@ static {
 ```bash
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 2 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 2 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --stage 2 --path my-gateway
 ```
 
 Stage 1's 43 assertions run again, then Stage 2's 46.

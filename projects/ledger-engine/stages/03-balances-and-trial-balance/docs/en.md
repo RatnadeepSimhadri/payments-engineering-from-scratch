@@ -78,7 +78,7 @@ Nothing on the right can disagree with the journal for long: the next `balanceAt
 
 Keep editing the workspace. Everything new goes in `Ledger.java` (the records can sit above the `Ledger` class). Stage 2's `post` gains one line: take a snapshot when the new sequence number is a multiple of K.
 
-Signatures (Java 21 first, then the same surface in Python; Go port follows later):
+Signatures (Java 21 first, then the same surface in Python and in Go):
 
 ```java
 /** Every account's signed balance after the entry with this sequence number. */
@@ -138,6 +138,30 @@ class Ledger:
     def is_reversed(self, entry_id: str) -> bool: ...
 ```
 
+The same surface in Go:
+
+```go
+type BalanceSnapshot struct{ Sequence int64; Balances map[string]Money }
+type TrialBalanceLine struct{ Account Account; Debit, Credit Money }
+type TrialBalance struct{ Currency Currency; Lines []TrialBalanceLine; TotalDebits, TotalCredits Money }
+func (tb TrialBalance) Difference() Money
+func (tb TrialBalance) IsBalanced() bool
+
+const DefaultSnapshotEvery = 100
+func NewLedger(accounts *AccountRegistry) (*Ledger, error)                                   // snapshot every 100
+func NewLedgerWithSnapshots(accounts *AccountRegistry, snapshotEvery int) (*Ledger, error)   // snapshotEvery < 1 -> error
+func (l *Ledger) SnapshotEvery() int
+func (l *Ledger) Balance(accountID string) (Money, error)                   // latest snapshot + tail replay; ErrUnknownAccount
+func (l *Ledger) BalanceAt(accountID string, sequence int64) (Money, error) // full replay through sequence inclusive
+func (l *Ledger) Snapshots() []BalanceSnapshot                              // deep copy: the maps are clones
+func (l *Ledger) TrialBalance() []TrialBalance                              // one per currency, sorted by code
+func ReversalID(entryID string) string                                      // "rev:" + entryID
+func (l *Ledger) Reverse(entryID string) (PostedEntry, error)               // posts the mirror; idempotent; ErrUnknownEntry
+func (l *Ledger) IsReversed(entryID string) bool
+```
+
+Java's `TreeMap` gave the trial balance its currency order for free; in Go, collect the currency codes from a map, `sort.Strings` them, and build the result in that order. `Snapshots()` must `maps.Clone` every balance map, because the grader empties the map it receives and expects the ledger's copy to still hold every account.
+
 What each must do:
 
 - **Signed effect of a posting** on its account: `+amount` when `posting.side() == account.normalSide()`, else `-amount`. Write this once as a private helper; `balance`, `balanceAt`, and stage 4's `lines` all use it.
@@ -172,6 +196,7 @@ What each must do:
 ```bash
 python3 scripts/project_test.py ledger-engine --lang java --stage 3 --path ~/ledger-engine-java
 python3 scripts/project_test.py ledger-engine --lang python --stage 3 --path ~/ledger-engine-py
+python3 scripts/project_test.py ledger-engine --lang go --stage 3 --path ~/ledger-engine-go
 ```
 
 Stages 1 and 2 run first, then `Stage03Test` (59 checks).

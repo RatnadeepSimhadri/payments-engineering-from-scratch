@@ -98,6 +98,32 @@ class RaftNode:                # fields: id, peers, storage, role, leader_id, co
 # partition / heal / crash / restart / expire_timer, plus nodes, storages, events, leaders_by_term and network.
 ```
 
+The same surface in Go (`raftnode.go`; exported CamelCase; the fields `Role`, `LeaderID`, `CommitIndex`, `LastApplied`, `StateMachine`, `NextIndex`, `MatchIndex`, `VotesGranted`, `ElectionDeadline`, `NextHeartbeat`, `ElectionsStarted`, `ConsistencyRejections`, `Peers`, and `Storage` are exported because `Cluster` and the tests read them directly):
+
+```go
+func NewRaftNode(id int, peers []int, storage *Storage, rng *Rng, config Config, now int, tracer Tracer) *RaftNode
+                                                        // given; calls n.ResetElectionTimer(now); nil tracer -> TracerNone
+func (n *RaftNode) ID() int; CurrentTerm() int64; VotedFor() int; ClusterSize() int; Majority() int; Votes() int
+func (n *RaftNode) Log() []LogEntry; LastLogIndex() int; LastLogTerm() int64        // given accessors
+func NodeName(id int) string                                                        // "n3"
+
+func (n *RaftNode) ResetElectionTimer(now int)              // ElectionDeadline = now + min + rng.NextInt(max - min + 1)
+func (n *RaftNode) Tick(now int) []Message                  // leader: heartbeats when now >= NextHeartbeat; else election when now >= ElectionDeadline
+func (n *RaftNode) StartElection(now int) []Message         // candidate: term+1, vote self, persist, reset timer, RequestVote to every peer
+func (n *RaftNode) Handle(m Message, now int) []Message     // higher term -> BecomeFollower, then switch m.Kind
+func (n *RaftNode) BecomeFollower(term int64, now int)      // Role Follower, LeaderID -1, votes cleared; if term > CurrentTerm: Save(term, -1); if was leader: reset timer
+func (n *RaftNode) OnRequestVote(m Message, now int) []Message
+func (n *RaftNode) OnVoteReply(m Message, now int) []Message
+func (n *RaftNode) BecomeLeader(now int) []Message          // Role Leader, LeaderID = id, then ReplicateAll(now)
+func (n *RaftNode) ReplicateAll(now int) []Message          // NextHeartbeat = now + HeartbeatInterval; one AppendEntries per peer
+func (n *RaftNode) OnAppendEntries(m Message, now int) []Message   // stage 2 subset; a second leader in the same term -> panic
+
+// Roles are Follower, Candidate, Leader; kinds are RequestVote, RequestVoteReply, AppendEntries, AppendEntriesReply.
+// VotesGranted is a map[int]bool, so a duplicate grant is harmless and Votes() is len(VotesGranted). An empty reply is nil.
+// NewCluster(size, seed, dropRate, maxDelay) is provided in cluster.go: Run / RunUntilStableLeader / StableLeader (nil when none) /
+// Leaders / MaxTerm / Partition([]int) / Heal / Crash / Restart / ExpireTimer, plus Nodes, Storages, Events, LeadersByTerm and Network.
+```
+
 Exact rules, in the paper's words where it has them:
 
 - **`resetElectionTimer(now)`**: draw from `rng`, this node's own stream, uniformly in `[electionTimeoutMin, electionTimeoutMax]`. With `min == max` the deadline is exactly `now + min`. Never read a wall clock.
@@ -177,13 +203,14 @@ Bugs this stage's tests are built to expose:
 | Leader does not re-arm its timer on step-down | after a partition heals the old leader sits as a follower forever, which is harmless here but hides the bug the next scenario needs |
 | `becomeFollower` saves even for an equal term | `writes` climbs on every heartbeat; the restart test still passes, but your `fsync` budget in a real system is gone |
 
-The Python port has the same surface in snake_case in one `main.py` (signatures above); Go port follows later.
+The Python port has the same surface in snake_case in one `main.py`, and the Go port the same surface in exported CamelCase in `raftnode.go` (signatures above). In Go the two-leaders case panics (there is no caller who could handle it), and `Handle` returns `nil` where Java returns `List.of()`.
 
 ## Run the grader
 
 ```bash
 python3 scripts/project_test.py raft-kv --lang java --stage 2 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --stage 2 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --stage 2 --path my-raft-kv
 ```
 
 The grader re-runs stage 1 first. Stage 2 has about 65 assertions: timeout range and determinism, the candidate transition, vote counting with stale and duplicate replies, every RequestVote receiver rule, the up-to-date guard, follower and candidate reactions to `AppendEntries`, leader step-down and heartbeat cadence, the seed-7 election, same-seed-same-trace, 40 lossy seeds with explicit at-most-one-leader-per-term tracking, 20 three-node clusters at 30 % loss, the partition and heal, and the crash-restart vote test. The cluster scenarios run in under two seconds; if yours take much longer, a node is probably starting an election every tick because `resetElectionTimer` was not called.

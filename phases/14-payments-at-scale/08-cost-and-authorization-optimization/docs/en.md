@@ -3,7 +3,7 @@
 > Network tokens, retries, and routing that lifts approvals.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 11, Lesson 02 (Card Authorization Lifecycle), Phase 11, Lesson 03 (ISO 8583), Phase 11, Lesson 05 (Tokenization and PCI Scope), Phase 11, Lesson 07 (Interchange and Scheme Fees), Phase 12, Lesson 04 (Smart Routing and Retries), Phase 14, Lesson 06 (Observability for Money Movement)
 **Time:** ~75 minutes
 
@@ -379,9 +379,37 @@ python3 -m unittest -v
 
 The Python tests port every Java check (41 assertions) and the demo output is identical to the Java run.
 
-### Porting notes
+### In Go
 
-Go: `math/rand` with `rand.New(rand.NewSource(seed))` (or a hand-written LCG for cross-language equality), `int64` minor units, a `map[Lever]bool` or bitmask for the lever set. The experiment is embarrassingly parallel per arm; if you run arms on goroutines, give each its own result struct and run `go test -race`.
+`code/go/main.go` keeps `PriceList`, `Txn`, `TxnTrace`, `ArmResult`, `AuthExperiment`, and `Uplift`; `money.go` is the Phase 10 `Money` and `javarandom.go` the JDK generator. The demo prints the same table: 83,737 control approvals, 7,823 extra under ALL, 10,941 as the sum of singles. What differs:
+
+- **`EnumSet<Lever>` is a bitmask.** `LeverSet` is a `uint8` with `Of(levers...)`, `AllLevers()`, `Has`, and a `String` that walks `Levers` in declaration order, so it prints `[NETWORK_TOKEN, ROUTING]` exactly as `EnumSet.toString` does. Enums with data (`ResponseCode`'s field 39 value and `DeclineClass`) are `iota` constants indexing a table, read through `Code()` and `DeclineClass()`.
+
+```go
+type LeverSet uint8
+
+func Of(levers ...Lever) LeverSet {
+    var s LeverSet
+    for _, l := range levers {
+        s |= 1 << l
+    }
+    return s
+}
+
+func (s LeverSet) Has(l Lever) bool { return s&(1<<l) != 0 }
+```
+
+- **Validation returns an error, arithmetic that cannot fail panics.** `NewTxn` returns `ErrBadDraw` for a draw outside `[0, 10000)` where Java's compact constructor throws, and the test checks it with `errors.Is`. `Money.Plus`, `Minus`, and `Times` return `(Money, error)` as in Phase 10; inside `Simulate` and `Run` every amount is the same currency and far below `int64`, so the calls go through a `need` helper that panics on the error instead of threading `if err != nil` through the hot loop.
+- **Equality is structural.** `TxnTrace` and `ArmResult` are plain structs of comparable fields, so "same txn, same levers, same trace" and "control is reproducible" are `==`. `Money.Compare` panics on a currency mismatch, as `compareTo` throws.
+- **Integer arithmetic.** Basis points and minor units are `int64`; Go's `/` truncates toward zero like Java's, so the approval rate, the cost per approval, and `DivideRounded` with `HalfEven` agree with the Java to the cent, including the negative LEVEL3_DATA cost delta. Seven arms over 100,000 transactions run in well under a second.
+
+```bash
+cd phases/14-payments-at-scale/08-cost-and-authorization-optimization/code/go
+go run .
+go test ./...
+```
+
+The Go tests port all 33 Java checks (40 assertions, plus a pin on the seed-2026 demo figures) and the demo output is identical to the Java run.
 
 ## Use It
 

@@ -1,6 +1,6 @@
 # Go Port Plan
 
-**Status (2026-10-27):** Wave 1 complete (batches A–F, 56 lessons). 96 of 143 Build lessons and 0 of 3 projects have Go; Wave 2 (G–L: Phases 8–12, 14 + projects) next. Go stays `ci: false` until Wave 2 lands. Two waves of six agents; the batches mirror the Python plan (A–F then G–L). Agent brief follows.
+**Status (2026-10-27):** COMPLETE. 143 of 143 Build lessons and 3 of 3 projects have Go; `languages.json` has Go `ci: true`, so a lesson is Complete only with Java, Python, and Go present. Two waves of six agents; the batches mirror the Python plan (A–F then G–L). Agent brief follows.
 
 Repository: `/home/claude/payments-engineering-from-scratch`. Every lesson below is complete in Java (and most in Python). Add a **faithful Go port** of each assigned lesson. Do not change the Java or Python code, the quiz, or the outputs.
 

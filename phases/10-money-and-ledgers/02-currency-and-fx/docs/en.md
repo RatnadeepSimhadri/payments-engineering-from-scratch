@@ -3,7 +3,7 @@
 > ISO 4217, exponents, and where the rounding residue goes.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -379,9 +379,31 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-A Go port would return `(Conversion, error)` from `Convert` and `(FxRate, error)` from `NewFxRate`, with sentinel errors `ErrUnknownCurrency`, `ErrStaleRate`, and `ErrCurrencyMismatch` for `errors.Is`; `math/big.Rat` is available for the rational but an `int64` pair with hand-written `mulChecked` keeps the design identical to Java. The registry's iteration order needs care for deterministic output: Go's `map` does not preserve insertion order, so the Go registry keeps a separate ordered slice of codes.
+The full port is `code/go/main.go` (registry, `FxRate`, `Conversion`, `Convert`, `RoundTrip`, `RateTable`) plus `code/go/money.go`, which is the Phase 10, Lesson 01 `Money` unchanged. Tests are in `code/go/main_test.go`. Three things differ:
+
+- **Errors are values, and each failure the lesson warns about has a sentinel.** `Convert` returns `(Conversion, error)`, `FxRateOf`/`NewFxRate` return `(FxRate, error)`, and the table's `Rate` returns `(FxRate, error)`. `ErrUnknownCurrency`, `ErrStaleRate`, and `ErrCurrencyMismatch` are wrapped with `%w` so callers and tests use `errors.Is`:
+
+```go
+func (r FxRate) RequireFresh(nowEpochSeconds, maxAgeSeconds int64) (FxRate, error) {
+    age := nowEpochSeconds - r.ObservedAtEpochSeconds
+    if age > maxAgeSeconds {
+        return FxRate{}, fmt.Errorf("%w: %s rate from %s is %ds old; max %ds",
+            ErrStaleRate, r.Pair(), r.Source, age, maxAgeSeconds)
+    }
+    return r, nil
+}
+```
+
+- **Overflow is checked by hand.** Every `Math.multiplyExact` in the Java (`cross`, `withSpreadApplied`, `convert`) becomes a call to `mulChecked`, which returns `ErrOverflow` instead of wrapping. `int64` `/` and `%` truncate toward zero exactly like Java, so `DivideRounded` is the same code and `-19.99 USD` converts to `-18.42 EUR` without a sign fix-up.
+- **Insertion order is explicit.** Go's `map` iterates in random order, so `CurrencyRegistry` and `RateTable` keep a `[]string` of keys next to the map to reproduce `LinkedHashMap` ordering in `All()`. The reduction of the rational happens in `NewFxRate`, the Go stand-in for the record's compact constructor, so an `FxRate` built any other way is a bug by construction.
+
+```bash
+cd phases/10-money-and-ledgers/02-currency-and-fx/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

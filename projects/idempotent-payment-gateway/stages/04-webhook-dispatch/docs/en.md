@@ -58,7 +58,7 @@ Every attempt is signed with the clock *at send time* (`t=` differs per attempt)
 
 ## Your task
 
-Add `Webhooks.java`, then extend `Gateway` with `attachWebhooks` and event emission. Stages 1 to 3 are graded again first. The Python port has the same surface in snake_case in one `main.py` (signatures below); Go port follows later.
+Add `Webhooks.java`, then extend `Gateway` with `attachWebhooks` and event emission. Stages 1 to 3 are graded again first. The Python port has the same surface in snake_case in one `main.py`, and the Go port the same surface in exported CamelCase (signatures below).
 
 ```java
 record WebhookEvent(String id, String type, String paymentId, String data, long createdAt) {
@@ -169,6 +169,44 @@ class Gateway:
     def attach_webhooks(self, dispatcher: WebhookDispatcher) -> None: ...   # charge() then emits payment.succeeded / payment.failed
 ```
 
+The same surface in Go (`webhooks.go`; `crypto/hmac` + `crypto/sha256` for the signature, `hmac.Equal` for the constant-time compare; there is no `null` string, so an empty header is the malformed case):
+
+```go
+type WebhookEvent struct{ ID, Type, PaymentID, Data string; CreatedAt int64 }
+func NewWebhookEvent(id, eventType, paymentID, data string, createdAt int64) (WebhookEvent, error)
+func (e WebhookEvent) ToBody() string
+var ErrMalformedBody error
+func ParseWebhookEvent(body string) (WebhookEvent, error)       // inverse of ToBody; ErrMalformedBody otherwise
+
+func HmacSha256Hex(secret []byte, message string) string
+func NewWebhookSigner(secret string) (*WebhookSigner, error)     // empty secret -> error
+func (s *WebhookSigner) Signature(timestampMillis int64, body string) string   // HMAC over "<ts>.<body>"
+func (s *WebhookSigner) Header(timestampMillis int64, body string) string      // "t=<ts>,v1=<hex>"
+
+type VerifyResult int; const ( VerifyOK VerifyResult = iota; MalformedHeader; StaleTimestamp; BadSignature )
+func NewWebhookVerifier(secret string, toleranceMillis int64, clock Clock) (*WebhookVerifier, error)
+func (v *WebhookVerifier) Verify(body, header string) VerifyResult
+
+type ReceiveStatus int; const ( Accepted ReceiveStatus = iota; Duplicate; Rejected )
+type ReceiveResult struct{ Status ReceiveStatus; Verification VerifyResult; Event *WebhookEvent }   // Event nil when Rejected
+func NewWebhookConsumer(verifier *WebhookVerifier) *WebhookConsumer
+func (c *WebhookConsumer) Receive(body, header string) ReceiveResult
+func (c *WebhookConsumer) Processed() []WebhookEvent
+
+type WebhookEndpoint interface{ Deliver(body, header string) bool }
+type Delivery struct{ Body, Header string }
+func NewScriptedEndpoint(script string) (*ScriptedEndpoint, error)   // 'S' 'F'; Deliver, Deliveries() []Delivery
+func NewConsumerEndpoint(consumer *WebhookConsumer) *ConsumerEndpoint
+
+type DeliveryJob struct{ Event WebhookEvent; Attempts int; NextAttemptAt int64 }
+func NewWebhookDispatcher(signer *WebhookSigner, endpoint WebhookEndpoint, clock Clock, retryDelaysMillis []int64) (*WebhookDispatcher, error)
+func (d *WebhookDispatcher) MaxAttempts() int; Enqueue(event WebhookEvent); RunDue() int
+func (d *WebhookDispatcher) Pending() []DeliveryJob; Delivered() []WebhookEvent; DeadLetters() []DeliveryJob   // copies
+func (g *Gateway) AttachWebhooks(dispatcher *WebhookDispatcher)
+```
+
+`RunDue` cannot remove from the slice it is iterating the way Java removes from `pending`; build two new slices (jobs not yet due, in order; then the retries it scheduled) and assign `d.pending = append(remaining, retries...)`. The grader checks the order through `Pending()`.
+
 Rules the tests pin down:
 
 - `verify` order: null body or header → `MALFORMED_HEADER`; header must be exactly two comma-separated parts `t=<long>` and `v1=<hex>`, else `MALFORMED_HEADER`; `|now - t| > tolerance` → `STALE_TIMESTAMP`; then compute the expected signature over `t + "." + body` and compare with `MessageDigest.isEqual` on the UTF-8 bytes → `OK` or `BAD_SIGNATURE`. Tolerance 0 accepts only the exact instant.
@@ -206,8 +244,10 @@ What must fail and how:
 ```bash
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --stage 4 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --stage 4 --path my-gateway
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --stage 4 --path my-gateway
 python3 scripts/project_test.py idempotent-payment-gateway --lang java --all --path my-gateway --report gateway-report.json
 python3 scripts/project_test.py idempotent-payment-gateway --lang python --all --path my-gateway --report gateway-report.json
+python3 scripts/project_test.py idempotent-payment-gateway --lang go --all --path my-gateway --report gateway-report.json
 ```
 
 Stages 1 to 3 run again (148 assertions), then Stage 4's 50. The `--report` file is what the `build-project` skill reads to mark the project complete.

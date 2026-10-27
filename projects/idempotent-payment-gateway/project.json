@@ -9,11 +9,13 @@
   "hours": 10,
   "languages": [
     "Java",
-    "Python"
+    "Python",
+    "Go"
   ],
   "languageWhy": {
     "Java": "Records, sealed-style enums and EnumMap give the state machine and the transition table a compact, type-checked shape; javax.crypto.Mac and MessageDigest.isEqual are the production HMAC tools.",
-    "Python": "hashlib, hmac.compare_digest and frozen dataclasses are the production-grade pieces in the standard library; the xorshift64* Rng is ported bit-for-bit, so a retry schedule drawn in Python is the one the Java tests expect."
+    "Python": "hashlib, hmac.compare_digest and frozen dataclasses are the production-grade pieces in the standard library; the xorshift64* Rng is ported bit-for-bit, so a retry schedule drawn in Python is the one the Java tests expect.",
+    "Go": "Constructors return (value, error) and misuse of the store or the state machine is a sentinel error you test with errors.Is, so 'illegal state' is a value, not a stack trace; a sync.Mutex inside the store is the explicit form of Java's synchronized, and crypto/hmac plus hmac.Equal are the standard-library pieces a real webhook receiver uses."
   },
   "status": "ready",
   "skills": [

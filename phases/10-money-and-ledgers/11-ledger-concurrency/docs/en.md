@@ -3,7 +3,7 @@
 > Ten thousand payments into one merchant account per second.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 05 (Balances and Snapshots), Phase 10, Lesson 07 (Holds and Available Balance), Phase 4, Lesson 02 (Locks and Atomic Counters)
 **Time:** ~90 minutes
 
@@ -384,9 +384,38 @@ python3 main.py            # add --stats for contention counters and timings
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go has true parallelism: use `sync.Mutex` per account, `atomic.Pointer[AccountState]` for the optimistic version, and run the tests under `go test -race`, which detects unsynchronized access the stress assertions might miss. Keep the expected-state computation separate from the concurrent run, exactly as `Workload.expected()` does.
+The full port is `code/go/main.go` (same `InterleavingChecker` as `Explore`, `PessimisticLedger`, `OptimisticLedger`, `ShardedLedger`, `Workload`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go`, so seed 42 produces the same 160,000 scripted transfers and the same `395807.83 USD` of payouts. Tests are in `code/go/main_test.go` and must pass under `go test -race ./...`. Three things differ:
+
+- **Goroutines and `sync` replace threads and `ReentrantLock`.** `Cell.lock` is a `sync.Mutex`; `TryLock` (Go 1.18+) counts the lock waits exactly as `tryLock()` did. `Workload.Run` releases every goroutine at once by closing a channel instead of a `CountDownLatch`, and a `sync.WaitGroup` stands in for `join()`. The deadlock-freedom test waits on a done channel with a ten-second `select` timeout rather than `join(10_000)`.
+- **The optimistic row is an `atomic.Pointer[AccountState]`.** Validation compares pointers, not values: a stale read is detected because a commit stores a *new* `AccountState`, so `a.state.Load() != sa` is the Go spelling of Java's `a.state().get() == sa` reference check. The validate-and-write section is a closure with deferred unlocks so every exit path releases both commit locks in order:
+
+```go
+for {
+    sa, sb := a.state.Load(), b.state.Load()                 // read phase: no locks
+    committed, err := func() (bool, error) {
+        first.commit.Lock(); defer first.commit.Unlock()
+        second.commit.Lock(); defer second.commit.Unlock()
+        if a.state.Load() != sa || b.state.Load() != sb {    // validate: nothing changed since the read
+            return false, nil
+        }
+        ...
+    }()
+    if err != nil || committed {
+        return err
+    }
+    l.retries.Add(1)                                          // stale read: go again
+}
+```
+
+- **No inheritance, so `ShardedLedger` embeds `*PessimisticLedger`.** Calls through the `ConcurrentLedger` interface reach the sharded `Transfer` and `Balance`; `RollUp` calls `l.PessimisticLedger.Transfer` explicitly where Java wrote `super.transfer`. `Math.floorMod` on the routing counter becomes a two-line `floorMod` helper, `ErrInsufficientFunds` is a sentinel checked with `errors.Is`, and the `ConcurrentHashMap`s become plain maps behind a `sync.RWMutex`, which the race detector would flag if any path forgot.
+
+```bash
+cd phases/10-money-and-ledgers/11-ledger-concurrency/code/go
+go run .                   # add --stats for contention counters and timings
+go test -race ./...
+```
 
 ## Use It
 

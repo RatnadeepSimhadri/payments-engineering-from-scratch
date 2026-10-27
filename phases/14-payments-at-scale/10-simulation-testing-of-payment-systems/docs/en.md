@@ -3,7 +3,7 @@
 > Run a year of payments in a minute with a seeded network.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 5, Lesson 02 (Failure Models), Phase 5, Lesson 09 (Idempotency Keys), Phase 12, Lesson 14 (Testing Payment Systems), Phase 14, Lesson 03 (Exactly-Once Money Movement)
 **Time:** ~120 minutes
 
@@ -464,9 +464,34 @@ python3 -m unittest -v
 
 The Python tests port every Java check (63 assertions, one of them pinning the seed-1 fingerprint to the Java value) and the demo output is identical to the Java run, fingerprints included.
 
-### Porting notes
+### In Go
 
-A Go port gets wrap-around for free with `uint64`, uses `container/heap` for the queue, returns `error` values where the Java throws, and must not use goroutines for any component: the point is that the whole simulation is one sequential loop. Keep the same four `split()` calls in the same order so a seed means the same universe in every language.
+`code/go/main.go` is the same harness: `Rng`, `Fingerprint`, `Simulator`, `Network`, `FaultSchedule`, `Processor`, `Gateway`, `Client`, `Harness`, with the Phase 10 `Money` in `money.go`. Seed 1 over 48 virtual hours produces the same 9,435 events and the same fingerprint `ff8801a677b7abd9` as the Java and Python runs, and the planted defects fall on the same seeds (1 and 4). What differs:
+
+- **SplitMix64 on `uint64` needs no masks and no `>>>`.** Unsigned multiplication wraps and `>>` is the logical shift, so `NextLong` is the six lines of the paper verbatim. `NextInt` takes the top 32 bits with `%` on unsigned words and `NextLongBounded` is a plain unsigned remainder, which is what `Long.remainderUnsigned` spells out in Java.
+
+```go
+func (r *Rng) NextLong() uint64 {
+    r.Draws++
+    r.state += 0x9E3779B97F4A7C15
+    z := r.state
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    return z ^ (z >> 31)
+}
+```
+
+- **`container/heap` is the event queue.** `eventHeap` orders by `(Time, Seq)`, so ties run in scheduling order exactly as the Java comparator does; `crypto/sha256` replaces `MessageDigest`, and because `hash.Hash.Sum` leaves the running state untouched, `Fingerprint.Hex` needs no clone.
+- **Errors are values, programming errors panic.** `Transfer` returns `ErrNonPositiveTransfer`, `Ledger.Post` returns `ErrUnbalancedEntry`, `RunUntilIdle` returns `ErrNoQuiescence`, and `FindFailingSeed` returns `(SimReport, bool)` where Java returns `null`; the tests use `errors.Is`. A negative delay or a non-positive RNG bound is a bug in the caller, so `Schedule` and `NextInt` panic as the Java throws `IllegalArgumentException`. `Money.Plus` on amounts the harness itself produced goes through `need`, which panics on the error that cannot happen.
+- **Insertion order is explicit, and there are no goroutines.** `Gateway.PaymentIds` and `Client.OutcomeKeys` keep the `LinkedHashMap` order next to the maps, `ApprovalsPerPayment` returns its ids sorted (the `TreeMap`), so the first violation reported is the one the Java reports. Closures capture the per-iteration loop variable (Go 1.22) where Python needed a default argument. Every component runs on the one event loop; `go test -race` passes trivially because nothing is shared, which is the point.
+
+```bash
+cd phases/14-payments-at-scale/10-simulation-testing-of-payment-systems/code/go
+go run .
+go test ./...
+```
+
+The Go tests port all 36 Java checks (43 assertions, one of them pinning the seed-1 fingerprint and event count to the Java values) and the demo output is identical to the Java run, fingerprints included.
 
 ## Use It
 

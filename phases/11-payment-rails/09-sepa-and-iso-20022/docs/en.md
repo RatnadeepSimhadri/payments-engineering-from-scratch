@@ -3,7 +3,7 @@
 > The XML message format the whole world is migrating to.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 08 (ACH and the NACHA File Format); Phase 11, Lesson 11 (IBAN, BIC, and Account Number Validation)
 **Time:** ~120 minutes
 
@@ -423,9 +423,31 @@ python3 -m unittest -v
 
 The Python tests port all 42 checks (43 assertions) and the demo output is identical to the Java run, XML included.
 
-### Porting notes
+### In Go
 
-Go's `encoding/xml` maps structs with tags such as `xml:"CdtTrfTxInf"`, ignores DTD entities, and makes the namespace check explicit via `XMLName`; return errors for every mismatch instead of throwing.
+The port in `code/go/main.go` (with `money.go`, the Phase 10 `Money` copied unchanged) keeps every type and method: `Iban.IsValid`, `SepaRules.Violations`, `Pain001.Write`, `Pacs008.FromPain001`, and the same `Xml` helpers, and it prints byte-identical XML. Four things differ:
+
+- **The DOM is a struct you write yourself.** `encoding/xml` is a token stream, not a tree, so `Xml.decode` builds a small `Element{Namespace, Name, Attrs, Text, Children}` from `StartElement`/`EndElement`/`CharData` tokens and `Xml.Serialize` prints it with the two-space indent the Java `Transformer` uses. The decoder resolves `xmlns`, so `Name.Space` is the namespace URI the root check compares against.
+- **The XXE guard is a prescan plus Strict mode.** Go's decoder never fetches external entities, but it has no `disallow-doctype-decl`, so `ParseRoot` refuses any input containing `<!DOCTYPE` before decoding, and `Strict = true` makes an undefined `&x;` a parse error instead of literal text:
+
+```go
+if doctype.MatchString(doc) {
+    return nil, isoErr("malformed XML: DOCTYPE is disallowed when processing a payment file")
+}
+d := xml.NewDecoder(strings.NewReader(doc))
+d.Strict = true
+```
+
+- **One error type, matched with `errors.Is`.** `Iso20022Error` carries the message and wraps the cause; `errors.Is(err, ErrIso20022)` is what the tests check. `Write`, `Parse`, `FromPain001`, `ControlSum`, and `Xml.Child` all return `(T, error)`. Inside the two `Parse` functions a `need(...)` helper panics with that error and a deferred `catch` converts it back into the return value, so forty field reads do not each need an `if err != nil`; nothing escapes the function.
+- **Optional fields are empty strings, records are structs with `Equals`.** `Party.Bic` and `Remittance` use `""` where Java used `null`, dates are `time.Time` in UTC formatted with `"2006-01-02T15:04:05"`, and `PaymentInitiation.Equals` compares the transfer slices element by element because a struct holding a slice is not comparable with `==`.
+
+```bash
+cd phases/11-payment-rails/09-sepa-and-iso-20022/code/go
+go run .
+go test ./...
+```
+
+The Go tests port all 42 checks (44 assertions, including an undefined-entity case) and the demo output is identical to the Java run, XML included.
 
 ## Use It
 

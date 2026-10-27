@@ -86,7 +86,7 @@ Finally the scaffolding. With `new Network(clock, 7, 0.0, 5)` (seed 7, no drops,
 
 ## Your task
 
-Implement every method of `Storage` in `Storage.java`. The fields are already declared and must keep their names and visibility: the harness and the tests read them directly. (Python: the `Storage` class in your `main.py`; the provided parts and the later-stage stubs sit in the same file.)
+Implement every method of `Storage` in `Storage.java`. The fields are already declared and must keep their names and visibility: the harness and the tests read them directly. (Python: the `Storage` class in your `main.py`; the provided parts and the later-stage stubs sit in the same file. Go: `storage.go` in your workspace; `sim.go` and `cluster.go` are the provided substrate, `raftnode.go`, `kvstore.go`, and `linearizability.go` hold the later-stage stubs.)
 
 ```java
 final class Storage {
@@ -129,6 +129,36 @@ class Storage:                 # fields keep their names: current_term, voted_fo
 # attribute plus tick(now) and handle(m, now); no_trace is the Python Tracer.NONE.
 ```
 
+The same surface in Go (one `package main` across the workspace files; exported CamelCase; the caller-bug guards panic where Java throws unchecked exceptions, because a node that saves a lower term or ships the sentinel is broken code, not a condition a caller handles):
+
+```go
+type Storage struct {
+    CurrentTerm int64
+    VotedFor    int          // -1 means null
+    Log         []LogEntry   // slot 0 = LogEntry{0, "<sentinel>"}
+    Writes      int          // stable-storage writes
+}
+func NewStorage() *Storage                                      // given: VotedFor -1, Log with the sentinel
+
+func (s *Storage) Save(term int64, votedFor int)                // term < CurrentTerm -> panic; Writes++
+func (s *Storage) Append(e LogEntry)                            // e.Term < LastTerm() -> panic; Writes++
+func (s *Storage) Truncate(fromIndex int)                       // fromIndex < 1 -> panic; past the end is a no-op (no write)
+func (s *Storage) LastIndex() int                               // len(Log) - 1
+func (s *Storage) LastTerm() int64                              // 0 when empty
+func (s *Storage) TermAt(index int) int64                       // out of range -> panic
+func (s *Storage) EntriesFrom(fromIndex int) []LogEntry         // slices.Clone(Log[fromIndex:]); range 1..LastIndex()+1 else panic
+func (s *Storage) UpToDate(candidateLastIndex int, candidateLastTerm int64) bool
+func (s *Storage) Describe() string                             // "[t1:PUT a 1, t3:NOOP]"
+
+// Provided in sim.go (do not edit): NewClock().Now()/Advance(); NewRng(seed).NextLong()/NextInt(bound)/NextDouble() (state is
+// uint64 so the shifts are logical like Java's >>>); NewRequestVote / NewVoteReply / NewAppendEntries / NewAppendReply build a
+// Message struct (fields Kind, From, To, Term, PrevLogIndex, PrevLogTerm, Entries, LeaderCommit, Success, MatchIndex);
+// Config{ElectionTimeoutMin, ElectionTimeoutMax, HeartbeatInterval}, DefaultConfig, and NewConfig(min, max, hb) (Config, error);
+// NewNetwork(clock, seed, dropRate, maxDelay) with Add / Send / SendAll / Tick / Partition([]int) / Heal / Crash / Restart / IsDown /
+// InFlight and the counters Sent / Delivered / Dropped; Node is the interface ID() int, Tick(now) []Message, Handle(m, now) []Message;
+// Tracer is func(now int, text string) and TracerNone discards.
+```
+
 Rules, including what must fail and how:
 
 - `save(term, votedFor)`: `term < currentTerm` throws `IllegalArgumentException` and changes nothing. Saving the same pair again still counts as a write (it is a persist, not a cache). `votedFor` may be any node id or -1.
@@ -167,18 +197,20 @@ Common mistakes the tests are designed to catch:
 
 `Sim.java`, `Cluster.java`, `Linearizability.java` (the `Op`, `History`, `CheckResult` types), and the stubbed `RaftNode.java`, `KVStore.java`, and `Checker` are in your workspace from `--init`. Leave `Sim.java` and `Cluster.java` alone; the other stubs are yours in later stages. The starter `Main` only drives the scaffolding; it runs as-is and you may replace it at any time.
 
-The Python port has the same surface in snake_case in one `main.py` (signatures above); Go port follows later.
+The Python port has the same surface in snake_case in one `main.py`, and the Go port the same surface in exported CamelCase across the workspace files (signatures above). In Go, leave `sim.go` and `cluster.go` alone; the `--init` workspace also holds the stubbed `raftnode.go`, `kvstore.go`, and `linearizability.go` (`Op`, `History`, `CheckResult` provided, `Checker` stubbed) and a `main.go` that only drives the scaffolding.
 
 ## Run the grader
 
 ```bash
 python3 scripts/project_test.py raft-kv --lang java --init my-raft-kv     # once
 python3 scripts/project_test.py raft-kv --lang python --init my-raft-kv     # once
+python3 scripts/project_test.py raft-kv --lang go --init my-raft-kv         # once
 python3 scripts/project_test.py raft-kv --lang java --stage 1 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --stage 1 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --stage 1 --path my-raft-kv
 ```
 
-The stage-1 test has about 70 assertions: fresh state, every `Storage` rule above including the three exception cases, the SplitMix64 stream (`new Rng(1).nextLong() == 0x910A2DEC89025CC1L`, `new Rng(42).nextInt(1000)` gives 451, 953, 371), the `Network` delivery schedule for seed 7, drops at rate 1.0, partitions, crash and restart, and the `Message` and `Config` helpers.
+The stage-1 test has about 70 assertions: fresh state, every `Storage` rule above including the three exception cases (panics in Go), the SplitMix64 stream (`new Rng(1).nextLong() == 0x910A2DEC89025CC1L`, `new Rng(42).nextInt(1000)` gives 451, 953, 371), the `Network` delivery schedule for seed 7, drops at rate 1.0, partitions, crash and restart, and the `Message` and `Config` helpers.
 
 ## Check yourself
 

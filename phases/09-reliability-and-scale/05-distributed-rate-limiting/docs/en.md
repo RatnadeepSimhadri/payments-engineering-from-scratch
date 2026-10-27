@@ -3,7 +3,7 @@
 > Token buckets across nodes without a coordinator.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 9, Lesson 04 (Cache Invalidation, Stampedes, and Request Coalescing), Phase 5, Lesson 10 (Retries, Backoff, and Jitter), Phase 1, Lesson 06 (Hash Maps from Scratch)
 **Time:** ~90 minutes
 
@@ -372,9 +372,34 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `int64` wraps silently like Java's `long`, so port the checked multiply from Phase 10, Lesson 01; the `RateLimiter` interface is a one-method Go interface and `Decision` a struct. A Go port that lets real goroutines call `SharedStore` concurrently must put a `sync.Mutex` around each bucket's read-modify-write (that is the race Step 3 warns about) and pass `go test -race ./...`.
+```go
+// Refill is lazy: add rate * elapsed, clamp to capacity. Called before every decision.
+func (b *TokenBucket) Refill(nowMillis int64) {
+    if nowMillis <= b.lastRefillMillis {
+        return
+    }
+    elapsed := nowMillis - b.lastRefillMillis
+    added := mustInt(mulChecked(elapsed, b.ratePerSecond))
+    b.tokensMilli = min(b.capacityMilli, mustInt(addChecked(b.tokensMilli, added)))
+    b.lastRefillMillis = nowMillis
+}
+```
+
+Differences, all in `code/go/main.go` and `javarandom.go`:
+
+- **`int64` wraps silently, so overflow is checked by hand.** `mulChecked` and `addChecked` (the Phase 10, Lesson 01 helpers) stand in for `Math.multiplyExact` and `Math.addExact`. The constructor returns `ErrOverflow` when `capacity * 1000` does not fit; inside `Refill` and `TryAcquire` an overflow is a programming error with no caller to report to, so `mustInt` panics there, which is what the Java `ArithmeticException` does too. All token math stays in `int64` milli-tokens; nothing is a `float64`.
+- **Invalid arguments are errors, not exceptions.** `NewTokenBucket`, `NewLocalSyncLimiter`, and `SetRatePerSecond` return `error` where Java throws `IllegalArgumentException`; tests check `err != nil` or `errors.Is(err, ErrOverflow)`. `FakeClock.Advance` panics on a negative step because a clock running backwards is a bug in the test, not a condition.
+- **The load generator is `java.util.Random`.** `JavaRandom.NextDouble` reproduces the 48-bit LCG, so seed 7 offers the same 3,893 even-load and 4,024 skewed requests and every row of the three tables matches the Java output; `TestSeededLoad` pins 1099 admitted for centralized and 1052 for `local+sync(1000ms)` under skew.
+- **Collections.** `ArrayDeque<Long>` is a `*[]int64` the limiter mutates in place (`(*log)[1:]` is `pollFirst`, `append` is `addLast`); the `long[]` demand and usage arrays are `[]int64` slices that share their backing array exactly as the Java arrays are shared by reference; `computeIfAbsent` is an explicit `if _, ok := m[key]; !ok` because the bucket constructor needs `nowMillis`.
+- **Formatting.** `%+10d` and `%10.2f` exist in `fmt` with the same meaning as in `String.format`, so the table prints identically.
+
+```bash
+cd phases/09-reliability-and-scale/05-distributed-rate-limiting/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

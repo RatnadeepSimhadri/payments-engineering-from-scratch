@@ -3,7 +3,7 @@
 > The event happened at 11:59; it arrived at 12:03. Which window?
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 8, Lesson 07 (Stream Processing and Windows), Phase 5, Lesson 02 (Clocks and Ordering), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
@@ -373,9 +373,38 @@ Differences, all in `code/python/main.py`:
 
 Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The event-by-event watermark trace and the side output match the Java run line for line.
 
-### Porting notes
+### In Go
 
-In Go, `Money.Plus` returns `(Money, error)` and the window state's `add` propagates it; `TreeMap` becomes a sorted slice of `Window` with `sort.Search` for insertion, and the sentinel is `math.MinInt64` with the same explicit check. Neither port needs concurrency: the operator is single-threaded by design, which is also how Flink and Kafka Streams run one operator instance per partition.
+```go
+// NoWatermark is the watermark before any event has been seen (Java's Long.MIN_VALUE).
+const NoWatermark int64 = math.MinInt64
+
+func (w *BoundedOutOfOrdernessWatermark) Current() int64 {
+    if w.maxEventTime == NoWatermark {
+        return NoWatermark
+    }
+    return w.maxEventTime - w.maxOutOfOrdernessMillis
+}
+
+func (s *WindowState) Add(e Event) error {
+    sum, err := s.Sum.Plus(e.Amount)
+    if err != nil {
+        return err
+    }
+    s.Count++
+    s.Sum = sum
+    return nil
+}
+```
+
+Differences, all in `code/go/main.go` and `code/go/money.go`:
+
+- **The sentinel is a named constant with the same explicit guard.** `NoWatermark` is `math.MinInt64`; `Process` checks `wmBefore != NoWatermark` before comparing, exactly as the Java checks `Long.MIN_VALUE`, because `NoWatermark - bound` would wrap silently in both languages. `hhmm(NoWatermark)` prints `-inf`.
+- **`Money.Plus` returns `(Money, error)` and the error propagates.** `WindowState.Add` returns it, so `EventTimeWindowOperator.Process` returns `([]WindowResult, error)` and `ProcessingTimeWindowOperator.Process` returns `error`: an event in a foreign currency is refused before it is counted, and the test checks that `AccountsForEveryEvent` still holds afterwards. Constructors return `error` where Java throws `IllegalArgumentException`.
+- **No `TreeMap`.** Open windows live in `map[Window]*WindowState`; `advance` takes a sorted snapshot of the keys (`sortedOpen`) once to fire and once to garbage-collect, matching the Java iteration order. The window count is tiny (two in the demo), so the sort is free.
+- **`floorDiv` is written by hand.** Go's `/` truncates toward zero like Java's, so `assign(-1)` needs `Math.floorDiv` semantics to land in `[-60 min, 0)`; the helper is six lines and the test pins it.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The event-by-event watermark trace and the side output match the Java run line for line.
 
 ## Use It
 

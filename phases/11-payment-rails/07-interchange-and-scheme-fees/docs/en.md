@@ -3,7 +3,7 @@
 > Who gets paid on a $100 transaction, to the cent.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 01 (How a Card Payment Works); Phase 11, Lesson 04 (PANs, Luhn, and BIN Ranges)
 **Time:** ~75 minutes
 
@@ -409,9 +409,30 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-In Go, `Rate` and `Money` are structs of `int64`, `Pricing` is an interface with an unexported marker method, and `Quote` returns `(FeeBreakdown, error)` so that `NoRateException` and the invariant failure become error values rather than panics. The Go port needs no concurrency: the engine is a pure function of the table.
+The full port is `code/go/main.go` (same `Rate`, `InterchangeTable`, `SchemeFees`, `FeeBreakdown`, `FeeEngine`; tests in `code/go/main_test.go`). `Money` is the canonical Go `Money` from Phase 10, Lesson 01, copied into `code/go/money.go`. Three things differ:
+
+- **The sealed interface is an interface with an unexported marker method.** Only types in this package can implement `pricing()`, so `IcPlusPlus` and `Blended` are the whole set, as `permits` guarantees in Java. Go's type switch is not checked for exhaustiveness, so `Quote` keeps a `default` branch that returns an error instead of silently charging nothing:
+
+```go
+type Pricing interface{ pricing() }
+
+type IcPlusPlus struct{ Markup Rate }
+type Blended struct{ MerchantRate Rate }
+
+func (IcPlusPlus) pricing() {}
+func (Blended) pricing()    {}
+```
+
+- **Every arithmetic step returns an error, so overflow is impossible to ignore.** `Money.Times` and `Plus` return `(Money, error)` where Java's `multiplyExact` and `addExact` throw, so `Rate.ApplyTo`, `SchemeFees.FeeFor`, `Quote`, `Attribute` and `Total` all return `(T, error)` and the chain stops at the first failure. `NoRateException` is `ErrNoRate`, the `FeeBreakdown` invariant is `ErrInvariant`, cap and argument violations are `ErrInvalidArgument`, and the mixed-currency attribution is `Money`'s own `ErrCurrencyMismatch`; the tests assert the kind with `errors.Is`. `MerchantDiscount()` and `EffectiveRateBps()` stay error-free because the constructor already proved the parts share a currency and sum to gross.
+- **Enums are typed integer constants with a `String()`.** `CardType`, `Region` and `Channel` print their Java names, `CardTypes` and `Channels` stand in for `values()`, and `RateKey.String()` prints `RateKey[cardType=..., region=..., channel=...]`, so the demo output, including the two `rejected:` lines, is byte-identical to Java. `RateOf` parses the percent with `strings.Cut` and zero-padding, never through a `float64`.
+
+```bash
+cd phases/11-payment-rails/07-interchange-and-scheme-fees/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 

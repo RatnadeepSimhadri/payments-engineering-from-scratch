@@ -1,6 +1,6 @@
 # Raft Key-Value Store
 
-**Level 3, Advanced. About 14 hours. Java or Python (Go port follows later).**
+**Level 3, Advanced. About 14 hours. Java, Python, or Go.**
 
 Build a Raft-replicated key-value store on the deterministic simulated network from the Raft lessons, then prove its client history linearizable. Five nodes, seeded randomness, explicit partitions and crashes: every run is a pure function of a seed, so the bug you find at seed 17, tick 1203 is the bug you can replay until it is gone.
 
@@ -25,33 +25,41 @@ You should be able to read Figure 2 of the paper and say what each bullet is for
 
 ## Commands
 
-Run everything from the repository root. Java 21 or Python 3.11+, standard library only; pick one `--lang` and keep it.
+Run everything from the repository root. Java 21, Python 3.11+, or Go 1.22+, standard library only; pick one `--lang` and keep it.
 
 ```bash
-# create a workspace with the stage-1 starter (Java: Sim.java, Cluster.java, and the stubs; Python: one main.py with the same parts)
+# create a workspace with the stage-1 starter (Java: Sim.java, Cluster.java, and the stubs; Python: one main.py with the same parts;
+# Go: go.mod, sim.go, cluster.go, and the stubs in storage.go, raftnode.go, kvstore.go, linearizability.go, main.go)
 python3 scripts/project_test.py raft-kv --lang java --init my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --init my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --init my-raft-kv
 
 # grade one stage (stages 1..N all run, so regressions show up)
 python3 scripts/project_test.py raft-kv --lang java --stage 1 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --stage 1 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --stage 1 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang java --stage 2 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --stage 2 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --stage 2 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang java --stage 3 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --stage 3 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --stage 3 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang java --stage 4 --path my-raft-kv
 python3 scripts/project_test.py raft-kv --lang python --stage 4 --path my-raft-kv
+python3 scripts/project_test.py raft-kv --lang go --stage 4 --path my-raft-kv
 
 # grade everything and write a completion report
 python3 scripts/project_test.py raft-kv --lang java --all --path my-raft-kv --report raft-kv-report.json
 python3 scripts/project_test.py raft-kv --lang python --all --path my-raft-kv --report raft-kv-report.json
+python3 scripts/project_test.py raft-kv --lang go --all --path my-raft-kv --report raft-kv-report.json
 
 # run your own demo
 cd my-raft-kv && javac -d .out *.java && java -cp .out Main   # Java
 cd my-raft-kv && python3 main.py                                # Python
+cd my-raft-kv && go run .                                       # Go
 ```
 
-Each stage runs in a fresh temporary directory containing your workspace sources plus that stage's tests (`StageNNTest.java`, or `test_stage_NN.py` run with `python3 -m unittest -v`); your workspace is never modified. The whole suite runs in a few seconds; if a stage takes longer than ten, a node is almost certainly campaigning every tick.
+Each stage runs in a fresh temporary directory containing your workspace sources plus that stage's tests (`StageNNTest.java`, `test_stage_NN.py` run with `python3 -m unittest -v`, or `stageNN_test.go` run with `go test ./...`); your workspace is never modified. The whole suite runs in a few seconds; if a stage takes longer than ten, a node is almost certainly campaigning every tick.
 
 ## Workspace layout after `--init`
 
@@ -67,7 +75,9 @@ Each stage runs in a fresh temporary directory containing your workspace sources
 
 In Python the whole workspace is one `main.py` with the same sections in the same order: the provided substrate (`Clock`, `Rng`, `Message`, `Config`, `Network`), `Storage` (stage 1), `KVStore` and `RaftNode` (stages 2 to 4), `Op`/`History`/`CheckResult` (provided) and `Checker` (stage 4), then the provided `Cluster`. Names are the Java ones in snake_case; `current_term`, `voted_for` and `log` are properties on `RaftNode`.
 
-Later stages ship a `starter/STAGE.md` listing the new signatures in both languages; nothing is copied after stage 1. You keep editing the same files.
+In Go the workspace is one `package main` in the same files as Java, lower-cased: `sim.go` and `cluster.go` (provided), `storage.go` (stage 1), `raftnode.go` (stages 2 to 4), `kvstore.go` (stage 4), `linearizability.go` (`Op`, `History`, `CheckResult` provided; `Checker` stage 4), and `main.go` (yours). Names are the Java ones in exported CamelCase (`Storage.Save`, `RaftNode.OnAppendEntries`, `KVStore.Apply`, `Checker.Check`); the fields the harness reads (`Role`, `LeaderID`, `CommitIndex`, `NextIndex`, ...) are exported. Where Java throws for a caller's bug (`Storage` guards, two leaders in a term, a violated Figure 3 invariant) the Go code panics; where a caller can check the input (`KVStore.Apply`, `NewConfig`, `Cluster.History`, `SubmitUntilAccepted`) it returns an `error` wrapping a sentinel (`ErrBadCommand`, `ErrInvariant`, `ErrPending`, `ErrNoLeader`). Every stub panics with `not implemented: TODO stage NN ...` until you replace it.
+
+Later stages ship a `starter/STAGE.md` listing the new signatures in all three languages; nothing is copied after stage 1. You keep editing the same files.
 
 ## What you keep
 
@@ -78,7 +88,7 @@ Later stages ship a `starter/STAGE.md` listing the new signatures in both langua
 
 ## Run with your own inputs
 
-`Main.java` (or `main()` in `main.py`) in your workspace is yours. Some things worth trying once the grader is green:
+`Main.java` (or `main()` in `main.py` / `main.go`) in your workspace is yours. Some things worth trying once the grader is green:
 
 - **Hunt for a split vote.** Loop seeds on a 4-node cluster with `new Cluster(4, seed, 0.0, 3)` and print the first seed whose stable leader has `currentTerm() > 1`; then narrow the timeout range in `Config` and watch how many terms it takes.
 - **Break the no-op.** Comment out the `NOOP` append in `becomeLeader`, run the stage-4 grader, and read which scenario catches it and at what tick.

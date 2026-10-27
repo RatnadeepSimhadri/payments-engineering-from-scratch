@@ -3,7 +3,7 @@
 > Sum a million postings in milliseconds without summing a million postings.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 04 (Chart of Accounts)
 **Time:** ~90 minutes
 
@@ -385,9 +385,32 @@ python3 main.py            # add --timing for wall-clock numbers
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go maps iterate in random order, so `verify` and any printed snapshot must sort account ids first; use `sort.Search` for both binary searches and `[]int64` for the column. The Go port needs no lock in this lesson; Lesson 11 is where Java's `synchronized` and Go's `sync.Mutex` start to differ.
+The full port is `code/go/main.go` (same `Ledger`, `Snapshot`, `Reading`, `LongList`, `PaymentStream`), with `money.go` (the Lesson 01 `Money`) and `javarandom.go` (the JDK's 48-bit LCG, so seed 7 produces the same 500,000 payments and the same `-116054.22 USD`). Tests are in `code/go/main_test.go`. Three things differ:
+
+- **Validation happens in constructors that return errors.** Java's compact record constructors throw; Go has no constructors, so `NewPosting`, `NewJournalEntry`, and `NewLedger` return `(T, error)`, and every ledger rule wraps the sentinel `ErrLedger` so tests check `errors.Is(err, ErrLedger)`. `Post` also pre-computes every new running total with `addChecked` *before* mutating anything, which is what makes "rejected entry left no trace" hold even for an overflow:
+
+```go
+after := make([]int64, len(entry.Postings))
+for i, p := range entry.Postings {
+    sum, err := addChecked(base, p.SignedMinor())
+    if err != nil {
+        return 0, err             // nothing has been appended yet
+    }
+    after[i] = sum
+}
+l.journal = append(l.journal, entry)
+```
+
+- **Map order is not insertion order.** `Ledger` keeps `accountOrder []string` beside the `accounts` map so `Verify` walks accounts in the order they were opened, and `Snapshot.AccountIDs()` sorts its keys. The snapshot's own map is private and copied in `NewSnapshot`: the copy is the snapshot, exactly as `Map.copyOf` is in Java.
+- **The binary searches are written out, not `sort.Search`ed.** `sort.Search` would find the same indices, but the hand-written loops keep `Reading.PostingsScanned` reporting the same probe count as Java (9 for the demo's lookup). `LongList` is a thin named wrapper over `[]int64`; Go slices are already unboxed, so the type exists only so the three ports read alike. `--timing` works the same way, with `time.Now()` instead of `System.nanoTime()`.
+
+```bash
+cd phases/10-money-and-ledgers/05-balances-and-snapshots/code/go
+go run .                   # add --timing for wall-clock numbers
+go test ./...
+```
 
 ## Use It
 

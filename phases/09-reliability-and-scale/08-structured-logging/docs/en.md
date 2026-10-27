@@ -3,7 +3,7 @@
 > Every log line carries the payment ID or it is noise.
 
 **Type:** Build
-**Languages:** Java, Python
+**Languages:** Java, Python, Go
 **Prerequisites:** Phase 9, Lesson 07 (Distributed Tracing and Context Propagation), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 10, Lesson 01 (Representing Money)
 **Time:** ~60 minutes
 
@@ -362,9 +362,33 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### Porting notes
+### In Go
 
-Go: `log/slog` (Go 1.21+) is structured logging in the standard library with `With(...)` for bound attributes and a `Handler` interface where redaction and sampling slot in; `encoding/json` with a struct whose field order is the declaration order; a `ReplaceAttr` function on the handler is the idiomatic redaction hook.
+```go
+// Fnv1a is FNV-1a over UTF-16 code units in wrapping 32-bit arithmetic, bit for bit the Java int version.
+func Fnv1a(s string) int32 {
+    h := uint32(0x811c9dc5)
+    for _, cu := range utf16.Encode([]rune(s)) {
+        h ^= uint32(cu)
+        h *= 0x01000193
+    }
+    return int32(h)
+}
+```
+
+Differences, all in `code/go/main.go`:
+
+- **The sampling hash wraps in `uint32`, then goes signed.** Go's `int32` would wrap too, but the unsigned form makes the intent visible; the result is converted to `int32` so `floorMod` (a four-line port of `Math.floorMod`, because Go's `%` keeps the dividend's sign) selects the same trace `1af76519...` and the demo prints the same "records kept: 11 of 37". Java hashes UTF-16 code units, so the loop runs over `utf16.Encode`, not over bytes or runes.
+- **RE2 has no lookaround, so the PAN matcher is written out.** `(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)` becomes `candidateAt`: start only at a digit not preceded by a digit, follow the digit/separator chain, then back off from 19 digits down to 13 until the next character is not a digit, exactly the regex engine's greedy-then-backtrack order. Two extra tests pin the corner cases (a 20-digit run never matches; a spaced 20-digit chain backs off to 16 at a separator). `\d` is ASCII in both languages; the Go version checks bytes `'0'..'9'`.
+- **Errors are values.** `NewSampler` returns `error` for a rate below 1, and `Log`/`Debug`/`Info`/`Warn`/`Error` return `ErrOddFields` for an odd key/value list (`errors.Is` in the test); the demo's call sites ignore the return because their argument lists are literals. `LogRecord.Field` returns `(string, bool)` instead of `null`, and the sampler takes `""` for "no trace bound".
+- **Ordered maps are explicit.** `LinkedHashMap` becomes the small `Fields` type (a key slice plus a map) used for bound context and record fields, so `With` copies and extends the order and `ToJson` emits bound fields before call-site fields, as the test requires. `Set.of(...)` of indexed fields is a variadic `[]string`; `Level` is an `int` enum with `String()` and `Syslog()` tables.
+- **`with` is a legal method name in Go**, so `With` and `WithTrace` keep the Java names; `String... kv` is `kv ...string`.
+
+```bash
+cd phases/09-reliability-and-scale/08-structured-logging/code/go
+go run .
+go test ./...
+```
 
 ## Use It
 
