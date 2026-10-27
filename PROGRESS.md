@@ -1,6 +1,6 @@
 # Progress Tracker
 
-Generated 2026-10-14T00:38:15+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
+Generated 2026-10-27T04:24:41+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
 
 ## Overall
 
@@ -13,7 +13,7 @@ Generated 2026-10-14T00:38:15+00:00 by `python3 scripts/progress.py` from the re
 | Go implementations | 40 / 143 Build lessons (port in progress, not gating) |
 | Projects | 3 ready: `idempotent-payment-gateway` (4 stages, Java), `ledger-engine` (4 stages, Java), `raft-kv` (4 stages, Java) |
 | Skills | 9 / 9 present and mirrored to `.claude/skills/` |
-| Git | HEAD `073a5e0 docs: pause Python port; save resume plan and log`; 121 uncommitted files |
+| Git | HEAD `bb2788a feat(python): port Wave 1 - 56 lessons across Phases 0-7 and 13`; 0 uncommitted files |
 
 ## By track and phase
 
