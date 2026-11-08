@@ -297,7 +297,7 @@ Final: customer liabilities owed to customers (positive balances only) = 0; safe
 
 - [Directive 2009/110/EC (Second E-Money Directive)](https://eur-lex.europa.eu/eli/dir/2009/110/oj) — the definition of e-money, issuance and redemption at par, the interest prohibition, and safeguarding by reference to PSD2
 - [Directive (EU) 2015/2366 (PSD2), Article 10](https://eur-lex.europa.eu/eli/dir/2015/2366/oj) — the safeguarding methods that e-money institutions also use
-- [FCA: Safeguarding regime for payments and e-money firms (PS25/12)](https://www.fca.org.uk/publications/policy-statements/ps25-12-changes-safeguarding-regime-payments-e-money-firms) — the UK's revised rules: daily reconciliation, monthly returns, resolution packs
+- [FCA: Safeguarding regime for payments and e-money firms (PS25/12)](https://www.fca.org.uk/publications/policy-statements/ps25-12-changes-safeguarding-regime-payments-and-e-money-firms) — the UK's revised rules: daily reconciliation, monthly returns, resolution packs
 - [CSBS Money Transmission Modernization Act](https://www.csbs.org/csbs-money-transmission-modernization-act-mtma) — the model state law on licensing, permissible investments, and trust treatment of customer funds
 - [FDIC: Financial Products That Are Not Insured and pass-through deposit insurance rules (12 CFR Part 330)](https://www.fdic.gov/resources/deposit-insurance/financial-products-insured) — when insurance passes through a custodial account and when it does not
 - [Reserve Bank of India Master Directions on Prepaid Payment Instruments](https://www.rbi.org.in/Scripts/BS_ViewMasDirections.aspx?id=12156) — the Indian PPI regime: escrow, KYC tiers, limits, interoperability
