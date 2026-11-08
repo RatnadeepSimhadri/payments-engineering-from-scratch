@@ -96,6 +96,20 @@ You need Java 21+, Python 3.11+, or Go 1.22+, depending on the language you choo
 
 </details>
 
+### Website
+
+The repository is also published as a static site at `https://<user>.github.io/payments-engineering-from-scratch/` (for this repository, [ratnadeepsimhadri.github.io/payments-engineering-from-scratch](https://ratnadeepsimhadri.github.io/payments-engineering-from-scratch/)): every lesson with code tabs in Java, Python, and Go, an interactive quiz, the artifacts, a roadmap with your progress, the projects and learning paths, a glossary, and search. Nothing leaves your browser: the language choice and completed lessons live in `localStorage`.
+
+Preview it locally with the standard library only:
+
+```bash
+python3 scripts/build_catalog.py          # refresh catalog.json
+python3 scripts/build_site.py             # writes site/ (gitignored); --check also validates every page
+python3 -m http.server -d site            # open http://localhost:8000/
+```
+
+`.github/workflows/site.yml` rebuilds and deploys the site on every push to `main`. Pages must be enabled once in the repository settings with the source set to **GitHub Actions**.
+
 ## Projects
 
 Staged projects with starters, graders, and reference solutions in Java, Python, and Go. The grader runs every earlier stage too, so a regression is reported the moment you introduce it.

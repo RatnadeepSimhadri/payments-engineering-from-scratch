@@ -17,6 +17,7 @@ python3 scripts/audit_lessons.py                          # 0 issues
 python3 scripts/run_lesson.py phases/NN-.../MM-... --lang java   # and python/go if you ported
 python3 scripts/build_catalog.py                          # regenerates README Contents, ROADMAP, phase READMEs
 python3 scripts/sync_skills.py --check                    # if you touched skills/
+python3 scripts/build_site.py --check                     # every lesson renders on the website; required when you touch docs/, outputs/, or site-src/
 ```
 
 - One commit per lesson directory: `feat(phase-NN/MM): <slug>`; ports use `feat(phase-NN/MM): <slug> python port`.

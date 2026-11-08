@@ -2,6 +2,12 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-11-01 — Fact-checks and static website
+
+- Fact-checked the nine regulatory claims written without network access, against primary sources. Corrected: FedNow per-transaction limit (now 10,000,000 USD network maximum since Nov 2025, participant default 100,000 USD; was "500,000 at launch"), FCA PS25/12 URL, RBI e-mandate link (Aug 2019 circular repealed by the Digital Payments E-mandate Framework 2026), EBA SCA-opinion URL (two lessons), Modern Treasury and Adyen doc links. Confirmed correct: FCA 2026 rules, Wirecard Drucksache 19/30900, ECI values, all cited reporting deadlines (SAR, Reg E, Nacha, UK APP, GDPR/CCPA). Unverifiable: Elkan 2001 PDF link (citation confirmed; host blocks fetches).
+- Static website: `scripts/build_site.py` (stdlib only, own Markdown renderer, `--check` validates every page and internal link) generates 228 pages into `site/` — index, roadmap, 16 phase pages, 199 lesson pages with Java/Python/Go code tabs and interactive quizzes, projects, learning paths, glossary with A–Z bar and filter, client-side search, local progress (localStorage). `.github/workflows/site.yml` deploys to GitHub Pages on push to `main` (Pages source must be set to "GitHub Actions" once in repo settings). Build ≈2 s.
+- Glossary refresh (every Key Terms row → entry) was started and interrupted by a usage limit; to resume.
+
 ## 2026-10-27 — Go port complete (Wave 2: 47 lessons + 3 projects) — all three languages done
 
 - Ported batches G–L: Phases 8, 9, 10, 11, 12, 14 lessons and the three projects. Go coverage: 96 → **143 / 143** Build lessons; all 3 projects pass 4/4 stages in Go (ledger-engine, idempotent-payment-gateway, raft-kv), Go starters compile and fail stage 1 as required.
