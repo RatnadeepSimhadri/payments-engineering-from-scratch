@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 6, Lesson 03 (Leader-Based Replication), Phase 7, Lesson 01 (Partitioning and Rebalancing), Phase 7, Lesson 13 (Transactional Outbox), Phase 9, Lesson 11 (Multi-Region and Disaster Recovery), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 10, Lesson 08 (Reconciliation), Phase 14, Lesson 03 (Exactly-Once Money Movement)
+**Prerequisites:** Phase 6 Lesson 01 (Replication Strategies), Phase 7 Lesson 01 (Partitioning Strategies and Rebalancing), Phase 7 Lesson 13 (The Transactional Outbox), Phase 9 Lesson 11 (Multi-Region Architecture and Disaster Recovery), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 08 (Reconciliation)
 **Time:** ~90 minutes
 
 ## Learning Objectives
@@ -17,7 +17,7 @@
 
 ## The Problem
 
-A digital wallet launches in Europe and the United States. To give both continents low latency, the team deploys the ledger in `eu-central` and `us-east` as an active-active pair: each region accepts writes for any account and replicates its journal to the other asynchronously, with a typical lag of 300 ms. Balances are computed from the replicated journal. Load tests pass. The architecture review praises the availability.
+A digital wallet launches in Europe and the United States. To give both continents low latency, the team deploys the ledger in `eu-central` and `us-east` as an active-active pair: each region accepts writes for any account and replicates its journal to the other asynchronously, with a typical lag of 300 ms. Balances are computed from the replicated journal. Load tests pass. The architecture review praises the availability. This lesson pairs with Phase 14 Lesson 03 (Exactly-Once Money Movement End to End), which comes later.
 
 A customer in Frankfurt has 600.00 EUR. At 14:02:11.200 her phone, on a mobile network that routes through Frankfurt, pays a 500.00 EUR invoice through the app. At 14:02:11.350 a scheduled transfer she set up last month, triggered by a job running in `us-east`, sends 500.00 EUR to her landlord. Each region checks the balance it can see: 600.00, enough. Each region posts the debit. Replication delivers each debit to the other region 300 ms later, and the balance becomes -400.00. Neither write was wrong given what its region knew. The ledger now records money that does not exist, and the platform has already sent 1,000.00 EUR out through two payment rails.
 

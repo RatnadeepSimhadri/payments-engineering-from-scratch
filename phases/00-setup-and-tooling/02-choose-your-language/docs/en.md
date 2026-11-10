@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 0, Lesson 01 (Dev Environment)
+**Prerequisites:** Phase 0 Lesson 01 (Dev Environment)
 **Time:** ~45 minutes
 
 ## Learning Objectives

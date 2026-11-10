@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 3, Lesson 03 (Balanced Trees: AVL and Red-Black), Phase 1, Lesson 04 (Linked Lists), Phase 0, Lesson 08 (Probability for Engineers)
+**Prerequisites:** Phase 3 Lesson 03 (Balanced Trees), Phase 1 Lesson 04 (Linked Lists), Phase 2 Lesson 14 (Randomized Algorithms and Reservoir Sampling)
 **Time:** ~60 minutes
 
 ## Learning Objectives

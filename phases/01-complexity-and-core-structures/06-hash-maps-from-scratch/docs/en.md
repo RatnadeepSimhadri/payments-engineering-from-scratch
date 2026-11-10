@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays), Phase 1, Lesson 04 (Linked Lists)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis), Phase 1 Lesson 03 (Dynamic Arrays), Phase 1 Lesson 04 (Linked Lists)
 **Time:** ~120 minutes
 
 ## Learning Objectives

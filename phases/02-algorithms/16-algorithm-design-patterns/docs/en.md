@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 2, Lessons 01 through 15 (this lesson is the index to them), Phase 1, Lesson 14 (Choosing a Structure)
+**Prerequisites:** Phase 2 Lesson 01 (Sorting), Phase 2 Lesson 02 (Binary Search and Its Variants), Phase 2 Lesson 03 (Two Pointers and Sliding Windows), Phase 2 Lesson 04 (Recursion and Backtracking), Phase 2 Lesson 05 (Divide and Conquer and the Master Theorem), Phase 2 Lesson 06 (Dynamic Programming), Phase 2 Lesson 07 (Greedy Algorithms and Exchange Arguments), Phase 2 Lesson 08 (Graph Traversal), Phase 2 Lesson 09 (Shortest Paths), Phase 2 Lesson 10 (Topological Sort and DAG Scheduling), Phase 2 Lesson 11 (Minimum Spanning Trees), Phase 2 Lesson 12 (String Matching), Phase 2 Lesson 13 (Interval Problems), Phase 2 Lesson 14 (Randomized Algorithms and Reservoir Sampling), Phase 2 Lesson 15 (Numerical Algorithms), Phase 1 Lesson 14 (Choosing a Structure)
 **Time:** ~45 minutes
 
 ## Learning Objectives

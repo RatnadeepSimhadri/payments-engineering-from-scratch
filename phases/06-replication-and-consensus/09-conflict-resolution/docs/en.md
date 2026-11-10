@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 03 (Lamport and Vector Clocks), Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks), Phase 6, Lesson 01 (Replication Strategies), Phase 6, Lesson 08 (CRDTs)
+**Prerequisites:** Phase 5 Lesson 03 (Lamport and Vector Clocks), Phase 5 Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks), Phase 6 Lesson 01 (Replication Strategies), Phase 6 Lesson 08 (CRDTs)
 **Time:** ~75 minutes
 
 ## Learning Objectives

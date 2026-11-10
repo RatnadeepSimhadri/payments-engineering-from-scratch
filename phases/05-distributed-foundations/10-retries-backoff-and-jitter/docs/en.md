@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 09 (Idempotency Keys), Phase 1, Lesson 09 (Heaps and Priority Queues)
+**Prerequisites:** Phase 5 Lesson 09 (Idempotency Keys), Phase 1 Lesson 09 (Heaps and Priority Queues)
 **Time:** ~90 minutes
 
 ## Learning Objectives

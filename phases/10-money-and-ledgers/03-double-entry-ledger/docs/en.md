@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 02 (Currencies and FX)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 10 Lesson 02 (Currencies and FX)
 **Time:** ~150 minutes
 
 ## Learning Objectives
@@ -131,18 +131,18 @@ Net debits sum to `+2.90 + 0 + 0 - 2.90 = 0`. The trial balance has 2.90 in the 
 
 ### Reversal, not edit
 
-The merchant refunds the customer. The wrong fix is `UPDATE entries SET ... WHERE id = 'pay-001'` or, worse, deleting it. The journal is evidence. Auditors, the reconciliation job in Lesson 08, and your own incident review all depend on the journal at time T being the same journal you see later.
+The capture turns out to be wrong (a duplicate, or voided before the batch closed) and must be undone in full. The wrong fix is `UPDATE entries SET ... WHERE id = 'pay-001'` or, worse, deleting it. The journal is evidence. Auditors, the reconciliation job in Lesson 08, and your own incident review all depend on the journal at time T being the same journal you see later.
 
-The right fix is a new entry whose postings are the originals with every side flipped:
+The right fix is a **reversal**: a new entry whose postings are the originals with every side flipped:
 
 ```text
-rev-001  refund: reverse pay-001   (reverses pay-001)
+rev-001  reversal: void pay-001   (reverses pay-001)
       Cr 1200 Processor Receivable 100.00 USD
   Dr 2100 Merchant Payable          97.10 USD
   Dr 4100 Fee Revenue                2.90 USD
 ```
 
-A flipped balanced entry is still balanced, so it is accepted by the same constructor. Its effect on every balance is the exact negative of the original, so `post(e); post(reversal(e))` is the identity on every account, which the tests assert on a fresh ledger. The reversal records what it reverses (`reversalOf = "pay-001"`), the ledger refuses to reverse the same entry twice, and the original stays at position one of the journal forever. Lesson 06 extends this to partial reversals and corrections with a different amount; the mechanism is the same.
+A flipped balanced entry is still balanced, so it is accepted by the same constructor. Its effect on every balance is the exact negative of the original, so `post(e); post(reversal(e))` is the identity on every account, which the tests assert on a fresh ledger. The reversal records what it reverses (`reversalOf = "pay-001"`), the ledger refuses to reverse the same entry twice, and the original stays at position one of the journal forever. A full mirror is a reversal (a void), not a refund: a true refund after settlement is a new forward entry (Dr 2100 Merchant Payable / Cr Refunds Payable to the customer), usually with the fee retained, which is why it does not touch 4100 Fee Revenue; Phase 10, Lesson 06 builds that entry alongside partial reversals and corrections with a different amount.
 
 ### Idempotent posting by entry id
 
@@ -373,8 +373,8 @@ rejected: entry bad-1 rejected: debits minus credits in USD = 2.90 USD (must be 
 rejected: entry bad-2 rejected: debits minus credits in USD = 100.00 USD; debits minus credits in EUR = -100.00 EUR (must be zero per currency)
 rejected: entry id pay-001 already posted with different content
 
-== Reversal: the merchant refunds the customer; nothing is edited ==
-fee revenue before refund 2.90 USD, after 0.00 USD
+== Reversal: the capture is voided; nothing is edited ==
+fee revenue before reversal 2.90 USD, after 0.00 USD
 journal now holds 4 entries; pay-001 is still entry #1
 
 == 10,000 seeded random balanced entries: trial balance still sums to zero ==

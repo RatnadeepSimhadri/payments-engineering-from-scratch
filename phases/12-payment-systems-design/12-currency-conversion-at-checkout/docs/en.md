@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 08 (Payouts and Balance Management); Phase 12, Lesson 10 (Payment Method Abstraction)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 12 Lesson 01 (Designing an Idempotent Payment API), Phase 12 Lesson 08 (Payouts and Balances), Phase 12 Lesson 10 (Payment Method Abstraction)
 **Time:** ~60 minutes
 
 ## Learning Objectives
@@ -85,7 +85,7 @@ sequenceDiagram
     D-->>C: LockedCharge(120.00 USD, 112.82 EUR)
     Note over D,M: authorization, capture, then settlement at T+2
     D->>M: sell 112.82 EUR at the T+2 market rate
-    D-->>C: merchant receives 120.00 USD; PSP keeps the difference
+    D-->>C: merchant receives 120.00 USD, PSP keeps the difference
 ```
 
 Why 15 minutes? It must outlast a checkout session (address entry, 3-D Secure, a wallet redirect) and must be short enough that the PSP's exposure per quote is bounded. Real products offer windows from minutes (checkout sessions) to 24 hours or more (invoices), and charge a wider spread for a longer lock, because the expected adverse movement grows with the square root of time.

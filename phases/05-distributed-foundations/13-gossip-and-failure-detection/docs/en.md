@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 02 (Failure Models); Phase 5, Lesson 08 (Timeouts and Deadline Propagation); Phase 5, Lesson 12 (Leases, Fencing Tokens, and Distributed Locks)
+**Prerequisites:** Phase 5 Lesson 02 (Failure Models), Phase 5 Lesson 08 (Timeouts and Deadline Propagation), Phase 5 Lesson 12 (Leases, Fencing Tokens, and Distributed Locks)
 **Time:** ~75 minutes
 
 ## Learning Objectives

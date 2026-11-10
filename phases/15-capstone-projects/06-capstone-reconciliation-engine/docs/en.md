@@ -4,7 +4,7 @@
 
 **Type:** Capstone
 **Languages:** Java, Python, or Go (pick one; the spec is language-neutral)
-**Prerequisites:** Phase 10 Lesson 08 (Reconciliation), Phase 11 Lessons 08, 09, 14 (NACHA, ISO 20022, Bank Statement Formats), Phase 14 Lesson 04 (Reconciliation at Scale), Phase 3 Lesson 15 (Serialization), Phase 2 Lesson 01 (Sorting), Phase 1 Lesson 06 (Hash Maps), Phase 13 Lesson 11 (Auditability), Phase 15 Lesson 01
+**Prerequisites:** Phase 10 Lesson 08 (Reconciliation), Phase 11 Lesson 08 (ACH and the NACHA File Format), Phase 11 Lesson 09 (SEPA, Wires, and ISO 20022), Phase 11 Lesson 14 (Bank Statement Formats), Phase 14 Lesson 04 (Reconciliation at Scale), Phase 3 Lesson 15 (Serialization), Phase 2 Lesson 01 (Sorting), Phase 1 Lesson 06 (Hash Maps), Phase 13 Lesson 11 (Auditability), Phase 15 Lesson 01 (A Durable Double-Entry Ledger Service)
 **Time:** ~360 minutes
 
 ## Learning Objectives

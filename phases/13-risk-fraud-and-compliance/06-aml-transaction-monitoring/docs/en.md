@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 05 (Sliding Windows and Two Pointers), Phase 13, Lesson 02 (Rules Engine and Velocity Checks), Phase 13, Lesson 03 (Risk Scoring and Thresholds)
+**Prerequisites:** Phase 2 Lesson 03 (Two Pointers and Sliding Windows), Phase 13 Lesson 02 (A Rules Engine with Velocity Checks), Phase 13 Lesson 03 (Risk Scoring and Thresholds)
 **Time:** ~90 minutes
 
 ## Learning Objectives

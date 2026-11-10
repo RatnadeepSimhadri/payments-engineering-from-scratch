@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 5, Lesson 13 (Gossip Protocols and Failure Detection)
+**Prerequisites:** Phase 8 Lesson 01 (The Append-Only Log), Phase 5 Lesson 13 (Gossip Protocols and Failure Detection)
 **Time:** ~90 minutes
 
 ## Learning Objectives

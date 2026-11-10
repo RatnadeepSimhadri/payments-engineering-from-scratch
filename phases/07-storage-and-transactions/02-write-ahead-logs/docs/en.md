@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 11 (Bit Manipulation and Compact Encodings), Phase 3, Lesson 05 (LSM Trees), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 1 Lesson 11 (Bit Manipulation and Compact Encodings), Phase 3 Lesson 05 (LSM Trees), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~120 minutes
 
 ## Learning Objectives

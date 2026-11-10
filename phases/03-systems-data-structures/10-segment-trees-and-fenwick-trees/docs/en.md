@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 03 (Dynamic Arrays), Phase 1, Lesson 08 (Binary Search Trees), Phase 1, Lesson 11 (Bit Manipulation), Phase 2, Lesson 05 (Divide and Conquer)
+**Prerequisites:** Phase 1 Lesson 03 (Dynamic Arrays), Phase 1 Lesson 08 (Binary Search Trees), Phase 1 Lesson 11 (Bit Manipulation and Compact Encodings), Phase 2 Lesson 05 (Divide and Conquer and the Master Theorem)
 **Time:** ~90 minutes
 
 ## Learning Objectives

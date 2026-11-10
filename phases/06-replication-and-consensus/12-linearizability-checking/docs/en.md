@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 05 (Consistency Models); Phase 6, Lesson 02 (Replication Lag and Read-Your-Writes); Phase 6, Lesson 06 (Raft II: Log Replication and Commit)
+**Prerequisites:** Phase 5 Lesson 05 (Consistency Models), Phase 6 Lesson 02 (Replication Lag and Read-Your-Writes), Phase 6 Lesson 06 (Raft II: Log Replication)
 **Time:** ~90 minutes
 
 ## Learning Objectives

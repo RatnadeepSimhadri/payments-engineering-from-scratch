@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 9, Lesson 10 (Capacity Planning and Queueing Theory), Phase 6, Lesson 02 (Replication: Leader-Follower, Sync vs Async), Phase 6, Lesson 05 (Raft), Phase 10, Lesson 03 (Double-Entry Ledger)
+**Prerequisites:** Phase 9 Lesson 10 (Capacity Planning and Queueing Theory), Phase 6 Lesson 01 (Replication Strategies), Phase 6 Lesson 05 (Raft I: Leader Election)
 **Time:** ~90 minutes
 
 ## Learning Objectives
@@ -17,7 +17,7 @@
 
 ## The Problem
 
-A payment processor runs in one cloud region. At 03:12 the region's power feed fails and the backup generators do not take over. Every service is down: API, ledger, processor adapters, dashboards. Merchants' checkouts return connection errors. The team has a replica of the ledger database in a second region, replicating asynchronously with a lag that averages two seconds. They have never failed over to it.
+A payment processor runs in one cloud region. At 03:12 the region's power feed fails and the backup generators do not take over. Every service is down: API, ledger, processor adapters, dashboards. Merchants' checkouts return connection errors. The team has a replica of the ledger database in a second region, replicating asynchronously with a lag that averages two seconds. They have never failed over to it. This lesson pairs with Phase 10 Lesson 03 (The Double-Entry Ledger from Scratch), which comes later.
 
 It takes forty minutes to decide to fail over, because nobody is sure whether the region will come back in five minutes and a failover is irreversible once writes land in the new region. It takes another fifty minutes to execute, because the DNS change has a ten-minute TTL, the secondary database must be promoted by hand, the processor adapters in the secondary region have never been issued production credentials by the acquirer, and the configuration service that would tell them where the acquirer's endpoints are is itself in the failed region. At 04:42 the platform is serving traffic from the second region. The last two seconds of ledger writes before the failure were never replicated and are gone: 114 postings, including 31 captures that the acquirer did receive and will settle. The ledger now says those merchants were not paid; the bank statement tomorrow will say they were. Reconciliation (Phase 10) will find every one of them, and finance will spend a week working them by hand.
 

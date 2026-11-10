@@ -218,14 +218,23 @@ class ExpiryTest(unittest.TestCase):
         self.assertFalse(t.expire_if_due("probe"))
         self.assertEqual(len(t.events), 2)
 
-    def test_partially_captured_also_expires_with_remainder(self):
+    def test_expired_partial_capture_lands_in_captured_and_stays_refundable(self):
         clock = FakeClock(T0)
         t = auth("100.00", clock)
         t.capture(usd("30.00"), "first")
         clock.advance(timedelta(days=8))
         with self.assertRaises(IllegalTransitionError):
             t.capture(usd("70.00"), "second")
-        self.assertEqual(t.events[2].amount, usd("70.00"))
+        self.assertIs(t.state, TransactionState.CAPTURED)
+        expiry = t.events[2]
+        self.assertIs(expiry.action, Action.EXPIRE)
+        self.assertEqual(expiry.amount, usd("70.00"))
+        self.assertIs(expiry.to_state, TransactionState.CAPTURED)
+        self.assertEqual(t.captured_amount, usd("30.00"))
+        self.assertTrue(t.remaining_authorization().is_zero())
+        t.refund(usd("30.00"), "customer returned the shipped item")
+        self.assertIs(t.state, TransactionState.REFUNDED)
+        self.assertTrue(t.net_settled().is_zero())
 
     def test_configurable_validity(self):
         clock = FakeClock(T0)

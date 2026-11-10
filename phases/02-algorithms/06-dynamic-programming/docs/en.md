@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 2, Lesson 04 (Recursion and Backtracking), Phase 2, Lesson 05 (Divide and Conquer and the Master Theorem), Phase 1, Lesson 06 (Hash Maps from Scratch)
+**Prerequisites:** Phase 2 Lesson 04 (Recursion and Backtracking), Phase 2 Lesson 05 (Divide and Conquer and the Master Theorem), Phase 1 Lesson 06 (Hash Maps)
 **Time:** ~120 minutes
 
 ## Learning Objectives

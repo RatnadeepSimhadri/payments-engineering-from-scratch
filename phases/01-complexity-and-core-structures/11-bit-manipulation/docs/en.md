@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes), Phase 1, Lesson 06 (Hash Maps from Scratch)
+**Prerequisites:** Phase 0 Lesson 07 (Decimal and Integer Arithmetic), Phase 1 Lesson 06 (Hash Maps)
 **Time:** ~60 minutes
 
 ## Learning Objectives

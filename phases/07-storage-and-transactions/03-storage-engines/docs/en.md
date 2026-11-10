@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 3, Lesson 04 (B-Trees and Why Databases Love Them), Phase 3, Lesson 05 (LSM Trees: Memtables, SSTables, and Compaction), Phase 7, Lesson 02 (Write-Ahead Logs and Crash Recovery)
+**Prerequisites:** Phase 3 Lesson 04 (B-Trees), Phase 3 Lesson 05 (LSM Trees), Phase 7 Lesson 02 (Write-Ahead Logs)
 **Time:** ~75 minutes
 
 ## Learning Objectives

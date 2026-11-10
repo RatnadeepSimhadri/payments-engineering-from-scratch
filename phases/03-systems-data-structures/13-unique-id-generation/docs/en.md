@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 1, Lesson 11 (Bit Manipulation), Phase 3, Lesson 04 (B-Trees and Why Databases Love Them)
+**Prerequisites:** Phase 1 Lesson 07 (Hash Functions and Collisions), Phase 1 Lesson 11 (Bit Manipulation and Compact Encodings), Phase 3 Lesson 04 (B-Trees)
 **Time:** ~60 minutes
 
 ## Learning Objectives

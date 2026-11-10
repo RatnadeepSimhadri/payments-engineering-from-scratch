@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model); Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 06 (Executors, Goroutines, and asyncio)
+**Prerequisites:** Phase 4 Lesson 01 (Threads and the Memory Model), Phase 4 Lesson 02 (Locks and Atomics), Phase 4 Lesson 06 (Executors, Goroutines, and asyncio)
 **Time:** ~45 minutes
 
 ## Learning Objectives

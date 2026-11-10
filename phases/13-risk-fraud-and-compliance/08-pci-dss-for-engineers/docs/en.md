@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 11, Lesson 02 (Card Networks and the Four-Party Model), Phase 12, Lesson 05 (Webhooks: Signing, Delivery, Ordering, and Replay), Phase 13, Lesson 07 (Device Fingerprinting and Signals)
+**Prerequisites:** Phase 11 Lesson 01 (How a Card Payment Works), Phase 12 Lesson 05 (Webhooks), Phase 13 Lesson 07 (Device Fingerprinting)
 **Time:** ~75 minutes
 
 ## Learning Objectives
@@ -133,7 +133,7 @@ sequenceDiagram
   participant P as Provider API
   participant M as Merchant backend
   B->>I: load iframe with publishable key
-  Note over I: card form rendered in the provider's origin;<br/>same-origin policy keeps the merchant's scripts out
+  Note over I: card form rendered in the provider's origin,<br/>same-origin policy keeps the merchant's scripts out
   I->>P: POST PAN, expiry, CVV over TLS
   P-->>I: token tok_7f3a... (and last four, brand)
   I-->>B: postMessage(token)

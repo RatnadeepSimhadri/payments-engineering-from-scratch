@@ -4,7 +4,7 @@
 
 **Type:** Capstone
 **Languages:** Java, Python, or Go (pick one; the spec is language-neutral)
-**Prerequisites:** Phase 11 Lessons 08, 09, 11, 15 (NACHA, ISO 20022, IBAN and BIC, Settlement and Clearing), Phase 12 Lesson 08 (Payouts and Balances), Phase 10 Lessons 03, 07, 10 (Double-Entry, Holds, Fees and Splits), Phase 14 Lessons 03 and 05 (Exactly-Once Money Movement, Batch vs Real-Time Settlement), Phase 7 Lesson 13 (Transactional Outbox), Phase 15 Lessons 01 and 06
+**Prerequisites:** Phase 11 Lesson 08 (ACH and the NACHA File Format), Phase 11 Lesson 09 (SEPA, Wires, and ISO 20022), Phase 11 Lesson 11 (IBAN, BIC, and Account Number Validation), Phase 11 Lesson 15 (Settlement and Clearing), Phase 12 Lesson 08 (Payouts and Balances), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 07 (Holds and Available Balance), Phase 10 Lesson 10 (Fees and Splits), Phase 14 Lesson 03 (Exactly-Once Money Movement), Phase 14 Lesson 05 (Batch vs Real-Time Settlement Pipelines), Phase 7 Lesson 13 (The Transactional Outbox), Phase 15 Lesson 01 (A Durable Double-Entry Ledger Service), Phase 15 Lesson 06 (A Reconciliation Engine)
 **Time:** ~360 minutes
 
 ## Learning Objectives

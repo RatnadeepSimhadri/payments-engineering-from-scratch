@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 03 (Lamport and Vector Clocks); Phase 5, Lesson 13 (Gossip Protocols and Failure Detection); Phase 6, Lesson 04 (Single-Decree Paxos from Scratch)
+**Prerequisites:** Phase 5 Lesson 03 (Lamport and Vector Clocks), Phase 5 Lesson 13 (Gossip Protocols and Failure Detection), Phase 6 Lesson 04 (Single-Decree Paxos)
 **Time:** ~150 minutes
 
 ## Learning Objectives
@@ -42,7 +42,7 @@ Every message carries the sender's term, so terms propagate like a Lamport clock
 stateDiagram-v2
     [*] --> Follower
     Follower --> Candidate: election timeout elapses
-    Candidate --> Candidate: timeout, no majority (split vote): new term
+    Candidate --> Candidate: timeout, no majority (split vote), new term
     Candidate --> Leader: votes from a majority
     Candidate --> Follower: AppendEntries from a leader, or any message with a higher term
     Leader --> Follower: any message with a higher term

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 0, Lesson 03 (Testing from the Standard Library)
+**Prerequisites:** Phase 0 Lesson 03 (Testing from the Standard Library)
 **Time:** ~60 minutes
 
 ## Learning Objectives
@@ -95,12 +95,12 @@ Python's `checked_add` is a range check: compute the exact result, raise `Overfl
 
 ```mermaid
 flowchart LR
-  S["\"19.99\" (string)"] -->|parse: reject >2 decimals| F["Fixed2 hundredths=1999"]
-  D["19.99 (double)"] -->|fromDouble: shortest string \"19.99\" then parse| F
+  S["#quot;19.99#quot; (string)"] -->|parse: reject >2 decimals| F["Fixed2 hundredths=1999"]
+  D["19.99 (double)"] -->|"fromDouble: shortest string #quot;19.99#quot; then parse"| F
   D -. "(long)(v * 100)" .-> X1["1998: wrong"]
   F -->|plus / minus: checked, exact| F
   F -->|"times(Fixed2, Rounding)<br/>timesRate(n, d, Rounding)<br/>dividedBy(n, Rounding)"| F
-  F -. "\"19.995\"" .-> X2["ArithmeticException: more than two decimals"]
+  F -. "#quot;19.995#quot;" .-> X2["ArithmeticException: more than two decimals"]
   F -. "MAX + 0.01" .-> X3["ArithmeticException: long overflow"]
   F -->|Phase 10 L01 adds Currency + allocate| M["Money"]
 ```

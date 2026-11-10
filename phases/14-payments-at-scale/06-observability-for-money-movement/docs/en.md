@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9, Lesson 06 (Metrics and Histograms), Phase 12, Lesson 02 (Payment State Machine), Phase 14, Lesson 04 (Reconciliation at Scale), Phase 14, Lesson 05 (Batch vs Real-Time Settlement)
+**Prerequisites:** Phase 9 Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9 Lesson 06 (Metrics and Histograms), Phase 12 Lesson 02 (The Payment State Machine), Phase 14 Lesson 04 (Reconciliation at Scale), Phase 14 Lesson 05 (Batch vs Real-Time Settlement Pipelines)
 **Time:** ~90 minutes
 
 ## Learning Objectives

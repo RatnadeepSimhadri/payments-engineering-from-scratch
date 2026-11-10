@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 03 (Dynamic Arrays), Phase 1, Lesson 04 (Linked Lists)
+**Prerequisites:** Phase 1 Lesson 03 (Dynamic Arrays), Phase 1 Lesson 04 (Linked Lists)
 **Time:** ~60 minutes
 
 ## Learning Objectives
@@ -450,5 +450,5 @@ Every rail connector has a bounded outbound queue to the network with `REJECT` s
 - [Apache Kafka documentation: Design](https://kafka.apache.org/documentation/#design) — offsets, retention, consumer position, and the log as the storage abstraction; read it as a distributed ring buffer.
 - [OpenJDK `ArrayDeque.java`](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/ArrayDeque.java) — the wrapped-index design with growth; compare its `inc`/`dec` helpers to this lesson's `indexOf`.
 - [OpenJDK `ArrayBlockingQueue.java`](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ArrayBlockingQueue.java) — the bounded ring with `BLOCK` semantics, one lock, and two conditions; Phase 4's starting point.
-- Knuth, *The Art of Computer Programming*, Volume 1, Sections 2.2.1 and 2.2.2 — stacks, queues, deques, and the original treatment of circular sequential allocation with the "one wasted slot" problem this lesson's sequences avoid.
+- Knuth, [*The Art of Computer Programming*, Volume 1](https://www.informit.com/store/art-of-computer-programming-volume-1-fundamental-algorithms-9780201896831) (Addison-Wesley), Sections 2.2.1 and 2.2.2 — stacks, queues, deques, and the original treatment of circular sequential allocation with the "one wasted slot" problem this lesson's sequences avoid.
 - [Linux `io_uring` design](https://kernel.dk/io_uring.pdf) (Axboe, 2019) — two shared ring buffers between user space and the kernel, each with head and tail sequences, as the interface for all asynchronous I/O.

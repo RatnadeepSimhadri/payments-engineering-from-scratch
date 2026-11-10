@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 9, Lesson 07 (Distributed Tracing and Context Propagation), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 9 Lesson 07 (Distributed Tracing and Context Propagation), Phase 1 Lesson 06 (Hash Maps), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~60 minutes
 
 ## Learning Objectives

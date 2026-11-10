@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 05 (Binary Search Trees), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 0, Lesson 04 (Recursion and the Call Stack)
+**Prerequisites:** Phase 1 Lesson 08 (Binary Search Trees), Phase 1 Lesson 06 (Hash Maps), Phase 2 Lesson 04 (Recursion and Backtracking)
 **Time:** ~120 minutes
 
 ## Learning Objectives

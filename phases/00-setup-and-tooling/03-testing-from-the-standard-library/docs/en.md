@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 0, Lesson 01 (Dev Environment), Phase 0, Lesson 02 (Choose Your Language)
+**Prerequisites:** Phase 0 Lesson 01 (Dev Environment), Phase 0 Lesson 02 (Choose Your Language)
 **Time:** ~60 minutes
 
 ## Learning Objectives

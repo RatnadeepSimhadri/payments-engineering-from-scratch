@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 10, Lesson 03 (The Double-Entry Ledger from Scratch)
+**Prerequisites:** Phase 10 Lesson 03 (The Double-Entry Ledger)
 **Time:** ~60 minutes
 
 ## Learning Objectives

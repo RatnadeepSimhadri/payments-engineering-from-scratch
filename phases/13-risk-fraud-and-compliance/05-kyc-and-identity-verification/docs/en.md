@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 13, Lesson 04 (Sanctions Screening); Phase 12, Lesson 01 (Payment State Machines); Phase 13, Lesson 01 (Fraud Patterns)
+**Prerequisites:** Phase 13 Lesson 04 (Sanctions Screening), Phase 12 Lesson 02 (The Payment State Machine), Phase 13 Lesson 01 (Fraud Patterns)
 **Time:** ~75 minutes
 
 ## Learning Objectives

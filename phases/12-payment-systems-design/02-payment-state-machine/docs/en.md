@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 10, Lesson 01 (Representing Money); Phase 7, Lesson 06 (MVCC and Snapshot Isolation)
+**Prerequisites:** Phase 12 Lesson 01 (Designing an Idempotent Payment API), Phase 10 Lesson 01 (Representing Money), Phase 7 Lesson 06 (MVCC and Snapshot Isolation)
 **Time:** ~120 minutes
 
 ## Learning Objectives

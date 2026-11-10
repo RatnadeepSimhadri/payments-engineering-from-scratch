@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 12 (Strings and Encodings), Phase 1, Lesson 13 (Tries), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 2, Lesson 08 (Graph Traversal)
+**Prerequisites:** Phase 1 Lesson 12 (Strings and Encodings), Phase 1 Lesson 13 (Tries and Prefix Trees), Phase 1 Lesson 07 (Hash Functions and Collisions), Phase 2 Lesson 08 (Graph Traversal)
 **Time:** ~90 minutes
 
 ## Learning Objectives

@@ -81,7 +81,15 @@ public final class MainTest {
         Set<Integer> four = new TreeSet<>(five);
         four.remove(oldLeader.id);
         check("removal change accepted", c.changeMembership(four) > 0);
-        check("C_new committed without the leader's own vote counting", c.runUntilConfigured(four, 3000) > 0 || oldLeader.steppedDownAfterRemoval);
+        // Drive the change until the old leader has committed C_new; stepping down is the only exit from that path.
+        for (int i = 0; i < 3000 && !oldLeader.steppedDownAfterRemoval; i++) c.tick();
+        int cNewIdx = oldLeader.storage.latestConfigIndex();
+        check("C_new is the old leader's latest config and is committed there",
+                oldLeader.configuration().equals(Configuration.simple(four)) && cNewIdx > 0 && cNewIdx <= oldLeader.commitIndex);
+        long replicasInCNew = four.stream().filter(m -> oldLeader.matchIndex.getOrDefault(m, 0) >= cNewIdx).count();
+        check("C_new committed by a majority of C_new alone, without the leader's own vote counting", replicasInCNew > four.size() / 2);
+        check("old leader stepped down after committing C_new", oldLeader.steppedDownAfterRemoval && oldLeader.role != Role.LEADER);
+        check("remaining members finish the change under a new leader", c.runUntilConfigured(four, 3000) > 0);
         c.runUntilStableLeader(3000);
         check("old leader stepped down", oldLeader.steppedDownAfterRemoval && oldLeader.role != Role.LEADER);
         RaftNode newLeader = c.stableLeader();

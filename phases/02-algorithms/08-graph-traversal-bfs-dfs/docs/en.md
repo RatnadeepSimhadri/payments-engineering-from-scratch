@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 1, Lesson 03 (Dynamic Arrays), Phase 2, Lesson 04 (Recursion and Backtracking)
+**Prerequisites:** Phase 1 Lesson 06 (Hash Maps), Phase 1 Lesson 03 (Dynamic Arrays), Phase 2 Lesson 04 (Recursion and Backtracking)
 **Time:** ~90 minutes
 
 ## Learning Objectives

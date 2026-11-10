@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 04 (Smart Routing, Cascading, and Retry Policies); Phase 12, Lesson 10 (Payment Method Abstraction); Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 12 Lesson 02 (The Payment State Machine), Phase 12 Lesson 04 (Smart Routing, Cascading, and Retry Policies), Phase 12 Lesson 10 (Payment Method Abstraction), Phase 10 Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
 ## Learning Objectives

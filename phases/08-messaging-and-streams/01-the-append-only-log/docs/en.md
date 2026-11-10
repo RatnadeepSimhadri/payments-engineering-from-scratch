@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 7, Lesson 02 (Write-Ahead Logs)
+**Prerequisites:** Phase 1 Lesson 07 (Hash Functions and Collisions), Phase 7 Lesson 02 (Write-Ahead Logs)
 **Time:** ~120 minutes
 
 ## Learning Objectives

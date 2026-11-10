@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis)
 **Time:** ~60 minutes
 
 ## Learning Objectives
@@ -294,8 +294,8 @@ Every row has the same shape: a cheap common case, an expensive rare case that t
 ## Further Reading
 
 - Robert E. Tarjan, ["Amortized Computational Complexity"](https://doi.org/10.1137/0606031), SIAM Journal on Algebraic and Discrete Methods, 1985 — the paper that named the technique and introduced the potential method; the dynamic array and union-find are both worked examples.
-- Cormen, Leiserson, Rivest, Stein, *Introduction to Algorithms*, Chapter 17 — aggregate, accounting, and potential methods on the binary counter, the stack with multipop, and dynamic tables including the shrink policy with hysteresis.
+- Cormen, Leiserson, Rivest, Stein, [*Introduction to Algorithms*](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/) (MIT Press), Chapter 17 — aggregate, accounting, and potential methods on the binary counter, the stack with multipop, and dynamic tables including the shrink policy with hysteresis.
 - Robert E. Tarjan, ["Efficiency of a Good But Not Linear Set Union Algorithm"](https://doi.org/10.1145/321879.321884), Journal of the ACM, 1975 — the inverse-Ackermann bound for union-find with path compression and union by rank.
-- Chris Okasaki, *Purely Functional Data Structures*, Chapter 5 and 6 (1998) — why amortized bounds fail under persistence and how lazy evaluation restores them; the clearest statement of the "inherited credit" problem.
+- Chris Okasaki, [*Purely Functional Data Structures*](https://doi.org/10.1017/CBO9780511530104) (Cambridge University Press), Chapter 5 and 6 (1998) — why amortized bounds fail under persistence and how lazy evaluation restores them; the clearest statement of the "inherited credit" problem.
 - [Redis documentation: incremental rehashing](https://redis.io/docs/latest/develop/reference/internals/) and the `dict.c` source — a production de-amortized hash table that rehashes a few buckets per operation to keep tail latency flat.
 - Gil Tene, ["How NOT to Measure Latency"](https://www.youtube.com/watch?v=lJ8ydIuPFeU) (2015) — why averages hide exactly the operations amortized analysis is about, and how to measure a p99.9 honestly.

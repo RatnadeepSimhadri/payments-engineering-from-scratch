@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 03 (Lamport and Vector Clocks), Phase 6, Lesson 01 (Replication Strategies), Phase 6, Lesson 03 (Quorums), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 5 Lesson 03 (Lamport and Vector Clocks), Phase 6 Lesson 01 (Replication Strategies), Phase 6 Lesson 03 (Quorums), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~90 minutes
 
 ## Learning Objectives

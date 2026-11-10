@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 4, Lesson 02 (Locks and Atomic Counters)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 4 Lesson 02 (Locks and Atomics)
 **Time:** ~90 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 2, Lesson 02 (Binary Search and Its Variants), Phase 2, Lesson 15 (Numerical Algorithms: GCD, Modular Arithmetic, and Check Digits), Phase 11, Lesson 01 (How a Card Payment Works)
+**Prerequisites:** Phase 2 Lesson 02 (Binary Search and Its Variants), Phase 2 Lesson 15 (Numerical Algorithms), Phase 11 Lesson 01 (How a Card Payment Works)
 **Time:** ~75 minutes
 
 ## Learning Objectives

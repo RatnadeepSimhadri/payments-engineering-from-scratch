@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 3, Lesson 01 (Bloom Filters from Scratch), Phase 3, Lesson 04 (B-Trees and Why Databases Love Them), Phase 1, Lesson 09 (Merge Sort and k-Way Merge)
+**Prerequisites:** Phase 3 Lesson 01 (Bloom Filters), Phase 3 Lesson 04 (B-Trees), Phase 2 Lesson 01 (Sorting)
 **Time:** ~120 minutes
 
 ## Learning Objectives

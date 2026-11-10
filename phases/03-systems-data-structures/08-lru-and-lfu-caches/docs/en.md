@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 04 (Linked Lists), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 1 Lesson 04 (Linked Lists), Phase 1 Lesson 06 (Hash Maps), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~90 minutes
 
 ## Learning Objectives

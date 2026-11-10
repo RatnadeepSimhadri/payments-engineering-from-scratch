@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 09 (Idempotency Keys); Phase 7, Lesson 13 (Transactional Outbox); Phase 8, Lesson 03 (Delivery Guarantees); Phase 10, Lesson 03 (Double-Entry Ledger); Phase 14, Lesson 01 (Architecture of a High-Availability Payment Gateway)
+**Prerequisites:** Phase 5 Lesson 09 (Idempotency Keys), Phase 7 Lesson 13 (The Transactional Outbox), Phase 8 Lesson 03 (Delivery Guarantees), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 14 Lesson 01 (Architecture of a High-Availability Payment Gateway)
 **Time:** ~150 minutes
 
 ## Learning Objectives

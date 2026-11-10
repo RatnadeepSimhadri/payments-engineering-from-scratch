@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 03 (Delivery Guarantees), Phase 8, Lesson 05 (Event Sourcing)
+**Prerequisites:** Phase 8 Lesson 01 (The Append-Only Log), Phase 8 Lesson 03 (Delivery Guarantees), Phase 8 Lesson 05 (Event Sourcing)
 **Time:** ~75 minutes
 
 ## Learning Objectives

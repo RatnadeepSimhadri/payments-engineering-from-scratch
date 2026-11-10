@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 8, Lesson 10 (Dead-Letter Queues and Poison Messages), Phase 8, Lesson 05 (Event Sourcing), Phase 0, Lesson 06 (Serialization Formats)
+**Prerequisites:** Phase 8 Lesson 10 (Dead-Letter Queues and Poison Messages), Phase 8 Lesson 05 (Event Sourcing), Phase 3 Lesson 15 (Serialization)
 **Time:** ~60 minutes
 
 ## Learning Objectives

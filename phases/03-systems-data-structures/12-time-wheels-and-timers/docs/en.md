@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 04 (Linked Lists), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 3, Lesson 08 (LRU and LFU Caches)
+**Prerequisites:** Phase 1 Lesson 04 (Linked Lists), Phase 1 Lesson 09 (Heaps and Priority Queues), Phase 3 Lesson 08 (LRU and LFU Caches)
 **Time:** ~75 minutes
 
 ## Learning Objectives

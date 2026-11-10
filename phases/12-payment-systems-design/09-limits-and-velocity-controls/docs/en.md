@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 08 (Payouts and Balance Management); Phase 10, Lesson 01 (Representing Money); Phase 1, Lesson 03 (Queues and Deques)
+**Prerequisites:** Phase 12 Lesson 01 (Designing an Idempotent Payment API), Phase 12 Lesson 08 (Payouts and Balances), Phase 10 Lesson 01 (Representing Money), Phase 1 Lesson 05 (Stacks, Queues, and Ring Buffers)
 **Time:** ~75 minutes
 
 ## Learning Objectives

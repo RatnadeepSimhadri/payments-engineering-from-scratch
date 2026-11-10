@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 11, Lesson 04 (PANs, Luhn, and BIN Range Routing), Phase 0, Lesson 09 (Hashing and Cryptographic Primitives)
+**Prerequisites:** Phase 11 Lesson 04 (PANs, Luhn, and BIN Range Routing), Phase 1 Lesson 07 (Hash Functions and Collisions)
 **Time:** ~90 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs and Crash Recovery), Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 7 Lesson 02 (Write-Ahead Logs), Phase 4 Lesson 02 (Locks and Atomics), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~120 minutes
 
 ## Learning Objectives

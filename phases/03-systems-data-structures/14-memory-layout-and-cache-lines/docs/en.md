@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 1, Lesson 03 (Dynamic Arrays), Phase 0, Lesson 05 (Benchmarking and Profiling), Phase 4, Lesson 02 (Locks and Atomic Counters)
+**Prerequisites:** Phase 1 Lesson 03 (Dynamic Arrays), Phase 0 Lesson 05 (Benchmarking and Profiling)
 **Time:** ~60 minutes
 
 ## Learning Objectives
@@ -17,7 +17,7 @@
 
 ## The Problem
 
-A risk-scoring service holds the last 10 million postings for a merchant portfolio in memory and, on every incoming authorization, sums the amounts for the cardholder's recent activity. The postings are `Posting` objects in an `ArrayList`: id, amount, account, timestamp, currency, status. The sum loop reads one field per object. A profiler shows the loop at 60 ms for a full scan, and the team's first instinct is that the JIT has failed to vectorize it. It has not. The loop executes about 10 million loads, and almost every one of them is a cache miss, because each `Posting` is a separate 48-byte object somewhere on the heap and the loop touches 8 bytes of each. The CPU fetches 64 bytes for every 8 it uses, and the 10 million objects are scattered across 480 MB of heap that the 2 MB L2 cache cannot hold. The same sum over a `long[] amounts` runs in 10 ms on the same machine: six times faster, same algorithm, same number of additions.
+A risk-scoring service holds the last 10 million postings for a merchant portfolio in memory and, on every incoming authorization, sums the amounts for the cardholder's recent activity. The postings are `Posting` objects in an `ArrayList`: id, amount, account, timestamp, currency, status. The sum loop reads one field per object. A profiler shows the loop at 60 ms for a full scan, and the team's first instinct is that the JIT has failed to vectorize it. It has not. The loop executes about 10 million loads, and almost every one of them is a cache miss, because each `Posting` is a separate 48-byte object somewhere on the heap and the loop touches 8 bytes of each. The CPU fetches 64 bytes for every 8 it uses, and the 10 million objects are scattered across 480 MB of heap that the 2 MB L2 cache cannot hold. The same sum over a `long[] amounts` runs in 10 ms on the same machine: six times faster, same algorithm, same number of additions. This lesson pairs with Phase 4 Lesson 02 (Locks, Atomics, and a Balance That Never Lies), which comes later.
 
 A second team, building the throughput counters for a payment gateway, keeps per-worker counters in a `long[16]`, one slot per thread, so that no two threads write the same variable and no lock is needed. The counters are correct and the design is lock-free. Under load the gateway's p99 latency doubles, and a CPU profile shows the worker threads stalled on their own counter increments. The 16 longs occupy 128 bytes, two cache lines, and eight threads are writing to each line. Every increment by one core invalidates the line in every other core's cache; the line ping-pongs between cores at about 100 ns per transfer, and a counter that should take one cycle takes two hundred. The threads share nothing logically and everything physically. Padding each counter to its own 64-byte line fixes it, and the team learns that the hardware's unit of ownership is the line, not the variable.
 

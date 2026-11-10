@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 1, Lesson 08 (Binary Search Trees), Phase 1, Lesson 12 (Strings and Encodings)
+**Prerequisites:** Phase 1 Lesson 06 (Hash Maps), Phase 1 Lesson 08 (Binary Search Trees), Phase 1 Lesson 12 (Strings and Encodings)
 **Time:** ~75 minutes
 
 ## Learning Objectives

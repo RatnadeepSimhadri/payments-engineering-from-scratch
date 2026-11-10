@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes)
+**Prerequisites:** Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~90 minutes
 
 ## Learning Objectives
@@ -68,13 +68,13 @@ Everything else — currency mismatch, overflow, excess precision — is rejecte
 
 ```mermaid
 flowchart LR
-  A["Decimal string<br/>\"19.99\" + USD"] -->|parse: validate exponent| M["Money<br/>minorUnits=1999, USD"]
+  A["Decimal string<br/>#quot;19.99#quot; + USD"] -->|parse: validate exponent| M["Money<br/>minorUnits=1999, USD"]
   M -->|plus / minus / negate| M
-  M -->|times(num, den, Rounding)| M
-  M -->|allocate(ratios...)| P["Money[]<br/>parts sum exactly to the whole"]
-  M -->|toString| S["\"19.99 USD\""]
+  M -->|"times(num, den, Rounding)"| M
+  M -->|"allocate(ratios...)"| P["Money[]<br/>parts sum exactly to the whole"]
+  M -->|toString| S["#quot;19.99 USD#quot;"]
   M -. "plus(EUR)" .-> X1["CurrencyMismatch"]
-  A -. "\"1.005\"" .-> X2["excess precision rejected"]
+  A -. "#quot;1.005#quot;" .-> X2["excess precision rejected"]
   M -. "Long.MAX + 1" .-> X3["overflow is an error"]
 ```
 

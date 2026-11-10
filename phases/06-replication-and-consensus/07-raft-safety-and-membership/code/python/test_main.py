@@ -74,7 +74,18 @@ class MembershipTest(unittest.TestCase):
         four = set(FIVE)
         four.discard(old_leader.id)
         self.assertGreater(c.change_membership(four), 0)
-        self.assertTrue(c.run_until_configured(four, 3000) > 0 or old_leader.stepped_down_after_removal)
+        # Drive the change until the old leader has committed C_new; stepping down is the only exit from that path.
+        for _ in range(3000):
+            if old_leader.stepped_down_after_removal:
+                break
+            c.tick()
+        c_new_idx = old_leader.storage.latest_config_index()
+        self.assertEqual(old_leader.configuration(), Configuration.simple(four))
+        self.assertTrue(0 < c_new_idx <= old_leader.commit_index, "C_new must be committed on the old leader")
+        replicas_in_c_new = sum(1 for m in four if old_leader.match_index.get(m, 0) >= c_new_idx)
+        self.assertGreater(replicas_in_c_new, len(four) // 2, "C_new committed by a majority of C_new alone")
+        self.assertTrue(old_leader.stepped_down_after_removal and old_leader.role != Role.LEADER)
+        self.assertGreater(c.run_until_configured(four, 3000), 0)
         c.run_until_stable_leader(3000)
         self.assertTrue(old_leader.stepped_down_after_removal and old_leader.role != Role.LEADER)
         new_leader = c.stable_leader()

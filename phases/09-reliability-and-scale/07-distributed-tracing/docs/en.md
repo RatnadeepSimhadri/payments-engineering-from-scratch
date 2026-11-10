@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 9, Lesson 06 (Metrics: Counters, Gauges, and Histograms Without Averages), Phase 5, Lesson 02 (Time and Clocks), Phase 1, Lesson 07 (Trees and Recursion)
+**Prerequisites:** Phase 9 Lesson 06 (Metrics and Histograms), Phase 5 Lesson 03 (Lamport and Vector Clocks), Phase 2 Lesson 04 (Recursion and Backtracking)
 **Time:** ~90 minutes
 
 ## Learning Objectives

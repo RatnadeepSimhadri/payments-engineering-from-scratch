@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 02 (Failure Models); Phase 5, Lesson 06 (CAP and PACELC); Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes)
+**Prerequisites:** Phase 5 Lesson 02 (Failure Models), Phase 5 Lesson 06 (CAP and PACELC), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~120 minutes
 
 ## Learning Objectives

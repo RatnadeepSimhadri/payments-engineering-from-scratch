@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model); Phase 4, Lesson 05 (Producers, Consumers, and Bounded Queues); Phase 5, Lesson 08 (Timeouts and Deadlines) is helpful but not required
+**Prerequisites:** Phase 4 Lesson 01 (Threads and the Memory Model), Phase 4 Lesson 05 (Producers, Consumers, and Bounded Queues)
 **Time:** ~90 minutes
 
 ## Learning Objectives
@@ -18,7 +18,7 @@
 
 ## The Problem
 
-A checkout service routes each card payment to the cheapest of four processors. Before authorising, it asks all four for a fee quote, waits for the answers, and picks the lowest. Each quote is an HTTP call that takes 80 to 400 milliseconds; sequentially that is up to 1.6 seconds, so the calls run in parallel. Version one submitted the four calls to a fixed pool of 64 threads shared by the whole service, then called `future.get()` on each.
+A checkout service routes each card payment to the cheapest of four processors. Before authorising, it asks all four for a fee quote, waits for the answers, and picks the lowest. Each quote is an HTTP call that takes 80 to 400 milliseconds; sequentially that is up to 1.6 seconds, so the calls run in parallel. Version one submitted the four calls to a fixed pool of 64 threads shared by the whole service, then called `future.get()` on each. This lesson pairs with Phase 5 Lesson 08 (Timeouts and Deadline Propagation), which comes later.
 
 One Tuesday a processor's quote endpoint stopped answering. It accepted connections and never replied. Each call to it held a pool thread until the socket timeout of 30 seconds. At 50 checkouts per second, 50 threads per second entered that 30-second wait; within two seconds all 64 pool threads were parked on a processor that had nothing to do with 75% of the work. Quotes from the three healthy processors could not start because there was no thread to run them. The service's own health check, which also used the pool, timed out, and the orchestrator restarted every instance. The three healthy processors were fine. The pool was the failure.
 

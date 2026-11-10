@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 3, Lesson 03 (Balanced Trees: AVL and Red-Black), Phase 1, Lesson 03 (Binary Search), Phase 0, Lesson 09 (Memory, Caches, and Why Arrays Win)
+**Prerequisites:** Phase 3 Lesson 03 (Balanced Trees), Phase 2 Lesson 02 (Binary Search and Its Variants), Phase 0 Lesson 05 (Benchmarking and Profiling)
 **Time:** ~120 minutes
 
 ## Learning Objectives

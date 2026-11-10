@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 9, Lesson 12 (Incident Response), Phase 9, Lesson 13 (Graceful Degradation), Phase 12, Lesson 02 (Payment State Machine), Phase 12, Lesson 04 (Smart Routing and Retries), Phase 12, Lesson 06 (Refunds and Partial Refunds), Phase 14, Lesson 04 (Reconciliation at Scale), Phase 14, Lesson 06 (Observability for Money Movement)
+**Prerequisites:** Phase 9 Lesson 12 (Incident Response and Blameless Postmortems), Phase 9 Lesson 13 (Graceful Degradation and Load Shedding), Phase 12 Lesson 02 (The Payment State Machine), Phase 12 Lesson 04 (Smart Routing, Cascading, and Retry Policies), Phase 12 Lesson 06 (Refunds, Partial Refunds, and Refund Windows), Phase 14 Lesson 04 (Reconciliation at Scale), Phase 14 Lesson 06 (Observability for Money Movement)
 **Time:** ~60 minutes
 
 ## Learning Objectives

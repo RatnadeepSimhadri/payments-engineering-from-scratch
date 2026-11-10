@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 12, Lesson 05 (Webhooks); Phase 12, Lesson 10 (Payment Method Abstraction); Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 12 Lesson 01 (Designing an Idempotent Payment API), Phase 12 Lesson 05 (Webhooks), Phase 12 Lesson 10 (Payment Method Abstraction), Phase 10 Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 6, Lesson 01 (Replication: Leader-Based, Multi-Leader, Leaderless); Phase 6, Lesson 02 (Replication Lag and Read-Your-Writes); Phase 5, Lesson 05 (Consistency Models)
+**Prerequisites:** Phase 6 Lesson 01 (Replication Strategies), Phase 6 Lesson 02 (Replication Lag and Read-Your-Writes), Phase 5 Lesson 05 (Consistency Models)
 **Time:** ~75 minutes
 
 ## Learning Objectives

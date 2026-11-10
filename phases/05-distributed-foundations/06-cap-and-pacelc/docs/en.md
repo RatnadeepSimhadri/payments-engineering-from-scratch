@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 5, Lesson 02 (Failure Models), Phase 5, Lesson 05 (Consistency Models)
+**Prerequisites:** Phase 5 Lesson 02 (Failure Models), Phase 5 Lesson 05 (Consistency Models)
 **Time:** ~60 minutes
 
 ## Learning Objectives
@@ -53,9 +53,9 @@ sequenceDiagram
   Note over G1,G2: partition: no messages pass between G1 and G2
   C1->>G1: write(v1)
   G1-->>C1: ok (availability requires a response)
-  Note over G1: G1 now holds v1; cannot tell G2
+  Note over G1: G1 now holds v1, cannot tell G2
   C2->>G2: read()
-  G2-->>C2: v0 (availability requires a response; G2 has heard nothing)
+  G2-->>C2: v0 (availability requires a response, G2 has heard nothing)
   Note over C1,C2: read began after write completed, returned the old value: not linearizable
 ```
 

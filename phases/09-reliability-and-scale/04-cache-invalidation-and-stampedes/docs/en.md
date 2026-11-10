@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 9, Lesson 03 (Caching Strategies), Phase 5, Lesson 10 (Retries, Backoff, and Jitter), Phase 1, Lesson 09 (Heaps and Priority Queues)
+**Prerequisites:** Phase 9 Lesson 03 (Caching Strategies), Phase 5 Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 1 Lesson 09 (Heaps and Priority Queues)
 **Time:** ~75 minutes
 
 ## Learning Objectives

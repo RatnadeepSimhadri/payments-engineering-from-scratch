@@ -29,6 +29,7 @@ Use on every pull request that creates or changes a transition on a card transac
 
 - [ ] The transaction reads time from an injected `Clock`. No `Instant.now()`, `time.time()`, or `time.Now()` inside the state machine.
 - [ ] Expiry is applied lazily before every merchant-initiated action (`expireIfDue`), so a late capture fails as an illegal transition from `EXPIRED` with the expiry recorded as its own event.
+- [ ] Expiry of a `PARTIALLY_CAPTURED` hold lands in `CAPTURED`, not `EXPIRED`: captured funds must stay refundable, so no terminal state ever holds captured money.
 - [ ] The authorization validity period comes from a `LifecyclePolicy` keyed by merchant category, not a constant in the code.
 - [ ] Incremental authorizations extend the ceiling but do not reset the validity window unless the policy says they do, and the test suite has a case that pins this down.
 

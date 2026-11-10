@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 06 (Refunds, Partial Refunds, and Refund Windows); Phase 10, Lesson 07 (Holds and Available Balance); Phase 11, Lesson 06 (3-D Secure and Strong Customer Authentication)
+**Prerequisites:** Phase 12 Lesson 02 (The Payment State Machine), Phase 12 Lesson 06 (Refunds, Partial Refunds, and Refund Windows), Phase 10 Lesson 07 (Holds and Available Balance), Phase 11 Lesson 06 (3-D Secure and Strong Customer Authentication)
 **Time:** ~90 minutes
 
 ## Learning Objectives

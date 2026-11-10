@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs), Phase 7, Lesson 10 (Secondary Indexes: Local vs Global), Phase 6, Lesson 01 (Replication Strategies)
+**Prerequisites:** Phase 7 Lesson 02 (Write-Ahead Logs), Phase 7 Lesson 10 (Secondary Indexes), Phase 6 Lesson 01 (Replication Strategies)
 **Time:** ~75 minutes
 
 ## Learning Objectives

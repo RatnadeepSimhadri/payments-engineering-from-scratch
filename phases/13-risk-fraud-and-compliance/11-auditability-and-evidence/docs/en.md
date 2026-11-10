@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 13, Lesson 03 (Risk Scoring and Thresholds); Phase 13, Lesson 10 (Data Privacy and Retention); Phase 3, lessons on hashing; Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 13 Lesson 03 (Risk Scoring and Thresholds), Phase 13 Lesson 10 (Data Privacy and Retention), Phase 1 Lesson 07 (Hash Functions and Collisions), Phase 3 Lesson 09 (Merkle Trees), Phase 10 Lesson 01 (Representing Money)
 **Time:** ~75 minutes
 
 ## Learning Objectives

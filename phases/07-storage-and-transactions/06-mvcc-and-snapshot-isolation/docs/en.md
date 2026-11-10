@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 7, Lesson 04 (Isolation Levels and Anomalies), Phase 7, Lesson 05 (Two-Phase Locking), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 7 Lesson 04 (Isolation Levels and Their Anomalies), Phase 7 Lesson 05 (Two-Phase Locking), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~120 minutes
 
 ## Learning Objectives

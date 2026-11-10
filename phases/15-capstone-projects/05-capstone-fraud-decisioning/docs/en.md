@@ -4,7 +4,7 @@
 
 **Type:** Capstone
 **Languages:** Java, Python, or Go (pick one; the spec is language-neutral)
-**Prerequisites:** Phase 13 Lessons 01-04, 06 (Fraud Patterns, Rules Engine, Risk Scoring, Sanctions Screening, AML Monitoring), Phase 8 Lessons 07-08 (Windows, Watermarks), Phase 3 Lessons 02 and 11 (Sketches, Rate Limiters), Phase 12 Lesson 09 (Limits and Velocity), Phase 14 Lesson 10 (Deterministic Simulation Testing), Phase 15 Lesson 02
+**Prerequisites:** Phase 13 Lesson 01 (Fraud Patterns), Phase 13 Lesson 02 (A Rules Engine with Velocity Checks), Phase 13 Lesson 03 (Risk Scoring and Thresholds), Phase 13 Lesson 04 (Sanctions Screening), Phase 13 Lesson 06 (AML Transaction Monitoring), Phase 8 Lesson 07 (Stream Processing and Windows), Phase 8 Lesson 08 (Watermarks, Event Time, and Late Data), Phase 3 Lesson 02 (Count-Min Sketch and HyperLogLog), Phase 3 Lesson 11 (Rate Limiter Algorithms), Phase 12 Lesson 09 (Limits and Velocity Controls), Phase 14 Lesson 10 (Deterministic Simulation Testing), Phase 15 Lesson 02 (An Idempotent Multi-Processor Payment Gateway)
 **Time:** ~360 minutes
 
 ## Learning Objectives

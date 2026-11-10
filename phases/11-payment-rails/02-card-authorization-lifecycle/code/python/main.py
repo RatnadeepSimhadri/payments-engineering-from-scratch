@@ -400,7 +400,10 @@ class CardTransaction:
         if self._clock.now() < self._expires_at:
             return False
         days = self._policy.auth_validity.days
-        self._transition(Action.EXPIRE, self.remaining_authorization(), TransactionState.EXPIRED,
+        # A never-captured authorization becomes EXPIRED (terminal). A partially captured one keeps its captured
+        # funds: the remainder lapses and it becomes CAPTURED, as close_capture would leave it, so refunds still work.
+        nxt = TransactionState.CAPTURED if self._state is TransactionState.PARTIALLY_CAPTURED else TransactionState.EXPIRED
+        self._transition(Action.EXPIRE, self.remaining_authorization(), nxt,
                          f"authorization validity of {days} days elapsed (while attempting: {attempted_reason})")
         return True
 

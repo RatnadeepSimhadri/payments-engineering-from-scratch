@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 8 Lesson 01 (The Append-Only Log), Phase 8 Lesson 04 (Message Ordering and Keys), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~120 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 04 (Linked Lists), Phase 1, Lesson 06 (Hash Maps from Scratch)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis), Phase 1 Lesson 04 (Linked Lists), Phase 1 Lesson 06 (Hash Maps)
 **Time:** ~90 minutes
 
 ## Learning Objectives

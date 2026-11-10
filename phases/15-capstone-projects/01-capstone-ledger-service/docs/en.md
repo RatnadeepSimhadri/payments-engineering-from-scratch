@@ -4,7 +4,7 @@
 
 **Type:** Capstone
 **Languages:** Java, Python, or Go (pick one; the spec is language-neutral)
-**Prerequisites:** Phase 10 (all lessons), Phase 7 Lesson 02 (Write-Ahead Logs), Phase 5 Lesson 09 (Idempotency Keys), Phase 12 Lesson 13 (API Design for Money), Phase 13 Lesson 11 (Auditability)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 10 Lesson 02 (Currencies and FX), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 04 (Chart of Accounts), Phase 10 Lesson 05 (Balances and Snapshots), Phase 10 Lesson 06 (Immutability and Reversals), Phase 10 Lesson 07 (Holds and Available Balance), Phase 10 Lesson 08 (Reconciliation), Phase 10 Lesson 09 (Multi-Currency Ledgers), Phase 10 Lesson 10 (Fees and Splits), Phase 10 Lesson 11 (Ledger Concurrency), Phase 10 Lesson 12 (Audit Trails, Trial Balance, and Financial Close), Phase 7 Lesson 02 (Write-Ahead Logs), Phase 5 Lesson 09 (Idempotency Keys), Phase 12 Lesson 13 (API Design for Money), Phase 13 Lesson 11 (Auditability)
 **Time:** ~480 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 11, Lesson 02 (The Card Lifecycle State Machine), Phase 10, Lesson 01 (Representing Money), Phase 0, Lesson 05 (Bits, Bytes, and Encodings)
+**Prerequisites:** Phase 11 Lesson 02 (The Card Lifecycle State Machine), Phase 10 Lesson 01 (Representing Money), Phase 1 Lesson 11 (Bit Manipulation and Compact Encodings)
 **Time:** ~150 minutes
 
 ## Learning Objectives

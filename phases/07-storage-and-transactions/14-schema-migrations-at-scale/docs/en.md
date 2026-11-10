@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 7, Lesson 05 (Two-Phase Locking), Phase 7, Lesson 11 (Change Data Capture), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 7 Lesson 05 (Two-Phase Locking), Phase 7 Lesson 11 (Change Data Capture), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~60 minutes
 
 ## Learning Objectives

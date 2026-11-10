@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 03 (Time, Order, and Clocks: Lamport and Vector Clocks), Phase 5, Lesson 02 (Failure Models)
+**Prerequisites:** Phase 5 Lesson 03 (Lamport and Vector Clocks), Phase 5 Lesson 02 (Failure Models)
 **Time:** ~75 minutes
 
 ## Learning Objectives

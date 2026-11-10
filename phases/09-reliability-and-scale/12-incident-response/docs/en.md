@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 9, Lesson 11 (Multi-Region Architecture and Disaster Recovery), Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9, Lesson 06 (Metrics), Phase 9, Lesson 07 (Distributed Tracing), Phase 9, Lesson 08 (Structured Logging)
+**Prerequisites:** Phase 9 Lesson 11 (Multi-Region Architecture and Disaster Recovery), Phase 9 Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9 Lesson 06 (Metrics and Histograms), Phase 9 Lesson 07 (Distributed Tracing and Context Propagation), Phase 9 Lesson 08 (Structured Logging)
 **Time:** ~60 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 2, Lesson 08 (Graph Traversal), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 2 Lesson 08 (Graph Traversal), Phase 1 Lesson 09 (Heaps and Priority Queues), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~120 minutes
 
 ## Learning Objectives

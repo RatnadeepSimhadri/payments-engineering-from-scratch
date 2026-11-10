@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 04 (PANs, Luhn, and BIN Ranges); Phase 0, Lesson 06 (Reading a Spec)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 11 Lesson 04 (PANs, Luhn, and BIN Range Routing), Phase 0 Lesson 06 (Reading a Spec)
 **Time:** ~120 minutes
 
 ## Learning Objectives

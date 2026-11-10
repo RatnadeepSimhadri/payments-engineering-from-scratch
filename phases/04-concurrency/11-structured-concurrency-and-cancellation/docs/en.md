@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 4, Lesson 06 (Executors, Goroutines, and asyncio); Phase 4, Lesson 01 (Threads and the Memory Model); Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 4 Lesson 06 (Executors, Goroutines, and asyncio), Phase 4 Lesson 01 (Threads and the Memory Model), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~75 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 08 (ACH and the NACHA File Format); Phase 11, Lesson 09 (SEPA, Wires, and ISO 20022)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 11 Lesson 08 (ACH and the NACHA File Format), Phase 11 Lesson 09 (SEPA, Wires, and ISO 20022)
 **Time:** ~90 minutes
 
 ## Learning Objectives

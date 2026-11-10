@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 2, Lesson 01 (Sorting)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis), Phase 1 Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 2 Lesson 01 (Sorting)
 **Time:** ~60 minutes
 
 ## Learning Objectives

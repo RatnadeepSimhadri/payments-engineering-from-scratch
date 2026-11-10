@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 1, Lesson 04 (Queues and Ring Buffers); Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 4 Lesson 02 (Locks and Atomics), Phase 1 Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~75 minutes
 
 ## Learning Objectives

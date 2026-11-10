@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 01 (How a Card Payment Works); Phase 11, Lesson 04 (PANs, Luhn, and BIN Ranges)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 11 Lesson 01 (How a Card Payment Works), Phase 11 Lesson 04 (PANs, Luhn, and BIN Range Routing)
 **Time:** ~75 minutes
 
 ## Learning Objectives

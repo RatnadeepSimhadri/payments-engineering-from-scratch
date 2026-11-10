@@ -246,14 +246,25 @@ func TestExpiryViaInjectedClock(t *testing.T) {
 	}
 }
 
-func TestPartiallyCapturedAlsoExpiresWithRemainder(t *testing.T) {
+func TestExpiredPartialCaptureLandsInCapturedAndStaysRefundable(t *testing.T) {
 	clock := NewFakeClock(t0)
 	txn := auth(t, "100.00", clock, Standard)
 	check(txn.Capture(usd(t, "30.00"), "first"))
 	clock.Advance(8 * 24 * time.Hour)
 	wantIllegal(t, "second capture after expiry", txn.Capture(usd(t, "70.00"), "second"))
-	if txn.Events()[2].Amount != usd(t, "70.00") {
-		t.Fatalf("expiry amount = %v", txn.Events()[2].Amount)
+	if txn.State() != Captured {
+		t.Fatalf("state=%v, want Captured (captured funds must stay refundable)", txn.State())
+	}
+	expiry := txn.Events()[2]
+	if expiry.Action != ActExpire || expiry.Amount != usd(t, "70.00") || expiry.To != Captured {
+		t.Fatalf("expiry event = %+v", expiry)
+	}
+	if txn.CapturedAmount() != usd(t, "30.00") || !txn.RemainingAuthorization().IsZero() {
+		t.Fatalf("captured=%v remaining=%v", txn.CapturedAmount(), txn.RemainingAuthorization())
+	}
+	check(txn.Refund(usd(t, "30.00"), "customer returned the shipped item"))
+	if txn.State() != Refunded || !txn.NetSettled().IsZero() {
+		t.Fatalf("state=%v net=%v", txn.State(), txn.NetSettled())
 	}
 }
 

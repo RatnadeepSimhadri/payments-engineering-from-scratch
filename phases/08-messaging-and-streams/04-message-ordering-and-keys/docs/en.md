@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 02 (Consumer Groups and Rebalancing), Phase 8, Lesson 03 (Delivery Guarantees)
+**Prerequisites:** Phase 8 Lesson 01 (The Append-Only Log), Phase 8 Lesson 02 (Consumer Groups), Phase 8 Lesson 03 (Delivery Guarantees)
 **Time:** ~60 minutes
 
 ## Learning Objectives

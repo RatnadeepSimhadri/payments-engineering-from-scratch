@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 7, Lesson 08 (Two-Phase Commit and Its Blocking Problem), Phase 7, Lesson 06 (MVCC and Snapshot Isolation), Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks), Phase 6, Lesson 06 (Raft II: Log Replication and Commit)
+**Prerequisites:** Phase 7 Lesson 08 (Two-Phase Commit), Phase 7 Lesson 06 (MVCC and Snapshot Isolation), Phase 5 Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks), Phase 6 Lesson 06 (Raft II: Log Replication)
 **Time:** ~90 minutes
 
 ## Learning Objectives

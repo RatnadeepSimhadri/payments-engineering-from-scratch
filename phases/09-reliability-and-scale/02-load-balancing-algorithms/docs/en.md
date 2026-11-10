@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 3, Lesson 06 (Consistent Hashing), Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets)
+**Prerequisites:** Phase 3 Lesson 06 (Consistent Hashing and Virtual Nodes), Phase 9 Lesson 01 (SLIs, SLOs, and Error Budgets)
 **Time:** ~90 minutes
 
 ## Learning Objectives

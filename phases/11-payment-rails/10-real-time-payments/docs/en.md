@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 11, Lesson 08 (ACH and the NACHA File Format); Phase 11, Lesson 09 (SEPA, Wires, and ISO 20022); Phase 5, Lesson 08 (Timeouts and Deadline Propagation); Phase 5, Lesson 09 (Idempotency Keys)
+**Prerequisites:** Phase 11 Lesson 08 (ACH and the NACHA File Format), Phase 11 Lesson 09 (SEPA, Wires, and ISO 20022), Phase 5 Lesson 08 (Timeouts and Deadline Propagation), Phase 5 Lesson 09 (Idempotency Keys)
 **Time:** ~75 minutes
 
 ## Learning Objectives

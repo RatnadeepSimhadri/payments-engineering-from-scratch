@@ -125,7 +125,7 @@ final class FakeClock implements Clock {
     void advance(Duration d) { current = current.plus(d); }
 }
 
-/** The seven states a card transaction can be in. Three are terminal: VOIDED, EXPIRED, REFUNDED. */
+/** The seven states a card transaction can be in. Three are terminal: VOIDED, EXPIRED (never captured), REFUNDED. */
 enum TransactionState {
     AUTHORIZED, PARTIALLY_CAPTURED, CAPTURED, VOIDED, EXPIRED, PARTIALLY_REFUNDED, REFUNDED;
 
@@ -323,11 +323,15 @@ final class CardTransaction {
      * The clock-driven transition. If the authorization window has passed and the state still allows EXPIRE,
      * record the expiry and return true. Called before every merchant-initiated action so that a late capture
      * fails with a precise reason instead of silently succeeding against a dead hold.
+     * A never-captured authorization becomes EXPIRED (terminal). A partially captured one keeps its captured
+     * funds: the uncaptured remainder lapses and the transaction becomes CAPTURED, exactly as closeCapture would
+     * leave it, so the captured money stays refundable.
      */
     boolean expireIfDue(String attemptedReason) {
         if (!LEGAL.get(state).contains(Action.EXPIRE)) return false;
         if (clock.now().isBefore(expiresAt)) return false;
-        transition(Action.EXPIRE, remainingAuthorization(), TransactionState.EXPIRED,
+        TransactionState next = state == TransactionState.PARTIALLY_CAPTURED ? TransactionState.CAPTURED : TransactionState.EXPIRED;
+        transition(Action.EXPIRE, remainingAuthorization(), next,
                 "authorization validity of " + policy.authValidity().toDays() + " days elapsed (while attempting: " + attemptedReason + ")");
         return true;
     }

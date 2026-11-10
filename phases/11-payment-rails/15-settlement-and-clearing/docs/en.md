@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 08 (Reconciliation), Phase 11, Lesson 01 (How a Card Payment Works), Phase 11, Lesson 08 (ACH and the NACHA File Format), Phase 11, Lesson 10 (Real-Time Payments)
+**Prerequisites:** Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 08 (Reconciliation), Phase 11 Lesson 01 (How a Card Payment Works), Phase 11 Lesson 08 (ACH and the NACHA File Format), Phase 11 Lesson 10 (Real-Time Payments)
 **Time:** ~75 minutes
 
 ## Learning Objectives

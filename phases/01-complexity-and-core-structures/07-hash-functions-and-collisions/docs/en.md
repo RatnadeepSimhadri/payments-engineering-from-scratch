@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 1, Lesson 02 (Amortized Analysis), Phase 1, Lesson 06 (Hash Maps from Scratch)
+**Prerequisites:** Phase 1 Lesson 02 (Amortized Analysis), Phase 1 Lesson 06 (Hash Maps)
 **Time:** ~60 minutes
 
 ## Learning Objectives
@@ -116,7 +116,7 @@ Java 8 changed `HashMap` so that a bucket holding 8 or more entries, when the ta
 | 10,000 | 50,000,000 | ~130,000 |
 | 100,000 | 5,000,000,000 | ~1,700,000 |
 
-This is a real mitigation, and it is why modern Java is far harder to stall than Java 7 was. It is not a complete defence. Treeification needs the keys to be mutually `Comparable`; keys that are not (or that are all equal under `compareTo` but not under `equals`) fall back to a list. It also does nothing for structures that are not `java.util.HashMap`: a hand-rolled chaining map (like Lesson 06's), a `HashSet` of a non-`Comparable` type, or a hash map in another language without the same fix. Treeification raises the cost of the attack; it does not remove the attacker's ability to choose the bucket.
+This is a real mitigation, and it is why modern Java is far harder to stall than Java 7 was. It is not a complete defence. Treeification still happens for keys that are not mutually `Comparable` (the bin is ordered by hash, then by class name and `System.identityHashCode` via `tieBreakOrder`), but that tiebreak order cannot be used to *search*, so a lookup among equal-hash, non-`Comparable` keys degrades to a linear scan of the tree nodes: the O(log n) bound is only earned when the keys are `Comparable`. It also does nothing for structures that are not `java.util.HashMap`: a hand-rolled chaining map (like Lesson 06's), a `HashSet` of a non-`Comparable` type, or a hash map in another language without the same fix. Treeification raises the cost of the attack; it does not remove the attacker's ability to choose the bucket.
 
 ### The real fix: make the bucket unpredictable
 
@@ -143,8 +143,8 @@ Make the family concrete. Take the integer multiply-shift family over 32-bit key
 Say `L = 3` (8 buckets) and the process happens to pick `a = 2,654,435,761` (a common odd choice). For keys 1000 and 2024:
 
 ```text
-a * 1000 mod 2^32 = 2,654,435,761 * 1000 mod 2^32 = 3,131,829,648  ->  >> 29 = 5   (bucket 5)
-a * 2024 mod 2^32 = ...                                             ->  >> 29 = 2   (bucket 2)
+a * 1000 mod 2^32 = 2,654,435,761 * 1000 mod 2^32 =   145,972,072  ->  >> 29 = 0   (bucket 0)
+a * 2024 mod 2^32 = 2,654,435,761 * 2024 mod 2^32 = 3,868,860,264  ->  >> 29 = 7   (bucket 7)
 ```
 
 A different startup picks a different `a` and sends the same two keys to different buckets. An attacker who wants 1000 and 2024 to collide would have to know `a`, which is chosen after their payload is built and never leaves the process. That is the whole mechanism: the colliding set is a function of a runtime secret, so it cannot be precomputed. The textbook additive family `((a*x + b) mod p) mod m` gives the same guarantee with a cleaner proof but a slower modulo; runtimes prefer multiply-shift or SipHash for speed.
@@ -225,7 +225,7 @@ None of this changes the defence; it changes the priority. A map keyed by untrus
 Most maps do not. Three situations change the calculus:
 
 1. **Keys are attacker-influenced and the map is on a shared hot path.** Use a keyed hash (SipHash) with a per-process random key, or in Java, cap the number of distinct keys per tenant and prefer a structure with treeified bins. This is the idempotency-store case.
-2. **The key itself is sensitive and must not be stored in the clear**, such as a card number used to deduplicate or rate-limit by PAN. Here the requirement is not table performance but confidentiality: store a keyed hash (HMAC-SHA-256 with a secret key held in a KMS, or a format-preserving token), never a bare SHA-256 (a 16-digit PAN has only 10^16 possibilities, so an unkeyed digest is reversible by brute force in seconds). The map is keyed by the token; the raw PAN never becomes a map key. Phase 13 covers tokenization in full.
+2. **The key itself is sensitive and must not be stored in the clear**, such as a card number used to deduplicate or rate-limit by PAN. Here the requirement is not table performance but confidentiality: store a keyed hash (HMAC-SHA-256 with a secret key held in a KMS, or a format-preserving token), never a bare SHA-256 (a 16-digit PAN has only 10^16 possibilities, so an unkeyed digest is reversible by brute force in hours to days on GPU clusters, and far faster once the BIN and Luhn check digit cut the space). The map is keyed by the token; the raw PAN never becomes a map key. Phase 13 covers tokenization in full.
 3. **The hash crosses a trust or persistence boundary** (sharding keys consistently across services, or persisting a hash). Here determinism *across processes* is required, so a per-process random seed is wrong; use a fixed, well-specified function (and, if the input is sensitive, a keyed one with a shared secret).
 
 The decision procedure: is the key adversarial? If no, any good non-cryptographic hash (the runtime default) is fine. If yes, is the concern CPU (table performance) or confidentiality (the key is a secret)? CPU wants a per-process keyed PRF; confidentiality wants a keyed cryptographic hash with the key in a vault. The two are different keys for different purposes and are easy to confuse.
@@ -324,9 +324,7 @@ The output of this audit is the `outputs/` checklist below, filled in for your s
 
 1. **Reinforce.** Compute `"Aa".hashCode()` and `"BB".hashCode()` by hand with the `h = 31 * h + c` rule and confirm they are equal. Then explain in two sentences why `HashMap.hash()` spreading the high bits into the low bits does **not** help against these keys, even though it improves distribution on benign keys.
 2. **Apply.** You own an idempotency store keyed by a client-supplied header on a shared hot path, running on Java 17. Write the threat model (who the adversary is, what they control, what they gain) and choose a defence from this lesson's list. Justify why you did or did not rely on Java 8 treeification, and state one input-validation control you would add regardless of the hash.
-3. **Extend.** Combine with Lesson 06 and Lesson 02: Lesson 06's hand-rolled chaining map has no treeification. Describe the minimal change that restores an expected-O(1) bound under adversarial keys (seed the hash with a per-process random value fed through a mixing function), and explain, using the amortized-analysis vocabulary from Lesson 02, why "expected O(1) with a random seed" is a different guarantee from "amortized O(1)" and which adversary each one does and does not defend against.
-4. **Apply (numbers).** A rate-limiter map uses linear probing and resizes at load factor 0.9 to save memory. Using the expected-probe table, compute the expected probes for a miss at 0.9 and at 0.75, and the extra probes per second at 50,000 checks per second. Then explain why lowering the load factor would not help at all if the map's keys were attacker-chosen and its hash unseeded.
-5. **Design.** Your service accepts webhook payloads whose JSON object keys are merchant-defined and parsed into a `HashMap`. Using the incident timeline, write the three-layer defence you would ship (one cap, one hash change, one detection signal), state the request size at which your cap bounds parsing to under 10 ms using the flooding-cost table, and name the one platform event in the timeline that shows why a seed alone is insufficient.
+3. **Extend.** Combine with Lesson 06 and Lesson 02: Lesson 06's hand-rolled chaining map has no treeification. Describe the minimal change that restores an expected-O(1) bound under adversarial keys (seed the hash with a per-process random value fed through a mixing function), and explain, using the amortized-analysis vocabulary from Lesson 02, why "expected O(1) with a random seed" is a different guarantee from "amortized O(1)" and which adversary each one does and does not defend against. Optional extensions: (a) put numbers on it with the expected-probe table: for a linear-probing rate-limiter map that resizes at load factor 0.9, compute the expected probes for a miss at 0.9 and at 0.75 and the extra probes per second at 50,000 checks per second, then explain why lowering the load factor would not help at all if the keys were attacker-chosen and the hash unseeded; (b) design the defence for a service that parses merchant-defined JSON object keys into a `HashMap`: using the incident timeline and the flooding-cost table, write the three-layer defence you would ship (one cap, one hash change, one detection signal), state the request size at which your cap bounds parsing to under 10 ms, and name the one platform event in the timeline that shows why a seed alone is insufficient.
 
 ## Key Terms
 
@@ -347,5 +345,5 @@ The output of this audit is the `outputs/` checklist below, filled in for your s
 - Jean-Philippe Aumasson and Daniel J. Bernstein, [*SipHash: a fast short-input PRF*](https://www.aumasson.jp/siphash/siphash.pdf) (2012) — the design and rationale for the keyed hash now default in Python, Ruby, and Rust.
 - Alexander Klink and Julian Walde, [*Efficient Denial of Service Attacks on Web Application Platforms*](https://fahrplan.events.ccc.de/congress/2011/Fahrplan/attachments/2007_28C3_Effective_DoS_on_web_application_platforms.pdf) (28C3, 2011) — the demonstration that forced the industry-wide fixes; the slides enumerate each platform's response.
 - [Python PEP 456: Secure and interchangeable hash algorithm](https://peps.python.org/pep-0456/) — why CPython moved to SipHash and made hash randomization the default; the clearest write-up of the seed-must-feed-a-PRF point.
-- Martin Thompson et al. and the OpenJDK `HashMap` source comments on treeification (`TREEIFY_THRESHOLD`, `MIN_TREEIFY_CAPACITY`) — the rationale for the Java 8 design and its stated limits.
+- Doug Lea and the OpenJDK team, [JEP 180: Handle Frequent HashMap Collisions with Balanced Trees](https://openjdk.org/jeps/180) and the OpenJDK `HashMap` source comments on treeification (`TREEIFY_THRESHOLD`, `MIN_TREEIFY_CAPACITY`) — the rationale for the Java 8 design and its stated limits.
 - Daniel Lemire, [*The universality of hashing*](https://arxiv.org/abs/1504.06804) and related notes — accessible treatment of universal and strongly-universal families with the probability proofs.

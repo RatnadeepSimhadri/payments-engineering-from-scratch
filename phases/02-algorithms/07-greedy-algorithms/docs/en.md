@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 09 (Heaps and Priority Queues from Scratch), Phase 2, Lesson 01 (Sorting), Phase 2, Lesson 04 (Recursion and Backtracking)
+**Prerequisites:** Phase 1 Lesson 09 (Heaps and Priority Queues), Phase 2 Lesson 01 (Sorting), Phase 2 Lesson 04 (Recursion and Backtracking)
 **Time:** ~60 minutes
 
 ## Learning Objectives

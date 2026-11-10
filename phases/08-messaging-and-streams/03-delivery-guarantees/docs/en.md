@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 8, Lesson 01 (The Append-Only Log), Phase 8, Lesson 02 (Consumer Groups), Phase 7, Lesson 02 (Write-Ahead Logs), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 8 Lesson 01 (The Append-Only Log), Phase 8 Lesson 02 (Consumer Groups), Phase 7 Lesson 02 (Write-Ahead Logs), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~90 minutes
 
 ## Learning Objectives

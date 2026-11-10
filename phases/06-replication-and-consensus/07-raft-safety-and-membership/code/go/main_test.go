@@ -109,7 +109,22 @@ func TestGrowAndRemoveLeader(t *testing.T) {
 	oldLeader := c.StableLeader()
 	four := without(five, oldLeader.id)
 	check(t, "removal change accepted", c.ChangeMembership(four) > 0)
-	check(t, "C_new committed without the leader's own vote counting", c.RunUntilConfigured(four, 3000) > 0 || oldLeader.SteppedDownAfterRemoval)
+	// Drive the change until the old leader has committed C_new; stepping down is the only exit from that path.
+	for i := 0; i < 3000 && !oldLeader.SteppedDownAfterRemoval; i++ {
+		c.Tick()
+	}
+	cNewIdx := oldLeader.Storage.LatestConfigIndex()
+	check(t, "C_new is the old leader's latest config and is committed there",
+		oldLeader.Configuration().Equal(Simple(four)) && cNewIdx > 0 && cNewIdx <= oldLeader.CommitIndex)
+	replicasInCNew := 0
+	for _, m := range four {
+		if oldLeader.MatchIndex[m] >= cNewIdx {
+			replicasInCNew++
+		}
+	}
+	check(t, "C_new committed by a majority of C_new alone, without the leader's own vote counting", replicasInCNew > len(four)/2)
+	check(t, "old leader stepped down after committing C_new", oldLeader.SteppedDownAfterRemoval && oldLeader.Role != Leader)
+	check(t, "remaining members finish the change under a new leader", c.RunUntilConfigured(four, 3000) > 0)
 	c.RunUntilStableLeader(3000)
 	check(t, "old leader stepped down", oldLeader.SteppedDownAfterRemoval && oldLeader.Role != Leader)
 	newLeader := c.StableLeader()

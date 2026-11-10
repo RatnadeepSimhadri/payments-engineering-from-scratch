@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 2, Lesson 04 (String Algorithms and Edit Distance), Phase 13, Lesson 03 (Risk Scoring and Thresholds)
+**Prerequisites:** Phase 2 Lesson 12 (String Matching), Phase 2 Lesson 06 (Dynamic Programming), Phase 13 Lesson 03 (Risk Scoring and Thresholds)
 **Time:** ~120 minutes
 
 ## Learning Objectives

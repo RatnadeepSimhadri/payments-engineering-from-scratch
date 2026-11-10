@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 12, Lesson 01 (Idempotent Payment API), Phase 12, Lesson 02 (Payment State Machine), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 10, Lesson 08 (Reconciliation), Phase 14, Lesson 01 (Architecture of a High-Availability Payment Gateway)
+**Prerequisites:** Phase 12 Lesson 01 (Designing an Idempotent Payment API), Phase 12 Lesson 02 (The Payment State Machine), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 08 (Reconciliation), Phase 14 Lesson 01 (Architecture of a High-Availability Payment Gateway)
 **Time:** ~90 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 3, Lesson 08 (LRU and LFU Caches), Phase 5, Lesson 05 (Consistency Models), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 1 Lesson 06 (Hash Maps), Phase 3 Lesson 08 (LRU and LFU Caches), Phase 5 Lesson 05 (Consistency Models), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~90 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 11 (Circuit Breakers and Bulkheads); Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks); Phase 4, Lesson 01 (Threads and the Memory Model)
+**Prerequisites:** Phase 5 Lesson 11 (Circuit Breakers and Bulkheads), Phase 5 Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks), Phase 4 Lesson 01 (Threads and the Memory Model)
 **Time:** ~90 minutes
 
 ## Learning Objectives

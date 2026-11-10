@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes), Phase 2, Lesson 06 (Dynamic Programming), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 0 Lesson 07 (Decimal and Integer Arithmetic), Phase 2 Lesson 06 (Dynamic Programming)
 **Time:** ~60 minutes
 
 ## Learning Objectives

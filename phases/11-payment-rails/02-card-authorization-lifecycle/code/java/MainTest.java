@@ -165,9 +165,16 @@ public final class MainTest {
         CardTransaction partialStale = auth("100.00", partialClock, LifecyclePolicy.STANDARD);
         partialStale.capture(usd("30.00"), "first");
         partialClock.advance(Duration.ofDays(8));
-        checkThrows("partially captured authorization also expires", IllegalTransitionException.class,
+        checkThrows("expired remainder of a partial capture cannot be captured", IllegalTransitionException.class,
                 () -> partialStale.capture(usd("70.00"), "second"));
-        check("expiry event amount is the uncaptured remainder", partialStale.events().get(2).amount().equals(usd("70.00")));
+        check("expiry of a partial capture lands in CAPTURED, not EXPIRED", partialStale.state() == TransactionState.CAPTURED);
+        check("expiry event releases the uncaptured remainder", partialStale.events().get(2).action() == Action.EXPIRE
+                && partialStale.events().get(2).amount().equals(usd("70.00")) && partialStale.events().get(2).to() == TransactionState.CAPTURED);
+        check("captured amount survives the expiry", partialStale.capturedAmount().equals(usd("30.00"))
+                && partialStale.remainingAuthorization().isZero());
+        partialStale.refund(usd("30.00"), "customer returned the shipped item");
+        check("captured funds stay refundable after the hold expires", partialStale.state() == TransactionState.REFUNDED
+                && partialStale.netSettled().isZero());
 
         FakeClock shortClock = new FakeClock(T0);
         CardTransaction shortLived = auth("10.00", shortClock, new LifecyclePolicy(Duration.ofHours(1), 0));

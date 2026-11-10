@@ -466,11 +466,11 @@ public final class Main {
                     Posting.debit("1200", net), Posting.credit("2100", net))));
         } catch (IdempotencyConflictException e) { System.out.println("rejected: " + e.getMessage()); }
 
-        System.out.println("\n== Reversal: the merchant refunds the customer; nothing is edited ==");
+        System.out.println("\n== Reversal: the capture is voided; nothing is edited ==");
         Money before = ledger.balance("4100");
-        JournalEntry reversal = ledger.reverse("pay-001", "rev-001", "refund: reverse pay-001");
+        JournalEntry reversal = ledger.reverse("pay-001", "rev-001", "reversal: void pay-001");
         printEntry(reversal);
-        System.out.println("fee revenue before refund " + before + ", after " + ledger.balance("4100"));
+        System.out.println("fee revenue before reversal " + before + ", after " + ledger.balance("4100"));
         System.out.println("journal now holds " + ledger.size() + " entries; pay-001 is still entry #1");
 
         System.out.println("\n== 10,000 seeded random balanced entries: trial balance still sums to zero ==");

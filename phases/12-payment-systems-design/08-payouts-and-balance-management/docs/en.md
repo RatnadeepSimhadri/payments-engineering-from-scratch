@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 12, Lesson 06 (Refunds, Partial Refunds, and Refund Windows); Phase 12, Lesson 07 (Disputes and Chargebacks); Phase 10, Lesson 07 (Holds and Available Balance); Phase 10, Lesson 08 (Reconciliation); Phase 11, Lesson 08 (ACH and NACHA)
+**Prerequisites:** Phase 12 Lesson 06 (Refunds, Partial Refunds, and Refund Windows), Phase 12 Lesson 07 (Disputes and Chargebacks), Phase 10 Lesson 07 (Holds and Available Balance), Phase 10 Lesson 08 (Reconciliation), Phase 11 Lesson 08 (ACH and the NACHA File Format)
 **Time:** ~90 minutes
 
 ## Learning Objectives

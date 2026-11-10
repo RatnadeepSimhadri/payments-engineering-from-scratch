@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 09 (Idempotency Keys), Phase 5, Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 10, Lesson 01 (Representing Money), Phase 11, Lesson 11 (IBAN, BIC, and Account Number Validation)
+**Prerequisites:** Phase 5 Lesson 09 (Idempotency Keys), Phase 5 Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 10 Lesson 01 (Representing Money), Phase 11 Lesson 11 (IBAN, BIC, and Account Number Validation)
 **Time:** ~120 minutes
 
 ## Learning Objectives
@@ -57,15 +57,15 @@ sequenceDiagram
   participant A as Aggregator (client)
   participant S as Bank auth server
   participant R as Bank data API
-  A->>A: verifier = random(64); challenge = B64URL(SHA256(verifier)); state = random
+  A->>A: verifier = random(64), challenge = B64URL(SHA256(verifier)), state = random
   A->>U: redirect to /authorize?client_id&redirect_uri&scope&state&code_challenge&code_challenge_method=S256
   U->>S: authenticate, review scopes, click allow
-  S->>S: store consent (90 d); store code bound to client, redirect_uri, challenge (10 min, single use)
+  S->>S: store consent (90 d), store code bound to client, redirect_uri, challenge (10 min, single use)
   S->>U: redirect to redirect_uri?code&state
   U->>A: code, state
   A->>A: state matches a pending authorization? else reject (CSRF)
   A->>S: POST /token grant_type=authorization_code, code, redirect_uri, code_verifier
-  S->>S: consume code; SHA256(verifier) == challenge? redirect_uri equal? not expired?
+  S->>S: consume code, SHA256(verifier) == challenge? redirect_uri equal? not expired?
   S->>A: access_token (300 s), refresh_token, scope
   A->>R: GET /accounts  Authorization: Bearer access_token
   R->>S: introspect(access_token)

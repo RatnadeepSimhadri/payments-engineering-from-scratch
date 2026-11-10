@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 07 (Deadlocks, Lock Ordering, and Detection); Phase 4, Lesson 01 (Threads and the Memory Model)
+**Prerequisites:** Phase 4 Lesson 02 (Locks and Atomics), Phase 4 Lesson 07 (Deadlocks, Lock Ordering, and Detection), Phase 4 Lesson 01 (Threads and the Memory Model)
 **Time:** ~75 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money); Phase 11, Lesson 08 (ACH and the NACHA File Format); Phase 11, Lesson 11 (IBAN, BIC, and Account Number Validation)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 11 Lesson 08 (ACH and the NACHA File Format)
 **Time:** ~120 minutes
 
 ## Learning Objectives
@@ -18,7 +18,7 @@
 
 ## The Problem
 
-A German robotics company pays its suppliers every Tuesday. Its ERP produces a file of credit transfers, the treasury team uploads it to the bank portal, and the bank executes it. One Tuesday the upload is rejected with `CtrlSum does not match sum of InstdAmt`. The ERP had been upgraded the week before, and the new export computed the control sum by adding the amounts as `double` values and formatting the result with two decimals. For 3 transactions the result was right. For 1,184 transactions it was 0.01 EUR off, because the float sum had accumulated an error that crossed a rounding boundary. The bank is right to refuse a file whose declared total disagrees with its contents; it cannot know which number is wrong.
+A German robotics company pays its suppliers every Tuesday. Its ERP produces a file of credit transfers, the treasury team uploads it to the bank portal, and the bank executes it. One Tuesday the upload is rejected with `CtrlSum does not match sum of InstdAmt`. The ERP had been upgraded the week before, and the new export computed the control sum by adding the amounts as `double` values and formatting the result with two decimals. For 3 transactions the result was right. For 1,184 transactions it was 0.01 EUR off, because the float sum had accumulated an error that crossed a rounding boundary. The bank is right to refuse a file whose declared total disagrees with its contents; it cannot know which number is wrong. This lesson pairs with Phase 11 Lesson 11 (IBAN, BIC, and Account Number Validation), which comes later.
 
 A month later a different failure: the file is accepted, the payments execute, and one supplier in Lyon writes to say it never received 1,250.00 EUR. The bank's status report (pain.002) says the transaction was rejected by the receiving bank with reason code `AC01`, incorrect account number. The ERP did not process pain.002 files, so nobody noticed for three weeks. The IBAN in the supplier master had a transposed pair of digits. An IBAN check digit would have caught it before the file left the building, and an end-to-end identifier that the ERP could match on would have connected the rejection to the invoice automatically.
 

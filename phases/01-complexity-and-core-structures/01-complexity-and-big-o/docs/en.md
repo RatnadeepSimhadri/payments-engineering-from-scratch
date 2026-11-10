@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 0, Lesson 05 (Benchmarking and Profiling)
+**Prerequisites:** Phase 0 Lesson 05 (Benchmarking and Profiling)
 **Time:** ~75 minutes
 
 ## Learning Objectives

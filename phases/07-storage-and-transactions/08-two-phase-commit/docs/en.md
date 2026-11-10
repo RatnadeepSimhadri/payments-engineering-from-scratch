@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs and Crash Recovery), Phase 5, Lesson 03 (Failure Models and Timeouts), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 7 Lesson 02 (Write-Ahead Logs), Phase 5 Lesson 02 (Failure Models), Phase 5 Lesson 08 (Timeouts and Deadline Propagation), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~120 minutes
 
 ## Learning Objectives
@@ -148,7 +148,7 @@ Does not promise:
 
 ### Complexity
 
-For `n` participants, one transaction costs `2n` messages in the happy path plus `n` acknowledgements, and `2n + 2` forced log writes (`n` PREPARED, one DECISION, `n` COMMITTED, one END). Latency is two round trips plus the slowest participant's fsync in each phase. Lock hold time is the full two round trips, which is why throughput on a hot account collapses under 2PC: every transfer touching alice serialises behind the previous one for the entire protocol duration, not just the duration of the local update.
+For `n` participants, one transaction costs `2n` messages in the happy path plus `n` acknowledgements, and `2n + 1` forced log writes (`n` PREPARED, one DECISION, `n` COMMITTED); the coordinator's END record is written lazily under presumed abort, since losing it only costs a harmless redelivery on recovery, so it adds a log append but no fsync to the critical path. Latency is two round trips plus the slowest participant's fsync in each phase. Lock hold time is the full two round trips, which is why throughput on a hot account collapses under 2PC: every transfer touching alice serialises behind the previous one for the entire protocol duration, not just the duration of the local update.
 
 ## Build It
 

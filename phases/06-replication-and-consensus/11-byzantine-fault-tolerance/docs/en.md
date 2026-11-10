@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 5, Lesson 02 (Failure Models: Crash-Stop, Omission, Byzantine), Phase 6, Lesson 04 (Single-Decree Paxos from Scratch), Phase 6, Lesson 06 (Raft II: Log Replication and Commit), Phase 6, Lesson 03 (Quorums: R + W > N and Its Limits)
+**Prerequisites:** Phase 5 Lesson 02 (Failure Models), Phase 6 Lesson 04 (Single-Decree Paxos), Phase 6 Lesson 06 (Raft II: Log Replication), Phase 6 Lesson 03 (Quorums)
 **Time:** ~75 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 7, Lesson 02 (Write-Ahead Logs), Phase 7, Lesson 11 (Change Data Capture), Phase 7, Lesson 12 (The Saga Pattern)
+**Prerequisites:** Phase 7 Lesson 02 (Write-Ahead Logs), Phase 7 Lesson 11 (Change Data Capture), Phase 7 Lesson 12 (The Saga Pattern)
 **Time:** ~90 minutes
 
 ## Learning Objectives

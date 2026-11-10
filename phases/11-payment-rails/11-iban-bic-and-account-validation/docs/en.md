@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 0, Lesson 07 (Decimal and Integer Arithmetic in Three Runtimes), Phase 11, Lesson 08 (ACH and NACHA)
+**Prerequisites:** Phase 0 Lesson 07 (Decimal and Integer Arithmetic), Phase 11 Lesson 08 (ACH and the NACHA File Format)
 **Time:** ~60 minutes
 
 ## Learning Objectives

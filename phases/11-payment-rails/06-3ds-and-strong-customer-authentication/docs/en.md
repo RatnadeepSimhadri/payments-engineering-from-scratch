@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 11, Lesson 01 (How a Card Payment Works); Phase 11, Lesson 02 (Authorization, Capture, Void, Refund); Phase 11, Lesson 03 (ISO 8583)
+**Prerequisites:** Phase 11 Lesson 01 (How a Card Payment Works), Phase 11 Lesson 02 (The Card Lifecycle State Machine), Phase 11 Lesson 03 (ISO 8583)
 **Time:** ~75 minutes
 
 ## Learning Objectives

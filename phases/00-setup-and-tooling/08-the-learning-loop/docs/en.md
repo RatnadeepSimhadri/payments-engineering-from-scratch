@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 0, Lesson 03 (Testing from the Standard Library), Phase 0, Lesson 04 (Git for Engineers)
+**Prerequisites:** Phase 0 Lesson 03 (Testing from the Standard Library), Phase 0 Lesson 04 (Git for Engineers)
 **Time:** ~30 minutes
 
 ## Learning Objectives

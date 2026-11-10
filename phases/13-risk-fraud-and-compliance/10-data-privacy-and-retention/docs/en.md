@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 10, Lesson 03 (Double-Entry Ledger); Phase 13, Lesson 05 (KYC and Identity Verification); Phase 8 (event logs and streams)
+**Prerequisites:** Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 13 Lesson 05 (KYC and Identity Verification), Phase 8 Lesson 01 (The Append-Only Log), Phase 8 Lesson 05 (Event Sourcing)
 **Time:** ~60 minutes
 
 ## Learning Objectives

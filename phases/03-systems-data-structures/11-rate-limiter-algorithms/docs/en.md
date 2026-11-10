@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 05 (Stacks, Queues, and Deques), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 3, Lesson 08 (LRU and LFU Caches)
+**Prerequisites:** Phase 1 Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 1 Lesson 06 (Hash Maps), Phase 3 Lesson 08 (LRU and LFU Caches)
 **Time:** ~90 minutes
 
 ## Learning Objectives

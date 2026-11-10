@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 2, Lesson 03 (Graph Traversal and Cycle Detection); Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 4 Lesson 02 (Locks and Atomics), Phase 2 Lesson 08 (Graph Traversal), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~60 minutes
 
 ## Learning Objectives

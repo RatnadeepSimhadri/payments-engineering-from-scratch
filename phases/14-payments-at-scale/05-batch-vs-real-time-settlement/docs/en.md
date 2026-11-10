@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 10, Lesson 10 (Fees and Splits), Phase 11, Lesson 08 (ACH and Nacha), Phase 11, Lesson 15 (Settlement and Clearing), Phase 12, Lesson 08 (Payouts and Balance Management), Phase 14, Lesson 04 (Reconciliation at Scale)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 10 (Fees and Splits), Phase 11 Lesson 08 (ACH and the NACHA File Format), Phase 11 Lesson 15 (Settlement and Clearing), Phase 12 Lesson 08 (Payouts and Balances), Phase 14 Lesson 04 (Reconciliation at Scale)
 **Time:** ~90 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 10 (Disjoint Sets), Phase 1, Lesson 09 (Heaps and Priority Queues), Phase 2, Lesson 07 (Greedy Algorithms and Exchange Arguments), Phase 2, Lesson 08 (Graph Traversal)
+**Prerequisites:** Phase 1 Lesson 10 (Disjoint Sets), Phase 1 Lesson 09 (Heaps and Priority Queues), Phase 2 Lesson 07 (Greedy Algorithms and Exchange Arguments), Phase 2 Lesson 08 (Graph Traversal)
 **Time:** ~60 minutes
 
 ## Learning Objectives

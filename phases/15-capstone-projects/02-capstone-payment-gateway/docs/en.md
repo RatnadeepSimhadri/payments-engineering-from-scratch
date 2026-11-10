@@ -4,7 +4,7 @@
 
 **Type:** Capstone
 **Languages:** Java, Python, or Go (pick one; the spec is language-neutral)
-**Prerequisites:** Phase 5 Lessons 09-11 (Idempotency Keys, Retries, Circuit Breakers), Phase 7 Lessons 12-13 (Sagas, Transactional Outbox), Phase 11 Lesson 02 (Card Lifecycle State Machine), Phase 12 Lessons 01-05, 10, 14, Phase 14 Lesson 10 (Deterministic Simulation Testing), Phase 15 Lesson 01
+**Prerequisites:** Phase 5 Lesson 09 (Idempotency Keys), Phase 5 Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 5 Lesson 11 (Circuit Breakers and Bulkheads), Phase 7 Lesson 12 (The Saga Pattern), Phase 7 Lesson 13 (The Transactional Outbox), Phase 11 Lesson 02 (The Card Lifecycle State Machine), Phase 12 Lesson 01 (Designing an Idempotent Payment API), Phase 12 Lesson 02 (The Payment State Machine), Phase 12 Lesson 03 (Payment Orchestration Across Processors), Phase 12 Lesson 04 (Smart Routing, Cascading, and Retry Policies), Phase 12 Lesson 05 (Webhooks), Phase 12 Lesson 10 (Payment Method Abstraction), Phase 12 Lesson 14 (Testing Payment Systems), Phase 14 Lesson 10 (Deterministic Simulation Testing), Phase 15 Lesson 01 (A Durable Double-Entry Ledger Service)
 **Time:** ~480 minutes
 
 ## Learning Objectives

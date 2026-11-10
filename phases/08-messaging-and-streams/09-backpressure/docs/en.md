@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 8, Lesson 08 (Watermarks, Event Time, and Late Data), Phase 4, Lesson 03 (Bounded Buffers and Producer-Consumer), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 8 Lesson 08 (Watermarks, Event Time, and Late Data), Phase 4 Lesson 05 (Producers, Consumers, and Bounded Queues), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~75 minutes
 
 ## Learning Objectives

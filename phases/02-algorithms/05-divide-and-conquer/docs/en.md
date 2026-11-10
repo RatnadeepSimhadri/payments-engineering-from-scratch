@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 2, Lesson 01 (Sorting), Phase 2, Lesson 02 (Binary Search and Its Variants)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis), Phase 2 Lesson 01 (Sorting), Phase 2 Lesson 02 (Binary Search and Its Variants)
 **Time:** ~60 minutes
 
 ## Learning Objectives

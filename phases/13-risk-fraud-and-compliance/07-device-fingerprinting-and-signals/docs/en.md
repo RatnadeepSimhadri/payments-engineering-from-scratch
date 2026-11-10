@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 13, Lesson 01 (Fraud Patterns); Phase 13, Lesson 02 (Rules Engine and Velocity Checks); Phase 13, Lesson 03 (Risk Scoring and Thresholds)
+**Prerequisites:** Phase 13 Lesson 01 (Fraud Patterns), Phase 13 Lesson 02 (A Rules Engine with Velocity Checks), Phase 13 Lesson 03 (Risk Scoring and Thresholds)
 **Time:** ~60 minutes
 
 ## Learning Objectives

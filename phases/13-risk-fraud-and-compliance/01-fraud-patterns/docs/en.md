@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 11, Lesson 02 (Card Networks and the Four-Party Model); Phase 12, Lesson 01 (Payment State Machines); Phase 10, Lesson 03 (Double-Entry Ledger)
+**Prerequisites:** Phase 11 Lesson 01 (How a Card Payment Works), Phase 12 Lesson 02 (The Payment State Machine), Phase 10 Lesson 03 (The Double-Entry Ledger)
 **Time:** ~75 minutes
 
 ## Learning Objectives

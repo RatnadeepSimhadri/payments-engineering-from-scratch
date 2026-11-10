@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 1, Lessons 01 through 13 (this lesson is the synthesis of the phase)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis), Phase 1 Lesson 02 (Amortized Analysis), Phase 1 Lesson 03 (Dynamic Arrays), Phase 1 Lesson 04 (Linked Lists), Phase 1 Lesson 05 (Stacks, Queues, and Ring Buffers), Phase 1 Lesson 06 (Hash Maps), Phase 1 Lesson 07 (Hash Functions and Collisions), Phase 1 Lesson 08 (Binary Search Trees), Phase 1 Lesson 09 (Heaps and Priority Queues), Phase 1 Lesson 10 (Disjoint Sets), Phase 1 Lesson 11 (Bit Manipulation and Compact Encodings), Phase 1 Lesson 12 (Strings and Encodings), Phase 1 Lesson 13 (Tries and Prefix Trees)
 **Time:** ~45 minutes
 
 ## Learning Objectives

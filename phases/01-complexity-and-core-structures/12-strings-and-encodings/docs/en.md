@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 1, Lesson 11 (Bit Manipulation and Compact Encodings), Phase 1, Lesson 07 (Hash Functions, Collisions, and HashDoS)
+**Prerequisites:** Phase 1 Lesson 11 (Bit Manipulation and Compact Encodings), Phase 1 Lesson 07 (Hash Functions and Collisions)
 **Time:** ~60 minutes
 
 ## Learning Objectives

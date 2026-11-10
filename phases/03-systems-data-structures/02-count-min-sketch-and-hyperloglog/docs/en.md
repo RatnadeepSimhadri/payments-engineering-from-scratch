@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 3, Lesson 01 (Bloom Filters from Scratch), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 1, Lesson 11 (Bit Manipulation)
+**Prerequisites:** Phase 3 Lesson 01 (Bloom Filters), Phase 1 Lesson 07 (Hash Functions and Collisions), Phase 1 Lesson 11 (Bit Manipulation and Compact Encodings)
 **Time:** ~90 minutes
 
 ## Learning Objectives

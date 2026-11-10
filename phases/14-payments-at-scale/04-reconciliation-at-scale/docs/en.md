@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 2, Lesson 03 (Merge Sort and External Sorting), Phase 3, Lesson 01 (Hash Tables), Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 08 (Reconciliation), Phase 14, Lesson 03 (Exactly-Once Money Movement)
+**Prerequisites:** Phase 2 Lesson 01 (Sorting), Phase 1 Lesson 06 (Hash Maps), Phase 10 Lesson 01 (Representing Money), Phase 10 Lesson 08 (Reconciliation), Phase 14 Lesson 03 (Exactly-Once Money Movement)
 **Time:** ~120 minutes
 
 ## Learning Objectives

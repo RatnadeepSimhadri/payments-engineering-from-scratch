@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 11 (Bit Manipulation), Phase 1, Lesson 12 (Strings and Encodings), Phase 0, Lesson 06 (Reading a Spec)
+**Prerequisites:** Phase 1 Lesson 11 (Bit Manipulation and Compact Encodings), Phase 1 Lesson 12 (Strings and Encodings), Phase 0 Lesson 06 (Reading a Spec)
 **Time:** ~90 minutes
 
 ## Learning Objectives

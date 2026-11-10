@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 6, Lesson 01 (Replication: Leader-Based, Multi-Leader, Leaderless); Phase 5, Lesson 05 (Consistency Models); Phase 5, Lesson 03 (Lamport and Vector Clocks)
+**Prerequisites:** Phase 6 Lesson 01 (Replication Strategies), Phase 5 Lesson 05 (Consistency Models), Phase 5 Lesson 03 (Lamport and Vector Clocks)
 **Time:** ~75 minutes
 
 ## Learning Objectives

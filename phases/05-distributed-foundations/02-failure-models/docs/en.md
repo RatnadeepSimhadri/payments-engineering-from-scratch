@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 5, Lesson 01 (The Fallacies of Distributed Computing)
+**Prerequisites:** Phase 5 Lesson 01 (The Fallacies of Distributed Computing)
 **Time:** ~60 minutes
 
 ## Learning Objectives

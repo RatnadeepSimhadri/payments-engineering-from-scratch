@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 03 (Dynamic Arrays), Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 0, Lesson 03 (Testing from the Standard Library)
+**Prerequisites:** Phase 1 Lesson 03 (Dynamic Arrays), Phase 1 Lesson 06 (Hash Maps), Phase 0 Lesson 03 (Testing from the Standard Library)
 **Time:** ~90 minutes
 
 ## Learning Objectives

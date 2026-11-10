@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 01 (Big-O and Measuring), Phase 3, Lesson 02 (Count-Min Sketch and HyperLogLog), Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis), Phase 3 Lesson 02 (Count-Min Sketch and HyperLogLog), Phase 9 Lesson 01 (SLIs, SLOs, and Error Budgets)
 **Time:** ~75 minutes
 
 ## Learning Objectives

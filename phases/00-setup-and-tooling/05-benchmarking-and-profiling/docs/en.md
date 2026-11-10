@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 0, Lesson 03 (Testing from the Standard Library)
+**Prerequisites:** Phase 0 Lesson 03 (Testing from the Standard Library)
 **Time:** ~75 minutes
 
 ## Learning Objectives

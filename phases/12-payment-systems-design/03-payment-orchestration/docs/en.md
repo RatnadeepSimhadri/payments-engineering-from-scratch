@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 12, Lesson 01 (Designing an Idempotent Payment API); Phase 7, Lesson 08 (Sagas and Compensating Transactions); Phase 10, Lesson 03 (The Double-Entry Ledger)
+**Prerequisites:** Phase 12 Lesson 02 (The Payment State Machine), Phase 12 Lesson 01 (Designing an Idempotent Payment API), Phase 7 Lesson 12 (The Saga Pattern), Phase 10 Lesson 03 (The Double-Entry Ledger)
 **Time:** ~120 minutes
 
 ## Learning Objectives

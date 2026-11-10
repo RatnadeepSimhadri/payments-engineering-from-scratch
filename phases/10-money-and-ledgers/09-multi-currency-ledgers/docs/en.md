@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 02 (Currencies and FX Conversion), Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 06 (Immutability and Reversals)
+**Prerequisites:** Phase 10 Lesson 02 (Currencies and FX), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 06 (Immutability and Reversals)
 **Time:** ~90 minutes
 
 ## Learning Objectives

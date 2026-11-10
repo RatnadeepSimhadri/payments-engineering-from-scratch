@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 5, Lesson 01 (Failure Models), Phase 9 README
+**Prerequisites:** Phase 5 Lesson 02 (Failure Models)
 **Time:** ~60 minutes
 
 ## Learning Objectives

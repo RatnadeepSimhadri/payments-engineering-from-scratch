@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 01 (The Fallacies of Distributed Computing), Phase 5, Lesson 08 (Timeouts and Deadline Propagation), Phase 1, Lesson 04 (Hash Maps), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 5 Lesson 01 (The Fallacies of Distributed Computing), Phase 5 Lesson 08 (Timeouts and Deadline Propagation), Phase 1 Lesson 06 (Hash Maps), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~120 minutes
 
 ## Learning Objectives

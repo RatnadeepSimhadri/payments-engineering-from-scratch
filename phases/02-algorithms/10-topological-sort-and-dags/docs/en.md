@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 2, Lesson 08 (Graph Traversal: BFS, DFS, and Connected Components), Phase 1, Lesson 05 (Stacks, Queues, and Deques)
+**Prerequisites:** Phase 2 Lesson 08 (Graph Traversal), Phase 1 Lesson 05 (Stacks, Queues, and Ring Buffers)
 **Time:** ~60 minutes
 
 ## Learning Objectives

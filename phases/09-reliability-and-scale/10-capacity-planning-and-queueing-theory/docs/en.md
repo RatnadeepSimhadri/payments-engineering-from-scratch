@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 9, Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9, Lesson 02 (Load Balancing), Phase 9, Lesson 06 (Metrics and Histograms)
+**Prerequisites:** Phase 9 Lesson 01 (SLIs, SLOs, and Error Budgets), Phase 9 Lesson 02 (Load Balancing), Phase 9 Lesson 06 (Metrics and Histograms)
 **Time:** ~75 minutes
 
 ## Learning Objectives

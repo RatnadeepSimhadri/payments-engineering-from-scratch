@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 13, Lesson 01 (Fraud Patterns); Phase 13, Lesson 02 (A Rules Engine with Velocity Checks); Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 13 Lesson 01 (Fraud Patterns), Phase 13 Lesson 02 (A Rules Engine with Velocity Checks), Phase 10 Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Capstone
 **Languages:** Java, Python, or Go (pick one; the spec is language-neutral)
-**Prerequisites:** Phase 8 Lessons 01, 05, 06 (Append-Only Log, Event Sourcing, CQRS and Projections), Phase 8 Lesson 11 (Schema Evolution), Phase 10 Lessons 01, 05, 07 (Money, Balances and Snapshots, Holds), Phase 11 Lesson 12 (Wallets and Stored Value), Phase 12 Lesson 09 (Limits and Velocity Controls), Phase 15 Lesson 01
+**Prerequisites:** Phase 8 Lesson 01 (The Append-Only Log), Phase 8 Lesson 05 (Event Sourcing), Phase 8 Lesson 06 (CQRS and Projections), Phase 8 Lesson 11 (Schema Registries and Compatible Evolution), Phase 10 Lesson 01 (Representing Money), Phase 10 Lesson 05 (Balances and Snapshots), Phase 10 Lesson 07 (Holds and Available Balance), Phase 11 Lesson 12 (Wallets and Stored Value), Phase 12 Lesson 09 (Limits and Velocity Controls), Phase 15 Lesson 01 (A Durable Double-Entry Ledger Service)
 **Time:** ~360 minutes
 
 ## Learning Objectives

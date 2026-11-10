@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 0, Lesson 01 (Dev Environment), Phase 0, Lesson 03 (Testing from the Standard Library)
+**Prerequisites:** Phase 0 Lesson 01 (Dev Environment), Phase 0 Lesson 03 (Testing from the Standard Library)
 **Time:** ~45 minutes
 
 ## Learning Objectives

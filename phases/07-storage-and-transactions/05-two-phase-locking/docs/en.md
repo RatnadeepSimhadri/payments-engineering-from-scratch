@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 7, Lesson 04 (Isolation Levels and Their Anomalies), Phase 4, Lesson 07 (Deadlocks, Lock Ordering, and Detection), Phase 2, Lesson 08 (Graph Traversal: BFS and DFS), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 7 Lesson 04 (Isolation Levels and Their Anomalies), Phase 4 Lesson 07 (Deadlocks, Lock Ordering, and Detection), Phase 2 Lesson 08 (Graph Traversal), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~90 minutes
 
 ## Learning Objectives

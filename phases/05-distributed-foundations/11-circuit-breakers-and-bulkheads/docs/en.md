@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 08 (Timeouts and Deadline Propagation), Phase 5, Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 4, Lesson 01 (Threads and the Memory Model)
+**Prerequisites:** Phase 5 Lesson 08 (Timeouts and Deadline Propagation), Phase 5 Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 4 Lesson 01 (Threads and the Memory Model)
 **Time:** ~75 minutes
 
 ## Learning Objectives

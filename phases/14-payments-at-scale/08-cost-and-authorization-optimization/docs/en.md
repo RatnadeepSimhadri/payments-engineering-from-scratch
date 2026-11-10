@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 11, Lesson 02 (Card Authorization Lifecycle), Phase 11, Lesson 03 (ISO 8583), Phase 11, Lesson 05 (Tokenization and PCI Scope), Phase 11, Lesson 07 (Interchange and Scheme Fees), Phase 12, Lesson 04 (Smart Routing and Retries), Phase 14, Lesson 06 (Observability for Money Movement)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 11 Lesson 02 (The Card Lifecycle State Machine), Phase 11 Lesson 03 (ISO 8583), Phase 11 Lesson 05 (Tokenization and PCI DSS Scope Reduction), Phase 11 Lesson 07 (Interchange, Scheme Fees, and Merchant Pricing), Phase 12 Lesson 04 (Smart Routing, Cascading, and Retry Policies), Phase 14 Lesson 06 (Observability for Money Movement)
 **Time:** ~75 minutes
 
 ## Learning Objectives

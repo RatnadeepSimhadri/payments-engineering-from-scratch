@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 07 (RPC, Framing, and Serialization Over Raw Sockets); Phase 5, Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks)
+**Prerequisites:** Phase 5 Lesson 07 (RPC and Serialization), Phase 5 Lesson 04 (Physical Clocks, NTP, and Hybrid Logical Clocks)
 **Time:** ~60 minutes
 
 ## Learning Objectives

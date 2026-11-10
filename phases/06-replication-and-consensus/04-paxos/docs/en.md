@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 6, Lesson 03 (Quorums: R + W > N and Its Limits); Phase 5, Lesson 03 (Lamport and Vector Clocks)
+**Prerequisites:** Phase 6 Lesson 03 (Quorums), Phase 5 Lesson 03 (Lamport and Vector Clocks)
 **Time:** ~120 minutes
 
 ## Learning Objectives

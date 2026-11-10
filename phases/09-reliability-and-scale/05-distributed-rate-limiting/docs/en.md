@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 9, Lesson 04 (Cache Invalidation, Stampedes, and Request Coalescing), Phase 5, Lesson 10 (Retries, Backoff, and Jitter), Phase 1, Lesson 06 (Hash Maps from Scratch)
+**Prerequisites:** Phase 9 Lesson 04 (Cache Invalidation, Stampedes, and Request Coalescing), Phase 5 Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 1 Lesson 06 (Hash Maps)
 **Time:** ~90 minutes
 
 ## Learning Objectives

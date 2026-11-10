@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 02 (Amortized Analysis), Phase 1, Lesson 06 (Hash Maps from Scratch)
+**Prerequisites:** Phase 1 Lesson 02 (Amortized Analysis), Phase 1 Lesson 06 (Hash Maps)
 **Time:** ~60 minutes
 
 ## Learning Objectives

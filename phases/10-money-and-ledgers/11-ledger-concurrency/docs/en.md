@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 03 (The Double-Entry Ledger), Phase 10, Lesson 05 (Balances and Snapshots), Phase 10, Lesson 07 (Holds and Available Balance), Phase 4, Lesson 02 (Locks and Atomic Counters)
+**Prerequisites:** Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 05 (Balances and Snapshots), Phase 10 Lesson 07 (Holds and Available Balance), Phase 4 Lesson 02 (Locks and Atomics)
 **Time:** ~90 minutes
 
 ## Learning Objectives

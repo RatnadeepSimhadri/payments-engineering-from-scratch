@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 7, Lesson 11 (Change Data Capture), Phase 7, Lesson 13 (Transactional Outbox), Phase 7, Lesson 14 (Schema Migrations at Scale), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 10, Lesson 04 (Chart of Accounts), Phase 10, Lesson 05 (Balances and Snapshots), Phase 10, Lesson 08 (Reconciliation), Phase 14, Lesson 03 (Exactly-Once Money Movement)
+**Prerequisites:** Phase 7 Lesson 11 (Change Data Capture), Phase 7 Lesson 13 (The Transactional Outbox), Phase 7 Lesson 14 (Schema Migrations at Scale), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 04 (Chart of Accounts), Phase 10 Lesson 05 (Balances and Snapshots), Phase 10 Lesson 08 (Reconciliation), Phase 14 Lesson 03 (Exactly-Once Money Movement)
 **Time:** ~90 minutes
 
 ## Learning Objectives

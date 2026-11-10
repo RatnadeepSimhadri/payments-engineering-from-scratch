@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 13, Lesson 01 (Fraud Patterns); Phase 10, Lesson 01 (Representing Money); Phase 1, Lesson 03 (Hash Maps)
+**Prerequisites:** Phase 13 Lesson 01 (Fraud Patterns), Phase 10 Lesson 01 (Representing Money), Phase 1 Lesson 06 (Hash Maps)
 **Time:** ~120 minutes
 
 ## Learning Objectives

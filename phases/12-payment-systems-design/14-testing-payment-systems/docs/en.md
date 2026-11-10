@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 03 (Double-Entry Ledger), Phase 12, Lesson 02 (Payment State Machine), Phase 12, Lesson 01 (Idempotent Payment API)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 12 Lesson 02 (The Payment State Machine), Phase 12 Lesson 01 (Designing an Idempotent Payment API)
 **Time:** ~120 minutes
 
 ## Learning Objectives

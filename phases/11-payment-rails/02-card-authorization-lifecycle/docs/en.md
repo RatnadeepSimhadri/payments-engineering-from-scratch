@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 11, Lesson 01 (How a Card Payment Works), Phase 10, Lesson 01 (Representing Money), Phase 10, Lesson 07 (Holds and Available Balance), Phase 8, Lesson 05 (Event Sourcing)
+**Prerequisites:** Phase 11 Lesson 01 (How a Card Payment Works), Phase 10 Lesson 01 (Representing Money), Phase 10 Lesson 07 (Holds and Available Balance), Phase 8 Lesson 05 (Event Sourcing)
 **Time:** ~120 minutes
 
 ## Learning Objectives
@@ -32,7 +32,7 @@ All three failures have the same shape: the system allowed a transition that the
 
 A card transaction starts with an **authorization**: the issuer confirms the card is valid and places a hold on the cardholder's available balance. No money has moved. The merchant then has a window, typically seven days for a standard purchase and up to thirty for travel and lodging, to **capture**: to present a clearing record that says "I delivered, pay me." Capture is what turns the hold into a settlement obligation. If the merchant captures nothing, the hold **expires** and the issuer releases it. If the merchant decides not to proceed, it **voids** the authorization, which releases the hold immediately rather than waiting for expiry. After capture, money can flow back to the cardholder only through a **refund**, which is a new transaction referencing the original, and can never return more than was captured.
 
-Two refinements make the machine realistic. First, a capture can be **partial**: an order with three items ships in two boxes, and each shipment captures its share. A partially captured authorization can be captured again or **closed**, which releases whatever was not captured. Second, the authorization can be **incremented** while it is still open: a hotel guest extends the stay and the merchant asks the issuer for an additional 30.00 against the same transaction, which the issuer approves or declines on its own merits.
+Two refinements make the machine realistic. First, a capture can be **partial**: an order with three items ships in two boxes, and each shipment captures its share. A partially captured authorization can be captured again or **closed**, which releases whatever was not captured. If the merchant does neither and the window runs out, the uncaptured remainder lapses on its own and the transaction lands in the same place a close would have put it: `CAPTURED`, with the captured amount intact and still refundable. Only an authorization that was never captured at all becomes `EXPIRED`. Second, the authorization can be **incremented** while it is still open: a hotel guest extends the stay and the merchant asks the issuer for an additional 30.00 against the same transaction, which the issuer approves or declines on its own merits.
 
 | State | Meaning | Hold on cardholder | Merchant's expected settlement |
 |-------|---------|-------------------|-------------------------------|
@@ -40,7 +40,7 @@ Two refinements make the machine realistic. First, a capture can be **partial**:
 | `PARTIALLY_CAPTURED` | Some captured; hold still open for the rest | authorized minus captured | captured |
 | `CAPTURED` | Capturing is finished (fully captured or closed) | 0 | captured |
 | `VOIDED` | Released before any capture; terminal | 0 | 0 |
-| `EXPIRED` | Validity window passed with hold still open; terminal | 0 | captured (if any) |
+| `EXPIRED` | Validity window passed with nothing captured; terminal | 0 | 0 |
 | `PARTIALLY_REFUNDED` | Some captured money returned | 0 | captured minus refunded |
 | `REFUNDED` | Everything captured has been returned; terminal | 0 | 0 |
 
@@ -57,7 +57,7 @@ stateDiagram-v2
   PARTIALLY_CAPTURED --> PARTIALLY_CAPTURED: CAPTURE (part)
   PARTIALLY_CAPTURED --> CAPTURED: CAPTURE (rest)
   PARTIALLY_CAPTURED --> CAPTURED: CLOSE_CAPTURE
-  PARTIALLY_CAPTURED --> EXPIRED: EXPIRE
+  PARTIALLY_CAPTURED --> CAPTURED: EXPIRE (remainder lapses)
   CAPTURED --> PARTIALLY_REFUNDED: REFUND (part)
   CAPTURED --> REFUNDED: REFUND (all)
   PARTIALLY_REFUNDED --> PARTIALLY_REFUNDED: REFUND (part)
@@ -70,6 +70,7 @@ Every arrow not in this diagram is an illegal transition. The ones people most o
 - **INCREMENT after a partial capture.** The networks define incremental authorization as an operation on an open authorization in a defined set of merchant categories. Once the merchant has begun capturing, the amount is fixed; a further charge needs a new authorization.
 - **REFUND before capture.** You cannot return money you have not received. A refund request against an `AUTHORIZED` transaction is almost always a client bug (the hotel's pre-filled form) and must be rejected, not converted to a void.
 - **Anything from a terminal state.** `VOIDED`, `EXPIRED`, and `REFUNDED` accept no actions. A second void is not idempotent success; it is an error that tells the caller its model of the world is stale.
+- **EXPIRED after a partial capture.** Captured funds must always be refundable, so a terminal state can never hold captured money. When the remainder of a `PARTIALLY_CAPTURED` hold lapses, the `EXPIRE` event moves the transaction to `CAPTURED`, not `EXPIRED`; a refund is still legal afterwards and a further capture is not.
 
 ### The two amount invariants
 
@@ -86,7 +87,7 @@ Both invariants are checked against **cumulative** totals, not the individual ca
 
 ### Time is an input
 
-Authorizations expire. The validity period depends on the network, the region, the merchant category, and whether the authorization was flagged as an estimate; seven days is the common default for a final-amount purchase and the policy object carries it. The machine has no background job that scans for expired holds. Instead, every merchant-initiated action first calls `expireIfDue`, which compares the injected clock against the stored expiry and, if the window has passed and the current state allows `EXPIRE`, appends an `EXPIRE` event and moves to `EXPIRED` before the requested action is evaluated. The late capture then fails as `CAPTURE is not allowed in state EXPIRED`, and the log shows exactly when and why.
+Authorizations expire. The validity period depends on the network, the region, the merchant category, and whether the authorization was flagged as an estimate; seven days is the common default for a final-amount purchase and the policy object carries it. The machine has no background job that scans for expired holds. Instead, every merchant-initiated action first calls `expireIfDue`, which compares the injected clock against the stored expiry and, if the window has passed and the current state allows `EXPIRE`, appends an `EXPIRE` event before the requested action is evaluated. From `AUTHORIZED` the move is to `EXPIRED`; from `PARTIALLY_CAPTURED` it is to `CAPTURED`, because the captured portion is settled money and only the open remainder lapses. The late capture then fails as `CAPTURE is not allowed in state EXPIRED` (or `in state CAPTURED`), and the log shows exactly when and why.
 
 Incrementing an authorization resets the window, because the issuer has just re-approved the transaction. Capturing part of it does not: the original approval is the one being drawn down.
 
@@ -277,13 +278,14 @@ The ceiling check is on `total`, the cumulative figure, not on `amount`. The nex
 boolean expireIfDue(String attemptedReason) {
     if (!LEGAL.get(state).contains(Action.EXPIRE)) return false;
     if (clock.now().isBefore(expiresAt)) return false;
-    transition(Action.EXPIRE, remainingAuthorization(), TransactionState.EXPIRED,
+    TransactionState next = state == TransactionState.PARTIALLY_CAPTURED ? TransactionState.CAPTURED : TransactionState.EXPIRED;
+    transition(Action.EXPIRE, remainingAuthorization(), next,
             "authorization validity of " + policy.authValidity().toDays() + " days elapsed (while attempting: " + attemptedReason + ")");
     return true;
 }
 ```
 
-Expiry is itself a transition through the same choke point, so it is in the log with the amount released (the uncaptured remainder) and a reason that names what the merchant was trying to do when the system noticed. `isBefore` makes the boundary exact: at `expiresAt` itself the hold is expired. The method is safe to call on any state, so it is also the probe the tests use.
+Expiry is itself a transition through the same choke point, so it is in the log with the amount released (the uncaptured remainder) and a reason that names what the merchant was trying to do when the system noticed. The target state depends on whether anything was captured: a bare authorization becomes `EXPIRED`, while a partial capture becomes `CAPTURED` with `captured` unchanged, the same end state `closeCapture` produces, so the captured funds remain refundable. `isBefore` makes the boundary exact: at `expiresAt` itself the hold is expired. The method is safe to call on any state, so it is also the probe the tests use.
 
 ### Step 9: Run it
 
@@ -316,7 +318,7 @@ transaction txn-hotel-001 [PARTIALLY_REFUNDED] authorized=150.00 USD captured=10
   #2 EXPIRE           45.00 USD  AUTHORIZED -> EXPIRED  @2026-03-13T15:00:00Z  "authorization validity of 7 days elapsed (while attempting: order shipped)"
 ```
 
-The test file has 60 assertions: one per legal edge, one per illegal edge, the ceiling at and one cent above the limit, the refund at and one cent above captured, expiry one second before and at the deadline, and the replay of the log to the totals.
+The test file has 60-plus assertions: one per legal edge, one per illegal edge, the ceiling at and one cent above the limit, the refund at and one cent above captured, expiry one second before and at the deadline, a partial capture whose hold expires and is then fully refunded, and the replay of the log to the totals.
 
 ### In Python
 

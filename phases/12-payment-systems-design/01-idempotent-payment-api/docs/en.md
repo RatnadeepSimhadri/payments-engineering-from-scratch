@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 09 (Idempotency Keys); Phase 5, Lesson 10 (Retries, Backoff, and Jitter); Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 5 Lesson 09 (Idempotency Keys), Phase 5 Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 10 Lesson 01 (Representing Money)
 **Time:** ~120 minutes
 
 ## Learning Objectives
@@ -54,16 +54,16 @@ What goes inside the scope is a design decision. Stripe scopes keys per account 
 
 Replaying a stored response is only correct if the retry is the same request. The retry is byte-for-byte identical in the easy case. In the hard cases the client re-serialized the body (field order changed, whitespace changed, a float printed as `19.99` once and `19.990` the next time), or the client has a bug and sent a different amount with the same key. The server needs a definition of "same" that is stable under harmless re-serialization and strict under meaningful change.
 
-The fingerprint is SHA-256 over a canonical encoding of the request's semantic fields. Canonical means: a fixed set of fields, sorted by name, one `name=value` per line, with the amount rendered as its integer minor units and the currency as its ISO code:
+The fingerprint is SHA-256 over a canonical encoding of the request's semantic fields. Canonical means: a fixed set of fields, sorted by name, one `name=value` per line, **every line terminated by `\n` (including the last one)**, with the amount rendered as its integer minor units and the currency as its ISO code. Shown with the line terminators visible:
 
 ```text
-amount=1999
-currency=USD
-description=Order 1001
-source=tok_visa_4242
+amount=1999\n
+currency=USD\n
+description=Order 1001\n
+source=tok_visa_4242\n
 ```
 
-SHA-256 of that text is `a3e98e16f24b06155d4539aa040c1d1362dcaafddc3debe88ee16fb23f9a644f`, and all three implementations in this lesson produce that exact string. That is a cross-language test vector: a Java service and a Go service fronting the same store will agree on whether two requests match. Note what is in the fingerprint and what is not. The amount in minor units is in, so `19.99` and `19.990` collapse to `1999`. The merchant is not in it, because the merchant is in the scope. The idempotency key itself is not in it, obviously. Transport-level noise (header order, `User-Agent`, the TLS session) is not in it.
+SHA-256 of those exact 69 bytes (UTF-8, four `\n` characters) is `a3e98e16f24b06155d4539aa040c1d1362dcaafddc3debe88ee16fb23f9a644f`, and all three implementations in this lesson produce that exact string; drop the final newline and you get a different digest, which is the first thing to check when two services disagree on a fingerprint. One known weakness of this simple form, left as it is here to keep the test vector short: a value is written raw, so a `description` containing a newline followed by `source=...` could forge another request's canonical bytes; a production encoding length-prefixes or escapes each value so a field boundary can never be injected through a value. That is a cross-language test vector: a Java service and a Go service fronting the same store will agree on whether two requests match. Note what is in the fingerprint and what is not. The amount in minor units is in, so `19.99` and `19.990` collapse to `1999`. The merchant is not in it, because the merchant is in the scope. The idempotency key itself is not in it, obviously. Transport-level noise (header order, `User-Agent`, the TLS session) is not in it.
 
 Why a hash rather than storing the canonical body? Because the comparison then is a fixed-length string equality, the store row is a fixed size regardless of body size, and the body never has to be retained. SHA-256's collision resistance means two different canonical bodies will not produce the same fingerprint in any realistic lifetime of the system.
 
@@ -74,9 +74,9 @@ stateDiagram-v2
     [*] --> ABSENT
     ABSENT --> IN_PROGRESS: reserve (first caller wins)
     IN_PROGRESS --> COMPLETED: complete(response)
-    IN_PROGRESS --> IN_PROGRESS: duplicate within lease: 409
-    IN_PROGRESS --> IN_PROGRESS: lease expired: RECOVER, new owner
-    COMPLETED --> COMPLETED: duplicate: replay stored response
+    IN_PROGRESS --> IN_PROGRESS: duplicate within lease - 409
+    IN_PROGRESS --> IN_PROGRESS: lease expired - RECOVER, new owner
+    COMPLETED --> COMPLETED: duplicate - replay stored response
     COMPLETED --> ABSENT: TTL elapsed
     IN_PROGRESS --> ABSENT: TTL elapsed
     note right of IN_PROGRESS

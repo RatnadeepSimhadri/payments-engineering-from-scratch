@@ -730,12 +730,12 @@ func main() {
 		fmt.Println("rejected:", err)
 	}
 
-	fmt.Println("\n== Reversal: the merchant refunds the customer; nothing is edited ==")
+	fmt.Println("\n== Reversal: the capture is voided; nothing is edited ==")
 	before, _ := ledger.Balance("4100")
-	reversal := mustEntry(ledger.Reverse("pay-001", "rev-001", "refund: reverse pay-001"))
+	reversal := mustEntry(ledger.Reverse("pay-001", "rev-001", "reversal: void pay-001"))
 	printEntry(reversal)
 	after, _ := ledger.Balance("4100")
-	fmt.Printf("fee revenue before refund %v, after %v\n", before, after)
+	fmt.Printf("fee revenue before reversal %v, after %v\n", before, after)
 	fmt.Printf("journal now holds %d entries; pay-001 is still entry #1\n", ledger.Size())
 
 	fmt.Println("\n== 10,000 seeded random balanced entries: trial balance still sums to zero ==")

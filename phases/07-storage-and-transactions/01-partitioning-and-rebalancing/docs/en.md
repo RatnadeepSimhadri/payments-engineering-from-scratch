@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 3, Lesson 06 (Consistent Hashing and Virtual Nodes), Phase 6, Lesson 01 (Replication Strategies)
+**Prerequisites:** Phase 1 Lesson 06 (Hash Maps), Phase 3 Lesson 06 (Consistent Hashing and Virtual Nodes), Phase 6 Lesson 01 (Replication Strategies)
 **Time:** ~75 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 11, Lesson 02 (Card Networks and the Four-Party Model); Phase 13, Lesson 03 (Risk Scoring and Thresholds); Phase 13, Lesson 07 (Device Fingerprinting and Signals)
+**Prerequisites:** Phase 11 Lesson 01 (How a Card Payment Works), Phase 13 Lesson 03 (Risk Scoring and Thresholds), Phase 13 Lesson 07 (Device Fingerprinting)
 **Time:** ~60 minutes
 
 ## Learning Objectives

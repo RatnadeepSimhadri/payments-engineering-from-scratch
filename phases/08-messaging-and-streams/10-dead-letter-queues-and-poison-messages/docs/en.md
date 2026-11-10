@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 8, Lesson 09 (Backpressure and Flow Control), Phase 8, Lesson 04 (Message Ordering and Keys), Phase 8, Lesson 03 (Delivery Guarantees), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 8 Lesson 09 (Backpressure and Flow Control), Phase 8 Lesson 04 (Message Ordering and Keys), Phase 8 Lesson 03 (Delivery Guarantees), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~60 minutes
 
 ## Learning Objectives

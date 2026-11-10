@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 6, Lesson 05 (Raft I: Terms, Leader Election, and a Simulated Network); Phase 6, Lesson 03 (Quorums: R + W > N and Its Limits)
+**Prerequisites:** Phase 6 Lesson 05 (Raft I: Leader Election), Phase 6 Lesson 03 (Quorums)
 **Time:** ~150 minutes
 
 ## Learning Objectives
@@ -56,7 +56,7 @@ sequenceDiagram
     L->>F2: AppendEntries(prev=(1,t1), [t1:SET alice 100], leaderCommit=1)
     F1->>F1: prev matches -> append, reply match=2
     F1-->>L: success, matchIndex=2
-    L->>L: matchIndex[n0]=2; replicas of index 2 = {n4, n0} = 2 of 5
+    L->>L: matchIndex[n0]=2, replicas of index 2 = {n4, n0} = 2 of 5
     F2-->>L: success, matchIndex=2
     L->>L: 3 of 5 -> commitIndex=2, apply SET alice 100
     L-->>C: ok

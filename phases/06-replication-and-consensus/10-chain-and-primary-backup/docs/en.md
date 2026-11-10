@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 6, Lesson 01 (Replication Strategies); Phase 6, Lesson 02 (Replication Lag and Read-Your-Writes); Phase 5, Lesson 13 (Gossip Protocols and Failure Detection); Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 6 Lesson 01 (Replication Strategies), Phase 6 Lesson 02 (Replication Lag and Read-Your-Writes), Phase 5 Lesson 13 (Gossip Protocols and Failure Detection), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~75 minutes
 
 ## Learning Objectives

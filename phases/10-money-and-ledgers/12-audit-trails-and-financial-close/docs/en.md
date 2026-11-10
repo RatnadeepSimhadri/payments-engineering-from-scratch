@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 10, Lesson 04 (Chart of Accounts), Phase 10, Lesson 05 (Balances and Snapshots), Phase 10, Lesson 06 (Immutability and Reversals), Phase 10, Lesson 08 (Reconciliation), Phase 10, Lesson 09 (Multi-Currency Ledgers), Phase 10, Lesson 11 (Ledger Concurrency)
+**Prerequisites:** Phase 10 Lesson 04 (Chart of Accounts), Phase 10 Lesson 05 (Balances and Snapshots), Phase 10 Lesson 06 (Immutability and Reversals), Phase 10 Lesson 08 (Reconciliation), Phase 10 Lesson 09 (Multi-Currency Ledgers), Phase 10 Lesson 11 (Ledger Concurrency)
 **Time:** ~60 minutes
 
 ## Learning Objectives

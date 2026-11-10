@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 8, Lesson 07 (Stream Processing and Windows), Phase 5, Lesson 02 (Clocks and Ordering), Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 8 Lesson 07 (Stream Processing and Windows), Phase 5 Lesson 03 (Lamport and Vector Clocks), Phase 0 Lesson 07 (Decimal and Integer Arithmetic)
 **Time:** ~90 minutes
 
 ## Learning Objectives

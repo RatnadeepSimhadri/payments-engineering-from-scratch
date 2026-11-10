@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 5, Lesson 02 (Failure Models), Phase 5, Lesson 05 (Consistency Models), Phase 5, Lesson 06 (CAP, PACELC, and What They Actually Constrain)
+**Prerequisites:** Phase 5 Lesson 02 (Failure Models), Phase 5 Lesson 05 (Consistency Models), Phase 5 Lesson 06 (CAP and PACELC)
 **Time:** ~75 minutes
 
 ## Learning Objectives
@@ -116,7 +116,7 @@ sequenceDiagram
   E->>P: writes (acked, LSN up to 1,000,250)
   P-->>R: async log, received up to 1,000,180
   Note over P,R: link between coasts lost for 43 s
-  O->>O: cannot reach P; timeout expires
+  O->>O: cannot reach P, timeout expires
   O->>R: PROMOTE
   W->>R: writes (LSN 1,000,181' onward, different history)
   E->>P: writes continue: P is alive, only unreachable

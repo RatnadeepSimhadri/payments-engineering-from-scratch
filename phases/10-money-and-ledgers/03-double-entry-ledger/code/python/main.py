@@ -502,11 +502,11 @@ def main() -> None:
         except LedgerError as exc:
             print(f"rejected: {exc}")
 
-    print("\n== Reversal: the merchant refunds the customer; nothing is edited ==")
+    print("\n== Reversal: the capture is voided; nothing is edited ==")
     before = ledger.balance("4100")
-    reversal = ledger.reverse("pay-001", "rev-001", "refund: reverse pay-001")
+    reversal = ledger.reverse("pay-001", "rev-001", "reversal: void pay-001")
     print_entry(reversal)
-    print(f"fee revenue before refund {before}, after {ledger.balance('4100')}")
+    print(f"fee revenue before reversal {before}, after {ledger.balance('4100')}")
     print(f"journal now holds {ledger.size()} entries; pay-001 is still entry #1")
 
     print("\n== 10,000 seeded random balanced entries: trial balance still sums to zero ==")

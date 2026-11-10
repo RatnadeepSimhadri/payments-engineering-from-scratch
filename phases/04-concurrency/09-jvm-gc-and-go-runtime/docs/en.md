@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model); Phase 0, Lesson 05 (Benchmarking and Profiling Without Lying to Yourself)
+**Prerequisites:** Phase 4 Lesson 01 (Threads and the Memory Model), Phase 0 Lesson 05 (Benchmarking and Profiling)
 **Time:** ~75 minutes
 
 ## Learning Objectives

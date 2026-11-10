@@ -4,7 +4,7 @@
 
 **Type:** Capstone
 **Languages:** Java, Python, or Go (pick one; the spec is language-neutral)
-**Prerequisites:** Phase 6 Lessons 05-07 (Raft), Phase 6 Lesson 12 (Linearizability Checking), Phase 7 Lesson 02 (Write-Ahead Logs), Phase 5 Lessons 07-09 (RPC, Timeouts, Idempotency Keys), Phase 5 Lesson 12 (Leases and Fencing Tokens), Phase 15 Lesson 01
+**Prerequisites:** Phase 6 Lesson 05 (Raft I: Leader Election), Phase 6 Lesson 06 (Raft II: Log Replication), Phase 6 Lesson 07 (Raft III: Safety and Membership), Phase 6 Lesson 12 (Linearizability Checking), Phase 7 Lesson 02 (Write-Ahead Logs), Phase 5 Lesson 07 (RPC and Serialization), Phase 5 Lesson 08 (Timeouts and Deadline Propagation), Phase 5 Lesson 09 (Idempotency Keys), Phase 5 Lesson 12 (Leases, Fencing Tokens, and Distributed Locks), Phase 15 Lesson 01 (A Durable Double-Entry Ledger Service)
 **Time:** ~480 minutes
 
 ## Learning Objectives

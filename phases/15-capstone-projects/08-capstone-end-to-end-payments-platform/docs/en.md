@@ -4,7 +4,7 @@
 
 **Type:** Capstone
 **Languages:** Java, Python, or Go (pick one; the spec is language-neutral)
-**Prerequisites:** Phase 15, Lessons 01 to 07 (every earlier capstone), Phase 14, Lesson 01 (Architecture of a High-Availability Payment Gateway), Phase 14, Lesson 06 (Observability for Money Movement), Phase 14, Lesson 07 (Incident Management for Payments), Phase 14, Lesson 10 (Deterministic Simulation Testing of Payment Systems)
+**Prerequisites:** Phase 15 Lesson 01 (A Durable Double-Entry Ledger Service), Phase 15 Lesson 02 (An Idempotent Multi-Processor Payment Gateway), Phase 15 Lesson 03 (A Raft-Replicated Key-Value Store), Phase 15 Lesson 04 (An Event-Sourced Wallet with CQRS), Phase 15 Lesson 05 (Real-Time Fraud Decisioning), Phase 15 Lesson 06 (A Reconciliation Engine), Phase 15 Lesson 07 (A Settlement and Payout Pipeline), Phase 14 Lesson 01 (Architecture of a High-Availability Payment Gateway), Phase 14 Lesson 06 (Observability for Money Movement), Phase 14 Lesson 07 (Incident Management for Payments), Phase 14 Lesson 10 (Deterministic Simulation Testing)
 **Time:** ~720 minutes
 
 ## Learning Objectives

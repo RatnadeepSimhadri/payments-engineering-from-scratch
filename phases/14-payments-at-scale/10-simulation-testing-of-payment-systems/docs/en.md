@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 02 (Failure Models), Phase 5, Lesson 09 (Idempotency Keys), Phase 12, Lesson 14 (Testing Payment Systems), Phase 14, Lesson 03 (Exactly-Once Money Movement)
+**Prerequisites:** Phase 5 Lesson 02 (Failure Models), Phase 5 Lesson 09 (Idempotency Keys), Phase 12 Lesson 14 (Testing Payment Systems), Phase 14 Lesson 03 (Exactly-Once Money Movement)
 **Time:** ~120 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model); Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 1, Lesson 05 (Stacks, Queues, and Deques)
+**Prerequisites:** Phase 4 Lesson 01 (Threads and the Memory Model), Phase 4 Lesson 02 (Locks and Atomics), Phase 1 Lesson 05 (Stacks, Queues, and Ring Buffers)
 **Time:** ~90 minutes
 
 ## Learning Objectives

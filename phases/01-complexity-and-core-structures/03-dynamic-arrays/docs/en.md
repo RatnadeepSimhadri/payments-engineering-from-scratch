@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 02 (Amortized Analysis)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis), Phase 1 Lesson 02 (Amortized Analysis)
 **Time:** ~75 minutes
 
 ## Learning Objectives
@@ -455,4 +455,4 @@ Every batch file parser, every in-memory sort before a bulk insert, and every `S
 - [folly `FBVector.md`](https://github.com/facebook/folly/blob/main/folly/docs/FBVector.md) — the clearest written argument for a growth factor of 1.5 and for memory-reuse-aware reallocation.
 - [CPython `Objects/listobject.c`, `list_resize`](https://github.com/python/cpython/blob/main/Objects/listobject.c) — the over-allocation formula and the comment explaining its growth pattern.
 - [Go runtime `slice.go`, `nextslicecap`](https://github.com/golang/go/blob/master/src/runtime/slice.go) — the 2x-then-taper policy and the rounding to size classes.
-- Cormen, Leiserson, Rivest, Stein, *Introduction to Algorithms*, Chapter 17 (Amortized Analysis), section on dynamic tables — the formal treatment of table doubling and halving with the `|2 * num - size|` potential function this lesson's hysteresis is built on.
+- Cormen, Leiserson, Rivest, Stein, [*Introduction to Algorithms*](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/) (MIT Press), Chapter 17 (Amortized Analysis), section on dynamic tables — the formal treatment of table doubling and halving with the `|2 * num - size|` potential function this lesson's hysteresis is built on.

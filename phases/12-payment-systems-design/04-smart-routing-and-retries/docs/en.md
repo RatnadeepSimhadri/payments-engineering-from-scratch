@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 12, Lesson 03 (Payment Orchestration Across Processors); Phase 12, Lesson 02 (The Payment State Machine); Phase 5, Lesson 10 (Retries, Backoff, and Jitter); Phase 11, Lesson 02 (Card Authorization Lifecycle)
+**Prerequisites:** Phase 12 Lesson 03 (Payment Orchestration Across Processors), Phase 12 Lesson 02 (The Payment State Machine), Phase 5 Lesson 10 (Retries, Exponential Backoff, and Jitter), Phase 11 Lesson 02 (The Card Lifecycle State Machine)
 **Time:** ~90 minutes
 
 ## Learning Objectives

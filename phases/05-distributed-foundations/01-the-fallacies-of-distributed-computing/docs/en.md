@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 4, Lesson 01 (Threads and the Memory Model)
+**Prerequisites:** Phase 4 Lesson 01 (Threads and the Memory Model)
 **Time:** ~45 minutes
 
 ## Learning Objectives

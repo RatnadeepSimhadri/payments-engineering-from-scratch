@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 01 (Complexity Analysis), Phase 1, Lesson 03 (Dynamic Arrays)
+**Prerequisites:** Phase 1 Lesson 01 (Complexity Analysis), Phase 1 Lesson 03 (Dynamic Arrays)
 **Time:** ~75 minutes
 
 ## Learning Objectives
@@ -490,7 +490,7 @@ Any list you iterate more than you mutate, any list you index, and any list you 
 
 ## Further Reading
 
-- Knuth, *The Art of Computer Programming*, Volume 1, Sections 2.2.3 to 2.2.5 (linked allocation, circular lists, doubly linked lists) — the original treatment, including the sentinel idea and the memory-management arguments for and against linking.
+- Knuth, [*The Art of Computer Programming*, Volume 1](https://www.informit.com/store/art-of-computer-programming-volume-1-fundamental-algorithms-9780201896831) (Addison-Wesley), Sections 2.2.3 to 2.2.5 (linked allocation, circular lists, doubly linked lists) — the original treatment, including the sentinel idea and the memory-management arguments for and against linking.
 - [Linux kernel `include/linux/list.h`](https://github.com/torvalds/linux/blob/master/include/linux/list.h) — the canonical intrusive doubly linked list: `list_add`, `list_del`, `list_splice`, each a handful of pointer writes with no ownership tracking.
 - [OpenJDK `LinkedHashMap.java`](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/LinkedHashMap.java) — read `afterNodeAccess` and `afterNodeInsertion` to see this lesson's `moveToFront` and LRU eviction inside a production class.
 - [OpenJDK `ArrayDeque.java`](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/ArrayDeque.java) — the class Javadoc states it is faster than `LinkedList` as a queue and than `Stack` as a stack, and explains why.

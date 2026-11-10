@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 6, Lesson 06 (Raft II: Log Replication and Commit); Phase 6, Lesson 05 (Raft I: Terms, Leader Election, and a Simulated Network); Phase 6, Lesson 03 (Quorums: R + W > N and Its Limits)
+**Prerequisites:** Phase 6 Lesson 06 (Raft II: Log Replication), Phase 6 Lesson 05 (Raft I: Leader Election), Phase 6 Lesson 03 (Quorums)
 **Time:** ~120 minutes
 
 ## Learning Objectives
@@ -85,7 +85,7 @@ sequenceDiagram
     participant L as Leader
     participant O as C_old servers
     participant N as new servers
-    L->>L: append C_old,new (joint); use it immediately
+    L->>L: append C_old,new (joint), use it immediately
     L->>O: AppendEntries(C_old,new)
     L->>N: AppendEntries(C_old,new)
     Note over L: commit needs majority of C_old AND majority of C_new

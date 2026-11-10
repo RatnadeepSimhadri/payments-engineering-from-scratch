@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 10, Lesson 01 (Representing Money)
+**Prerequisites:** Phase 10 Lesson 01 (Representing Money)
 **Time:** ~90 minutes
 
 ## Learning Objectives
@@ -99,11 +99,11 @@ Three conversions, three exponents, one code path. The exponent arithmetic is `r
 
 ```mermaid
 flowchart LR
-  R["CurrencyRegistry<br/>ISO 4217: code, numeric, exponent"] -->|currency(code)| C["Currency(code, exponent)"]
+  R["CurrencyRegistry<br/>ISO 4217: code, numeric, exponent"] -->|"currency(code)"| C["Currency(code, exponent)"]
   C --> M["Money(1999, USD)"]
   F["FxRate USD/EUR 9217/10000<br/>source, observedAt, spreadBps"] -->|bid / ask / invert / cross| F
-  M -->|convert(amount, rate, rounding)| X["Conversion<br/>to = 18.42 EUR<br/>remainder 4783/10000"]
-  X -->|convert back with rate.invert()| RT["RoundTrip<br/>back = 19.98 USD<br/>residue = 0.01 USD"]
+  M -->|"convert(amount, rate, rounding)"| X["Conversion<br/>to = 18.42 EUR<br/>remainder 4783/10000"]
+  X -->|"convert back with rate.invert()"| RT["RoundTrip<br/>back = 19.98 USD<br/>residue = 0.01 USD"]
   RT -->|post| G["FX rounding gain/loss account (Lesson 09)"]
   F -. "requireFresh fails" .-> S["StaleRateException"]
   R -. "unknown code" .-> U["UnknownCurrencyException"]

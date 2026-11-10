@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch); Phase 4, Lesson 02 (Locks, Atomics, and a Balance That Never Lies); Phase 4, Lesson 03 (Compare-and-Swap and Lock-Free Structures)
+**Prerequisites:** Phase 1 Lesson 06 (Hash Maps), Phase 4 Lesson 02 (Locks and Atomics), Phase 4 Lesson 03 (Compare-and-Swap and Lock-Free Structures)
 **Time:** ~90 minutes
 
 ## Learning Objectives

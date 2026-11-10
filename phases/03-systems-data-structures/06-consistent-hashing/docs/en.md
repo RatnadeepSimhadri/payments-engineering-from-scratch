@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 1, Lesson 06 (Hash Maps from Scratch), Phase 1, Lesson 07 (Hash Functions and Collisions), Phase 2, Lesson 02 (Binary Search and Its Variants), Phase 3, Lesson 01 (Bloom Filters)
+**Prerequisites:** Phase 1 Lesson 06 (Hash Maps), Phase 1 Lesson 07 (Hash Functions and Collisions), Phase 2 Lesson 02 (Binary Search and Its Variants), Phase 3 Lesson 01 (Bloom Filters)
 **Time:** ~90 minutes
 
 ## Learning Objectives

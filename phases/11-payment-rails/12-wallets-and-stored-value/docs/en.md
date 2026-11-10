@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 10, Lesson 03 (The Double-Entry Ledger from Scratch); Phase 10, Lesson 04 (Chart of Accounts and Account Types); Phase 10, Lesson 07 (Holds, Pending Transactions, and Available Balance); Phase 10, Lesson 08 (Reconciliation)
+**Prerequisites:** Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 04 (Chart of Accounts), Phase 10 Lesson 07 (Holds and Available Balance), Phase 10 Lesson 08 (Reconciliation)
 **Time:** ~60 minutes
 
 ## Learning Objectives

@@ -556,7 +556,13 @@ func (t *CardTransaction) ExpireIfDue(attemptedReason string) bool {
 		return false
 	}
 	days := int64(t.policy.AuthValidity / (24 * time.Hour))
-	_ = t.transition(ActExpire, t.RemainingAuthorization(), Expired,
+	// A never-captured authorization becomes Expired (terminal). A partially captured one keeps its captured
+	// funds: the remainder lapses and it becomes Captured, as CloseCapture would leave it, so refunds still work.
+	next := Expired
+	if t.state == PartiallyCaptured {
+		next = Captured
+	}
+	_ = t.transition(ActExpire, t.RemainingAuthorization(), next,
 		fmt.Sprintf("authorization validity of %d days elapsed (while attempting: %s)", days, attemptedReason))
 	return true
 }

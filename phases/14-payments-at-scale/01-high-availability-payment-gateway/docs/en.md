@@ -4,7 +4,7 @@
 
 **Type:** Learn
 **Languages:** —
-**Prerequisites:** Phase 5, Lesson 09 (Idempotency Keys), Phase 5, Lesson 11 (Circuit Breakers and Bulkheads), Phase 7, Lesson 13 (Transactional Outbox), Phase 9, Lesson 10 (Capacity Planning and Queueing Theory), Phase 12, Lesson 02 (Payment State Machine), Phase 12, Lesson 05 (Webhooks and Callbacks)
+**Prerequisites:** Phase 5 Lesson 09 (Idempotency Keys), Phase 5 Lesson 11 (Circuit Breakers and Bulkheads), Phase 7 Lesson 13 (The Transactional Outbox), Phase 9 Lesson 10 (Capacity Planning and Queueing Theory), Phase 12 Lesson 02 (The Payment State Machine), Phase 12 Lesson 05 (Webhooks)
 **Time:** ~90 minutes
 
 ## Learning Objectives
@@ -137,11 +137,11 @@ sequenceDiagram
   participant E2 as Edge 2
   participant DB as Payment store
   M->>E1: POST /payments key=ord-5581
-  E1->>DB: BEGIN; INSERT payments(ord-5581) ...
+  E1->>DB: BEGIN, INSERT payments(ord-5581) ...
   M->>E2: POST /payments key=ord-5581 (client timeout, retry)
-  E2->>DB: BEGIN; INSERT payments(ord-5581)
+  E2->>DB: BEGIN, INSERT payments(ord-5581)
   Note over DB: E2 blocks on the unique index lock held by E1
-  E1->>DB: INSERT outbox; COMMIT
+  E1->>DB: INSERT outbox, COMMIT
   DB-->>E1: ok
   E1-->>M: 202 {id: pay_01J9, state: PENDING}
   DB-->>E2: unique violation

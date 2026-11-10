@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 5, Lesson 02 (Failure Models); Phase 3, Lesson 03 (Heaps and Priority Queues)
+**Prerequisites:** Phase 5 Lesson 02 (Failure Models), Phase 1 Lesson 09 (Heaps and Priority Queues)
 **Time:** ~120 minutes
 
 ## Learning Objectives

@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 7, Lesson 01 (Partitioning Strategies and Rebalancing), Phase 7, Lesson 02 (Write-Ahead Logs), Phase 3, Lesson 06 (Consistent Hashing and Virtual Nodes)
+**Prerequisites:** Phase 7 Lesson 01 (Partitioning Strategies and Rebalancing), Phase 7 Lesson 02 (Write-Ahead Logs), Phase 3 Lesson 06 (Consistent Hashing and Virtual Nodes)
 **Time:** ~75 minutes
 
 ## Learning Objectives

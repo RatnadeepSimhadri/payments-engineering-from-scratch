@@ -4,7 +4,7 @@
 
 **Type:** Build
 **Languages:** Java, Python, Go
-**Prerequisites:** Phase 12, Lesson 02 (The Payment State Machine); Phase 10, Lesson 03 (The Double-Entry Ledger); Phase 10, Lesson 06 (Immutability and Reversals); Phase 10, Lesson 10 (Fees and Splits)
+**Prerequisites:** Phase 12 Lesson 02 (The Payment State Machine), Phase 10 Lesson 03 (The Double-Entry Ledger), Phase 10 Lesson 06 (Immutability and Reversals), Phase 10 Lesson 10 (Fees and Splits)
 **Time:** ~75 minutes
 
 ## Learning Objectives
