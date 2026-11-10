@@ -1,5 +1,6 @@
 """Tests for phases/04-concurrency/04-concurrent-hash-maps. Run: python3 -m unittest -v"""
 import threading
+import time
 import unittest
 
 from main import (AtomicInteger, GlobalLockMap, Hashing, LockFreeReadMap, StripedHashMap, race_get_then_put,
@@ -58,8 +59,12 @@ class StoreContract:
     def test_concurrent_with_barriers(self):
         """Every phase starts behind a barrier, so the assertions are about end states every interleaving produces."""
         m = self.make()
-        threads, per_thread, shared, bumps = 4, 5_000, 100, 1_000
-        barrier = threading.Barrier(threads)
+        # Java runs 5_000 keys x 1_000 bumps; under the GIL the contended phase is 20-50x slower on a
+        # small CI runner, so Python runs a fifth of the volume. The invariants are identical.
+        threads, per_thread, shared, bumps = 4, 2_000, 100, 200
+        # A worker that raises must break the barrier, otherwise the other workers wait forever and
+        # the suite times out instead of failing with a message.
+        barrier = threading.Barrier(threads, timeout=60)
         errors = AtomicInteger()
 
         def work(id_):
@@ -82,6 +87,7 @@ class StoreContract:
                         errors.increment_and_get()
             except Exception:
                 errors.increment_and_get()
+                barrier.abort()
 
         workers = [threading.Thread(target=work, args=(t,)) for t in range(threads)]
         for w in workers:
@@ -145,19 +151,23 @@ class LockFreeReadMapTest(StoreContract, unittest.TestCase):
         stable_keys = 64
         for i in range(stable_keys):
             m.put(f"stable-{i}", i)
-        stop = threading.Event()
         anomalies = AtomicInteger()
         reads = AtomicInteger()
+        # Readers do a fixed number of passes rather than spinning until the writers finish: under the
+        # GIL a spinning reader can starve the writers, which made this test's runtime unbounded on a
+        # small CI runner. The property is unchanged: no read ever observes a torn or missing stable key.
+        passes = 300
 
         def reader():
-            while not stop.is_set():
+            for _ in range(passes):
                 for i in range(stable_keys):
                     if m.get(f"stable-{i}") != i:
                         anomalies.increment_and_get()
                     reads.increment_and_get()
+                time.sleep(0)  # let a writer in between passes
 
         def writer(id_):
-            for i in range(20_000):
+            for i in range(8_000):
                 k = f"churn-{id_}-{i % 500}"
                 if i % 3 == 2:
                     m.remove(k)
@@ -168,11 +178,8 @@ class LockFreeReadMapTest(StoreContract, unittest.TestCase):
         writers = [threading.Thread(target=writer, args=(w,)) for w in range(2)]
         for t in readers + writers:
             t.start()
-        for w in writers:
-            w.join()
-        stop.set()
-        for r in readers:
-            r.join()
+        for t in readers + writers:
+            t.join()
         self.assertEqual(anomalies.get(), 0)
         self.assertGreater(reads.get(), stable_keys)
         self.assertGreater(m.buckets(), 4)

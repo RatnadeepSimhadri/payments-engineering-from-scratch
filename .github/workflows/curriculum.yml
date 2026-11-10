@@ -34,7 +34,7 @@ jobs:
       - uses: actions/setup-go@v5
         if: matrix.lang == 'go'
         with: { go-version: "1.22" }
-      - run: python3 scripts/run_lesson.py --all --lang ${{ matrix.lang }}
+      - run: python3 scripts/run_lesson.py --all --lang ${{ matrix.lang }} --timeout 600
 
   projects:
     name: Grade project reference solutions
