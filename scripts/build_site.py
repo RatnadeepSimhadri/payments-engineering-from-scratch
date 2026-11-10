@@ -957,8 +957,7 @@ def build_roadmap(site: Site) -> None:
                 f'<h3><a href="{site.relative("phases/" + phase["slug"] + "/index.html", url)}"><span class="num">Phase {phase["number"]}</span> {escape(phase["title"])}</a></h3>'
                 f'<p class="motto">{escape(phase["motto"])}</p>'
                 f'<p class="phase-stats">{len(phase["lessons"])} lessons · {(str(done) + " complete · ") if done != len(phase["lessons"]) else ""}~{phase["minutes"] // 60} h · '
-                f'<span data-progress-text="{scope}">0 of {len(phase["lessons"])}</span> done by you</p>'
-                f'<div class="progress" data-progress="{scope}"><div class="progress-bar"></div></div>'
+                f'<span class="progress inline" data-progress="{scope}"><span class="progress-bar"></span></span> <span data-progress-text="{scope}">0 of {len(phase["lessons"])}</span> done by you</p>'
                 f'<div class="table-wrap"><table class="roadmap"><thead><tr><th>#</th><th>Lesson</th><th>Type</th><th>Min</th><th>Languages</th><th>Done</th></tr></thead>'
                 f'<tbody>{"".join(rows)}</tbody></table></div></section>'
             )
@@ -979,7 +978,15 @@ def build_phase(site: Site, phase: dict) -> None:
     url = f"phases/{phase['slug']}/index.html"
     readme_path = ROOT / "phases" / phase["slug"] / "README.md"
     ctx = RenderContext(site, f"phases/{phase['slug']}/README.md", url)
-    readme_html = render_markdown(readme_path.read_text(encoding="utf-8"), ctx) if readme_path.is_file() else f"<h1>Phase {phase['number']}: {escape(phase['title'])}</h1><blockquote><p>{escape(phase['motto'])}</p></blockquote>"
+    if readme_path.is_file():
+        readme_md = readme_path.read_text(encoding="utf-8")
+        # Repository-maintenance sentence: meaningless on the site (every lesson is complete, and the
+        # generator credit belongs in the repo, not in front of a learner).
+        readme_md = re.sub(r"^(\d+ lessons), \d+ complete, (~\d+ hours)\. Generated from `[^`]*` by `[^`]*`\.\s*$",
+                           r"\1, \2.", readme_md, flags=re.M)
+        readme_html = render_markdown(readme_md, ctx)
+    else:
+        readme_html = f"<h1>Phase {phase['number']}: {escape(phase['title'])}</h1><blockquote><p>{escape(phase['motto'])}</p></blockquote>"
     done = sum(1 for l in phase["lessons"] if l["status"] == "Complete")
     scope = f"phase-{phase['number']}"
     lesson_items = "".join(lesson_list_item(site, lesson, url) for lesson in phase["lessons"])
@@ -988,8 +995,7 @@ def build_phase(site: Site, phase: dict) -> None:
 <div class="phase-readme" data-progress-scope="{scope}">
 {readme_html}
 <h2 id="your-progress">Your progress</h2>
-<p class="phase-stats">{len(phase["lessons"])} lessons · {done} complete in the repository · <span data-progress-text="{scope}">0 of {len(phase["lessons"])}</span> marked done by you</p>
-<div class="progress" data-progress="{scope}"><div class="progress-bar"></div></div>
+<p class="phase-stats">{len(phase["lessons"])} lessons · <span class="progress inline" data-progress="{scope}"><span class="progress-bar"></span></span> <span data-progress-text="{scope}">0 of {len(phase["lessons"])}</span> marked done by you</p>
 <h2 id="lesson-cards">Lesson list</h2>
 <ul class="lesson-cards">{lesson_items}</ul>
 </div>
@@ -1371,8 +1377,7 @@ def build_path(site: Site, path: dict) -> None:
 <p class="lede">{escape(path.get("summary", ""))}</p>
 <dl class="meta"><div><dt>Lessons</dt><dd>{len(path["lessons"])}</dd></div><div><dt>Time</dt><dd>~{path.get("estimatedMinutes", 0) // 60} hours</dd></div>
 <div><dt>Tutor languages</dt><dd>{escape(", ".join(path.get("languages", [])) or "any")}</dd></div><div><dt>State file</dt><dd><code>{escape(path.get("stateFile", ""))}</code></dd></div></dl>
-<p class="phase-stats"><span data-progress-text="{scope}">0 of {len(path["lessons"])}</span> marked done by you</p>
-<div class="progress" data-progress="{scope}"><div class="progress-bar"></div></div>
+<p class="phase-stats"><span class="progress inline" data-progress="{scope}"><span class="progress-bar"></span></span> <span data-progress-text="{scope}">0 of {len(path["lessons"])}</span> marked done by you</p>
 <h2 id="lessons">Lessons, in order</h2>
 <ol class="lesson-cards ordered">{"".join(items)}</ol>
 {project_html}
