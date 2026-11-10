@@ -181,7 +181,7 @@ Two habits make the record trustworthy. Write the evidence line immediately afte
 
 ### Planned lessons
 
-`ROADMAP.md` marks every lesson ✅ Complete, 🚧 In Progress, or ⬚ Planned. A planned lesson has a title, hook, and objectives in `curriculum.json` and a short outline on disk, and nothing else. `learn` skips planned lessons and tells you once per session how many it skipped; `course-guide` will name a planned lesson that matches your question but will say it is not teachable yet and point at the nearest complete one. Do not treat the skip as a gap in your knowledge; treat it as a lesson to come back to. The hour estimates in `## Path` count planned lessons too, so a phase with skipped lessons finishes sooner than estimated.
+Every lesson in this edition of the course is complete, so you will not meet one today, but the mechanism exists because a fork or a future edition may add lessons before they are written. `ROADMAP.md` marks every lesson ✅ Complete, 🚧 In Progress, or ⬚ Planned. A planned lesson has a title, hook, and objectives in `curriculum.json` and a short outline on disk, and nothing else. `learn` skips planned lessons and tells you once per session how many it skipped; `course-guide` will name a planned lesson that matches your question but will say it is not teachable yet and point at the nearest complete one. Do not treat the skip as a gap in your knowledge; treat it as a lesson to come back to. The hour estimates in `## Path` count planned lessons too, so a phase with skipped lessons finishes sooner than estimated.
 
 ### Pace, and what the tutor expects from you
 

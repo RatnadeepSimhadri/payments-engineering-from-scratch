@@ -224,12 +224,14 @@ def render_phase_readme(phase: dict, catalog: dict) -> str:
         "",
         "## Lessons",
         "",
-        "| # | Lesson | Type | Time | Status | Hook |",
-        "|:---:|--------|:----:|:----:|:------:|------|",
+        "| # | Lesson | Type | Time | Hook |",
+        "|:---:|--------|:----:|:----:|------|",
     ]
     for l in phase["lessons"]:
-        out.append(f"| {l['n']:02d} | [{l['title']}]({l['slug']}/) | {l['type']} | ~{l['minutes']} min | {STATUS_GLYPH[l['status']]} | {l['hook']} |")
-    out += ["", "Browse the [full curriculum](../../README.md#contents) or the [roadmap](../../ROADMAP.md)."]
+        # Authoring status lives in ROADMAP.md; a column of identical ticks here only reads like progress.
+        flag = "" if l["status"] == "Complete" else f" {STATUS_GLYPH[l['status']]} *{l['status']}*"
+        out.append(f"| {l['n']:02d} | [{l['title']}]({l['slug']}/){flag} | {l['type']} | ~{l['minutes']} min | {l['hook']} |")
+    out += ["", "Browse the [full curriculum](../../README.md#contents) or the status [roadmap](../../ROADMAP.md)."]
     return "\n".join(out) + "\n"
 
 
