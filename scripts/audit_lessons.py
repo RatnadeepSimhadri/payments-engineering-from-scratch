@@ -9,7 +9,8 @@ Checks, per lesson that exists on disk:
                      Learning Objectives (4-6), required sections for Build lessons, every fenced
                      code block has a language tag, no ASCII box-drawing diagrams
     quiz.json        exactly 6 questions (1 pre, 3 check, 2 post), 4 options, zero-indexed correct,
-                     non-empty explanation, correct answer not the longest option by >40%
+                     non-empty explanation, correct answer not the longest option by >40%,
+                     no correct index used more than twice
     code/<lang>/     entry + test file exist for each language named in the header; a 4-6 line
                      header comment cites docs/en.md
     outputs/         optional; if present, every file has YAML frontmatter with name + description
@@ -144,6 +145,13 @@ def audit_quiz(audit: Audit, lesson: Path, planned: bool) -> None:
         others = [l for j, l in enumerate(lengths) if j != correct]
         if others and lengths[correct] > 1.4 * max(others):
             audit.add("quiz-bias", lesson, quiz, f"question {i}: correct option is >40% longer than every distractor")
+    spread: dict[int, int] = {}
+    for q in questions:
+        c = q.get("correct")
+        if isinstance(c, int):
+            spread[c] = spread.get(c, 0) + 1
+    if spread and max(spread.values()) > 2:
+        audit.add("quiz-spread", lesson, quiz, f"correct index {max(spread, key=spread.get)} is used {max(spread.values())} times; spread the answers (max 2 per position)")
     blob = json.dumps(data)
     if "TODO" in blob or any(q.get("options") == ["A", "B", "C", "D"] for q in questions):
         audit.add("quiz-placeholder", lesson, quiz, "quiz still contains scaffold placeholder questions")

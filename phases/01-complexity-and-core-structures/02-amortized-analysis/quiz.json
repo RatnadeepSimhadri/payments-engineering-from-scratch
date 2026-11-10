@@ -55,11 +55,11 @@
       "question": "An authorization service must respond in under 50 ms at p99.9. Its duplicate list is a doubling array whose average append is 30 ns. Which statement is correct?",
       "options": [
         "The amortized O(1) bound guarantees the deadline, since 30 ns is six orders of magnitude below 50 ms and doublings are rare",
-        "The bound says nothing about one append; a copy of two million elements can take 180 ms, so only a worst-case or de-amortized design meets the deadline",
         "The deadline is met as long as the array is pre-sized to the expected daily volume plus a ten percent margin for busy days",
-        "Replacing the array with a linked list removes the copies entirely and therefore meets the deadline with no other change needed"
+        "Replacing the array with a linked list removes the copies entirely and therefore meets the deadline with no other change needed",
+        "The bound says nothing about one append; a copy of two million elements can take 180 ms, so only a worst-case or de-amortized design meets the deadline"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Amortized analysis bounds the sum over a sequence, not the cost of one operation. De-amortization (migrating two elements per append into a second array) converts the bound to worst-case O(1). Pre-sizing works only if the volume estimate is never exceeded, which is exactly the day the service fails; a linked list has no copies but makes the duplicate check O(n) per request."
     },
     {
@@ -67,11 +67,11 @@
       "question": "A multi-tenant service shares one dynamic array across tenants. Tenant A performs a million cheap appends; tenant B's single append then triggers the full copy. What does the amortized guarantee say about B's cost?",
       "options": [
         "B's append is O(1) amortized like every other append in the sequence, so its latency is covered by the same guarantee",
-        "Nothing: the bound covers the whole sequence from empty, and B inherited a structure whose credit A's operations already spent",
         "B's append is O(log n) because the copy cost is split evenly across the doublings that A's appends triggered earlier",
-        "The guarantee transfers to B because both tenants share the same potential function over the same underlying array"
+        "The guarantee transfers to B because both tenants share the same potential function over the same underlying array",
+        "Nothing: the bound covers the whole sequence from empty, and B inherited a structure whose credit A's operations already spent"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The amortized bound is about totals over a sequence starting from empty; it does not say which operation pays. In the accounting metaphor, A's appends banked the credit and B's append spends it all at once. In a shared or persistent structure this is a fairness problem and, if B can time the operation, a denial-of-service lever, which is why latency-critical shared structures use de-amortized designs."
     }
   ]

@@ -6,12 +6,12 @@
       "stage": "pre",
       "question": "A producer emits 1,200 events per second and the consumer processes 1,000 per second, sustained for one hour, through an unbounded in-memory queue. What is the queue depth after the hour, and how long does an event entering then wait?",
       "options": [
-        "About 200 events; it waits 0.2 seconds",
         "About 720,000 events; it waits about 12 minutes",
+        "About 200 events; it waits 0.2 seconds",
         "About 72,000 events; it waits about 72 seconds",
         "The depth stays near zero because the queue drains between bursts"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "The backlog is the rate gap times the duration: (1200 - 1000) * 3600 = 720,000 events, and by Little's Law an event behind 720,000 others at 1,000 per second waits 720 seconds. Option D describes a burst, not a sustained gap; a sustained gap never drains."
     },
     {

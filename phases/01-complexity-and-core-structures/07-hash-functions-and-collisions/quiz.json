@@ -43,23 +43,23 @@
       "question": "Why is adding a random secret constant to String.hashCode (h = hashCode(x) + seed) not a real defence?",
       "options": [
         "The secret seed value can be read directly out of the running process memory by a determined attacker",
-        "The differences between the keys that produce a collision are left unchanged by adding any constant offset",
         "The addition overflows the signed 32-bit integer range and silently discards the secret seed on every call",
-        "The seed used would have to be widened to at least 128 bits before it could make any practical difference"
+        "The seed used would have to be widened to at least 128 bits before it could make any practical difference",
+        "The differences between the keys that produce a collision are left unchanged by adding any constant offset"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Collisions depend on differences between hashes; adding the same constant to every hash leaves all those differences identical, so every previously colliding pair still collides regardless of the seed. The seed must feed a function whose output is a pseudorandom function of the key (SipHash), which is why the industry fix replaced the function rather than offsetting it."
     },
     {
       "stage": "post",
       "question": "How does drawing a hash function at random from a universal family at process startup restore expected O(1) against adversarial keys?",
       "options": [
-        "It makes the hash function fully collision-resistant, so that no two distinct keys can share a bucket at all",
         "Any fixed pair collides with probability at most 1/m over the family, and the chosen function is a startup secret",
+        "It makes the hash function fully collision-resistant, so that no two distinct keys can share a bucket at all",
         "It sorts every key into order before hashing them, so the resulting bucket chains are always kept balanced",
         "It causes the backing table to grow far faster than before, so the load factor can never rise under the flood"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Universality guarantees that any fixed pair collides with probability at most 1/m averaged over the family; because the specific function is chosen from a secret at startup, the attacker cannot predict the colliding set and the keys spread as if random, giving expected chain length n/m. It is not collision resistance, does not sort, and is independent of table growth."
     },
     {
@@ -67,11 +67,11 @@
       "question": "You must deduplicate requests by card number (PAN) without storing the PAN in the clear. Why is a bare SHA-256 of the PAN the wrong map key?",
       "options": [
         "SHA-256 is simply too slow to run on the key of every single incoming request at payment-gateway scale",
-        "A 16-digit PAN has about 10^16 values, so an unkeyed digest is brute-force reversible; use an HMAC keyed from a vault",
         "SHA-256 produces far too many collisions when it is fed short fixed-length 16-digit numeric inputs like a PAN",
-        "A 256-bit SHA-256 output is simply too wide a value to be usable as a key in a standard hash-map structure"
+        "A 256-bit SHA-256 output is simply too wide a value to be usable as a key in a standard hash-map structure",
+        "A 16-digit PAN has about 10^16 values, so an unkeyed digest is brute-force reversible; use an HMAC keyed from a vault"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The PAN space is small enough that any unkeyed digest is trivially reversible by hashing all candidates, so SHA-256 provides no confidentiality for a PAN. A keyed hash (HMAC-SHA-256) or a token with the secret held in a KMS is required; the concern here is confidentiality of the key, which is a different requirement from the CPU-DoS defence and uses a different kind of key."
     }
   ]

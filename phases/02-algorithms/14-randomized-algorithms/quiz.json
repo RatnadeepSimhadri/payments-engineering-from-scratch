@@ -55,11 +55,11 @@
       "question": "Miller-Rabin with 10 random bases reports 561 as composite and 1,000,003 as probably prime. Which statement about its errors is correct?",
       "options": [
         "Both answers could be wrong with probability at most 4^-10",
-        "The composite verdict is certain; the prime verdict is wrong with probability at most 4^-10",
         "The prime verdict is certain; the composite verdict is wrong with probability at most 4^-10",
-        "Neither verdict is certain, which is why 561 is called a Carmichael number"
+        "Neither verdict is certain, which is why 561 is called a Carmichael number",
+        "The composite verdict is certain; the prime verdict is wrong with probability at most 4^-10"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A witness is a proof of compositeness, so 'composite' is never wrong. 'Probably prime' means no witness was found in 10 tries, which a composite survives with probability at most 4^-10. 561 is a Carmichael number because it fools the plain Fermat test, not Miller-Rabin."
     },
     {
@@ -67,11 +67,11 @@
       "question": "An auditor asks you to prove that today's 500-transaction sample was not hand-picked. What property of the sampler makes that possible, and what would make it unsafe elsewhere?",
       "options": [
         "A cryptographic generator, which makes the sample unpredictable to everyone but also impossible to reproduce for the auditor",
-        "A recorded seed for a deterministic generator, which makes the sample reproducible but predictable to anyone holding the seed",
         "Sampling the first 500 items of the stream, which anyone can verify from the recorded stream order without any generator",
-        "Reducing nextLong() modulo n for each draw, which spreads the sample evenly across the whole day's stream"
+        "Reducing nextLong() modulo n for each draw, which spreads the sample evenly across the whole day's stream",
+        "A recorded seed for a deterministic generator, which makes the sample reproducible but predictable to anyone holding the seed"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Given the seed and the stream, the auditor regenerates the identical sample, proving it was not chosen by hand. The same predictability is why a seeded non-cryptographic generator must never produce tokens or keys. First-500 is reproducible but not uniform; modulo reduction is biased for most n."
     }
   ]

@@ -55,11 +55,11 @@
       "question": "The daily risk report computes peak exposure by sampling every minute. What does the weighted sweep line give that sampling cannot?",
       "options": [
         "A lower memory footprint, since no per-minute samples need to be stored anywhere",
-        "The exact peak and the exact instant, at a cost independent of timeline resolution",
         "A time-weighted running average of exposure in place of a simple maximum",
-        "The ability to work with closed intervals as well as half-open ones"
+        "The ability to work with closed intervals as well as half-open ones",
+        "The exact peak and the exact instant, at a cost independent of timeline resolution"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Exposure only changes at hold starts and ends, so visiting those events in order finds every peak, including ones lasting a second, in O(n log n) for n holds. Sampling misses peaks shorter than the sample period and its cost grows with resolution."
     },
     {
@@ -67,11 +67,11 @@
       "question": "Maximum overlap of a set of intervals is 3. What does that number also tell you about scheduling them on identical resources?",
       "options": [
         "At least 3 intervals must be dropped to fit on one resource",
-        "Exactly 3 resources are necessary and sufficient to host all of them without conflict",
         "The intervals can be merged into exactly 3 disjoint intervals",
-        "The earliest-end greedy will choose exactly 3 intervals"
+        "The earliest-end greedy will choose exactly 3 intervals",
+        "Exactly 3 resources are necessary and sufficient to host all of them without conflict"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Three intervals open at one instant need three resources, and the interval-partitioning greedy (sort by start, assign to any free resource) never needs more than the maximum overlap. The number of merged intervals and the size of the greedy schedule are different quantities."
     }
   ]

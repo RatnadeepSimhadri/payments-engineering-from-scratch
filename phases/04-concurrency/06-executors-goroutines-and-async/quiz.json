@@ -43,11 +43,11 @@
       "question": "At t=800 ms gamma's alarm wins and its quote is TIMED_OUT, yet gamma.outstanding() is still 1. What does this tell you about the design?",
       "options": [
         "There is a bug: a timed-out call should have been removed from the adapter",
-        "The timeout abandoned the wait but did not cancel the request, which may still complete at the processor",
         "The adapter double-counted the call because applyToEither invoked quote twice",
-        "ManualTimer failed to fire because the alarm was cancelled by whenComplete"
+        "ManualTimer failed to fire because the alarm was cancelled by whenComplete",
+        "The timeout abandoned the wait but did not cancel the request, which may still complete at the processor"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A timeout is a decision to stop waiting; the in-flight request is unaffected unless something explicitly cancels it. For quotes that is harmless; for an authorisation it means the payment may succeed after the caller gave up, which is why idempotency keys and reconciliation exist. The adapter was called once, and the alarm did fire."
     },
     {
@@ -55,11 +55,11 @@
       "question": "Why does the lesson route every delay through a Timer interface with a ManualTimer in tests instead of using CompletableFuture.orTimeout directly?",
       "options": [
         "orTimeout is not available on Java 21 and requires a third-party scheduler",
-        "So the fan-out's timeout behaviour can be exercised in microseconds, in a chosen order, without real sleeps or flaky waits",
         "Because orTimeout holds a platform thread for the duration of the timeout, starving the pool",
+        "So the fan-out's timeout behaviour can be exercised in microseconds, in a chosen order, without real sleeps or flaky waits",
         "So the production code can run without any scheduler thread at all"
       ],
-      "correct": 1,
+      "correct": 2,
       "explanation": "Injecting time lets a test say 'beta answers at 250, delta fails at 550, the deadline fires at 800' and run instantly and deterministically. orTimeout exists in Java 9+ and uses a shared scheduler thread without blocking; RealTimer wraps the same delayed executor for production."
     },
     {
@@ -67,11 +67,11 @@
       "question": "firstOk completes with the first OK quote, or empty when every adapter has failed or timed out. Why is CompletableFuture.anyOf not sufficient to implement it?",
       "options": [
         "anyOf requires all inputs to have the same generic type, which Quote futures do not",
-        "anyOf completes on the first completion of any kind, so a failed adapter would end the race before an OK one arrives",
         "anyOf blocks the calling thread until one input completes, defeating the asynchronous design",
-        "anyOf cannot be combined with a ManualTimer because it schedules on the common pool"
+        "anyOf cannot be combined with a ManualTimer because it schedules on the common pool",
+        "anyOf completes on the first completion of any kind, so a failed adapter would end the race before an OK one arrives"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "anyOf is 'first to complete', not 'first to succeed'; since failures and timeouts are completions, it would often return a non-OK quote while a good answer was seconds away. The lesson's version completes the winner only on OK and uses a countdown to detect the all-failed case. anyOf does not block and accepts heterogeneous inputs."
     }
   ]

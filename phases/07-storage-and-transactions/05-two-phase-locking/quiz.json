@@ -67,11 +67,11 @@
       "question": "PostgreSQL aborts your transfer with SQLSTATE 40P01. What should the application do?",
       "options": [
         "Retry only the failed UPDATE statement, since the earlier statements succeeded",
-        "Re-run the whole transaction from the start, re-reading balances, with the same idempotency key, a bounded number of times",
         "Switch the connection to READ UNCOMMITTED so that the lock wait cannot occur again",
-        "Report the payment as failed to the customer, because the database has already rolled it back"
+        "Report the payment as failed to the customer, because the database has already rolled it back",
+        "Re-run the whole transaction from the start, re-reading balances, with the same idempotency key, a bounded number of times"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The victim has been rolled back in full, so any values it read may be stale; the only correct response is to repeat the entire transaction, including the reads, under the same idempotency key so a double retry cannot double-apply, and to stop after a few attempts. Retrying one statement would commit a transaction built on reads from a state that no longer exists."
     }
   ]

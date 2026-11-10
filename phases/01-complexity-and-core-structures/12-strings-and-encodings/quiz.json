@@ -55,11 +55,11 @@
       "question": "Which normalization should a system use to store a beneficiary name, and which to build a matching key for sanctions screening?",
       "options": [
         "NFKC for storage and NFC for matching, so the stored form is the most compact",
-        "NFC for storage and NFKC plus case folding for matching, because NFKC is lossy",
         "NFD for both, because decomposed forms are the Unicode default",
-        "No normalization for storage and NFC for matching, to preserve the original bytes"
+        "No normalization for storage and NFC for matching, to preserve the original bytes",
+        "NFC for storage and NFKC plus case folding for matching, because NFKC is lossy"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "NFC is canonical and lossless, so it is the right stored form. NFKC folds ligatures, fullwidth forms, and superscripts, which is what matching wants but destroys information, so it belongs only in the comparison key. Storing raw bytes loses equality guarantees; NFD is not the common interchange form."
     },
     {

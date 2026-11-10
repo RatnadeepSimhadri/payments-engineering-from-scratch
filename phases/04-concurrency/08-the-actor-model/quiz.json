@@ -31,11 +31,11 @@
       "question": "In ThreadedScheduler.run, the finally block clears the scheduled flag and then re-checks the mailbox. What goes wrong if those two lines are swapped?",
       "options": [
         "Two runs for the same actor could execute at once because the flag is clear while messages are being processed",
-        "A message that arrives between the re-check and the clear is never scheduled: the sender saw the flag set, and nobody re-checks after it",
         "The executor would reject the resubmission because the previous run has not returned yet",
-        "Throughput batching would stop working and every message would need its own run"
+        "Throughput batching would stop working and every message would need its own run",
+        "A message that arrives between the re-check and the clear is never scheduled: the sender saw the flag set, and nobody re-checks after it"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Re-check first: the mailbox looks empty. A tell lands and sees scheduled == true, so it does not submit. Then the flag is cleared and the run exits. The message sits until some later tell happens to arrive. Clearing first and re-checking second closes that window. The flag is never clear during processing, so two runs cannot overlap either way."
     },
     {
@@ -54,12 +54,12 @@
       "stage": "post",
       "question": "Between Withdrawn and Deposited in the transfer protocol, what is true about 75.00 USD that a locked transfer would never allow?",
       "options": [
-        "It exists in both accounts at once until the coordinator reconciles them",
         "It is in neither account, so a balance query at that instant sums to less than the system total",
+        "It exists in both accounts at once until the coordinator reconciles them",
         "It has been lost and must be recovered by the supervisor's RESTART of the coordinator",
         "It is held in the coordinator's inFlight map as a third balance that GetBalance can read"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "The actor transfer is two steps separated by a message hop, and the funds are in transit between them; a locked transfer makes both changes under one lock so the intermediate state is unobservable. Nothing is lost: the Deposit is in a mailbox and will be processed. The coordinator records the transfer, not a balance."
     },
     {

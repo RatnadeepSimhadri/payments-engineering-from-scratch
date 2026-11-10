@@ -5,42 +5,72 @@
     {
       "stage": "pre",
       "question": "A service commits a payment row and then publishes a PaymentCreated event to a message bus. The process is killed between the two steps. What is the resulting state?",
-      "options": ["The database rolls back the payment because the publish did not complete", "The payment exists in the database but no event was ever published", "The event is published automatically on restart from the service's memory", "Both the row and the event are lost, so the caller retries safely"],
+      "options": [
+        "The database rolls back the payment because the publish did not complete",
+        "The payment exists in the database but no event was ever published",
+        "The event is published automatically on restart from the service's memory",
+        "Both the row and the event are lost, so the caller retries safely"
+      ],
       "correct": 1,
       "explanation": "The commit has already returned; nothing ties the later publish to it, so the row stays and the event is simply gone. The database has no knowledge of the bus and cannot roll back, and process memory does not survive a kill. This is the dual-write gap that reading the commit log closes."
     },
     {
       "stage": "check",
       "question": "In the CDC connector, when is the consumer offset saved relative to delivering a batch to the sink, and what delivery guarantee follows?",
-      "options": ["Before delivery, giving at-least-once because the log is re-read on restart", "After delivery, giving at-least-once because a crash in between redelivers the batch", "Before delivery, giving exactly-once because the offset is a transaction", "After delivery, giving at-most-once because redelivered events are dropped"],
+      "options": [
+        "Before delivery, giving at-least-once because the log is re-read on restart",
+        "After delivery, giving at-least-once because a crash in between redelivers the batch",
+        "Before delivery, giving exactly-once because the offset is a transaction",
+        "After delivery, giving at-most-once because redelivered events are dropped"
+      ],
       "correct": 1,
       "explanation": "The offset is written only after every event in the batch has been applied. A crash after apply and before the save leaves the old offset, so the same batch is delivered again: at-least-once. Saving before delivery would lose a batch on crash (at-most-once). Exactly-once needs the offset and the sink write in one atomic operation, which this design does not have."
     },
     {
       "stage": "check",
       "question": "The snapshot method records the log head as snapshotLsn, scans the table emitting r events, then stores snapshotLsn as the offset. Why must the head be recorded before the scan rather than after?",
-      "options": ["So that the snapshot events carry a smaller LSN and sort before stream events in the sink", "So that rows the scan has not reached yet are included in the snapshot by LSN", "So that a change committed during the scan has an LSN above the offset and is streamed rather than lost", "So that the offset store is written once instead of once per row scanned"],
+      "options": [
+        "So that the snapshot events carry a smaller LSN and sort before stream events in the sink",
+        "So that rows the scan has not reached yet are included in the snapshot by LSN",
+        "So that a change committed during the scan has an LSN above the offset and is streamed rather than lost",
+        "So that the offset store is written once instead of once per row scanned"
+      ],
       "correct": 2,
       "explanation": "A change that lands while the scan is running may or may not be seen by the scan, depending on which rows it has passed. Recording the head first guarantees its LSN is above the stored offset, so the stream delivers it; the sink may see that row twice, never zero times. Recording the head after the scan would put such a change below the offset and silently drop it."
     },
     {
       "stage": "check",
       "question": "BalanceViewSink keeps the last applied LSN per account and ignores events at or below it. Which situation does this guard NOT protect against?",
-      "options": ["A batch redelivered after the connector crashed before committing its offset", "A snapshot r event arriving after a stream update for the same row", "The same update event appearing twice in one batch", "An amount column that was written as a floating-point decimal upstream"],
+      "options": [
+        "A batch redelivered after the connector crashed before committing its offset",
+        "A snapshot r event arriving after a stream update for the same row",
+        "The same update event appearing twice in one batch",
+        "An amount column that was written as a floating-point decimal upstream"
+      ],
       "correct": 3,
       "explanation": "The LSN guard is about duplicates and ordering: redelivered batches, snapshot overlap, and repeated events all carry LSNs the sink has already seen and are skipped. It says nothing about the content of the row; a float written upstream is a Phase 10 data-representation defect that CDC faithfully propagates."
     },
     {
       "stage": "post",
       "question": "A consumer was down for a week. On restart its first poll throws LogTruncatedException. What is the correct recovery?",
-      "options": ["Set the offset to the oldest available LSN and continue streaming from there", "Take a fresh snapshot at the current head, store that as the offset, then stream", "Replay the consumer's own output log to reconstruct the missing week of changes", "Wait for the database to restore the truncated segments from backup"],
-      "correct": 1,
+      "options": [
+        "Set the offset to the oldest available LSN and continue streaming from there",
+        "Replay the consumer's own output log to reconstruct the missing week of changes",
+        "Wait for the database to restore the truncated segments from backup",
+        "Take a fresh snapshot at the current head, store that as the offset, then stream"
+      ],
+      "correct": 3,
       "explanation": "The changes between the old offset and the oldest retained LSN are gone from the log, so skipping to the oldest LSN would silently miss them and leave the view wrong forever. Only a new snapshot restores complete state; the stream then resumes from the snapshot LSN. The consumer's output contains no information it never received, and databases do not restore recycled WAL on request."
     },
     {
       "stage": "post",
       "question": "A dashboard counts Debezium events with op \"c\" on the payments table to show payments created today. After the connector is re-snapshotted, the number is wrong. Why?",
-      "options": ["Snapshot rows are emitted with op \"r\", so existing payments are not counted while redelivered creates may be counted twice", "Snapshot rows are emitted with op \"c\", so every historical payment is counted as created today", "The snapshot resets the LSN sequence to zero, so events are counted in the wrong day", "The re-snapshot deletes the dashboard's offset, so it starts counting from the first payment ever"],
+      "options": [
+        "Snapshot rows are emitted with op \"r\", so existing payments are not counted while redelivered creates may be counted twice",
+        "Snapshot rows are emitted with op \"c\", so every historical payment is counted as created today",
+        "The snapshot resets the LSN sequence to zero, so events are counted in the wrong day",
+        "The re-snapshot deletes the dashboard's offset, so it starts counting from the first payment ever"
+      ],
       "correct": 0,
       "explanation": "A snapshot emits op \"r\" for rows that already existed, which a count of \"c\" ignores, and the subsequent at-least-once stream can redeliver genuine creates. A correct counter is idempotent by payment key and uses the row's own created timestamp, not the event type, to decide what counts as today. LSNs never reset, and a re-snapshot stores a new offset rather than removing one."
     }

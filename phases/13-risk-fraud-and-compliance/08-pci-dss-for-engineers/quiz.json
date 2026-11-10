@@ -56,22 +56,22 @@
       "options": [
         "Whenever it is on the same network as the payment service",
         "Only if engineers use it to administer payment hosts",
-        "If any log line has ever carried a PAN, because it then stores cardholder data",
-        "Never; log systems are explicitly excluded from the CDE definition"
+        "Never; log systems are explicitly excluded from the CDE definition",
+        "If any log line has ever carried a PAN, because it then stores cardholder data"
       ],
-      "correct": 2,
+      "correct": 3,
       "explanation": "A system that stores cardholder data is in the CDE by definition, and a logged request body makes the log store exactly that. Otherwise the pipeline is connected-to and still in scope for the controls, but with a different risk profile. Same-network placement makes it connected-to, not CDE; nothing in the standard excludes logging systems."
     },
     {
       "stage": "post",
       "question": "The standard permits rendering a stored PAN unreadable with a one-way hash. Why is a plain SHA-256 of the PAN not acceptable under v4.0?",
       "options": [
-        "Because SHA-256 has been removed from the PCI SSC's list of strong cryptography and must be replaced with SHA-3",
         "Because the public BIN and the Luhn check digit leave so few candidates that the hash is reversed by brute force; a keyed hash is required",
+        "Because SHA-256 has been removed from the PCI SSC's list of strong cryptography and must be replaced with SHA-3",
         "Because a hash cannot be rotated the way an encryption key can, so a compromised hash table cannot be re-protected",
         "Because hashing makes the PAN unavailable for refunds and chargebacks, which the standard requires to keep working"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "A PAN has little entropy once the public BIN is known and the check digit is fixed, so an unsalted hash of every candidate in a BIN range is computed in minutes. Requirement 3.5.1.1 therefore requires a keyed cryptographic hash with managed keys. SHA-256 itself is fine as a primitive; the problem is the input space, and refunds use tokens, not hashes."
     }
   ]

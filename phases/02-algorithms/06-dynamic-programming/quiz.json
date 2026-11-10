@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "A payout service makes 30.00 USD from gift instruments of 1.00, 15.00, and 25.00 by always taking the largest that fits. How many instruments does it issue, and what is the minimum?",
-      "options": ["Six, and six is the minimum", "Two, and two is the minimum", "Six, but two would have sufficed", "Three, but two would have sufficed"],
+      "options": [
+        "Six, and six is the minimum",
+        "Two, and two is the minimum",
+        "Six, but two would have sufficed",
+        "Three, but two would have sufficed"
+      ],
       "correct": 2,
       "explanation": "Largest-first takes one 25.00 and then five 1.00s, six instruments. Two 15.00 instruments make 30.00 exactly. Greedy is optimal for canonical coin systems like US coins, but this voucher set is not canonical, so a table is needed to find the two-instrument answer."
     },
     {
       "stage": "check",
       "question": "The recursive fewest-coins function makes 20,736 calls for amount 20 with denominations {1, 3, 4}; the memoised version makes 56. What explains the difference?",
-      "options": ["Memoisation prunes denominations that are larger than the remaining amount", "Only 21 distinct amounts exist, and the memo computes each one exactly once", "The memoised version iterates bottom-up so it never needs the call stack", "The recursive version also explores orderings that the memo treats as duplicates"],
+      "options": [
+        "Memoisation prunes denominations that are larger than the remaining amount",
+        "Only 21 distinct amounts exist, and the memo computes each one exactly once",
+        "The memoised version iterates bottom-up so it never needs the call stack",
+        "The recursive version also explores orderings that the memo treats as duplicates"
+      ],
       "correct": 1,
       "explanation": "There are only amount + 1 distinct sub-states but exponentially many paths to them; the memo turns every repeated path into a cache hit. Both versions skip denominations that do not fit, so pruning is not the difference, and the memoised version is still top-down recursion."
     },
     {
       "stage": "check",
       "question": "In the number-of-ways table, denominations are the outer loop and amounts the inner loop. What happens if you swap them?",
-      "options": ["The count becomes wrong because ways[a - d] is read before it is written", "The result is unchanged, because addition is commutative", "You count ordered sequences instead of unordered bundles, so the answer grows", "The table now needs two dimensions to remain correct"],
+      "options": [
+        "The count becomes wrong because ways[a - d] is read before it is written",
+        "The result is unchanged, because addition is commutative",
+        "You count ordered sequences instead of unordered bundles, so the answer grows",
+        "The table now needs two dimensions to remain correct"
+      ],
       "correct": 2,
       "explanation": "With denominations outer, each bundle is built in one canonical order so {1,3} and {3,1} are counted once. With amounts outer, both orders are counted separately: 5 from {1,2,5} gives 9 instead of 4. The table stays one-dimensional and every read is still of a smaller amount; only the question being answered changes."
     },
     {
       "stage": "check",
       "question": "Why does the 0/1 knapsack 'take' branch read best[i-1][c - weight] rather than best[i][c - weight]?",
-      "options": ["Row i is not yet filled at column c - weight when the inner loop runs upward", "Reading row i - 1 ensures payout i is counted at most once in any solution", "Row i - 1 is smaller, so the lookup is faster for large tables", "Reading row i would let the reconstruction loop skip over payout i"],
+      "options": [
+        "Row i is not yet filled at column c - weight when the inner loop runs upward",
+        "Reading row i - 1 ensures payout i is counted at most once in any solution",
+        "Row i - 1 is smaller, so the lookup is faster for large tables",
+        "Reading row i would let the reconstruction loop skip over payout i"
+      ],
       "correct": 1,
       "explanation": "Row i - 1 has never seen payout i, so adding it there uses it exactly once. Reading the same row would allow the payout to be added repeatedly, which is unbounded knapsack (and is exactly what coin change does on purpose with its one-dimensional table). With an upward inner loop, row i at c - weight is in fact already filled, so the first option describes the wrong mechanism."
     },
     {
       "stage": "post",
       "question": "A settlement limit is 10,000,000.00 USD and amounts are in cents. Why is running the minor-unit knapsack table directly a problem, and what is a sound fix?",
-      "options": ["The table has a billion columns; round amounts up to whole dollars for the table, then verify the chosen set against the exact limit in cents", "The table has a billion columns; round amounts to the nearest dollar for the table and trust the result since the error is under one dollar", "The priorities overflow a 64-bit integer; store them as doubles and accept the loss of precision", "Reconstruction becomes ambiguous; switch to the 1D table which has a unique answer"],
+      "options": [
+        "The table has a billion columns; round amounts up to whole dollars for the table, then verify the chosen set against the exact limit in cents",
+        "The table has a billion columns; round amounts to the nearest dollar for the table and trust the result since the error is under one dollar",
+        "The priorities overflow a 64-bit integer; store them as doubles and accept the loss of precision",
+        "Reconstruction becomes ambiguous; switch to the 1D table which has a unique answer"
+      ],
       "correct": 0,
       "explanation": "O(n * limit) in cents is pseudo-polynomial and the table cannot be allocated. Rounding weights UP makes any set that fits in the coarse table fit in the exact one, and the final check in minor units keeps the settlement file exact. Rounding to nearest can admit a set that exceeds the real cap by up to n/2 dollars, which a rail will reject."
     },
     {
       "stage": "post",
       "question": "Two different longest common subsequences of the same length exist between a bank statement and the ledger. Why does the lesson insist on a fixed tie rule in the walk-back?",
-      "options": ["Without it the table itself may compute a shorter length on some inputs", "Without it the reconciliation report can change between runs on identical input", "Without it the walk-back may fail to terminate on repeated lines", "Without it the left-only and right-only lists can overlap each other"],
-      "correct": 1,
+      "options": [
+        "Without it the table itself may compute a shorter length on some inputs",
+        "Without it the walk-back may fail to terminate on repeated lines",
+        "Without it the left-only and right-only lists can overlap each other",
+        "Without it the reconciliation report can change between runs on identical input"
+      ],
+      "correct": 3,
       "explanation": "The table's length is unique; only the reconstruction has choices. If the walk-back resolves equal neighbours differently on different runs or in different languages, two reconciliation jobs produce different break lists from the same data, which is unreviewable. The walk always terminates because every step decrements i or j."
     }
   ]

@@ -55,11 +55,11 @@
       "question": "A producer retries a publish after a lost acknowledgement, so the log holds the same capture at offsets 4 and 93. Which design posts it once?",
       "options": [
         "A consumer that posts and commits the offset in one transaction per record",
-        "A consumer that enforces insert-if-absent on the capture's business key in the ledger store",
         "A consumer with batch size 1 that commits after every record",
-        "A consumer that commits the offset before processing each batch"
+        "A consumer that commits the offset before processing each batch",
+        "A consumer that enforces insert-if-absent on the capture's business key in the ledger store"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Two offsets are two records, so any offset-based mechanism, transactional or not, processes both. Only a check on the business identifier of the capture recognises them as one event. The transactional route protects against the consumer's own crash, not against a duplicate on the log."
     },
     {

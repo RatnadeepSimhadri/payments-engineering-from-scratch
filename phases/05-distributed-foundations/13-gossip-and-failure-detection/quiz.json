@@ -55,11 +55,11 @@
       "question": "In the demo, n1 cannot reach n2 but n0, n3, and n4 can. With k = 3 indirect probes there were no false positives in 600 ticks; with k = 0 the same cut eventually produced one. What does this show?",
       "options": [
         "Indirect probes make the protocol period shorter, so refutations arrive within the window more often than before",
-        "The suspicion mechanism alone cannot save a node whose refutations keep arriving late through other paths forever",
         "Indirect probes are only needed when message loss is above 10 percent; below that the suspicion timeout is sufficient",
-        "With k = 0 the incarnation number stops increasing, so the target has no way to refute the repeated accusations"
+        "With k = 0 the incarnation number stops increasing, so the target has no way to refute the repeated accusations",
+        "The suspicion mechanism alone cannot save a node whose refutations keep arriving late through other paths forever"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Suspicion plus refutation buys time, and n2 did refute (its incarnation rose), but each period n1 re-suspects and eventually one refutation misses the window and n2 is declared dead. Indirect probes fix the cause by routing the probe around the bad link, so the suspicion never arises. The period length and the loss rate are unchanged between the two runs."
     },
     {
@@ -67,11 +67,11 @@
       "question": "Consul runs SWIM for membership and Raft for its service catalog. Why not derive leadership from the gossip view?",
       "options": [
         "Because gossip messages are too small to carry a leader id and a term number alongside updates",
-        "Because gossip converges only eventually, so two nodes may hold different views and both act as leader",
         "Because SWIM secretly requires a coordinator, which would have to be the Raft leader anyway",
-        "Because Raft's election timeouts detect a crashed leader faster than SWIM probes in every configuration"
+        "Because Raft's election timeouts detect a crashed leader faster than SWIM probes in every configuration",
+        "Because gossip converges only eventually, so two nodes may hold different views and both act as leader"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "SWIM gives each node a locally consistent, eventually convergent view; it never guarantees that all nodes agree at one instant, which is exactly what safe leadership needs. SWIM has no coordinator by design, and Raft's election timeouts are not generally faster than SWIM's probes; the difference is agreement, not speed."
     }
   ]

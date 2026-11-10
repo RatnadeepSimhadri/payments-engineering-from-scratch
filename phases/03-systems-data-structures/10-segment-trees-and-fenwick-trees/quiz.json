@@ -68,10 +68,10 @@
       "options": [
         "Lazy segment tree: it is the most general and handles any future requirement",
         "Prefix-sum array: range sums are O(1) and 50 million updates are affordable",
-        "Fenwick tree: n+1 longs, O(log n) for both operations, and addition is invertible",
-        "Segment tree with power-of-two padding: 2 * 2^26 longs and no bit tricks to get wrong"
+        "Segment tree with power-of-two padding: 2 * 2^26 longs and no bit tricks to get wrong",
+        "Fenwick tree: n+1 longs, O(log n) for both operations, and addition is invertible"
       ],
-      "correct": 2,
+      "correct": 3,
       "explanation": "Sum is invertible and updates are to single positions, so a Fenwick tree does everything required in about n longs and fifteen lines. The segment tree would use 2.7x the memory for no additional capability here, and a lazy tree 8x; a prefix array makes each update O(n), which at 50 million entries is the failure in The Problem."
     }
   ]

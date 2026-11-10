@@ -102,6 +102,7 @@ If a contribution needs a library, it is the wrong lesson design. Rewrite the le
 
 Build lessons: `## The Problem`, `## The Concept`, `## Build It`, `## Use It`, `## Ship It`, `## Exercises`, `## Key Terms`, `## Further Reading`.
 Learn lessons: `## The Problem`, `## The Concept`, `## Exercises`, `## Key Terms`, `## Further Reading` (plus `## Worked Example` where a trace helps).
+Capstone lessons (Phase 15): `## The Problem`, `## What You Will Build`, `## Requirements`, `## Milestones`, `## Acceptance Criteria`, `## Rubric`, `## Further Reading`. A capstone is a project spec, not a tutorial: no code ships with it, every requirement names the lessons that teach the mechanism, and the rubric is what the `build-project` coach grades against.
 
 Depth expectations for a Complete lesson:
 
@@ -111,8 +112,8 @@ Depth expectations for a Complete lesson:
 - **Use It**: the standard-library or production equivalent (`java.util.HashMap`, `sorted`, `sync.Map`, PostgreSQL, Kafka, Stripe's API shape), and specifically what it does that the from-scratch version made explicit.
 - **Ship It**: the artifact in `outputs/` — a checklist, a design-review template, an interview card, a runbook — written so the learner can use it at work on Monday.
 - **Exercises**: three, graded easy / medium / hard, with the hard one combining a previous lesson.
-- **Key Terms**: a 4-8 row table: term, what people say, what it actually means.
-- **Further Reading**: 3-6 primary sources with one line each on why.
+- **Key Terms**: a 4-10 row table: term, what people say, what it actually means. Every term must have an entry in `glossary/terms.md`.
+- **Further Reading**: 3-8 primary sources with one line each on why; every entry carries a URL (publisher page or DOI for books and papers).
 
 Target length: 350–700 lines for a Build lesson, 250–450 for a Learn lesson. Depth comes from worked examples, invariants, and failure modes, not from adjectives.
 
@@ -133,7 +134,7 @@ Target length: 350–700 lines for a Build lesson, 250–450 for a Learn lesson.
 }
 ```
 
-Exactly six questions: one `pre` (activates prior knowledge before reading), three `check` (asked mid-lesson by the tutor), two `post` (the end-of-lesson quiz). `correct` is zero-indexed. Spread the correct index across positions. Explanations say why the right answer is right *and* why the strongest distractor is wrong.
+Exactly six questions: one `pre` (activates prior knowledge before reading), three `check` (asked mid-lesson by the tutor), two `post` (the end-of-lesson quiz). `correct` is zero-indexed. Spread the correct index across positions: no index may be correct for more than two of the six questions, and explanations must not refer to options by position ("the second option") so options can be reordered. Explanations say why the right answer is right *and* why the strongest distractor is wrong.
 
 ### code/
 
@@ -205,4 +206,4 @@ To add a lesson that is not yet in `curriculum/curriculum.json`, add it there fi
 
 ---
 
-Last reviewed: 2026-10-11.
+Last reviewed: 2026-11-09.

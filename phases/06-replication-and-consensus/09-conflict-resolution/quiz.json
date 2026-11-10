@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "Two replicas accept different writes to the same key during a partition, and the store keeps the one with the later wall-clock timestamp. What happened to the other write?",
-      "options": ["It is kept as a second version until a reader resolves it", "It is discarded, and nothing in the store records that it existed", "It is queued and re-applied when the partition heals", "It is merged field by field into the winning value"],
+      "options": [
+        "It is kept as a second version until a reader resolves it",
+        "It is discarded, and nothing in the store records that it existed",
+        "It is queued and re-applied when the partition heals",
+        "It is merged field by field into the winning value"
+      ],
       "correct": 1,
       "explanation": "Last-writer-wins stores one value per key; the losing write is overwritten with no tombstone, log entry, or sibling. Keeping both as versions is what a sibling store does, and field-by-field merging requires an application merge function; neither is LWW."
     },
     {
       "stage": "check",
       "question": "Version {A=2, B=1} is compared with {A=1, B=2}. What is the relation, and what does it mean?",
-      "options": ["BEFORE: the second version saw the first and supersedes it", "AFTER: the first version saw the second and supersedes it", "CONCURRENT: neither writer observed the other, so both must be kept", "EQUAL: the entries sum to the same total so the versions are the same"],
+      "options": [
+        "BEFORE: the second version saw the first and supersedes it",
+        "AFTER: the first version saw the second and supersedes it",
+        "CONCURRENT: neither writer observed the other, so both must be kept",
+        "EQUAL: the entries sum to the same total so the versions are the same"
+      ],
       "correct": 2,
       "explanation": "A is greater in the first vector and B is greater in the second, so each writer made progress the other did not see; that is the definition of concurrent and the only case that is a genuine conflict. Vectors are compared pointwise, never by sum, so equal totals mean nothing."
     },
     {
       "stage": "check",
       "question": "Why does a node with a clock running five seconds slow cause LWW to keep the wrong value?",
-      "options": ["Its writes are rejected by every peer because their timestamps lie in the past", "Its writes carry smaller timestamps and lose to earlier writes from correct clocks", "Its writes are held back by the store until its clock catches up with the cluster", "Its writes are tie-broken against peers by replica id, which is an arbitrary order"],
+      "options": [
+        "Its writes are rejected by every peer because their timestamps lie in the past",
+        "Its writes carry smaller timestamps and lose to earlier writes from correct clocks",
+        "Its writes are held back by the store until its clock catches up with the cluster",
+        "Its writes are tie-broken against peers by replica id, which is an arbitrary order"
+      ],
       "correct": 1,
       "explanation": "LWW compares timestamps, not real-time order. A write made later in real time on a slow-clock node carries a smaller stamp than an earlier write from a fast-clock node and is discarded. Nothing rejects or delays the write; it simply loses. The replica-id tie-break only applies when timestamps are exactly equal."
     },
     {
       "stage": "check",
       "question": "In the dotted-version-vector sibling store, when is a stored version considered obsolete by an incoming write?",
-      "options": ["When the incoming write has a later wall-clock timestamp", "When the incoming write's dot has a higher sequence number", "When the incoming write's context covers the stored version's dot", "When the incoming write comes from the same replica that stored it"],
+      "options": [
+        "When the incoming write has a later wall-clock timestamp",
+        "When the incoming write's dot has a higher sequence number",
+        "When the incoming write's context covers the stored version's dot",
+        "When the incoming write comes from the same replica that stored it"
+      ],
       "correct": 2,
       "explanation": "A version is obsolete exactly when another writer's context shows it had observed that version's dot; that writer built on it, so it can be dropped. Sequence numbers alone cannot decide this, because two clients on the same replica with the same context produce different dots and are concurrent, not ordered. Timestamps play no role."
     },
     {
       "stage": "post",
       "question": "Replica A removes 'pen' from a cart while replica B concurrently adds another 'book'. The merge rule is union of items with max quantity. What does the merged cart contain, and why?",
-      "options": ["book only, because the removal happened at A and union respects removals", "book and pen, because a state has no record of removals so union restores pen", "pen only, because A's write has the higher version vector entry", "an empty cart, because concurrent writes to a cart are rejected"],
-      "correct": 1,
+      "options": [
+        "book only, because the removal happened at A and union respects removals",
+        "pen only, because A's write has the higher version vector entry",
+        "an empty cart, because concurrent writes to a cart are rejected",
+        "book and pen, because a state has no record of removals so union restores pen"
+      ],
+      "correct": 3,
       "explanation": "B's cart still contains pen, and a union of states cannot distinguish 'B never had pen' from 'A removed pen', so pen reappears. This is the anomaly the Dynamo paper reports. Fixing it requires making removal an observed fact, which is what an OR-Set's tombstoned tags do."
     },
     {
       "stage": "post",
       "question": "The dispute case-file merge keeps every note and picks the most restrictive status. What is the justification for biasing toward the restrictive status?",
-      "options": ["Restrictive statuses have higher version-vector entries so they dominate", "Releasing held funds wrongly is irreversible, while holding them wrongly can be undone", "The store requires merge functions to be monotonic in the status enum", "Agents in the east region have priority over agents in the west region"],
-      "correct": 1,
+      "options": [
+        "Releasing held funds wrongly is irreversible, while holding them wrongly can be undone",
+        "Restrictive statuses have higher version-vector entries so they dominate",
+        "The store requires merge functions to be monotonic in the status enum",
+        "Agents in the east region have priority over agents in the west region"
+      ],
+      "correct": 0,
       "explanation": "A merge function encodes a business rule about which error is cheaper. Paying out a merchant who should have been held cannot be undone; holding funds that should have been released can be corrected after review. Version vectors say nothing about status values, and no store imposes monotonicity on application merges."
     }
   ]

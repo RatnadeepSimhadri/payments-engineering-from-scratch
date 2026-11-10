@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "In Java, what is the value of the int expression 1 << 32?",
-      "options": ["0, because every bit has been shifted out of the 32-bit word", "1, because only the low five bits of the shift count are used for an int", "4294967296, because the result is widened to a long automatically", "A compile-time error, because the shift exceeds the width of int"],
+      "options": [
+        "0, because every bit has been shifted out of the 32-bit word",
+        "1, because only the low five bits of the shift count are used for an int",
+        "4294967296, because the result is widened to a long automatically",
+        "A compile-time error, because the shift exceeds the width of int"
+      ],
       "correct": 1,
       "explanation": "JLS 15.19 masks an int shift distance to 5 bits (6 for long), so 1 << 32 is 1 << 0. The result is never widened, and the compiler accepts it without a warning, which is exactly why this trap survives code review."
     },
     {
       "stage": "check",
       "question": "You extract a field from the top bits of a long that may be negative. Which expression is correct?",
-      "options": ["(v >> shift) & mask(width), because the mask removes any copied sign bits", "(v << shift) & mask(width), because the field must be moved to the bottom first", "(v >>> shift) & mask(width), because the logical shift fills with zeros instead of the sign", "v & (mask(width) << shift), which returns the field already in position"],
+      "options": [
+        "(v >> shift) & mask(width), because the mask removes any copied sign bits",
+        "(v << shift) & mask(width), because the field must be moved to the bottom first",
+        "(v >>> shift) & mask(width), because the logical shift fills with zeros instead of the sign",
+        "v & (mask(width) << shift), which returns the field already in position"
+      ],
       "correct": 2,
       "explanation": "An arithmetic shift copies the sign bit in from the left; if the field sits at the top of the word those copies survive the mask and corrupt the result. The logical shift >>> has no such problem. The last option isolates the field but leaves it shifted up, not as a value."
     },
     {
       "stage": "check",
       "question": "In an ISO 8583 primary bitmap stored as a Java long, which bit represents data element 2 (the PAN)?",
-      "options": ["Bit 1, counting from the least significant bit", "Bit 2, because fields and bit positions use the same numbering", "Bit 62, because field 1 is the most significant bit and field f is bit 64 - f", "Bit 63, because field 1 is structural and the PAN is the first real field"],
+      "options": [
+        "Bit 1, counting from the least significant bit",
+        "Bit 2, because fields and bit positions use the same numbering",
+        "Bit 62, because field 1 is the most significant bit and field f is bit 64 - f",
+        "Bit 63, because field 1 is structural and the PAN is the first real field"
+      ],
       "correct": 2,
       "explanation": "ISO 8583 numbers bit 1 as the most significant bit of the first byte, so field f lives at Java bit 64 - f: field 1 at bit 63, field 2 at bit 62, field 64 at bit 0. Counting from the least significant end is the mistake that moved every field above 32 in The Problem."
     },
     {
       "stage": "check",
       "question": "A Snowflake generator with a 12-bit sequence has issued 4,096 ids in the current millisecond and is asked for another before the clock advances. What must it do?",
-      "options": ["Wrap the sequence to zero and issue the id, since the worker id keeps it unique", "Wait until the clock reads a later millisecond, then issue with sequence zero", "Borrow a bit from the worker field to extend the sequence for this millisecond", "Increment the timestamp field by one and continue, correcting it later"],
+      "options": [
+        "Wrap the sequence to zero and issue the id, since the worker id keeps it unique",
+        "Wait until the clock reads a later millisecond, then issue with sequence zero",
+        "Borrow a bit from the worker field to extend the sequence for this millisecond",
+        "Increment the timestamp field by one and continue, correcting it later"
+      ],
       "correct": 1,
       "explanation": "Wrapping to zero would reproduce the id issued 4,096 calls earlier, because timestamp and worker are unchanged. The layout is fixed, so no field can be borrowed. Waiting for the clock is what Snowflake does; its throughput limit is therefore per millisecond per worker."
     },
     {
       "stage": "post",
       "question": "Why does a Snowflake-style id sort by creation time when compared as a plain signed long?",
-      "options": ["Because the generator keeps a global counter that it adds to each id", "Because the timestamp occupies the most significant bits below a sign bit that is always zero", "Because the sequence field is in the high bits and resets every millisecond", "Because databases index 64-bit values by their creation order automatically"],
-      "correct": 1,
+      "options": [
+        "Because the generator keeps a global counter that it adds to each id",
+        "Because the sequence field is in the high bits and resets every millisecond",
+        "Because databases index 64-bit values by their creation order automatically",
+        "Because the timestamp occupies the most significant bits below a sign bit that is always zero"
+      ],
+      "correct": 3,
       "explanation": "With the sign bit fixed at zero, long comparison compares the timestamp bits first; worker and sequence only break ties within a millisecond. There is no global counter, the sequence is in the low bits, and databases index whatever value they are given."
     },
     {
       "stage": "post",
       "question": "A binary search computes mid = (lo + hi) / 2 with ints and both bounds are around two billion. What happens, and what is the fix?",
-      "options": ["It works, because Java promotes the intermediate sum to long", "The sum overflows to a negative value; use lo + ((hi - lo) >>> 1) instead", "The division rounds the wrong way; use Math.floorDiv instead", "The sum overflows; use (lo + hi) >> 1 so the shift corrects the sign"],
-      "correct": 1,
+      "options": [
+        "The sum overflows to a negative value; use lo + ((hi - lo) >>> 1) instead",
+        "It works, because Java promotes the intermediate sum to long",
+        "The division rounds the wrong way; use Math.floorDiv instead",
+        "The sum overflows; use (lo + hi) >> 1 so the shift corrects the sign"
+      ],
+      "correct": 0,
       "explanation": "Two ints near 2^31 sum past Integer.MAX_VALUE and wrap negative, producing a negative index. Java does not promote int arithmetic to long. The difference hi - lo cannot overflow for valid bounds, and >>> halves it as an unsigned value. An arithmetic shift of the overflowed sum is still wrong."
     }
   ]

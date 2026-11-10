@@ -67,11 +67,11 @@
       "question": "Two ledger services share a ring configuration, but one was deployed with a hash function that omits the mix64 finaliser. What happens?",
       "options": [
         "Both services still agree on owners, because the finaliser only affects balance",
-        "The modified service routes most accounts to different shards than the other, so writes split across shards",
         "The modified service fails fast because the ring detects the hash mismatch",
-        "Only the virtual node positions differ; key lookups are unaffected"
+        "Only the virtual node positions differ; key lookups are unaffected",
+        "The modified service routes most accounts to different shards than the other, so writes split across shards"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The owner is a pure function of the key hash and the point hashes, so a service with a different hash computes different positions for both and disagrees with its peer on almost every account, writing to the wrong shard with no error. Nothing in the ring can detect this; only a cross-service test asserting identical owners for fixed keys, as the lesson's tests do across Java, Python, and Go, catches it."
     }
   ]

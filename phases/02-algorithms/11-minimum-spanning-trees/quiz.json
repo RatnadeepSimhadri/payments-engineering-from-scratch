@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "Eight sites must all be connected by leased lines. Each site leases only its single cheapest line. Why can the result fail to connect everything?",
-      "options": ["Because the cheapest lines are usually the longest ones", "Because two sites can pick each other and form an island with no link outward", "Because at least one site always has no feasible line at all", "Because eight sites need at least eight lines and this picks seven"],
+      "options": [
+        "Because the cheapest lines are usually the longest ones",
+        "Because two sites can pick each other and form an island with no link outward",
+        "Because at least one site always has no feasible line at all",
+        "Because eight sites need at least eight lines and this picks seven"
+      ],
       "correct": 1,
       "explanation": "Picking per node ignores global connectivity: London and Frankfurt pick each other and nothing connects that pair to the rest. A spanning tree on eight nodes needs exactly seven edges, so the count is not the issue; the issue is that connectivity is a property of the whole edge set."
     },
     {
       "stage": "check",
       "question": "Kruskal reaches the edge newyork-chicago (weight 9) after having taken ashburn-newyork (4) and ashburn-chicago (7). What does the union-find say and what does Kruskal do?",
-      "options": ["find(newyork) != find(chicago), so the edge is taken", "find(newyork) == find(chicago), so the edge is skipped as a cycle", "The ranks differ, so the edge is taken and the ranks are merged", "The edge is deferred until all lighter edges have been examined"],
+      "options": [
+        "find(newyork) != find(chicago), so the edge is taken",
+        "find(newyork) == find(chicago), so the edge is skipped as a cycle",
+        "The ranks differ, so the edge is taken and the ranks are merged",
+        "The edge is deferred until all lighter edges have been examined"
+      ],
       "correct": 1,
       "explanation": "New York and Chicago are already connected through Ashburn, so they share a representative and union returns false: taking the edge would close the cycle newyork-ashburn-chicago. Ranks only affect how the trees are attached, never whether an edge is taken."
     },
     {
       "stage": "check",
       "question": "What is the one difference between Prim's heap key and Dijkstra's heap key for a frontier edge (u, v) with u in the tree?",
-      "options": ["Prim uses weight(u,v); Dijkstra uses dist[u] + weight(u,v)", "Prim uses dist[u] + weight(u,v); Dijkstra uses weight(u,v)", "Prim uses the degree of v; Dijkstra uses the weight of the edge", "There is none; the two algorithms produce the same tree"],
+      "options": [
+        "Prim uses weight(u,v); Dijkstra uses dist[u] + weight(u,v)",
+        "Prim uses dist[u] + weight(u,v); Dijkstra uses weight(u,v)",
+        "Prim uses the degree of v; Dijkstra uses the weight of the edge",
+        "There is none; the two algorithms produce the same tree"
+      ],
       "correct": 0,
       "explanation": "Prim asks how much it costs to attach v right now; Dijkstra asks how far v is from the start through u. Dropping the dist[u] term turns Dijkstra into Prim, and keeping it is why a shortest-path tree is in general not a minimum spanning tree."
     },
     {
       "stage": "check",
       "question": "Prim pops an edge from the heap and finds both of its endpoints are already in the tree. What is this and why does it happen?",
-      "options": ["A bug: the frontier should never contain such an edge", "A cycle in the input graph that must be reported to the caller", "A stale entry from lazy deletion: the edge was valid when pushed, and the heap cannot delete it early", "A duplicate edge in the input that should have been rejected at construction"],
+      "options": [
+        "A bug: the frontier should never contain such an edge",
+        "A cycle in the input graph that must be reported to the caller",
+        "A stale entry from lazy deletion: the edge was valid when pushed, and the heap cannot delete it early",
+        "A duplicate edge in the input that should have been rejected at construction"
+      ],
       "correct": 2,
       "explanation": "When v joins the tree, every earlier frontier edge into v becomes stale, but a binary heap cannot remove an arbitrary element cheaply, so the entry stays until it is popped and discarded. Every edge enters the heap at most twice, so the total extra work is bounded by O(E log E)."
     },
     {
       "stage": "post",
       "question": "A colleague's MST implementation returns a spanning tree whose total weight equals Kruskal's on the test graph. Which check could still reveal that the implementation is wrong?",
-      "options": ["Counting that it has V - 1 edges", "Summing the weights a second time with Math.addExact", "Running Prim from a different start node and comparing totals", "Checking that for each tree edge no lighter graph edge crosses the cut it defines"],
+      "options": [
+        "Counting that it has V - 1 edges",
+        "Summing the weights a second time with Math.addExact",
+        "Running Prim from a different start node and comparing totals",
+        "Checking that for each tree edge no lighter graph edge crosses the cut it defines"
+      ],
       "correct": 3,
       "explanation": "Equal totals and the right edge count do not prove minimality or even that the edges form a tree on the right nodes. The cut property applied to every tree edge is a sufficient condition for minimality, so the checker in this lesson is an independent oracle; re-running another algorithm only compares two possibly wrong answers."
     },
     {
       "stage": "post",
       "question": "Removing the k - 1 heaviest edges from a minimum spanning tree gives k components. What clustering does this correspond to?",
-      "options": ["k-means with the tree edges as initial centroids", "Single-linkage clustering: the k groups maximizing the smallest inter-group distance", "Complete-linkage clustering: the k groups minimizing the largest in-group distance", "A balanced partition into k groups of equal size"],
-      "correct": 1,
+      "options": [
+        "k-means with the tree edges as initial centroids",
+        "Complete-linkage clustering: the k groups minimizing the largest in-group distance",
+        "A balanced partition into k groups of equal size",
+        "Single-linkage clustering: the k groups maximizing the smallest inter-group distance"
+      ],
+      "correct": 3,
       "explanation": "Kruskal merges the two closest components at every step, which is exactly single-linkage agglomeration; stopping with k components left is the same as cutting the k - 1 heaviest MST edges. Complete linkage uses the farthest pair between clusters and is not computed by an MST."
     }
   ]

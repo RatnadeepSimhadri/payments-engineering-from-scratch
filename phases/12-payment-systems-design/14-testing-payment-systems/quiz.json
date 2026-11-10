@@ -54,12 +54,12 @@
       "stage": "post",
       "question": "The postOnTimeout bug passes 500 trials and fails at trial 930. What is the lesson's recommended response?",
       "options": [
-        "Raise the trial count in CI to 5,000 so rare sequences are reliably reached",
         "Change the generator so it emits commands legal in the current state and reaches deep paths sooner",
+        "Raise the trial count in CI to 5,000 so rare sequences are reliably reached",
         "Add a hand-written example for the timeout path and drop the property test for it",
         "Lower the fee rate so that the invariant check is more sensitive to small amounts"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "The bug needs an approved authorize, a capture with a specific one-in-five behaviour, and a later reconcile; uniform generation wastes most slots on commands the state machine rejects. A state-aware generator raises the odds of the deep path far more than any affordable trial count. Hand-written examples are kept as regression tests, but the property stays."
     },
     {

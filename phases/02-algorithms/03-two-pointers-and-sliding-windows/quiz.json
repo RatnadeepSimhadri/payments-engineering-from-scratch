@@ -55,11 +55,11 @@
       "question": "A velocity rule says no more than 4 authorizations per trailing 60 seconds. An authorization arrived at t = 0 and another at t = 60,000 ms exactly. Under this lesson's checker, is the first one still in the window?",
       "options": [
         "Yes: the window is inclusive at both ends, so an event 60 seconds old still counts",
-        "No: eviction removes events with timestamp <= now - 60,000, so the boundary is strict and the first is gone",
         "It depends on wall-clock jitter, because the checker reads System.currentTimeMillis() on each call",
-        "Yes: events are only evicted when the window exceeds its count limit, not by time"
+        "Yes: events are only evicted when the window exceeds its count limit, not by time",
+        "No: eviction removes events with timestamp <= now - 60,000, so the boundary is strict and the first is gone"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The trailing window is (t - w, t]; the test pins +60,000 ms as evicted and +59,999 ms as retained. Time is an input (the event's timestamp), never the wall clock, which is what makes the checker replayable. Eviction is by time on every record call, not by count."
     },
     {

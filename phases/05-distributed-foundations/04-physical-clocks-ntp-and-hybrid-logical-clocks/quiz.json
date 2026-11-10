@@ -67,11 +67,11 @@
       "question": "On the payment trace with the ledger's clock 80 ms behind, which statement about the three timestamp schemes is correct?",
       "options": [
         "Wall clock and Lamport both misorder some causal pairs; only HLC orders all of them correctly, because it merges the remote l on receive",
-        "Wall clock misorders some causal pairs; Lamport and HLC order all of them correctly, and only HLC also stays within the skew of true time",
         "All three order every causal pair correctly, but only wall clock and HLC produce values that can be meaningfully compared across nodes",
-        "Lamport and HLC misorder the same causal pairs because both derive from the same max-plus-one counter rule applied on receive"
+        "Lamport and HLC misorder the same causal pairs because both derive from the same max-plus-one counter rule applied on receive",
+        "Wall clock misorders some causal pairs; Lamport and HLC order all of them correctly, and only HLC also stays within the skew of true time"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Both logical clocks satisfy happens-before by construction; the wall clock does not, and the report shows two violated pairs. What HLC adds over Lamport is that its l component stays within the largest clock offset (35 ms in the trace) of true time, so it is still usable as a timestamp. Lamport's value of 9 says nothing about when anything happened."
     }
   ]

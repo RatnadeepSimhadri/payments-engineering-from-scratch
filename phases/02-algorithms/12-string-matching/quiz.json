@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "A screening service calls text.contains(name) for each of 14,000 listed names on every payment. What is the dominant cost, and what property would an ideal replacement have?",
-      "options": ["Memory for 14,000 strings; the replacement should compress the list", "One pass over the text per name; the replacement should read the text once for all names", "Case folding on each call; the replacement should pre-normalize the list", "JVM warm-up on each call; the replacement should cache the compiled matcher"],
+      "options": [
+        "Memory for 14,000 strings; the replacement should compress the list",
+        "One pass over the text per name; the replacement should read the text once for all names",
+        "Case folding on each call; the replacement should pre-normalize the list",
+        "JVM warm-up on each call; the replacement should cache the compiled matcher"
+      ],
       "correct": 1,
       "explanation": "The cost scales with the number of names because each contains call rereads the text. Aho-Corasick reads the text once and reports every listed name, making the per-payment cost independent of list size. Normalization and caching help constants but do not change the scaling."
     },
     {
       "stage": "check",
       "question": "What is the KMP failure function of the pattern ABABAC?",
-      "options": ["[0, 0, 1, 2, 3, 0]", "[0, 1, 2, 3, 4, 0]", "[0, 0, 1, 2, 3, 4]", "[0, 0, 0, 0, 0, 0]"],
+      "options": [
+        "[0, 0, 1, 2, 3, 0]",
+        "[0, 1, 2, 3, 4, 0]",
+        "[0, 0, 1, 2, 3, 4]",
+        "[0, 0, 0, 0, 0, 0]"
+      ],
       "correct": 0,
       "explanation": "fail[i] is the longest proper prefix of P[0..i] that is also its suffix: ABA has A (1), ABAB has AB (2), ABABA has ABA (3), and ABABAC has none because no prefix ends in C. The second option would need every prefix to be a run of one letter, like aaaaa."
     },
     {
       "stage": "check",
       "question": "Rabin-Karp finds that the window hash equals the pattern hash. What must happen next, and why?",
-      "options": ["Report the match; equal hashes of equal-length strings imply equal strings", "Compare the characters, because different strings can share a hash", "Rehash with a second prime and report if both agree", "Advance the window by m characters to avoid overlapping matches"],
+      "options": [
+        "Report the match; equal hashes of equal-length strings imply equal strings",
+        "Compare the characters, because different strings can share a hash",
+        "Rehash with a second prime and report if both agree",
+        "Advance the window by m characters to avoid overlapping matches"
+      ],
       "correct": 1,
       "explanation": "A hash is many-to-one, so a collision is always possible and the character comparison is what makes the algorithm exact. A second hash reduces but does not remove the possibility, and skipping m characters would miss overlapping matches."
     },
     {
       "stage": "check",
       "question": "In the Aho-Corasick automaton for {he, she, his, hers}, the search is at node 'she' after reading 'ushe'. Which patterns are reported, and through which link?",
-      "options": ["Only 'she', because a node reports only its own pattern", "'she' from the node and 'he' through the output link to node 'he'", "'she' and 'his', because both share the letter h", "'he' only, because the failure link replaces the current node"],
-      "correct": 1,
+      "options": [
+        "Only 'she', because a node reports only its own pattern",
+        "'she' and 'his', because both share the letter h",
+        "'he' only, because the failure link replaces the current node",
+        "'she' from the node and 'he' through the output link to node 'he'"
+      ],
+      "correct": 3,
       "explanation": "Node 'she' ends a pattern, so it is reported directly; its output link points to 'he', the nearest node up its failure chain that also ends a pattern, so 'he' ending at the same position is reported too. 'his' does not end here and is not reachable through any link from 'she'."
     },
     {
       "stage": "post",
       "question": "The list contains 'Rashid'. The screener reports 'Rashida Patel' as clear but 'Al Rashid Exchange House' as a hit. Which rule produces exactly that behaviour?",
-      "options": ["Matches must be bounded by separators on both sides (whole-token matching)", "Matches must start at the beginning of the normalized name", "Matches shorter than seven characters are ignored", "Matches are accepted only if the pattern is the longest listed name present"],
+      "options": [
+        "Matches must be bounded by separators on both sides (whole-token matching)",
+        "Matches must start at the beginning of the normalized name",
+        "Matches shorter than seven characters are ignored",
+        "Matches are accepted only if the pattern is the longest listed name present"
+      ],
       "correct": 0,
       "explanation": "Whole-token matching keeps RASHID when it is followed by a space and drops it when it is followed by an A. Requiring a match at the start would miss 'Al Rashid'; a length threshold would drop RASHID in both names; the longest-only rule would still hit on Rashida."
     },
     {
       "stage": "post",
       "question": "Why is KMP's search O(n) even though the inner while loop can run several times for one text character?",
-      "options": ["Because the while loop runs at most once per character in practice", "Because j increases at most once per character and every while iteration strictly decreases j, so total decreases are at most n", "Because the failure function is precomputed, so each lookup is O(1) and there are n lookups", "Because the text is read backwards at most m characters per mismatch"],
-      "correct": 1,
+      "options": [
+        "Because the while loop runs at most once per character in practice",
+        "Because the failure function is precomputed, so each lookup is O(1) and there are n lookups",
+        "Because j increases at most once per character and every while iteration strictly decreases j, so total decreases are at most n",
+        "Because the text is read backwards at most m characters per mismatch"
+      ],
+      "correct": 2,
       "explanation": "This is the amortized argument: j can only go down as much as it has gone up, and it goes up at most n times, so the while loop body runs at most n times across the entire search. Precomputation alone would not bound the number of loop iterations, and KMP never reads the text backwards."
     }
   ]

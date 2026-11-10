@@ -18,12 +18,12 @@
       "stage": "check",
       "question": "A bounded-out-of-orderness watermark with a 5-minute bound has observed a maximum event time of 12:09. An event with time 11:30 then arrives. What is the watermark after observing it?",
       "options": [
-        "11:25, because the watermark tracks the most recent event",
         "12:04, because the watermark never moves backwards",
+        "11:25, because the watermark tracks the most recent event",
         "11:30, because the watermark equals the minimum unfired time",
         "12:09, because a late event forces the watermark to catch up"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "The watermark is max(eventTime) - bound = 12:09 - 5 min = 12:04, and a late event does not lower the maximum. If it moved to 11:25, windows that already fired would have to un-fire. Option D confuses the maximum observed time with the watermark itself."
     },
     {

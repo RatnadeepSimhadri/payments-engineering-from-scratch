@@ -31,11 +31,11 @@
       "question": "After a framing error (a length above the maximum), the server closes the connection rather than skipping the bad frame. Why?",
       "options": [
         "Closing is cheaper than logging the error and continuing",
-        "The protocol has no delimiter, so the reader cannot find where the next frame starts",
         "The client is required to reconnect after every error of any kind",
-        "The Framer object cannot be reused once feed() has thrown"
+        "The Framer object cannot be reused once feed() has thrown",
+        "The protocol has no delimiter, so the reader cannot find where the next frame starts"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Once a length is wrong the reader has lost synchronisation and every later 'frame' would be garbage parsed from inside a payload; without a delimiter there is no way to resynchronise, so closing is the only honest option. A decode error inside a complete frame, by contrast, is skipped because the next boundary is still known."
     },
     {

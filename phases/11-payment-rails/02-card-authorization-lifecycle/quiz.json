@@ -56,11 +56,11 @@
       "options": [
         "AUTHORIZED -> INCREMENT -> AUTHORIZED, and PARTIALLY_CAPTURED -> INCREMENT -> AUTHORIZED",
         "CAPTURED -> VOID -> VOIDED, and PARTIALLY_REFUNDED -> REFUND -> REFUNDED",
-        "PARTIALLY_CAPTURED -> EXPIRE -> EXPIRED, and PARTIALLY_REFUNDED -> REFUND -> REFUNDED",
-        "AUTHORIZED -> REFUND -> PARTIALLY_REFUNDED, and VOIDED -> CAPTURE -> CAPTURED"
+        "PARTIALLY_CAPTURED -> EXPIRE -> CAPTURED, and PARTIALLY_REFUNDED -> REFUND -> REFUNDED",
+        "PARTIALLY_CAPTURED -> EXPIRE -> EXPIRED, and VOIDED -> CAPTURE -> CAPTURED"
       ],
       "correct": 2,
-      "explanation": "A partially captured authorization still has an open hold, so it can expire; a partially refunded transaction can keep refunding until refunded equals captured. INCREMENT is only legal from AUTHORIZED (the first option's second edge is forbidden), VOID is illegal once anything is captured, REFUND needs captured funds, and VOIDED is terminal."
+      "explanation": "When the open remainder of a partial capture lapses, the EXPIRE event moves the transaction to CAPTURED, the same end state as CLOSE_CAPTURE, because captured funds must stay refundable and a terminal state can never hold captured money; a partially refunded transaction can keep refunding until refunded equals captured. The fourth option's first edge is the trap: only a never-captured AUTHORIZED transaction goes to EXPIRED. INCREMENT is only legal from AUTHORIZED, VOID is illegal once anything is captured, and VOIDED is terminal."
     },
     {
       "stage": "post",

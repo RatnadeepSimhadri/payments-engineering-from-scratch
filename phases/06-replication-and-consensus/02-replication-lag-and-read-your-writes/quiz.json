@@ -5,42 +5,72 @@
     {
       "stage": "pre",
       "question": "A service writes to a leader and reads from asynchronous replicas. Right after a successful write, a read of the same key returns the old value. Which component violated its contract?",
-      "options": ["The leader, because it acknowledged before replicas applied the write", "The replica, because it served a value it knew to be stale", "The load balancer, because it should pin a client to one replica", "None of them; the read was routed without any freshness requirement"],
+      "options": [
+        "The leader, because it acknowledged before replicas applied the write",
+        "The replica, because it served a value it knew to be stale",
+        "The load balancer, because it should pin a client to one replica",
+        "None of them; the read was routed without any freshness requirement"
+      ],
       "correct": 3,
       "explanation": "Asynchronous replication means the leader acknowledges before replicas apply, replicas serve whatever they have, and load balancers spread reads. Each did its job. The missing piece is a freshness requirement on the read, which is what a session token supplies. Pinning a client to one replica helps monotonic reads but does not by itself guarantee the replica has the client's write."
     },
     {
       "stage": "check",
       "question": "A replica reports appliedLsn = 16 while it has also applied record #18. What must be true for that report to be honest?",
-      "options": ["Record #17 has arrived and is waiting in the reorder buffer", "Record #17 has not been applied, so the watermark stops at 16", "Record #18 was a no-op that does not count toward the watermark", "The replica is in on-arrival mode and has applied 17 as well"],
+      "options": [
+        "Record #17 has arrived and is waiting in the reorder buffer",
+        "Record #17 has not been applied, so the watermark stops at 16",
+        "Record #18 was a no-op that does not count toward the watermark",
+        "The replica is in on-arrival mode and has applied 17 as well"
+      ],
       "correct": 1,
       "explanation": "appliedLsn is the highest LSN such that every record up to it has been applied. Having #18 but not #17 leaves the watermark at 16, which is exactly what a session floor must compare against; overstating it would let a floor of 17 be satisfied by a replica missing record 17. Whether #17 is in the buffer or still in flight does not change the watermark."
     },
     {
       "stage": "check",
       "question": "A session's last write was at LSN 42 and its last read was served at LSN 45. In SESSION mode, what floor does the next read use and why?",
-      "options": ["42, because read-your-writes is the stronger of the two guarantees", "45, because the floor is the maximum of the write and read LSNs", "87, because the two floors are combined by adding them together", "0, because the session has already observed its own write once"],
+      "options": [
+        "42, because read-your-writes is the stronger of the two guarantees",
+        "45, because the floor is the maximum of the write and read LSNs",
+        "87, because the two floors are combined by adding them together",
+        "0, because the session has already observed its own write once"
+      ],
       "correct": 1,
       "explanation": "SESSION mode takes max(lastWriteLsn, lastReadLsn) = 45. A floor of 42 would satisfy read-your-writes but allow a later read at LSN 43 or 44, which is older than the state already seen and so breaks monotonic reads. The floors are both positions in one log, so the maximum, not the sum, is the right combination."
     },
     {
       "stage": "check",
       "question": "A dashboard reads payment:p-7:capture = CAPTURED and payment:p-7:auth missing from the same replica at the same tick, although the authorization was written first. Which fix removes this anomaly?",
-      "options": ["Carry a read-your-writes token so the dashboard reads from a fresher replica", "Make the replica apply records in LSN order instead of on arrival", "Route all dashboard reads to the leader for five seconds after any write", "Pin the dashboard session to a single replica so reads are monotonic"],
-      "correct": 1,
+      "options": [
+        "Carry a read-your-writes token so the dashboard reads from a fresher replica",
+        "Route all dashboard reads to the leader for five seconds after any write",
+        "Pin the dashboard session to a single replica so reads are monotonic",
+        "Make the replica apply records in LSN order instead of on arrival"
+      ],
+      "correct": 3,
       "explanation": "Seeing a later record without an earlier one means the replica's state is not a prefix of the leader's history, which only an on-arrival apply loop can produce. A reorder buffer that applies only the contiguous prefix restores consistent prefix. Tokens, pinning, and leader windows address which replica serves a read, not the order in which one replica applied records."
     },
     {
       "stage": "post",
       "question": "In the 20-seed run, READ_YOUR_WRITES sent 1780 of 6000 reads to the leader while LEADER mode sent all 6000. Which statement about the 1780 is correct?",
-      "options": ["They are the reads where every replica was behind the session's last write, so the alternative was a wrong answer", "They are wasted capacity, because a sticky replica would have served every one of them correctly", "They are the reads from sessions that had never written, since those have no replica to prefer", "They are an artefact of the simulation; with real latencies the leader share is always above half"],
+      "options": [
+        "They are the reads where every replica was behind the session's last write, so the alternative was a wrong answer",
+        "They are wasted capacity, because a sticky replica would have served every one of them correctly",
+        "They are the reads from sessions that had never written, since those have no replica to prefer",
+        "They are an artefact of the simulation; with real latencies the leader share is always above half"
+      ],
       "correct": 0,
       "explanation": "The router falls back to the leader only when no replica's watermark reaches the floor, so each of those reads would have missed the session's own write on any replica. Sticky routing does not make a slow replica faster. Sessions with no writes have floor 0 and never redirect. Real systems with sub-second page loads and millisecond lag see a far smaller leader share, not a larger one."
     },
     {
       "stage": "post",
       "question": "After a failover promotes a replica whose watermark is 40, a client presents a token with LSN 42. What should the read router do?",
-      "options": ["Serve from the new leader, since the leader is always the freshest node available", "Wait until the new leader's LSN reaches 42 by accepting new writes, then serve", "Report the floor as unsatisfiable, because records 41 and 42 were lost in the failover", "Lower the token to 40 and serve, since the client cannot tell the difference"],
+      "options": [
+        "Serve from the new leader, since the leader is always the freshest node available",
+        "Wait until the new leader's LSN reaches 42 by accepting new writes, then serve",
+        "Report the floor as unsatisfiable, because records 41 and 42 were lost in the failover",
+        "Lower the token to 40 and serve, since the client cannot tell the difference"
+      ],
       "correct": 2,
       "explanation": "The new leader never had records 41 and 42; they existed only on the old leader. New writes will reuse those LSNs with different content, so waiting or serving would satisfy the number while violating the guarantee. The honest response is an explicit failure, and the structural fix is Raft's rule of acknowledging only writes a majority holds (Lesson 06)."
     }

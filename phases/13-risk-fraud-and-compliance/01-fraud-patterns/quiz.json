@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "A merchant's authorisation attempts jump from 6 per minute to 300 per minute at 2 a.m., 75% of them declined, almost all for $1.00. Before reading the lesson, what is the most likely explanation?",
-      "options": ["A marketing email landed in a timezone where it is daytime", "Someone is using the checkout to sort stolen card numbers", "The acquirer is flapping and retrying the same authorisations", "A subscription renewal batch is running at its scheduled hour"],
+      "options": [
+        "A marketing email landed in a timezone where it is daytime",
+        "Someone is using the checkout to sort stolen card numbers",
+        "The acquirer is flapping and retrying the same authorisations",
+        "A subscription renewal batch is running at its scheduled hour"
+      ],
       "correct": 1,
       "explanation": "Small identical amounts, a very high decline ratio, and a sudden volume spike at a quiet hour are the signature of card testing: the form is being used as an oracle for card validity. A renewal batch or marketing spike would have a normal decline ratio and normal ticket sizes; acquirer retries would show repeated identical cards, not thousands of distinct ones."
     },
     {
       "stage": "check",
       "question": "Why does a card-testing attack cost the merchant money even though almost every attempt is declined?",
-      "options": ["Issuers charge the merchant for every card they flag as compromised", "The gateway bills a higher rate once the decline ratio exceeds 50%", "Each attempt incurs an authorisation fee, and the approved ones become chargebacks with fees", "Declined authorisations still settle and must be refunded manually"],
+      "options": [
+        "Issuers charge the merchant for every card they flag as compromised",
+        "The gateway bills a higher rate once the decline ratio exceeds 50%",
+        "Each attempt incurs an authorisation fee, and the approved ones become chargebacks with fees",
+        "Declined authorisations still settle and must be refunded manually"
+      ],
       "correct": 2,
       "explanation": "Acquirers charge an authorisation fee on every attempt, approved or declined, and the approved low-value attempts are disputed later at $15 to $25 each. Network monitoring programmes may add fines on top. Declined authorisations never settle, so there is nothing to refund; the cost is fees, chargebacks, and a damaged risk rating."
     },
     {
       "stage": "check",
       "question": "An account logs in from a new device in a new country, changes its email, changes its password, then buys a $480 gift card shipped to a never-seen address, all within three minutes. Which statement about detection is correct?",
-      "options": ["Each event is individually anomalous enough to block on its own", "Only the sequence is anomalous; each event alone looks like normal account behaviour", "The purchase alone is anomalous because saved-card payments are high risk", "Only the login is anomalous; the later events are consequences and add no signal"],
+      "options": [
+        "Each event is individually anomalous enough to block on its own",
+        "Only the sequence is anomalous; each event alone looks like normal account behaviour",
+        "The purchase alone is anomalous because saved-card payments are high risk",
+        "Only the login is anomalous; the later events are consequences and add no signal"
+      ],
       "correct": 1,
       "explanation": "Account takeover is detected as a sequence: new device, then contact-detail change, then purchase to a new address, in a short window. People do travel, change emails, and buy gift cards, so no single event justifies blocking. A saved card on a logged-in account is normally the lowest-risk payment type, which is exactly why the sequence, not the payment, must carry the signal."
     },
     {
       "stage": "check",
       "question": "A cardholder disputes a $89 subscription renewal as 'not recognised'. The merchant shows two prior undisputed renewals on the same card from the same device and account login and wins representment. What happens to the merchant's dispute ratio for that month?",
-      "options": ["It is unchanged, because the dispute still counts in the month it was raised", "It falls, because a won dispute is removed from the count", "It falls only if the win is confirmed within 30 days", "It rises, because representments are counted as a second dispute"],
+      "options": [
+        "It is unchanged, because the dispute still counts in the month it was raised",
+        "It falls, because a won dispute is removed from the count",
+        "It falls only if the win is confirmed within 30 days",
+        "It rises, because representments are counted as a second dispute"
+      ],
       "correct": 0,
       "explanation": "Network monitoring programmes count disputes raised in a month against sales in that month; winning the representment returns the $89 but not the fee and does not remove the dispute from the count. That is why pre-dispute alerts and refunds, which prevent the chargeback from being filed at all, are the only lever that lowers the ratio."
     },
     {
       "stage": "post",
       "question": "A marketplace sees new sellers offering electronics 30% below retail, with tracking numbers originating from a large retailer's warehouse, and buyer complaints arriving months later. Which pattern is this and who bears the loss today?",
-      "options": ["Refund abuse; the marketplace bears it through refunds to new instruments", "Account takeover; the sellers' accounts have been hijacked and the sellers bear it", "Triangulation; the retailer whose goods were bought with stolen cards bears it", "Bust-out; the marketplace bears it through unpaid seller credit lines"],
+      "options": [
+        "Refund abuse; the marketplace bears it through refunds to new instruments",
+        "Account takeover; the sellers' accounts have been hijacked and the sellers bear it",
+        "Triangulation; the retailer whose goods were bought with stolen cards bears it",
+        "Bust-out; the marketplace bears it through unpaid seller credit lines"
+      ],
       "correct": 2,
       "explanation": "This is triangulation: the seller takes real buyers' money, then fulfils orders from a legitimate retailer using stolen cards. The retailer eats the chargebacks months later; the marketplace is exposed only when the seller's payouts have already left. Account takeover would show profile changes on existing sellers, not newly onboarded ones selling below cost."
     },
     {
       "stage": "post",
       "question": "After a wave of 'not recognised' disputes on legitimate subscription renewals, a team proposes adding a CAPTCHA to checkout and declining all transactions above a risk score of 80. What is the most accurate assessment?",
-      "options": ["Both controls reduce the disputes because they add friction for fraudsters", "Neither control touches friendly fraud; both add cost on real customers, and the second blocks revenue", "The CAPTCHA helps but the score threshold is too high to matter", "The score threshold helps but the CAPTCHA should be shown only after a decline"],
-      "correct": 1,
+      "options": [
+        "Both controls reduce the disputes because they add friction for fraudsters",
+        "The CAPTCHA helps but the score threshold is too high to matter",
+        "The score threshold helps but the CAPTCHA should be shown only after a decline",
+        "Neither control touches friendly fraud; both add cost on real customers, and the second blocks revenue"
+      ],
+      "correct": 3,
       "explanation": "Friendly fraud is committed by real customers on transactions that look legitimate at authorisation time, so neither a CAPTCHA nor a risk-score decline changes the dispute count; they only reduce conversion. The controls that work are clear statement descriptors, renewal reminders, easy refunds, pre-dispute alerts, and retained device and login evidence for representment."
     }
   ]

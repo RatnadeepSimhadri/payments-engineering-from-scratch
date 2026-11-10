@@ -56,10 +56,10 @@
       "options": [
         "Five independent breaches occurred and each should be investigated separately",
         "The operator double-counted records; sliding windows should assign each record to one window",
-        "A single burst is visible to every window that fully contains it, so repeats are expected and need suppression downstream",
-        "The timer interval is too coarse; a 1-second timer would emit the breach exactly once"
+        "The timer interval is too coarse; a 1-second timer would emit the breach exactly once",
+        "A single burst is visible to every window that fully contains it, so repeats are expected and need suppression downstream"
       ],
-      "correct": 2,
+      "correct": 3,
       "explanation": "Sliding windows overlap by design, so a burst lasting less than size minus slide is wholly inside several windows and each reports it; the repeats are the cost of catching the burst at all and are removed by suppressing further breaches per card until the count drops. Assigning each record to one window is the tumbling model that missed the burst, and the timer interval decides when windows emit, not how many of them see the burst."
     },
     {

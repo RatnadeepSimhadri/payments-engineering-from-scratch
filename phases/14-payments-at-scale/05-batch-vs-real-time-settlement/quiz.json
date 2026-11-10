@@ -66,12 +66,12 @@
       "stage": "post",
       "question": "Which check proves that no payout was lost or paid twice after a batch run?",
       "options": [
-        "Each merchant's payable equals carried balance plus unsettled event effects",
         "The settlement file's trailer total equals the sum of its detail lines",
         "The number of payout instructions equals the number of active merchants",
-        "The acquirer's funding wire equals the batch's total payout amount"
+        "The acquirer's funding wire equals the batch's total payout amount",
+        "Each merchant's payable equals carried balance plus unsettled event effects"
       ],
-      "correct": 0,
+      "correct": 3,
       "explanation": "The tie-out derives each merchant's expected balance from events and carries and compares it with the ledger, so a duplicated payout or an event settled without being netted shows up as a mismatch. The trailer check only proves the file is internally consistent; a file that pays a merchant twice in two batches still has a correct trailer."
     }
   ]

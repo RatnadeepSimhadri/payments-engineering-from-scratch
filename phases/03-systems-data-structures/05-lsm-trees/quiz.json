@@ -43,23 +43,23 @@
       "question": "A compaction merges three SSTables but leaves a fourth, older one untouched. A key has a tombstone in one of the three and a live value in the fourth. What must the output contain?",
       "options": [
         "Nothing for that key, since the tombstone wins the merge",
-        "The tombstone, because dropping it would let the old value reappear",
         "The live value copied from the fourth table so the key is consistent",
-        "A tombstone in the fourth table as well, written during the merge"
+        "A tombstone in the fourth table as well, written during the merge",
+        "The tombstone, because dropping it would let the old value reappear"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A tombstone can only be dropped when no table outside the compaction could hold an older value; here the fourth table does, so the tombstone must be carried forward. The fourth table is immutable and cannot be edited, and copying the old value would undo the delete."
     },
     {
       "stage": "post",
       "question": "The demo reports write amplification 4.25x: 1.5 MB written by the user, 6.4 MB written to disk. Where do the extra bytes come from?",
       "options": [
-        "The Bloom filter and sparse index are stored on disk with each table",
         "Each flushed byte is rewritten once per compaction tier it passes through",
+        "The Bloom filter and sparse index are stored on disk with each table",
         "Every write is first appended to a log and then written again at flush",
         "Tombstones double the size of every table that contains a deleted key"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "A byte is written at flush and then copied each time its table is merged into a larger tier; with four tiers in the demo that is about four to five writes per byte. The lesson keeps the Bloom filter and index in memory and has no log, and tombstones are a few bytes each."
     },
     {
@@ -67,11 +67,11 @@
       "question": "A payment-status service writes 40,000 records per second and reads a few hundred, mostly recent keys. Which storage choice and reasoning fit?",
       "options": [
         "A B-tree, because every read must be a single page lookup and reads are what the service is judged on",
-        "An LSM tree with size-tiered compaction: sequential flushes, low write amplification, recent keys in the memtable or newest tables",
         "A hash index on the UUID keys, because random keys give uniform bucket distribution and O(1) lookups",
-        "An LSM tree with compaction disabled, since reads are rare enough that scanning many files does not matter"
+        "An LSM tree with compaction disabled, since reads are rare enough that scanning many files does not matter",
+        "An LSM tree with size-tiered compaction: sequential flushes, low write amplification, recent keys in the memtable or newest tables"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Write-heavy with random keys is the LSM case: appends instead of random page writes, and size-tiered compaction keeps write amplification near the number of tiers. Recent-key reads hit the memtable or the newest tables. Without compaction the file count grows unboundedly and even rare reads degrade; a hash index still pays the random-page write cost."
     }
   ]

@@ -67,11 +67,11 @@
       "question": "A bug in the daily-activity projection's code counted reversed withdrawals twice for three months. What is the correct remedy?",
       "options": [
         "Write a script that corrects the affected rows in place and keep the projection running",
-        "Register a new version with the fixed code, rebuild it from position 0, and promote it when caught up",
         "Delete the three months of events from the log and re-enter them through corrected commands",
-        "Add a compensating event to each affected account's stream so the next apply undoes the error"
+        "Add a compensating event to each affected account's stream so the next apply undoes the error",
+        "Register a new version with the fixed code, rebuild it from position 0, and promote it when caught up"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A projection's rows are derived; when the code was wrong the fix is new code and a rebuild, which can be checked against the log and cannot be undone by the next rebuild. Patching rows in place is unverifiable and is silently reverted the next time the view is rebuilt. Events are facts and are never deleted; compensating events belong to the write model and would corrupt every other projection to fix one."
     }
   ]

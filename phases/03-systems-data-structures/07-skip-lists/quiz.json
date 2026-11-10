@@ -31,23 +31,23 @@
       "question": "What does a span of 4 on the header's level-4 pointer to key 367 mean, and what does it make possible?",
       "options": [
         "367 participates in four lists, one for each of its levels, and the header mirrors that count",
-        "The pointer jumps over four level-0 positions, so 367 has rank 4; summing spans gives rank in O(log n)",
         "Four nodes were inserted into the list before 367 arrived, and the header remembers the insertion order",
-        "The header keeps four duplicate pointers at that level so a corrupted pointer can be recovered"
+        "The header keeps four duplicate pointers at that level so a corrupted pointer can be recovered",
+        "The pointer jumps over four level-0 positions, so 367 has rank 4; summing spans gives rank in O(log n)"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A span counts level-0 steps the pointer skips. Accumulating spans along a search path yields the rank of the node reached, which is how Redis's ZRANK runs in O(log n). The node's own level and its insertion history are unrelated to the span value."
     },
     {
       "stage": "check",
       "question": "The demo inserts 100,000 keys in sorted order and measures 33.1 comparisons per search, the same as for random order. Why does sorted input not degrade a skip list the way it degrades a plain BST?",
       "options": [
-        "Because the skip list rebalances itself after every insert, exactly as an AVL tree does with rotations",
         "Because a node's level comes from an independent coin flip, so the shape does not depend on the keys or their order",
+        "Because the skip list rebalances itself after every insert, exactly as an AVL tree does with rotations",
         "Because sorted keys all land at the tail of the list, where a search starting from the head is cheapest",
         "Because the skip list stores its keys in a contiguous array and uses binary search inside each level"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Balance comes from randomness that is independent of the data: the level distribution is geometric regardless of what the keys are or when they arrive. There is no rebalancing step at all, and searches still start at the head and descend; a biased or key-derived coin is the only thing that can degrade it."
     },
     {
@@ -55,11 +55,11 @@
       "question": "A list is built with a level source that always returns 1. What happens, and what does it demonstrate?",
       "options": [
         "Insert fails on the second key, because every non-header node must hold at least two levels to be linked",
-        "The list stays correct but search costs about n/2 comparisons: the randomness, not the data, is what balances it",
         "Search still costs O(log n) because the header retains all of its levels and skips over the flat nodes",
-        "The list silently promotes every other node to level 2 so that the expected shape is preserved anyway"
+        "The list silently promotes every other node to level 2 so that the expected shape is preserved anyway",
+        "The list stays correct but search costs about n/2 comparisons: the randomness, not the data, is what balances it"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Without promotions the structure is a sorted linked list: still a correct map, but O(n) to search (11,364 comparisons for 20,000 keys in the demo). It shows that the probabilistic guarantee depends entirely on a fair, independent coin, which is why the RNG is injected and never derived from keys."
     },
     {

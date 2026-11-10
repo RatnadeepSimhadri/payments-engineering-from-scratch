@@ -68,10 +68,10 @@
       "options": [
         "The Raft log replication has a latent bug that the Lesson 06 invariant checks did not detect",
         "The checker's 64-operation limit was exceeded and the result is meaningless",
-        "The read path returned state from a replica without confirming it had applied all committed entries",
-        "Two of the clients used different clocks and the history must be sequentially consistent instead"
+        "Two of the clients used different clocks and the history must be sequentially consistent instead",
+        "The read path returned state from a replica without confirming it had applied all committed entries"
       ],
-      "correct": 2,
+      "correct": 3,
       "explanation": "A correct Raft log makes the committed sequence linearizable, but a read that bypasses it (served from a follower's or a deposed leader's state machine) can return a value older than an acknowledged write; the fix is ReadIndex or lease reads. Thirty ops is under the limit, and clock skew would be a reason to widen intervals, not to change the consistency model being claimed."
     }
   ]

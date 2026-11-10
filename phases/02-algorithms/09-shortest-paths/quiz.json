@@ -5,42 +5,72 @@
     {
       "stage": "pre",
       "question": "A conversion from USD to JPY can go direct or through EUR. The result of a route is determined by what operation on the per-hop rates?",
-      "options": ["Their sum, which is why shortest-path algorithms apply directly", "Their product, which must be turned into a sum before shortest-path algorithms apply", "Their maximum, since the worst hop dominates the route", "Their average, weighted by the number of hops in the route"],
-      "correct": 1,
+      "options": [
+        "Their sum, which is why shortest-path algorithms apply directly",
+        "Their maximum, since the worst hop dominates the route",
+        "Their average, weighted by the number of hops in the route",
+        "Their product, which must be turned into a sum before shortest-path algorithms apply"
+      ],
+      "correct": 3,
       "explanation": "10,000 USD x 0.91816 x 162.714 multiplies the rates along the path. Shortest-path algorithms minimise sums, so the lesson takes the negative logarithm of each rate to turn the product into a sum. Treating rates as additive is the mistake that makes an engineer reach for Dijkstra on the raw numbers."
     },
     {
       "stage": "check",
       "question": "Edges: A->B 1, A->C 3, C->B -3. Dijkstra from A reports the distance to B as 1 while the true distance is 0. Which step of the algorithm produced the wrong answer?",
-      "options": ["The heap popped C before B because the heap was not indexed", "B was settled when popped with distance 1, and settled nodes are never relaxed again", "The relaxation of C->B overflowed because the weight was negative", "The parent map recorded A for B and could not be updated to C"],
-      "correct": 1,
+      "options": [
+        "B was settled when popped with distance 1, and settled nodes are never relaxed again",
+        "The heap popped C before B because the heap was not indexed",
+        "The relaxation of C->B overflowed because the weight was negative",
+        "The parent map recorded A for B and could not be updated to C"
+      ],
+      "correct": 0,
       "explanation": "Dijkstra's invariant is that a popped node's distance is final, which holds only because remaining edges cannot shorten a path. The negative edge C->B offers 3 + (-3) = 0 after B is already settled, and the algorithm correctly refuses to touch a settled node, which is now the wrong thing to do. The parent map and heap behaved normally; the premise was violated."
     },
     {
       "stage": "check",
       "question": "Why does Bellman-Ford run a V-th round of relaxation after the V-1 rounds that suffice for shortest paths?",
-      "options": ["To propagate distances to nodes that became reachable only in the last round", "To recompute parent pointers so the path reconstruction is consistent", "Because any relaxation in that round proves a reachable negative cycle exists", "To reset the early-exit flag before the algorithm returns its result"],
+      "options": [
+        "To propagate distances to nodes that became reachable only in the last round",
+        "To recompute parent pointers so the path reconstruction is consistent",
+        "Because any relaxation in that round proves a reachable negative cycle exists",
+        "To reset the early-exit flag before the algorithm returns its result"
+      ],
       "correct": 2,
       "explanation": "After V-1 rounds every shortest path, which has at most V-1 edges, is final; if some edge still relaxes, a walk keeps getting shorter, which only a negative cycle can cause. Reachability is already complete after V-1 rounds, and parent pointers are maintained during every relaxation, not in a separate pass."
     },
     {
       "stage": "check",
       "question": "Rates 0.16, 0.25, and 25.0 form a cycle whose product is exactly 1, yet the lesson's integer weights sum to -1 micro-nat and Bellman-Ford reports a negative cycle. What does the lesson do about it?",
-      "options": ["Increases WEIGHT_SCALE until the rounding error disappears for this input", "Treats the cycle as a candidate and confirms it with an exact big-integer product of the scaled rates", "Switches to double weights, which represent the logarithms more precisely", "Ignores cycles whose total weight is within one micro-nat of zero"],
-      "correct": 1,
+      "options": [
+        "Increases WEIGHT_SCALE until the rounding error disappears for this input",
+        "Switches to double weights, which represent the logarithms more precisely",
+        "Ignores cycles whose total weight is within one micro-nat of zero",
+        "Treats the cycle as a candidate and confirms it with an exact big-integer product of the scaled rates"
+      ],
+      "correct": 3,
       "explanation": "Each weight is rounded to the nearest micro-nat, so a k-edge cycle total can be off by up to k/2. The integer weights are a deterministic candidate finder; the exact rational product (numerator over RATE_SCALE^k) is the decision, and it rejects this cycle. A larger scale or doubles would move the threshold without removing it, and a tolerance constant becomes a cross-service disagreement."
     },
     {
       "stage": "post",
       "question": "An engineer proposes making the FX weights non-negative by adding a constant to every -ln(rate) so Dijkstra can be used. What goes wrong?",
-      "options": ["Nothing; shortest paths are unchanged because every edge shifts by the same amount", "Routes with more hops absorb more of the constant, so multi-leg routes are penalised and the best route can change", "The constant makes every cycle positive, so arbitrage detection becomes impossible but routing stays correct", "Dijkstra still rejects the graph because the heap requires strictly positive weights"],
+      "options": [
+        "Nothing; shortest paths are unchanged because every edge shifts by the same amount",
+        "Routes with more hops absorb more of the constant, so multi-leg routes are penalised and the best route can change",
+        "The constant makes every cycle positive, so arbitrage detection becomes impossible but routing stays correct",
+        "Dijkstra still rejects the graph because the heap requires strictly positive weights"
+      ],
       "correct": 1,
       "explanation": "A path's shifted length is its true length plus the constant times its edge count, so a two-leg route is charged twice as much extra as a direct quote. That systematically prefers direct quotes, which is exactly the bug the lesson opened with. Dijkstra accepts zero weights, so the last option is wrong; and losing arbitrage detection is a second cost, not the only one."
     },
     {
       "stage": "post",
       "question": "The treasury service needs (a) the cheapest route by total spread in basis points, and (b) a check that the quote set contains no arbitrage loop. Which pairing is correct?",
-      "options": ["(a) Bellman-Ford on basis points; (b) Dijkstra on -ln(rate) weights from each currency", "(a) Dijkstra on basis points; (b) Bellman-Ford on -ln(rate) weights from a virtual source, then an exact product check", "(a) Dijkstra on -ln(rate) weights; (b) BFS on the undirected view to find connected components", "(a) BFS by hop count; (b) Bellman-Ford on basis points from the home currency"],
+      "options": [
+        "(a) Bellman-Ford on basis points; (b) Dijkstra on -ln(rate) weights from each currency",
+        "(a) Dijkstra on basis points; (b) Bellman-Ford on -ln(rate) weights from a virtual source, then an exact product check",
+        "(a) Dijkstra on -ln(rate) weights; (b) BFS on the undirected view to find connected components",
+        "(a) BFS by hop count; (b) Bellman-Ford on basis points from the home currency"
+      ],
       "correct": 1,
       "explanation": "Spread costs are non-negative, so Dijkstra is correct and faster. Negative-log weights are negative for rates above 1, which rules out Dijkstra; Bellman-Ford handles them, a virtual source reaches every cycle in one run, and the exact product confirms the candidate. Hop counts and components answer different questions entirely."
     }

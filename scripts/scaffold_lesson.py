@@ -270,7 +270,9 @@ def scaffold(phase: dict, lesson: dict, planned: bool, force: bool) -> Path:
     if planned or lesson["type"] == "Learn" and planned:
         write(path / "docs" / "en.md", PLANNED_TEMPLATE.format(phase=phase["number"], **lesson), force)
         return path
-    prereqs = "None" if lesson["n"] == 1 else f"Phase {phase['number']}, Lesson {lesson['n'] - 1:02d}"
+    prev = next((l for l in phase["lessons"] if l["n"] == lesson["n"] - 1), None)
+    prev_title = prev["title"].split(":")[0] if prev else ""
+    prereqs = "None" if prev is None else f"Phase {phase['number']} Lesson {prev['n']:02d} ({prev_title})"
     write(
         path / "docs" / "en.md",
         DOCS_TEMPLATE.format(

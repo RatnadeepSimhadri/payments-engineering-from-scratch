@@ -43,23 +43,23 @@
       "question": "'Find the cheapest THB-to-NGN conversion through available currency pairs.' Which tempting pattern is wrong here, and why?",
       "options": [
         "Dijkstra, because currency graphs are always far too large for a heap-based search",
-        "BFS, because it minimizes hops rather than cost and can return a two-hop route costlier than a three-hop one",
         "Union-find, because it can only tell whether two currencies are connected, not through which pairs",
-        "Sliding window, because rates change over time and a trailing window would capture the drift"
+        "Sliding window, because rates change over time and a trailing window would capture the drift",
+        "BFS, because it minimizes hops rather than cost and can return a two-hop route costlier than a three-hop one"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "BFS treats every edge as cost 1; the problem has weighted edges (spreads), so the fewest-hop path is not the cheapest. Dijkstra on -log(rate) weights is the right tool, with Bellman-Ford if any rate exceeds 1 after spread. Union-find does answer connectivity, just not cost."
     },
     {
       "stage": "post",
       "question": "'Smallest per-job timeout such that 99.9% of yesterday's jobs would have finished.' Which pattern is the most direct, and what does the binary-search-on-the-answer view add?",
       "options": [
-        "Sort every duration; binary search adds nothing because once sorted the data is already ordered by X",
         "Quickselect for the 99.9th percentile in O(n); the binary-search view shows the answer is unique since the fraction finishing within X is monotone in X",
+        "Sort every duration; binary search adds nothing because once sorted the data is already ordered by X",
         "Dynamic programming over job durations in minor units; binary search is used only to size the table before filling it",
         "A heap of all durations popped 0.1% of the way; binary search locates the heap index at which to stop popping"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "The answer is an order statistic, so selection finds it in linear time without a sort. Seeing the problem as 'minimum X such that a monotone check passes' is what guarantees a unique answer exists and would let you binary search if the data were only available through a counting query. DP and heaps do not fit the shape."
     },
     {
@@ -67,11 +67,11 @@
       "question": "In the Cloudflare (2019) and Stack Overflow (2016) outages, what was the shared recognition failure?",
       "options": [
         "Using a hash map for lookups where a sorted array with binary search was the required structure",
-        "Choosing a backtracking regex engine for a matching task without asking its cost per unit of input, when a linear-time approach existed",
         "Running Dijkstra on a currency graph with negative edges so that the shortest path returned was silently wrong",
-        "Sampling the first N requests of each day instead of drawing a uniform reservoir sample across the whole stream"
+        "Sampling the first N requests of each day instead of drawing a uniform reservoir sample across the whole stream",
+        "Choosing a backtracking regex engine for a matching task without asking its cost per unit of input, when a linear-time approach existed"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Both incidents were quadratic regex behaviour on long inputs: a WAF rule and a whitespace trim. The fixes were a linear-time matching engine and a hand-written O(n) loop. The miss was not skill but skipping the input-size and cost-per-unit questions before reaching for the familiar tool."
     }
   ]

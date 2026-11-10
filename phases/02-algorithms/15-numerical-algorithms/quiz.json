@@ -55,11 +55,11 @@
       "question": "A team tests its Luhn implementation by flipping one random digit a thousand times and reports 100% detection. Which real keying error class is their test blind to, and what does Luhn actually do with it?",
       "options": [
         "Twin errors (aa -> bb); Luhn detects all of them because doubled and undoubled digits sum differently",
-        "Jump transpositions (digits two apart swapped); Luhn detects none of them because the two positions carry the same weight",
         "Adjacent transpositions; Luhn detects none of them because its weights alternate between the two positions",
-        "Single-digit errors in the check position itself; Luhn ignores the check digit when it validates a number"
+        "Single-digit errors in the check position itself; Luhn ignores the check digit when it validates a number",
+        "Jump transpositions (digits two apart swapped); Luhn detects none of them because the two positions carry the same weight"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Positions two apart are both doubled or both undoubled, so swapping them leaves the sum unchanged: the aggregate run shows 0 of 2,531 jump transpositions caught. Luhn catches most adjacent transpositions (all but 09/90) and most twin errors (all but three pairs). A single-random-flip test can never surface a weakness in transpositions, which is why the lesson enumerates each class exhaustively."
     },
     {

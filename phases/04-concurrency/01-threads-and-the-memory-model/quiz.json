@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "Two threads each run `balance += 2500` once on a field that starts at 10000, with no synchronization. Which final values does the Java memory model permit?",
-      "options": ["Only 15000, because each thread adds once", "12500 or 15000, depending on how the threads interleave", "Only 12500, because the second write always wins", "Any value, because the result is undefined behaviour"],
+      "options": [
+        "Only 15000, because each thread adds once",
+        "12500 or 15000, depending on how the threads interleave",
+        "Only 12500, because the second write always wins",
+        "Any value, because the result is undefined behaviour"
+      ],
       "correct": 1,
       "explanation": "The statement compiles to a read, an add, and a write. If both reads happen before either write, both threads compute 12500 and one update is lost; otherwise the result is 15000. Java does not make racy programs undefined (unlike C++): every read sees a value some write produced, so arbitrary garbage is not allowed, only the lost update."
     },
     {
       "stage": "check",
       "question": "A worker loops on `while (!done) {}` where `done` is a plain boolean set to true by another thread. After JIT warm-up the loop never exits. Which property is missing, and what fixes it?",
-      "options": ["Atomicity; wrap the read in a synchronized block", "Visibility; declare the field volatile so the write happens-before the read", "Ordering; add a Thread.yield() call inside the loop body", "Fairness; raise the priority of the thread that sets the flag"],
+      "options": [
+        "Atomicity; wrap the read in a synchronized block",
+        "Visibility; declare the field volatile so the write happens-before the read",
+        "Ordering; add a Thread.yield() call inside the loop body",
+        "Fairness; raise the priority of the thread that sets the flag"
+      ],
       "correct": 1,
       "explanation": "With no happens-before edge between the write and the read, the compiler may hoist the read out of the loop and never observe the new value. JLS 17.4.5 says a volatile write happens-before every subsequent read of that field, which forbids the hoist. A synchronized block would also work but atomicity is not the issue for a single boolean read; yield and priority are scheduling hints and provide no memory-model guarantee."
     },
     {
       "stage": "check",
       "question": "In CPython, why does the GIL not make `self.balance += amount` safe to call from two threads?",
-      "options": ["Because the GIL only protects C extension modules, not pure Python code", "Because integers are immutable so the addition creates a new object outside the lock", "Because the GIL makes each bytecode atomic but a thread switch can occur between the LOAD_ATTR and the STORE_ATTR", "Because the GIL is released whenever an attribute lookup falls through to __getattr__"],
+      "options": [
+        "Because the GIL only protects C extension modules, not pure Python code",
+        "Because integers are immutable so the addition creates a new object outside the lock",
+        "Because the GIL makes each bytecode atomic but a thread switch can occur between the LOAD_ATTR and the STORE_ATTR",
+        "Because the GIL is released whenever an attribute lookup falls through to __getattr__"
+      ],
       "correct": 2,
       "explanation": "The statement compiles to several bytecodes (LOAD_ATTR, BINARY_OP, STORE_ATTR). The GIL guarantees no preemption inside a single bytecode, not across the sequence, so two threads can both load 10000 before either stores. Integer immutability is true but irrelevant: the new object is created under the GIL; the problem is the stale value loaded before the switch."
     },
     {
       "stage": "check",
       "question": "Thread A writes `balance = 12500` then releases mutex m. Thread B acquires m and reads balance. Which happens-before rule guarantees B sees 12500?",
-      "options": ["Program order alone, since A's write precedes B's read in wall-clock time", "An unlock of a monitor happens-before every subsequent lock of that same monitor", "Thread start: A was started before B so all of A's actions are visible to B", "Volatile semantics, because mutex-protected fields are implicitly volatile"],
-      "correct": 1,
+      "options": [
+        "An unlock of a monitor happens-before every subsequent lock of that same monitor",
+        "Program order alone, since A's write precedes B's read in wall-clock time",
+        "Thread start: A was started before B so all of A's actions are visible to B",
+        "Volatile semantics, because mutex-protected fields are implicitly volatile"
+      ],
+      "correct": 0,
       "explanation": "JLS 17.4.5 rule: an unlock on m happens-before every subsequent lock on m; combined with program order on each side this gives hb(A.write, B.read). Wall-clock ordering by itself creates no edge, which is exactly why a serialized-by-luck execution is still a data race. Thread start only orders the starter's actions before the started thread's actions, not sibling threads against each other."
     },
     {
       "stage": "post",
       "question": "On amd64 the Go compiler emits `ADDQ BX, (AX)` for `a.balance += amount`, a single instruction. Is the increment atomic with respect to other goroutines?",
-      "options": ["Yes, because a single instruction cannot be interrupted partway by another core's memory access", "Yes, because Go guarantees that word-sized operations on int64 are atomic on 64-bit platforms", "No, but only because the race detector rewrites it; without -race the instruction is indivisible", "No, without the LOCK prefix the load and store are separate bus transactions and another core can write between them"],
+      "options": [
+        "Yes, because a single instruction cannot be interrupted partway by another core's memory access",
+        "Yes, because Go guarantees that word-sized operations on int64 are atomic on 64-bit platforms",
+        "No, but only because the race detector rewrites it; without -race the instruction is indivisible",
+        "No, without the LOCK prefix the load and store are separate bus transactions and another core can write between them"
+      ],
       "correct": 3,
       "explanation": "Instruction count says nothing about atomicity. Without the LOCK prefix the processor performs the load and the store separately and another core may write in between; atomic.AddInt64 compiles to LOCK XADDQ precisely because of this. Go's word-size guarantee only says a racy read will not tear, not that a read-modify-write is indivisible, and the race detector reports races rather than fixing them."
     },
     {
       "stage": "post",
       "question": "A team runs a 32-thread counter test 10,000 times in CI with no failures and concludes the unsynchronized increment is safe. What is the correct objection?",
-      "options": ["The test needs at least as many threads as the production machine has cores before its result counts", "A passing test is consistent with a racy program; only a happens-before argument for every conflicting pair shows correctness", "CI machines have a different cache hierarchy, so the test must be repeated on the production hardware", "The test should assert the count is at most the expected value, since that is the stronger assertion"],
-      "correct": 1,
+      "options": [
+        "The test needs at least as many threads as the production machine has cores before its result counts",
+        "CI machines have a different cache hierarchy, so the test must be repeated on the production hardware",
+        "The test should assert the count is at most the expected value, since that is the stronger assertion",
+        "A passing test is consistent with a racy program; only a happens-before argument for every conflicting pair shows correctness"
+      ],
+      "correct": 3,
       "explanation": "The memory model permits the correct outcome of a racy program, so observing it is not evidence. The window is nanoseconds wide, the JIT changes the code after warm-up, and ARM reorders more than x86, so the environment where the test passes is systematically the one where the race hides. More threads or different hardware change the odds but not the argument; asserting at most the expected value is how this course demonstrates a race, not how it proves absence of one."
     }
   ]

@@ -31,11 +31,11 @@
       "question": "Why does a cascade re-insert entries starting from the lowest wheel (the root) rather than the wheel directly below the one being flushed?",
       "options": [
         "Because the lower wheel's buckets are full and only the root has free slots",
-        "Because only the root can recognise an entry due at exactly this boundary and fire it now",
         "Because the lower wheel's currentTime has not been updated yet at that point",
-        "Because re-inserting at the root is cheaper: it avoids one recursive call per level"
+        "Because re-inserting at the root is cheaper: it avoids one recursive call per level",
+        "Because only the root can recognise an entry due at exactly this boundary and fire it now"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "An entry due at exactly the boundary has deadline == root.currentTime; the root's add returns false and the entry fires on time. The wheel just below the coarse one would also report 'due now' for entries that are still several fine ticks away, firing them early. The root's add then walks up the levels as needed, so no slot or cost argument is involved."
     },
     {
@@ -66,12 +66,12 @@
       "stage": "post",
       "question": "A wheel with 1 ms tick and 64 buckets per level needs to hold deadlines up to 600,000 ms away. How many levels does it use, and what does each entry pay for the hierarchy?",
       "options": [
-        "Two levels; each entry is hashed once and never moves",
         "Four levels (64, 4096, 262144, 16777216 ms); each entry cascades at most three times, O(1) each",
+        "Two levels; each entry is hashed once and never moves",
         "Ten levels, one per decimal digit of the delay; each cascade costs O(log n)",
         "One level of 600,000 buckets; the hierarchy is only needed when memory is constrained"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Level intervals grow by a factor of 64: 64 ms, 4,096 ms, 262,144 ms, 16,777,216 ms, so the fourth level is the first that covers 600,000 ms. An entry moves down one level per cascade, each an O(1) unlink and re-link, and never more than levels minus one times. A single 600,000-bucket wheel would work but wastes memory and makes idle ticking expensive."
     }
   ]

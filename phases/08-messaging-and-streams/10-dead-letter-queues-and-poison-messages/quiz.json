@@ -6,13 +6,13 @@
       "stage": "pre",
       "question": "A Kafka consumer fails to parse the record at offset 48,211,907 on partition 7, does not commit, and polls again. The partition carries thousands of account keys. What is the effect on accounts whose records are at later offsets on that partition?",
       "options": [
-        "Only the account the bad record belongs to is affected; other keys continue",
         "Every account on partition 7 stops receiving records until the bad one is handled",
+        "Only the account the bad record belongs to is affected; other keys continue",
         "The broker skips the record automatically after a timeout and consumption continues",
         "Other consumers in the group take over partition 7 and process past the bad record"
       ],
-      "correct": 1,
-      "explanation": "A partition is a FIFO: the consumer cannot reach offset n+1 without finishing offset n, so every key on the partition is blocked (head-of-line blocking). Option A describes the goal of per-key quarantine, which the default consumer does not have; option D is wrong because a rebalanced consumer resumes from the same uncommitted offset and hits the same record."
+      "correct": 0,
+      "explanation": "A partition is a FIFO: the consumer cannot reach offset n+1 without finishing offset n, so every key on the partition is blocked (head-of-line blocking). Option B describes the goal of per-key quarantine, which the default consumer does not have; option D is wrong because a rebalanced consumer resumes from the same uncommitted offset and hits the same record."
     },
     {
       "stage": "check",

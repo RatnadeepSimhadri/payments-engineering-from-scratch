@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "Under snapshot isolation, which kind of dependency can exist between two transactions that ran concurrently?",
-      "options": ["Write-write: the second overwrote the first's version", "Write-read: the second read the first's committed version", "Read-write: one read a version the other then overwrote", "None; concurrent transactions are fully independent"],
+      "options": [
+        "Write-write: the second overwrote the first's version",
+        "Write-read: the second read the first's committed version",
+        "Read-write: one read a version the other then overwrote",
+        "None; concurrent transactions are fully independent"
+      ],
       "correct": 2,
       "explanation": "First-committer-wins forbids concurrent write-write, and snapshots hide concurrent writes so write-read cannot happen either. Only read-write antidependencies survive: one transaction read the old version while the other was making a new one. That is why SSI tracks exactly that edge."
     },
     {
       "stage": "check",
       "question": "What is the dangerous structure that SSI aborts on?",
-      "options": ["Any transaction whose read was overwritten by a concurrent writer", "A transaction with an incoming and an outgoing rw-edge to concurrent transactions", "Two transactions that write the same key within one snapshot window", "A cycle of write-read dependencies among three or more transactions"],
+      "options": [
+        "Any transaction whose read was overwritten by a concurrent writer",
+        "A transaction with an incoming and an outgoing rw-edge to concurrent transactions",
+        "Two transactions that write the same key within one snapshot window",
+        "A cycle of write-read dependencies among three or more transactions"
+      ],
       "correct": 1,
       "explanation": "Fekete et al. proved every non-serializable SI history contains a pivot with T_in -rw-> T_pivot -rw-> T_out. A single overwritten read is one edge and is harmless; aborting on it would be plain optimistic concurrency control with far more aborts. Same-key writes are handled by first-committer-wins, not SSI."
     },
     {
       "stage": "check",
       "question": "Why must a SIREAD lock be kept after its transaction commits?",
-      "options": ["So that vacuum knows which versions the committed transaction still needs", "Because a concurrent transaction that began before the commit may still write the key, creating a real rw-edge", "So that the next transaction from the same session inherits its snapshot", "Because the lock is converted into a shared lock that blocks writers until released"],
+      "options": [
+        "So that vacuum knows which versions the committed transaction still needs",
+        "Because a concurrent transaction that began before the commit may still write the key, creating a real rw-edge",
+        "So that the next transaction from the same session inherits its snapshot",
+        "Because the lock is converted into a shared lock that blocks writers until released"
+      ],
       "correct": 1,
       "explanation": "If R read k and committed, and T began before R committed, T writing k means R saw the old k while T made a new one: R -rw-> T, and R could be the T_in of a dangerous structure. SIREADs never block anything and have nothing to do with vacuum or session state; they are retained until no concurrent transaction remains."
     },
     {
       "stage": "check",
       "question": "In the write-skew history, T2 and T3 each read A and B, T2 writes A, T3 writes B, and T2 commits first. What happens?",
-      "options": ["Both abort, because each is a pivot at the time it commits", "T2 aborts as the pivot; its edges are removed and T3 commits", "T2 commits and T3 aborts at its own commit with a write conflict", "Both commit, because their write sets are disjoint"],
-      "correct": 1,
+      "options": [
+        "Both abort, because each is a pivot at the time it commits",
+        "T2 commits and T3 aborts at its own commit with a write conflict",
+        "Both commit, because their write sets are disjoint",
+        "T2 aborts as the pivot; its edges are removed and T3 commits"
+      ],
+      "correct": 3,
       "explanation": "T2 has in={T3} and out={T3} when it tries to commit, so it is aborted as a pivot. Aborting removes T2 from T3's conflict sets, leaving T3 with no edges, so T3 commits. Under plain SI both would commit (disjoint write sets); the paper's boolean flags would abort both, which is why the sets are tracked by transaction id."
     },
     {
       "stage": "post",
       "question": "P reads A, writes B, and commits. Q, which started before P committed, reads B and then writes A. When is Q aborted and why?",
-      "options": ["At Q's commit, when its own in and out sets are both non-empty", "Never: P already committed, so P cannot be part of a dangerous structure", "On Q's write of A, because P is now a committed pivot and Q is the only transaction left to abort", "On Q's read of B, because reading a version newer than the snapshot is a serialization failure"],
+      "options": [
+        "At Q's commit, when its own in and out sets are both non-empty",
+        "Never: P already committed, so P cannot be part of a dangerous structure",
+        "On Q's write of A, because P is now a committed pivot and Q is the only transaction left to abort",
+        "On Q's read of B, because reading a version newer than the snapshot is a serialization failure"
+      ],
       "correct": 2,
       "explanation": "Q's read of B records Q -rw-> P (one edge; P has no out-edge yet, so nothing fires). Q's write of A finds P's retained SIREAD on A and records P -rw-> Q, giving the committed P both edges. P cannot be aborted, so the store aborts Q immediately rather than letting it finish and fail at commit."
     },
     {
       "stage": "post",
       "question": "A ledger service moves to PostgreSQL SERIALIZABLE. Which obligation does that place on the application code?",
-      "options": ["Add SELECT ... FOR UPDATE to every read so that SIREAD locks are taken", "Wrap every transaction in a retry loop that re-runs it with fresh reads on SQLSTATE 40001", "Disable autovacuum during business hours so retained locks are not reclaimed early", "Mark every reporting query READ UNCOMMITTED so it cannot become a pivot"],
-      "correct": 1,
+      "options": [
+        "Wrap every transaction in a retry loop that re-runs it with fresh reads on SQLSTATE 40001",
+        "Add SELECT ... FOR UPDATE to every read so that SIREAD locks are taken",
+        "Disable autovacuum during business hours so retained locks are not reclaimed early",
+        "Mark every reporting query READ UNCOMMITTED so it cannot become a pivot"
+      ],
+      "correct": 0,
       "explanation": "SSI can abort a transaction that did nothing wrong (a false positive) as well as a real pivot, and the only correct response is to retry the whole transaction with new reads. FOR UPDATE is a different, blocking mechanism; vacuum is unrelated to SIREAD retention; and PostgreSQL treats READ UNCOMMITTED as READ COMMITTED, which does not remove the obligation for writers."
     }
   ]

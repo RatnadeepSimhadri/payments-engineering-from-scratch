@@ -5,42 +5,72 @@
     {
       "stage": "pre",
       "question": "Six identical-looking servers sit behind a round-robin balancer at 83% utilisation. One becomes half as fast but still answers correctly. What happens to the fleet's p99 latency?",
-      "options": ["It rises by about one sixth, in proportion to the slow server's share of traffic", "It roughly doubles, because the slow server's requests take twice as long", "It grows without bound, because that server's queue never drains", "It is unchanged, because the other five servers absorb the difference"],
+      "options": [
+        "It rises by about one sixth, in proportion to the slow server's share of traffic",
+        "It roughly doubles, because the slow server's requests take twice as long",
+        "It grows without bound, because that server's queue never drains",
+        "It is unchanged, because the other five servers absorb the difference"
+      ],
       "correct": 2,
       "explanation": "Round robin keeps sending the slow server one request in six regardless of how fast it drains. At 83% fleet utilisation, half speed puts that single server above 100% utilisation, so its queue grows forever and one sixth of all requests wait in it. The other servers cannot absorb anything because the balancer never looks at them."
     },
     {
       "stage": "check",
       "question": "With smooth weighted round robin and weights a=5, b=1, c=1, what sequence do the first seven picks produce, and why does that matter?",
-      "options": ["a a a a a b c; a's picks are grouped so its connections are reused", "a a b a c a a; a's picks are spread so no backend sees a burst", "a b c a a a a; low-weight backends go first to warm up", "a b a c a b a; picks alternate so every backend stays busy"],
+      "options": [
+        "a a a a a b c; a's picks are grouped so its connections are reused",
+        "a a b a c a a; a's picks are spread so no backend sees a burst",
+        "a b c a a a a; low-weight backends go first to warm up",
+        "a b a c a b a; picks alternate so every backend stays busy"
+      ],
       "correct": 1,
       "explanation": "The nginx algorithm adds each weight to a running score, picks the maximum, and subtracts the total weight from the winner. That interleaves a's five picks with b's and c's across the cycle. The grouped sequence is what a naive weighted scheme produces and it sends five consecutive requests to a and then leaves it idle."
     },
     {
       "stage": "check",
       "question": "Why are two random choices so much better than one when assigning items to bins, in the balls-into-bins model?",
-      "options": ["Two choices double the chance of hitting the emptiest bin, halving the maximum load", "Two choices turn the max load from about ln n / ln ln n into about ln ln n, an exponential gain", "Two choices let the balancer detect a failed bin and skip it before assigning", "Two choices average out the randomness, so the distribution becomes nearly uniform"],
+      "options": [
+        "Two choices double the chance of hitting the emptiest bin, halving the maximum load",
+        "Two choices turn the max load from about ln n / ln ln n into about ln ln n, an exponential gain",
+        "Two choices let the balancer detect a failed bin and skip it before assigning",
+        "Two choices average out the randomness, so the distribution becomes nearly uniform"
+      ],
       "correct": 1,
       "explanation": "With one uniform choice the fullest of n bins holds about ln n / ln ln n items; comparing two random bins and taking the emptier gives about ln ln n / ln 2. The logarithm moves inside another logarithm, which is why the demo drops from a max load of 6 to 3 at n = 10,000 and a third choice barely helps. It is not a doubling, and it says nothing about failures."
     },
     {
       "stage": "check",
       "question": "The health checker evicts after 3 consecutive failures. Why consecutive rather than cumulative?",
-      "options": ["Consecutive counts are cheaper to store because they fit in a single byte", "A cumulative count would eventually evict any backend with a nonzero error rate", "Consecutive failures are the only ones the balancer can observe on real traffic", "Cumulative counts cannot be reset once a backend has been readmitted"],
-      "correct": 1,
+      "options": [
+        "Consecutive counts are cheaper to store because they fit in a single byte",
+        "Consecutive failures are the only ones the balancer can observe on real traffic",
+        "Cumulative counts cannot be reset once a backend has been readmitted",
+        "A cumulative count would eventually evict any backend with a nonzero error rate"
+      ],
+      "correct": 3,
       "explanation": "A backend that fails one request in a thousand would accumulate three failures after three thousand requests and be evicted despite being healthy. A consecutive streak resets on every success, so only a backend that is actually down reaches the threshold. Storage cost and observability are not the distinction; cumulative counts can be reset, they just evict the wrong servers first."
     },
     {
       "stage": "post",
       "question": "A team uses consistent hashing on merchant id to spread load across a fleet with one slow server. The simulation shows a p99 worse than round robin. Why?",
-      "options": ["Consistent hashing needs more virtual nodes than the team configured to be uniform", "Hashing assigns each server a fixed share of keys regardless of how fast it drains them", "The hash function clusters nearby merchant ids on the same ring position", "Consistent hashing is only correct when every key arrives exactly once"],
-      "correct": 1,
+      "options": [
+        "Consistent hashing needs more virtual nodes than the team configured to be uniform",
+        "The hash function clusters nearby merchant ids on the same ring position",
+        "Consistent hashing is only correct when every key arrives exactly once",
+        "Hashing assigns each server a fixed share of keys regardless of how fast it drains them"
+      ],
+      "correct": 3,
       "explanation": "The ring is a placement function: it maps keys to servers and never reads load. The slow server gets its share of the key space and therefore its share of requests, exactly like round robin, with additional skew from an uneven ring. That is why consistent hashing is for affinity, not load spreading, and why bounded-load variants exist. Virtual node count and hash quality affect the skew but not the root cause."
     },
     {
       "stage": "post",
       "question": "Two thousand service-mesh sidecars each balance across 500 backends using slightly stale in-flight counts. Why does Envoy default to power of two choices rather than least connections?",
-      "options": ["P2C reads two counters instead of 500 per pick, and random sampling stops every sidecar herding onto the same emptiest backend", "P2C is exact when counts are stale because it always samples the two most recently updated backends", "P2C needs no in-flight counters at all, so stale data cannot affect it", "Least connections cannot work across more than 64 backends in most implementations"],
+      "options": [
+        "P2C reads two counters instead of 500 per pick, and random sampling stops every sidecar herding onto the same emptiest backend",
+        "P2C is exact when counts are stale because it always samples the two most recently updated backends",
+        "P2C needs no in-flight counters at all, so stale data cannot affect it",
+        "Least connections cannot work across more than 64 backends in most implementations"
+      ],
       "correct": 0,
       "explanation": "With thousands of independent balancers, least connections costs n reads per pick and, worse, every balancer sees the same emptiest backend in its stale view and sends to it at once. Two random samples cost O(1) and decorrelate the balancers, so stale information does little damage. P2C does read in-flight counts; it just reads two of them."
     }

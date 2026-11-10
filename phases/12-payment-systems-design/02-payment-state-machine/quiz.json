@@ -68,10 +68,10 @@
       "options": [
         "Version contiguity, because gaps are expected after log compaction",
         "That fromState matches the current state, because the stored state is authoritative",
-        "That each transition's guard still holds, because the rules may have changed since it was written",
-        "That the event ids are unique, because the processor guarantees that already"
+        "That the event ids are unique, because the processor guarantees that already",
+        "That each transition's guard still holds, because the rules may have changed since it was written"
       ],
-      "correct": 2,
+      "correct": 3,
       "explanation": "Guards were evaluated when the transition was accepted. Re-evaluating them on load would make old histories unloadable after a rule change. Replay checks structure instead: contiguous versions and a fromState chain, both of which indicate corruption if broken. Event ids are recorded by replay so later duplicates are still recognised."
     }
   ]

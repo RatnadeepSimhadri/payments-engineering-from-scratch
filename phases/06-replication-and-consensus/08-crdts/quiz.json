@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "Two replicas of a counter both read 100, each subtracts 80 while partitioned, and each stores 20. After the partition heals, what is the true value of the counter?",
-      "options": ["20, because both replicas agree on it", "-60, because both subtractions happened", "100, because the writes conflict and cancel", "40, because each replica contributed half"],
+      "options": [
+        "20, because both replicas agree on it",
+        "-60, because both subtractions happened",
+        "100, because the writes conflict and cancel",
+        "40, because each replica contributed half"
+      ],
       "correct": 1,
       "explanation": "Both decrements are real operations that must survive the merge, so the value is 100 - 80 - 80 = -60. Keeping 20 because the two absolute values happen to agree discards one decrement entirely; that is the data loss a PN-Counter is designed to avoid by storing deltas per replica instead of the total."
     },
     {
       "stage": "check",
       "question": "A proposed merge function for a replicated counter adds the two replicas' totals together. Which CRDT law does it violate, and what network event exposes the bug?",
-      "options": ["Commutativity; two messages arriving in swapped order", "Associativity; a state relayed through a third replica", "Idempotence; a duplicated or retried state message", "Monotonicity; a replica restarting from an older snapshot"],
+      "options": [
+        "Commutativity; two messages arriving in swapped order",
+        "Associativity; a state relayed through a third replica",
+        "Idempotence; a duplicated or retried state message",
+        "Monotonicity; a replica restarting from an older snapshot"
+      ],
       "correct": 2,
       "explanation": "Addition is commutative and associative, but merge(a, a) = 2a, so receiving the same state twice doubles the count. The G-Counter avoids this with per-replica slots merged by max, which is idempotent. Monotonicity is a property of each slot, not one of the three merge laws."
     },
     {
       "stage": "check",
       "question": "Why does a G-Counter keep one slot per replica and merge by per-slot maximum instead of storing a single total?",
-      "options": ["Because a single total would overflow a 64-bit integer much sooner", "Because each slot only grows, so max of two versions is always the newer one", "Because the slots allow each replica to decrement its own contribution", "Because readers need to know which replica performed each increment"],
+      "options": [
+        "Because a single total would overflow a 64-bit integer much sooner",
+        "Because each slot only grows, so max of two versions is always the newer one",
+        "Because the slots allow each replica to decrement its own contribution",
+        "Because readers need to know which replica performed each increment"
+      ],
       "correct": 1,
       "explanation": "The per-slot max is a valid join only because each slot is monotonically non-decreasing and written by exactly one replica; the max is then the most recent version of that slot. A single total has no such structure, so no merge of two totals can tell replayed state from new increments. Decrements live in a separate G-Counter (the PN-Counter), and attribution is a side effect, not the reason."
     },
     {
       "stage": "check",
       "question": "In an OR-Set, replica A removes element x while replica B concurrently adds x again. After merge, is x present, and why?",
-      "options": ["Absent, because removes are always applied after adds", "Present, because B's add minted a tag that A's remove never observed", "Absent, because the tombstone for x covers every tag of x", "Present, because merge resolves ties by the larger replica id"],
-      "correct": 1,
+      "options": [
+        "Absent, because removes are always applied after adds",
+        "Absent, because the tombstone for x covers every tag of x",
+        "Present, because merge resolves ties by the larger replica id",
+        "Present, because B's add minted a tag that A's remove never observed"
+      ],
+      "correct": 3,
       "explanation": "A's remove tombstones only the tags A had observed; B's concurrent add created a new unique tag that is not in the tombstone set, so x has a live tag after the union merge. That is add-wins semantics. A tombstone per element name (rather than per tag) would give remove-wins and would also block legitimate re-adds forever."
     },
     {
       "stage": "post",
       "question": "A wallet balance is replicated as a PN-Counter of minor units across two regions, and each region checks the local balance before approving a debit. What does this design guarantee?",
-      "options": ["The merged balance reflects every credit and debit, but it can be negative", "The balance can never go negative because each region validated its debit", "Debits are rejected in both regions whenever the inter-region link is down", "The merge picks the region whose debit was approved first by timestamp"],
+      "options": [
+        "The merged balance reflects every credit and debit, but it can be negative",
+        "The balance can never go negative because each region validated its debit",
+        "Debits are rejected in both regions whenever the inter-region link is down",
+        "The merge picks the region whose debit was approved first by timestamp"
+      ],
       "correct": 0,
       "explanation": "The PN-Counter guarantees convergence to the sum of all deltas, so no debit is lost, but a non-negative balance is a predicate over global state that no replica can see during a partition. Local checks pass in both regions and the merge yields a negative balance. Keeping the invariant requires coordination (a leader or quorum) or a bounded-counter design that gives each region its own spendable share."
     },
     {
       "stage": "post",
       "question": "An LWW-Register breaks timestamp ties by comparing replica ids. What would go wrong if it did not?",
-      "options": ["Replicas would retain both values and have to expose them as siblings", "Merge would no longer be commutative, so replicas could end with different values", "Every write would need a vector clock instead of a scalar timestamp", "The register would reject any write whose timestamp was not strictly increasing"],
-      "correct": 1,
+      "options": [
+        "Replicas would retain both values and have to expose them as siblings",
+        "Every write would need a vector clock instead of a scalar timestamp",
+        "The register would reject any write whose timestamp was not strictly increasing",
+        "Merge would no longer be commutative, so replicas could end with different values"
+      ],
+      "correct": 3,
       "explanation": "Without a total order on (timestamp, replica), two writes with equal timestamps would make merge(a, b) depend on which argument came first, violating commutativity and breaking convergence. The tie-break restores a total order and therefore a join. The register never keeps siblings; that is the multi-value register design from Lesson 09, which has its own costs."
     }
   ]

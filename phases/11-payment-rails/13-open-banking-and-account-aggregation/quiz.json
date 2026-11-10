@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "What did OAuth-based open banking replace, and what was the core problem with the old approach?",
-      "options": ["Batch file exchange, which was too slow for daily account views", "Screen scraping with the user's own credentials, which gave a third party full access forever", "Direct database replication from the bank, which leaked other customers' data", "Card-network messaging, which could not carry account balances"],
+      "options": [
+        "Batch file exchange, which was too slow for daily account views",
+        "Screen scraping with the user's own credentials, which gave a third party full access forever",
+        "Direct database replication from the bank, which leaked other customers' data",
+        "Card-network messaging, which could not carry account balances"
+      ],
       "correct": 1,
       "explanation": "Aggregators used to log in as the user with the user's password and parse HTML, so a breach at the aggregator was a breach of every connected bank and the user could not limit what was accessed. Delegated authorization gives a token scoped to specific permissions with an expiry, and the password never leaves the bank."
     },
     {
       "stage": "check",
       "question": "What attack does the PKCE code_challenge defend against that the state parameter does not?",
-      "options": ["An attacker tricking the victim into completing the attacker's authorization in the victim's session", "An attacker registering a redirect URI they control at the bank", "An attacker who intercepts the authorization code exchanging it for tokens", "An attacker guessing the client secret from the authorize URL"],
+      "options": [
+        "An attacker tricking the victim into completing the attacker's authorization in the victim's session",
+        "An attacker registering a redirect URI they control at the bank",
+        "An attacker who intercepts the authorization code exchanging it for tokens",
+        "An attacker guessing the client secret from the authorize URL"
+      ],
       "correct": 2,
       "explanation": "The code travels through the browser and can be intercepted; PKCE makes it useless without the verifier, which never left the client. The state parameter defends against login CSRF (the first option), and exact redirect-URI matching at registration defends against the second. There is no client secret in the authorize URL."
     },
     {
       "stage": "check",
       "question": "The aggregator receives 403 insufficient_scope when fetching transactions. What should it do?",
-      "options": ["Refresh the access token once and retry, since the token may be stale", "Report that the consent lacks the permission; refreshing cannot add a scope", "Retry with exponential backoff, since the bank may be rate limiting", "Exchange the authorization code again to obtain a broader token"],
+      "options": [
+        "Refresh the access token once and retry, since the token may be stale",
+        "Report that the consent lacks the permission; refreshing cannot add a scope",
+        "Retry with exponential backoff, since the bank may be rate limiting",
+        "Exchange the authorization code again to obtain a broader token"
+      ],
       "correct": 1,
       "explanation": "RFC 6750 distinguishes invalid_token (401, refresh and retry) from insufficient_scope (403, the consent never included this scope). A refresh issues a token with the same scopes, so retrying is a loop that floods the token endpoint. A broader permission requires a new consent from the user; the original code is single-use and gone."
     },
     {
       "stage": "check",
       "question": "A retired refresh token is presented to the token endpoint. Why does the server revoke the whole consent rather than just rejecting the request?",
-      "options": ["Because RFC 6749 requires every invalid_grant response to revoke the consent", "Because the server cannot tell whether the attacker or the honest client refreshed first", "Because retired tokens are deleted and the server has no record to reject against", "Because the access token issued with it has already expired anyway"],
-      "correct": 1,
+      "options": [
+        "Because RFC 6749 requires every invalid_grant response to revoke the consent",
+        "Because retired tokens are deleted and the server has no record to reject against",
+        "Because the access token issued with it has already expired anyway",
+        "Because the server cannot tell whether the attacker or the honest client refreshed first"
+      ],
+      "correct": 3,
       "explanation": "A replay proves a copy exists. If the attacker refreshed first, the honest client now holds the dead token and the attacker holds the live one, so rejecting only the replay would leave the attacker's session working. Killing the family forces re-authorization, which only the real user can complete. Retired tokens are kept precisely so replays can be detected."
     },
     {
       "stage": "post",
       "question": "Bank B sends {\"Amount\": {\"Amount\": \"36.50\", \"Currency\": \"GBP\"}, \"CreditDebitIndicator\": \"Debit\"}. What should the normalized Transaction amount be?",
-      "options": ["Money(3650, GBP), since Bank B amounts are always positive", "Money(-3650, GBP), applying the indicator so outflows are negative like Bank A", "Money(-36, GBP), truncating to whole pounds for consistency with FDX", "Money(3650, USD), converting to the aggregator's base currency"],
-      "correct": 1,
+      "options": [
+        "Money(-3650, GBP), applying the indicator so outflows are negative like Bank A",
+        "Money(3650, GBP), since Bank B amounts are always positive",
+        "Money(-36, GBP), truncating to whole pounds for consistency with FDX",
+        "Money(3650, USD), converting to the aggregator's base currency"
+      ],
+      "correct": 0,
       "explanation": "The unified schema has one sign convention: negative is money leaving the account. UK OB amounts are unsigned with a separate indicator, so the adapter applies the sign; FDX amounts arrive signed. Keeping it unsigned would make spending at Bank B look like income next to Bank A. Minor units are kept exactly and currency is never converted at this layer."
     },
     {
       "stage": "post",
       "question": "Why does the aggregator's fetch loop treat the page cursor as an opaque string instead of computing the next offset itself?",
-      "options": ["Because RFC 6749 forbids clients from constructing resource-server URLs", "Because each bank encodes paging differently and only its adapter should know how", "Because offsets would overflow a Java int on large transaction histories", "Because the access token must be embedded in the cursor for the next request"],
-      "correct": 1,
+      "options": [
+        "Because RFC 6749 forbids clients from constructing resource-server URLs",
+        "Because offsets would overflow a Java int on large transaction histories",
+        "Because the access token must be embedded in the cursor for the next request",
+        "Because each bank encodes paging differently and only its adapter should know how"
+      ],
+      "correct": 3,
       "explanation": "Bank A pages by numeric offset and Bank B by a Links.Next URL; the loop passes back whatever the adapter extracted until it is null. That is what lets a new bank be added by writing one adapter, and lets a bank change its paging scheme without breaking the client. OAuth says nothing about resource-server pagination, and tokens travel in the Authorization header, not the cursor."
     }
   ]

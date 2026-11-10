@@ -55,23 +55,23 @@
       "question": "PostgreSQL documentation describes its default index as a 'B-tree'. What does it actually build, and what does that change?",
       "options": [
         "A B-tree exactly like this lesson's, storing values at every level so a lookup can stop at an internal page",
-        "A B+ tree: values only in leaves, linked leaves, so range scans walk sideways without re-descending",
         "A red-black tree serialized onto 8 KB pages, because the TreeMap design proved itself in the JDK",
-        "A hash index over the key column with a B-tree fallback used only when a query asks for a range"
+        "A hash index over the key column with a B-tree fallback used only when a query asks for a range",
+        "A B+ tree: values only in leaves, linked leaves, so range scans walk sideways without re-descending"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Nearly every database 'B-tree' is a B+ tree: internal pages hold only separators (higher fan-out) and leaf pages are linked, so a range scan follows next pointers. A point lookup always reads to the leaf, one page more than a B-tree that can stop early, in exchange for a shorter tree and cheap scans."
     },
     {
       "stage": "post",
       "question": "A team proposes UUIDv4 primary keys for a 2-billion-row postings table in InnoDB. Which consequence follows from this lesson?",
       "options": [
-        "Lookups degrade to O(n) because random 128-bit values cannot be ordered or binary searched",
         "Each insert lands on a random page, so inserts dirty random pages and leave ~69% fill, instead of appending to the rightmost page",
+        "Lookups degrade to O(n) because random 128-bit values cannot be ordered or binary searched",
         "The tree becomes roughly twice as tall because 128-bit keys halve the fan-out of every internal page",
         "Range scans on the primary key become impossible because UUIDv4 values carry no usable ordering"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Random keys scatter inserts across the whole clustered index: every insert is a likely cache miss and a dirtied random page, versus sequential keys that repeatedly touch the rightmost page. Fan-out shrinks a little with wider keys but height barely changes; UUIDs compare fine and ranges still work, they are just meaningless."
     }
   ]

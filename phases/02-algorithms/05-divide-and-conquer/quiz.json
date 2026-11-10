@@ -31,11 +31,11 @@
       "question": "Karatsuba replaces four half-size multiplications with three, keeping the O(n) additions. What happens to the running time?",
       "options": [
         "It drops from O(n^2) to O(n log n) because the additions now dominate",
-        "It drops from Θ(n^2) to Θ(n^1.585) because the leaf count falls from n^2 to n^(log2 3)",
         "It stays Θ(n^2) because the combine step is unchanged and the combine step sets the bound",
-        "It drops by a constant factor of 3/4 since one quarter of the multiplications is saved"
+        "It drops by a constant factor of 3/4 since one quarter of the multiplications is saved",
+        "It drops from Θ(n^2) to Θ(n^1.585) because the leaf count falls from n^2 to n^(log2 3)"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Both recurrences are case 1 (f = n is polynomially smaller than the critical exponent), so the leaves dominate and the answer is n^(log2 a): n^2 for a = 4, n^1.585 for a = 3. The number of subproblems sets the exponent; the combine cost only matters when it is as large as the leaf work."
     },
     {
@@ -54,12 +54,12 @@
       "stage": "post",
       "question": "A team parallelises a linear two-pointer reconciliation by recursively splitting both lists at a matching timestamp (a linear scan) and reconciling halves on separate cores. Why is it slower?",
       "options": [
-        "Because thread creation in the JVM costs more than the reconciliation work saved by splitting",
         "Because the recurrence is 2 T(n/2) + n, which is Θ(n log n); the log n factor exceeds the gain from 32 cores",
+        "Because thread creation in the JVM costs more than the reconciliation work saved by splitting",
         "Because recursive algorithms cannot be parallelised without a shared lock on the output",
         "Because the lists must be re-sorted at every level, adding an n log n sort per split"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "The split scan is a linear combine cost at every level, so the design is merge sort's recurrence and does about 28x more work than the single pass for n of a few hundred million; dividing by 32 cores does not recover it. Partitioning once into 32 ranges and running the linear merge on each is Θ(n / 32)."
     },
     {

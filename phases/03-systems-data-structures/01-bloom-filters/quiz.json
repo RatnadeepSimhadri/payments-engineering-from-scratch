@@ -67,11 +67,11 @@
       "question": "A teammate proposes: 'When the filter says the idempotency key was possibly seen, return the cached response directly and skip the database read to save even more load.' What is wrong with this?",
       "options": [
         "Nothing: the filter's one-sided guarantee makes 'possibly seen' reliable enough",
-        "At p = 0.01 about one new request in a hundred would be treated as a retry and get another customer's response",
         "The filter cannot be queried twice for the same key without resetting its bits",
-        "It only works if the filter is rebuilt from the table on every restart"
+        "It only works if the filter is rebuilt from the table on every restart",
+        "At p = 0.01 about one new request in a hundred would be treated as a retry and get another customer's response"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "'Possibly seen' includes every false positive, and at the configured 1% rate a new payment would be mistaken for a retry one time in a hundred. The one-sided guarantee covers only the 'definitely absent' answer; a positive is a hint to consult the authoritative store, never a result to act on. Rebuild-on-restart is a separate concern and does not fix this."
     }
   ]

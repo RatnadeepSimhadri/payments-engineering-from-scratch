@@ -56,22 +56,22 @@
       "options": [
         "A java.util.LinkedList with remove(Object), since linked lists have O(1) removal",
         "An ArrayList sorted by authorization id with binary search followed by remove(index)",
-        "An intrusive doubly linked list where PendingAuthorization carries its own prev and next links",
-        "A singly linked list with a tail pointer, removing by walking from the tail backwards"
+        "A singly linked list with a tail pointer, removing by walking from the tail backwards",
+        "An intrusive doubly linked list where PendingAuthorization carries its own prev and next links"
       ],
-      "correct": 2,
+      "correct": 3,
       "explanation": "The element is its own node, so remove(auth) is four pointer writes with no search and no allocation. LinkedList.remove(Object) hides its nodes and must scan: O(n). Binary search finds the index in O(log n) but ArrayList.remove(index) shifts the tail: O(n). A singly linked list cannot walk backwards at all and cannot unlink without the predecessor."
     },
     {
       "stage": "post",
       "question": "The demo sums one million longs: 0.68 ms from a long[], 5.4 ms from a list whose nodes are in memory order, 132 ms from a list whose nodes are in shuffled order. What explains the third number?",
       "options": [
-        "The shuffled list has more nodes because the shuffle duplicated some values",
         "Each step is a dependent load to an unpredictable address, so every node costs a full DRAM round trip the prefetcher cannot overlap",
+        "The shuffled list has more nodes because the shuffle duplicated some values",
         "Java's garbage collector moves shuffled objects more often, so the walk is interrupted by collections",
         "The shuffled list is singly linked and must walk twice as far to find each next node"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "All three structures hold exactly one million values and compute the same sum. The array streams eight values per cache line with the prefetcher ahead of it; the in-order list still benefits from adjacent-line prefetch; the shuffled list defeats every hardware trick, so each node is a 60 to 100 ns miss serialized behind the previous one. The GC is not involved and the list type is identical in both cases."
     }
   ]

@@ -55,23 +55,23 @@
       "question": "A queue backed by a dynamic array grows 2x when full and shrinks to half when it drops below half full. Under steady load near the boundary it spends most of its time in System.arraycopy. What is the fix?",
       "options": [
         "Grow by 1.5x instead of 2x, so each copy moves fewer elements and the thrash becomes cheaper",
-        "Shrink only when below one quarter full, so a shrink leaves it half full and the next copy is far away",
         "Disable shrinking entirely in the hot path and call trimToSize from a scheduled job at a quiet hour",
-        "Replace the array with a doubly linked list, so neither growing nor shrinking ever copies anything"
+        "Replace the array with a doubly linked list, so neither growing nor shrinking ever copies anything",
+        "Shrink only when below one quarter full, so a shrink leaves it half full and the next copy is far away"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The thrash comes from adjacent triggers: a shrink lands exactly at full, so the next add grows. Hysteresis (shrink below 1/4, to 1/2) guarantees capacity/2 adds or capacity/4 removes between reallocations, which pays for them. Disabling shrink also stops the thrash but gives up memory reclamation entirely; a linked list trades the copies for pointer chasing on every operation."
     },
     {
       "stage": "post",
       "question": "A clearing-file parser appends 3.2 million records to a default ArrayList and the heap dump shows the backing array has 4.8 million slots. What is the cheapest change that removes both the slack and the reallocation latency spikes?",
       "options": [
+        "Construct the list with the record count from the file header so it is allocated once at the right size",
         "Switch to a LinkedList, which has no capacity to manage and therefore never copies elements",
         "Call trimToSize after the loop finishes so the unused slots are released back to the heap",
-        "Construct the list with the record count from the file header so it is allocated once at the right size",
         "Lower the growth factor to 1.125x as CPython does so that the slack stays under fifteen percent"
       ],
-      "correct": 2,
+      "correct": 0,
       "explanation": "Pre-sizing eliminates every reallocation, so there are no copy spikes and no slack. trimToSize fixes the slack after the fact but keeps all the spikes during the loop. A LinkedList uses more memory per element and is far slower to iterate. A smaller growth factor reduces slack but increases the number of copy spikes."
     }
   ]

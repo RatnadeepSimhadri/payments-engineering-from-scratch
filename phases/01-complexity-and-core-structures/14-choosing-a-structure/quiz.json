@@ -43,11 +43,11 @@
       "question": "Why is a tree keyed by timestamp the wrong primary structure for an append-only audit log?",
       "options": [
         "Trees cannot store more than a few million entries before running out of heap",
-        "Append order already is time order, so the tree spends its work maintaining an order the log has for free",
         "Timestamps are not unique, and a tree cannot store duplicate keys under any scheme",
-        "Range queries by time are impossible on a tree and require a hash map"
+        "Range queries by time are impossible on a tree and require a hash map",
+        "Append order already is time order, so the tree spends its work maintaining an order the log has for free"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A log answers time-range queries with a binary search for the start and a sequential scan, with no per-append cost; an unbalanced tree degenerates on monotonic inserts and a balanced one rotates for nothing. Duplicate timestamps are handled by a composite key, and trees do support range queries."
     },
     {
@@ -66,12 +66,12 @@
       "stage": "post",
       "question": "What belongs in the design note's \"impossible operation\" section, and why?",
       "options": [
-        "Every operation the structure supports, with its complexity, so reviewers can confirm the API is complete and matches the table",
         "The operations the structure makes O(n) or cannot express, so a later request for one triggers a redesign instead of a workaround",
+        "Every operation the structure supports, with its complexity, so reviewers can confirm the API is complete and matches the table",
         "The Big-O of each operation copied from the textbook table for the structure, so the note is self-contained for new readers",
         "A list of competing structures that were considered, with their benchmark results, so the choice can be defended in review"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Naming what the structure cannot do cheaply is what makes a future change recognisable as a change of access pattern. Supported operations and complexities are the access-pattern table; rejected candidates have their own section."
     }
   ]

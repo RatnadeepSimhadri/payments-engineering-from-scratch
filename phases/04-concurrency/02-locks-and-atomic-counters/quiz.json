@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "Two threads each run `balance += 2500` once on a balance of 10000, with no synchronization. Which final value is possible but wrong?",
-      "options": ["15000", "12500", "17500", "10000"],
+      "options": [
+        "15000",
+        "12500",
+        "17500",
+        "10000"
+      ],
       "correct": 1,
       "explanation": "If both threads load 10000 before either stores, both compute 12500 and the second store overwrites the first: one update is lost. 15000 is the correct result, 17500 would need an update to be applied twice, and 10000 would need both stores to vanish; neither can happen with two loads and two stores."
     },
     {
       "stage": "check",
       "question": "Why does the test suite exercise RacyCounter only through the injected betweenLoadAndStore hook rather than by running it from several threads?",
-      "options": ["Because starting threads inside a unit test is slower than calling a hook", "Because the race is a scheduler decision, so a threaded test can pass by luck and Go's -race would fail it", "Because the hook is the only way to call add() from code outside the class", "Because the racy counter cannot be shared between threads without a compile error"],
+      "options": [
+        "Because starting threads inside a unit test is slower than calling a hook",
+        "Because the race is a scheduler decision, so a threaded test can pass by luck and Go's -race would fail it",
+        "Because the hook is the only way to call add() from code outside the class",
+        "Because the racy counter cannot be shared between threads without a compile error"
+      ],
       "correct": 1,
       "explanation": "Whether the lost update happens depends on where the scheduler preempts, so a threaded test proves nothing when it passes, and under `go test -race` any real race is reported as a failure. The hook reproduces the exact interleaving in one thread, every run. Thread start-up cost is real but is not the reason."
     },
     {
       "stage": "check",
       "question": "An AtomicCounter is exact under contention. Why can it still not implement `debit(amount)` that refuses to go below zero with `if (get() >= amount) add(-amount)`?",
-      "options": ["Because AtomicLong.get() is not guaranteed to return the most recent value", "Because add() with a negative delta is not atomic on 64-bit words", "Because the check and the act are two separate atomic operations with a gap between them", "Because the comparison needs a lock to read the value without tearing"],
+      "options": [
+        "Because AtomicLong.get() is not guaranteed to return the most recent value",
+        "Because add() with a negative delta is not atomic on 64-bit words",
+        "Because the check and the act are two separate atomic operations with a gap between them",
+        "Because the comparison needs a lock to read the value without tearing"
+      ],
       "correct": 2,
       "explanation": "Each call is atomic, but two threads can both pass the check before either acts, and both subtract. The fix is a lock around check and act, or a CAS whose expected value is the one the check used. AtomicLong.get() is volatile and does return the latest value; 64-bit atomics do not tear."
     },
     {
       "stage": "check",
       "question": "StripedAccountMap guards account id with locks[stableHash(id) mod N]. What does striping buy over one global lock, and what does it not?",
-      "options": ["It buys exactness for a single hot account; it does not help when accounts hash to different stripes", "It buys lower contention for accounts on different stripes; it does not make a two-account transfer atomic", "It buys a consistent total() without locking; it does not allow a debit to be refused", "It buys lock-free reads of every balance; it does not scale beyond N threads"],
-      "correct": 1,
+      "options": [
+        "It buys exactness for a single hot account; it does not help when accounts hash to different stripes",
+        "It buys a consistent total() without locking; it does not allow a debit to be refused",
+        "It buys lock-free reads of every balance; it does not scale beyond N threads",
+        "It buys lower contention for accounts on different stripes; it does not make a two-account transfer atomic"
+      ],
+      "correct": 3,
       "explanation": "Accounts on different stripes never wait for each other, so contention falls by about N. A transfer touches two accounts, so it needs two stripe locks and an ordering rule (Lesson 07). total() does lock, all stripes in order, and debit is a check-then-act under the stripe lock, so the other options describe the wrong trade."
     },
     {
       "stage": "post",
       "question": "In the demo the racy counter reports the highest ops/s of the four implementations. What is the correct reading of that number?",
-      "options": ["The racy version is the best choice when throughput matters more than exactness", "Throughput is meaningless until the lost column is zero, so the racy number is not comparable", "The JIT optimized away the racy adds, so the measurement is an artefact", "Lock-free code is always faster than locked code, which the racy result confirms"],
-      "correct": 1,
+      "options": [
+        "Throughput is meaningless until the lost column is zero, so the racy number is not comparable",
+        "The racy version is the best choice when throughput matters more than exactness",
+        "The JIT optimized away the racy adds, so the measurement is an artefact",
+        "Lock-free code is always faster than locked code, which the racy result confirms"
+      ],
+      "correct": 0,
       "explanation": "A benchmark that does not check its result rewards the implementation that does the least work, and skipping synchronization is less work. The racy counter lost hundreds of dollars in the same run. Its adds were executed, not elided; and 'lock-free' describes the CAS counter, not unsynchronized code."
     },
     {
       "stage": "post",
       "question": "LockedCounter.get() acquires the lock just to read a long. Which problem would an unlocked, non-volatile read reintroduce?",
-      "options": ["The lost update, because the read could interleave with a writer's store", "Visibility: without a happens-before edge the reader may see a stale cached value", "Deadlock, because a reader and a writer could each wait for the other", "Overflow, because Math.addExact is not applied on the read path"],
-      "correct": 1,
+      "options": [
+        "The lost update, because the read could interleave with a writer's store",
+        "Deadlock, because a reader and a writer could each wait for the other",
+        "Overflow, because Math.addExact is not applied on the read path",
+        "Visibility: without a happens-before edge the reader may see a stale cached value"
+      ],
+      "correct": 3,
       "explanation": "A read does not modify anything, so it cannot cause a lost update, and a single lock cannot deadlock with itself. But a plain read has no happens-before relationship with writes made under the lock, so the JLS allows it to return an old value indefinitely. Acquiring the lock (or making the field volatile) supplies the edge."
     }
   ]

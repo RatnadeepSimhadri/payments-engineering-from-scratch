@@ -67,11 +67,11 @@
       "question": "Events for payment pay_77 arrive as sequence 2 (captured) and then sequence 1 (authorized). After both are handled, what is the consumer's recorded status and what did it do with the second event?",
       "options": [
         "authorized; it applied the second event because events are applied in arrival order",
-        "captured; it returned OUT_OF_ORDER with a 200 and did not apply the older event",
         "captured; it returned 500 so the producer would resend sequence 1 later",
-        "authorized; it rolled back to the lower sequence because it is the earlier state"
+        "authorized; it rolled back to the lower sequence because it is the earlier state",
+        "captured; it returned OUT_OF_ORDER with a 200 and did not apply the older event"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The consumer keeps the highest applied sequence per object. Sequence 1 is less than the recorded 2, so the event is real but stale: it is acknowledged with 200 and not applied, leaving the status at captured. Returning 500 would cause pointless redelivery of an event the consumer will never need; applying it would roll a payment back from captured to authorized."
     }
   ]

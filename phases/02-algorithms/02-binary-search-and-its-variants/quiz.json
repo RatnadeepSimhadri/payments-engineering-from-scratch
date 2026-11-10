@@ -43,11 +43,11 @@
       "question": "Why is int mid = (lo + hi) / 2 a bug even though it is correct arithmetic?",
       "options": [
         "Integer division truncates, so mid can equal lo and the loop fails to shrink the range",
-        "When lo + hi exceeds Integer.MAX_VALUE the sum wraps negative and mid becomes an invalid index",
         "It rounds toward lo, which biases the search and doubles the expected number of probes",
-        "It evaluates hi before lo, so a concurrent writer can observe an inconsistent midpoint"
+        "It evaluates hi before lo, so a concurrent writer can observe an inconsistent midpoint",
+        "When lo + hi exceeds Integer.MAX_VALUE the sum wraps negative and mid becomes an invalid index"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "With about a billion elements lo + hi overflows 32 bits, wraps, and the search throws or loops; this exact defect sat in java.util.Arrays for nine years. lo + ((hi - lo) >>> 1) cannot overflow because hi - lo is always a valid non-negative int. Truncation toward lo is harmless since lo <= mid < hi always holds."
     },
     {
@@ -55,11 +55,11 @@
       "question": "A treasury tool must find the largest per-payout cap c such that the sum of min(amount, c) over all payouts fits a budget. Why can this be solved with firstTrue, and over what range?",
       "options": [
         "The payouts are sorted by amount, so the cap is found by indexOf on the amounts array",
-        "The total is non-decreasing in c, so 'total exceeds budget' is monotone over caps from 0 to the largest payout",
         "Each payout is independent, so the cap is the budget divided by the number of payouts, no search needed",
+        "The total is non-decreasing in c, so 'total exceeds budget' is monotone over caps from 0 to the largest payout",
         "The total is bounded above by the budget, so the cap is found by searching the budget's divisors"
       ],
-      "correct": 1,
+      "correct": 2,
       "explanation": "Raising the cap never lowers any min(amount, c), so the total is monotone and the first infeasible cap minus one is the answer; caps above the largest payout change nothing, which bounds the range. Dividing the budget evenly ignores that small payouts are not capped, and the amounts need not be sorted at all."
     },
     {
@@ -67,11 +67,11 @@
       "question": "A fee-tier lookup uses Arrays.binarySearch on a thresholds array that contains duplicate values, and tiers occasionally flip between runs. What is the correct fix?",
       "options": [
         "Sort the thresholds array with a stable sort before each lookup so the duplicates keep their order",
-        "Replace the call with a lowerBound (first index with threshold >= amount) so ties resolve to a defined index",
         "Switch to Collections.binarySearch, which is specified to return the lowest matching index",
-        "Wrap the array in a TreeMap and use get, which throws when a key appears more than once"
+        "Wrap the array in a TreeMap and use get, which throws when a key appears more than once",
+        "Replace the call with a lowerBound (first index with threshold >= amount) so ties resolve to a defined index"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Arrays.binarySearch documents that with duplicates there is no guarantee which index is returned; lowerBound (or upperBound minus one, depending on the rule) names a specific boundary. Collections.binarySearch has the same caveat, sorting does not change which duplicate is hit, and a TreeMap cannot hold duplicate keys in the first place."
     }
   ]

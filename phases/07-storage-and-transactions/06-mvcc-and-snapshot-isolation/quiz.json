@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "Under strict two-phase locking, a three-hour reporting transaction has read a balance row. What happens to a payment that wants to update that row?",
-      "options": ["It proceeds; readers and writers use different lock modes", "It waits until the report commits and releases its shared lock", "It fails immediately with a serialization error", "It overwrites the row and the report rereads it"],
+      "options": [
+        "It proceeds; readers and writers use different lock modes",
+        "It waits until the report commits and releases its shared lock",
+        "It fails immediately with a serialization error",
+        "It overwrites the row and the report rereads it"
+      ],
       "correct": 1,
       "explanation": "Under 2PL a shared lock is held until commit, and an exclusive lock conflicts with it, so the writer queues behind the reader for the rest of the report. Shared and exclusive are different modes but they conflict with each other; that conflict is the whole reason MVCC exists."
     },
     {
       "stage": "check",
       "question": "A transaction begins with snapshot timestamp 4. The chain for key A has versions at commit timestamps 1, 4, and 6. Which value does it read?",
-      "options": ["The version at timestamp 6, the newest one", "The version at timestamp 1, the oldest committed one", "The version at timestamp 4, the newest at or below its snapshot", "It blocks until the writer of timestamp 6 finishes"],
+      "options": [
+        "The version at timestamp 6, the newest one",
+        "The version at timestamp 1, the oldest committed one",
+        "The version at timestamp 4, the newest at or below its snapshot",
+        "It blocks until the writer of timestamp 6 finishes"
+      ],
       "correct": 2,
       "explanation": "Visibility is the newest version with commitTs <= snapshot, so timestamp 4 wins; 6 is invisible because it was committed after the snapshot was taken. Nothing blocks: visibility is computed from data already present. The newest version is what READ COMMITTED would see on a fresh statement, not what a fixed snapshot sees."
     },
     {
       "stage": "check",
       "question": "T1 and T2 both start at snapshot 2 and both write key A. T1 commits at timestamp 3. What happens when T2 commits?",
-      "options": ["T2 commits at 4 and its value replaces T1's", "T2 aborts: A now has a version newer than T2's snapshot", "T2 waits for T1's version to be vacuumed, then commits", "T2 commits only if it also read A before writing it"],
+      "options": [
+        "T2 commits at 4 and its value replaces T1's",
+        "T2 aborts: A now has a version newer than T2's snapshot",
+        "T2 waits for T1's version to be vacuumed, then commits",
+        "T2 commits only if it also read A before writing it"
+      ],
       "correct": 1,
       "explanation": "First committer wins: at commit the store checks every written key for a version with commitTs greater than the snapshot. A has one at 3 > 2, so T2 aborts with a write conflict. Whether T2 read A is irrelevant; the rule looks only at the write set, which is why blind writes to the same key also conflict."
     },
     {
       "stage": "check",
       "question": "Why does a read-only transaction under snapshot isolation never abort and never consume a commit timestamp?",
-      "options": ["Because the oracle hands out timestamps only to writers that hold locks", "Because its reads are re-executed at commit time against the newest versions", "Because its write set is empty, so validation has nothing to check and nothing to publish", "Because the store detects it is read-only at begin and skips the snapshot"],
+      "options": [
+        "Because the oracle hands out timestamps only to writers that hold locks",
+        "Because its reads are re-executed at commit time against the newest versions",
+        "Because its write set is empty, so validation has nothing to check and nothing to publish",
+        "Because the store detects it is read-only at begin and skips the snapshot"
+      ],
       "correct": 2,
       "explanation": "Validation iterates over the write set; an empty set passes trivially and there are no versions to append, so no timestamp is needed. The transaction still has a snapshot, taken at begin, and its reads are never re-executed; repeatable reads are exactly the point."
     },
     {
       "stage": "post",
       "question": "Accounts A and B share the rule A + B >= 0, each at 100. Two concurrent transactions each check the sum and withdraw 150 from a different account. Why do both commit under snapshot isolation?",
-      "options": ["Their write sets are disjoint, so first-committer-wins finds no conflict even though each read what the other wrote", "The second transaction's snapshot already includes the first withdrawal, so its check was correct", "Snapshot isolation only validates reads, and both reads were of committed data", "The constraint is not stored in the database, so no isolation level could enforce it"],
+      "options": [
+        "Their write sets are disjoint, so first-committer-wins finds no conflict even though each read what the other wrote",
+        "The second transaction's snapshot already includes the first withdrawal, so its check was correct",
+        "Snapshot isolation only validates reads, and both reads were of committed data",
+        "The constraint is not stored in the database, so no isolation level could enforce it"
+      ],
       "correct": 0,
       "explanation": "This is write skew: each transaction's check was true on its own snapshot and neither wrote a key the other wrote, so validation has nothing to catch. The second snapshot does not include the first write because both started before either committed. Serializable snapshot isolation (Lesson 07) catches this by tracking the read-write dependencies, and overlapping the write sets with a constraint row also works."
     },
     {
       "stage": "post",
       "question": "A reporting transaction has been open for three hours on a ledger committing 2,000 writes per second. What does MVCC do about the versions written during that time?",
-      "options": ["It reclaims them incrementally as each newer version is committed", "It keeps all of them, because the report's snapshot is below their commit timestamps", "It blocks new writers once the version chain exceeds a configured length", "It aborts the report when its snapshot becomes older than the retention window"],
-      "correct": 1,
+      "options": [
+        "It reclaims them incrementally as each newer version is committed",
+        "It blocks new writers once the version chain exceeds a configured length",
+        "It aborts the report when its snapshot becomes older than the retention window",
+        "It keeps all of them, because the report's snapshot is below their commit timestamps"
+      ],
+      "correct": 3,
       "explanation": "The vacuum horizon is the oldest active snapshot. Every version committed after the report began has commitTs above that horizon, so it may still be needed and cannot be removed: around 21.6 million versions are pinned. Oracle's 'snapshot too old' aborts the reader instead, but that is a different design choice; PostgreSQL and this lesson's store keep the versions and bloat."
     }
   ]

@@ -31,11 +31,11 @@
       "question": "The settlement search sorts receivables in descending order before searching. Why?",
       "options": [
         "Because the allocations must be reported with the largest invoice first for the operator",
-        "Because the overshoot prune fires closer to the root when large amounts are tried first, cutting bigger subtrees",
         "Because the suffix-sum array can only be computed on a descending sequence",
-        "Because the search would otherwise find duplicate allocations in different orders"
+        "Because the search would otherwise find duplicate allocations in different orders",
+        "Because the overshoot prune fires closer to the root when large amounts are tried first, cutting bigger subtrees"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Pruning saves the most when it triggers high in the tree; putting large items first makes sum > target happen after few choices. The output order is a presentation concern, suffix sums work on any order, and the include/exclude structure never produces duplicates regardless of order."
     },
     {
@@ -55,11 +55,11 @@
       "question": "When converting the recursive settlement search to an explicit stack, the code pushes the 'skip' frame before the 'take' frame. Why?",
       "options": [
         "Because the skip branch is cheaper to evaluate and should be explored first so that dead ends fail fast",
-        "Because a stack pops the most recent push first, so reversing the push order reproduces the recursion's visit order",
         "Because the take frame needs the skip frame's result to compute its running sum before it can be pushed",
-        "Because pushing the take frame first would make the stack grow without bound on inputs with many receivables"
+        "Because pushing the take frame first would make the stack grow without bound on inputs with many receivables",
+        "Because a stack pops the most recent push first, so reversing the push order reproduces the recursion's visit order"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The recursion explored take then skip; with LIFO popping, the frame pushed last is explored first, so skip is pushed first. The tests check that node counts and output order match exactly. Neither branch depends on the other and stack growth is bounded by the depth times the branching factor either way."
     },
     {

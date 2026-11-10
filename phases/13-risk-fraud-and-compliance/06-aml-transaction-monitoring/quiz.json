@@ -55,11 +55,11 @@
       "question": "The synthetic run at an 80% floor alerts on the planted structurer and on a legitimate laundromat whose daily cash deposits are 8,400 to 9,300. Raising the floor to 93% keeps the structurer and drops the laundromat. What should the team conclude?",
       "options": [
         "93% is the correct floor for all banks and should be hard-coded",
-        "The floor is a tunable policy parameter whose setting must be justified with labelled data for this customer base",
         "The laundromat should be reported anyway, since its deposits exceed the threshold weekly",
-        "The structuring scenario should be replaced by the velocity scenario, which has no floor"
+        "The structuring scenario should be replaced by the velocity scenario, which has no floor",
+        "The floor is a tunable policy parameter whose setting must be justified with labelled data for this customer base"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The right floor depends on the institution's customers; a bank with many cash businesses will tune differently from one with few. What matters to an examiner is that the setting is a reviewed parameter backed by a precision/recall analysis on labelled cases, not a constant in code. Reporting legitimate businesses floods the queue and is not what the law asks for."
     },
     {
@@ -67,11 +67,11 @@
       "question": "Why does every Alert carry the list of transactions that triggered it rather than only a score and a scenario id?",
       "options": [
         "Because the score cannot be computed without re-reading the transactions",
-        "Because a suspicious activity report requires a narrative citing specific transactions, and the investigator has 30 days",
         "Because the merge step needs transaction ids to detect overlap, so they must be stored anyway",
-        "Because regulators require that raw transaction data be transmitted with each filing"
+        "Because regulators require that raw transaction data be transmitted with each filing",
+        "Because a suspicious activity report requires a narrative citing specific transactions, and the investigator has 30 days"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The filing's narrative must say who, what, when, and how with specific transactions, and the investigation clock is short. An alert without evidence forces the investigator to reconstruct the case from scratch. The merge step does use the ids, but that is a convenience, not the reason; raw data is not transmitted with a SAR."
     }
   ]

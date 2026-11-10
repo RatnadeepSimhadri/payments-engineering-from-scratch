@@ -42,12 +42,12 @@
       "stage": "check",
       "question": "In the Michael-Scott queue, an enqueuer finds tail.next is not null. What does it do, and why is this safe?",
       "options": [
-        "Spins until tail.next becomes null again, because another enqueue is in progress",
         "Swings tail forward to tail.next with a CAS and retries; at most one of the competing CASes succeeds",
+        "Spins until tail.next becomes null again, because another enqueue is in progress",
         "Appends its node to tail.next.next so that both enqueues are linked in one step",
         "Aborts and returns false, leaving the caller to retry after a backoff"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "A non-null tail.next means another thread linked a node but has not yet moved tail. The observer helps by performing that second CAS itself; the original enqueuer's CAS then fails harmlessly because both expected the same old tail. Spinning on another thread's progress would make the queue blocking, not lock-free."
     },
     {
@@ -67,11 +67,11 @@
       "question": "Which production mechanism is the closest analogue of the stamp in AtomicStampedReference?",
       "options": [
         "A row-level SELECT ... FOR UPDATE that blocks concurrent writers until commit",
-        "An UPDATE ... WHERE id = ? AND version = ? that affects zero rows if the row changed",
         "A Redis INCRBY that adds to a counter without reading it first",
-        "A database sequence that hands out unique identifiers to concurrent inserters"
+        "A database sequence that hands out unique identifiers to concurrent inserters",
+        "An UPDATE ... WHERE id = ? AND version = ? that affects zero rows if the row changed"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Optimistic locking stores a version with the row and makes the write conditional on the version the writer read; a zero-row update is a failed CAS, and the writer re-reads. FOR UPDATE is pessimistic locking, the blocking alternative; INCRBY is an unconditional atomic add with no stale-read detection."
     }
   ]

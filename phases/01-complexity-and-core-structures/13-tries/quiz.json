@@ -55,11 +55,11 @@
       "question": "A processor's router uses a six-digit hash map and, on a miss, retries with five, four, three, two, then one digit. Which failure does a trie with longest-prefix match remove?",
       "options": [
         "The hash map cannot store the two-digit Amex prefixes 34 and 37, because every key in it has to be padded to exactly six digits",
-        "A stale short rule such as 27 can win before the correct 2720 rule is ever checked, and every range must be expanded into tens of thousands of six-digit keys",
         "Hash lookups are slower than trie walks for keys longer than four characters, so six attempts cost far more than one eight-step walk",
-        "The retry loop cannot handle 15-digit Amex PANs, because it assumes a 16-digit input when it slices off the leading six digits"
+        "The retry loop cannot handle 15-digit Amex PANs, because it assumes a 16-digit input when it slices off the leading six digits",
+        "A stale short rule such as 27 can win before the correct 2720 rule is ever checked, and every range must be expanded into tens of thousands of six-digit keys"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The retry loop encodes 'longest wins' by hand and is only as correct as the order and completeness of its six tables; a leftover 27 rule wins over 2720 if the four-digit table was never consulted first, and every range has to be expanded to the fixed key length. A trie stores each rule at its natural length and one walk returns the deepest match. Hash maps can hold short keys fine, and lookup speed is not the issue."
     },
     {

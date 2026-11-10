@@ -55,23 +55,23 @@
       "question": "A team changes `int64 amount_minor = 2` to `string amount_minor = 2` so that amounts can carry decimals. What happens when a new producer sends to an old consumer?",
       "options": [
         "The old consumer parses the string as a decimal number, rounds it to minor units, and continues normally",
-        "The old consumer finds LENGTH_DELIMITED where it expects VARINT on field 2 and rejects the message as malformed",
         "The old consumer ignores field 2 entirely and falls back to the protobuf default amount of zero minor units",
-        "Nothing breaks: changing a field's type while keeping its number is a wire-compatible change in proto3"
+        "Nothing breaks: changing a field's type while keeping its number is a wire-compatible change in proto3",
+        "The old consumer finds LENGTH_DELIMITED where it expects VARINT on field 2 and rejects the message as malformed"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The field number is the same but the wire type changed, which violates Rule 2; the typed accessor checks the wire type and throws. A reader that did not check would misinterpret bytes instead. The correct change is a new field number for the new representation, with the old one reserved."
     },
     {
       "stage": "post",
       "question": "Why does this lesson warn against hashing or signing serialized protobuf bytes directly?",
       "options": [
-        "Because protobuf bytes are compressed and the compression dictionary varies by machine",
         "Because the encoding is not canonical: field order and default-omission can differ between encoders for the same message",
+        "Because protobuf bytes are compressed and the compression dictionary varies by machine",
         "Because varints are little-endian and hash functions require big-endian input",
         "Because the tag bytes contain the field names, which differ between language bindings"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Two correct encoders may emit the same message with fields in different orders, or with a default value present in one and omitted in the other, producing different bytes and therefore different hashes. Signing requires a defined canonical form, as Lesson 09 used for its Merkle leaves. Tags carry numbers, not names, and varints are not compressed."
     }
   ]

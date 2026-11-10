@@ -67,11 +67,11 @@
       "question": "Bitcoin pairs an odd last node with a copy of itself. What is the consequence that CVE-2012-2459 exploited?",
       "options": [
         "Proofs for the last leaf are longer than for other leaves",
-        "The lists [p0..p4] and [p0..p4,p4] produce the same root",
         "The root depends on the order the leaves are hashed",
-        "The tree height grows by one level for every odd leaf"
+        "The tree height grows by one level for every odd leaf",
+        "The lists [p0..p4] and [p0..p4,p4] produce the same root"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "Duplicating the odd node makes a list with a genuinely repeated last element indistinguishable from the odd list, so two different inputs share one root and a cached 'bad block' hash can match a valid block. Carrying the node up avoids this because the leaf counts, and therefore the roots, differ."
     }
   ]

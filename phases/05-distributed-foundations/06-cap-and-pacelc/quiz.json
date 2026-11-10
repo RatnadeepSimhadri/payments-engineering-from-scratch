@@ -67,11 +67,11 @@
       "question": "Why does this lesson classify an idempotency key store as PC rather than PA, even though availability is normally prized for payment APIs?",
       "options": [
         "Because idempotency keys are small and cheap to replicate synchronously, so the latency cost is negligible",
-        "Because a store that answers 'key not seen' when it cannot check would cause exactly the duplicate it exists to prevent",
         "Because regulators require that every payment request be recorded in a single authoritative region",
-        "Because key lookups are reads, and reads are always safe to serve from a quorum rather than a local replica"
+        "Because key lookups are reads, and reads are always safe to serve from a quorum rather than a local replica",
+        "Because a store that answers 'key not seen' when it cannot check would cause exactly the duplicate it exists to prevent"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The store is a safety mechanism: its purpose is to detect a repeated request. If a partitioned replica cannot see a key written on the other side and reports it as new, the payment is executed twice. A safety mechanism that fails open is not one, so the correct partition behaviour is to refuse or queue, not to guess. The latency argument is a reason PC is affordable, not the reason it is required."
     }
   ]

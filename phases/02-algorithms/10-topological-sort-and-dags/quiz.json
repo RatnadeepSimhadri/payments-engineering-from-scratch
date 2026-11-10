@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "A batch of jobs is scheduled by fixed clock times (fees at 23:10 because ingest 'always finishes by 23:05'). What is the underlying structure this schedule is approximating?",
-      "options": ["A priority queue ordered by how urgent each job is", "A directed graph of dependencies between the jobs", "A hash map from job name to its average duration", "A binary tree with the slowest job at the root"],
+      "options": [
+        "A priority queue ordered by how urgent each job is",
+        "A directed graph of dependencies between the jobs",
+        "A hash map from job name to its average duration",
+        "A binary tree with the slowest job at the root"
+      ],
       "correct": 1,
       "explanation": "Each 'runs after' relationship is an edge in a directed graph, and the clock times are a guess at one topological order of that graph. A priority queue is a plausible distractor because schedulers use one, but priorities alone cannot express 'must not start until X finishes'."
     },
     {
       "stage": "check",
       "question": "Kahn's algorithm finishes with 7 of 9 nodes emitted. What does that tell you?",
-      "options": ["The graph is disconnected and two nodes were unreachable", "Two nodes have out-degree zero and were never enqueued", "The graph contains a cycle somewhere among the two leftover nodes", "The ready queue was a FIFO when it should have been a priority queue"],
+      "options": [
+        "The graph is disconnected and two nodes were unreachable",
+        "Two nodes have out-degree zero and were never enqueued",
+        "The graph contains a cycle somewhere among the two leftover nodes",
+        "The ready queue was a FIFO when it should have been a priority queue"
+      ],
       "correct": 2,
       "explanation": "A node is emitted when its in-degree reaches zero; a node that is never emitted is waiting on another unemitted node, which can only happen in a cycle. Disconnected graphs are handled fine because every component has its own sources; out-degree is irrelevant to being enqueued."
     },
     {
       "stage": "check",
       "question": "During the DFS, the current node has an edge to a node coloured GRAY. What does that mean, and what does an edge to a BLACK node mean?",
-      "options": ["GRAY: a cycle through the recursion stack; BLACK: an already-finished subtree, safe to skip", "GRAY: an already-finished subtree; BLACK: a cycle through the recursion stack", "GRAY: a node in another component; BLACK: a node in the same component", "GRAY: a node with higher in-degree; BLACK: a node with in-degree zero"],
+      "options": [
+        "GRAY: a cycle through the recursion stack; BLACK: an already-finished subtree, safe to skip",
+        "GRAY: an already-finished subtree; BLACK: a cycle through the recursion stack",
+        "GRAY: a node in another component; BLACK: a node in the same component",
+        "GRAY: a node with higher in-degree; BLACK: a node with in-degree zero"
+      ],
       "correct": 0,
       "explanation": "GRAY nodes are on the current DFS stack, so an edge to one returns to an open ancestor: a back edge, hence a cycle. BLACK nodes are finished, and the edge is a cross or forward edge that is skipped, which is what keeps the algorithm linear. The second option swaps the two meanings."
     },
     {
       "stage": "check",
       "question": "Why does this lesson's Kahn implementation call the DFS to report a cycle rather than reporting the nodes Kahn left over?",
-      "options": ["Because Kahn cannot detect cycles at all without a second pass", "Because the leftover set includes everything downstream of the cycle, not just the cycle", "Because the DFS is faster than Kahn on graphs that contain cycles", "Because the leftover nodes are stored in a HashMap with no stable order"],
+      "options": [
+        "Because Kahn cannot detect cycles at all without a second pass",
+        "Because the leftover set includes everything downstream of the cycle, not just the cycle",
+        "Because the DFS is faster than Kahn on graphs that contain cycles",
+        "Because the leftover nodes are stored in a HashMap with no stable order"
+      ],
       "correct": 1,
       "explanation": "Kahn detects the cycle (the shortfall in emitted nodes) but the leftovers are every node on a cycle plus every node that depends on one, which on a large graph is almost everything. The DFS walks the parent chain from the back edge and names exactly the loop."
     },
     {
       "stage": "post",
       "question": "In the settlement schedule, generate-payout-file has 40 minutes of slack and post-ledger has zero. You can make exactly one of them 10 minutes faster. What happens to the 115-minute makespan?",
-      "options": ["Either choice gives 105 minutes, since both feed submit-to-bank", "Speeding up post-ledger gives 105; speeding up generate-payout-file leaves 115", "Speeding up generate-payout-file gives 105; speeding up post-ledger leaves 115", "Neither changes the makespan because submit-to-bank is the bottleneck"],
-      "correct": 1,
+      "options": [
+        "Either choice gives 105 minutes, since both feed submit-to-bank",
+        "Speeding up generate-payout-file gives 105; speeding up post-ledger leaves 115",
+        "Neither changes the makespan because submit-to-bank is the bottleneck",
+        "Speeding up post-ledger gives 105; speeding up generate-payout-file leaves 115"
+      ],
+      "correct": 3,
       "explanation": "Only tasks on the critical path (zero slack) affect the makespan. post-ledger is critical, so saving 10 minutes there finishes the batch 10 minutes sooner. generate-payout-file already has 40 minutes it could lose without delaying anything, so making it faster buys nothing."
     },
     {
       "stage": "post",
       "question": "Two engineers run the same scheduler on the same nine-job graph and get different, both valid, topological orders. Which implementation detail most plausibly explains it?",
-      "options": ["One used Kahn and the other used DFS, and both are deterministic", "The graph stored adjacency in a HashMap, so iteration order varied between runs", "One of the graphs contained a cycle that the scheduler silently ignored", "The durations differed, which changes the topological order"],
-      "correct": 1,
+      "options": [
+        "One used Kahn and the other used DFS, and both are deterministic",
+        "One of the graphs contained a cycle that the scheduler silently ignored",
+        "The durations differed, which changes the topological order",
+        "The graph stored adjacency in a HashMap, so iteration order varied between runs"
+      ],
+      "correct": 3,
       "explanation": "Both algorithms break ties by the order they encounter nodes, so a HashMap whose iteration order depends on hash codes and table size produces different valid orders between runs or JVM versions. Kahn versus DFS would also differ, but the question says the same scheduler; durations affect the critical path, not the topological order."
     }
   ]

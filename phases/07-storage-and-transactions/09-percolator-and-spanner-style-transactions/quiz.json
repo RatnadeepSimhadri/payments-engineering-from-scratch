@@ -54,12 +54,12 @@
       "stage": "post",
       "question": "CockroachDB does not commit-wait by default. How does it avoid returning stale data when a reader's clock is behind a writer's by less than max_offset?",
       "options": [
-        "It routes every read to the Raft leader, which has the authoritative clock",
         "It treats values timestamped within (t, t + max_offset] as uncertain and restarts the reader above them",
+        "It routes every read to the Raft leader, which has the authoritative clock",
         "It rejects any write whose timestamp is ahead of the reader's clock",
         "It synchronizes clocks with atomic hardware so that skew is always below one millisecond"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "A value in the uncertainty interval might have been committed before the reader started by a node whose clock was ahead, so the reader cannot safely ignore it; the transaction restarts at a timestamp above the value and re-reads. Leaders do not have special clocks, writes are not rejected for being ahead, and CockroachDB runs on commodity NTP, which is exactly why the interval exists."
     },
     {

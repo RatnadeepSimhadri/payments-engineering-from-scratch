@@ -31,11 +31,11 @@
       "question": "Why does the bulkhead run before the breaker in GuardedCall.begin(), and why is a bulkhead rejection not recorded in the breaker's window?",
       "options": [
         "Because the bulkhead check is cheaper, and recording rejections would make the window overflow its buckets",
-        "Because a full bulkhead means the caller is saturated, not that the dependency failed, so counting it would trip the breaker on a healthy dependency",
         "Because the breaker only accepts results from calls that completed, and a rejected call has no completion time to record",
-        "Because the bulkhead owns the clock, and the breaker cannot compute the failure rate until a permit has been granted"
+        "Because the bulkhead owns the clock, and the breaker cannot compute the failure rate until a permit has been granted",
+        "Because a full bulkhead means the caller is saturated, not that the dependency failed, so counting it would trip the breaker on a healthy dependency"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A bulkhead rejection is evidence about our own capacity. If it entered the window, a traffic spike against a perfectly healthy processor would open the breaker and then reject good traffic for openDurationMs. The cost of the check is irrelevant; the ordering is about what each rejection means."
     },
     {
@@ -54,12 +54,12 @@
       "stage": "post",
       "question": "The breaker is HALF_OPEN with 3 permits. Two probes have succeeded and the third fails at t = 14000. What is the state, and when can the next probe be admitted (openDurationMs = 3000)?",
       "options": [
-        "CLOSED, because two of three probes succeeded, which is above the 50% threshold",
         "OPEN, and the next probe is admitted at t = 17000 because the timer restarts from the failure",
+        "CLOSED, because two of three probes succeeded, which is above the 50% threshold",
         "OPEN, and the next probe is admitted at t = 15000 because the timer runs from the original trip",
         "HALF_OPEN, and one more probe is admitted immediately to break the tie"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Any probe failure in HALF_OPEN re-opens the breaker and sets openedAtMs to the failure time, so the next transition to HALF_OPEN is at 14000 + 3000 = 17000. The failure-rate threshold applies only in CLOSED; in HALF_OPEN the rule is all probes succeed or the breaker re-opens."
     },
     {

@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "A service's mean latency is 35 ms against a 100 ms SLO, yet a merchant reports two-second authorizations about once per hundred calls. How can both be true?",
-      "options": ["The merchant's clock is skewed, so their measurements include network time", "A mean hides the tail: 99 fast calls and one slow one average to a healthy-looking number", "Means are computed over a sliding window that excludes the slowest samples", "The SLO applies to the median, and the mean is always below the median"],
+      "options": [
+        "The merchant's clock is skewed, so their measurements include network time",
+        "A mean hides the tail: 99 fast calls and one slow one average to a healthy-looking number",
+        "Means are computed over a sliding window that excludes the slowest samples",
+        "The SLO applies to the median, and the mean is always below the median"
+      ],
       "correct": 1,
       "explanation": "(99 * 12 + 2000) / 100 is about 32 ms. Every number is true and the result says nothing about the one customer who waited two seconds. Latency distributions have long tails, and a mean is insensitive to how samples are distributed. The mean is not always below the median, and SLOs are stated on percentiles or fractions, not means."
     },
     {
       "stage": "check",
       "question": "Why does a counter's contract forbid decrements, and what does a scraper conclude when a counter's value drops between two samples?",
-      "options": ["Decrements would make the sum field negative; a drop means the scrape was corrupted and is discarded", "Only-up lets the scraper difference samples for a rate; a drop means a process restart, so the delta is the current value", "Decrements are a gauge operation; a drop means the metric was reclassified as a gauge", "Counters are stored unsigned; a drop indicates integer overflow and the rate is set to zero"],
+      "options": [
+        "Decrements would make the sum field negative; a drop means the scrape was corrupted and is discarded",
+        "Only-up lets the scraper difference samples for a rate; a drop means a process restart, so the delta is the current value",
+        "Decrements are a gauge operation; a drop means the metric was reclassified as a gauge",
+        "Counters are stored unsigned; a drop indicates integer overflow and the rate is set to zero"
+      ],
       "correct": 1,
       "explanation": "Because a counter only increases, the difference between two samples is the number of events in between, and dividing by the interval gives a rate. A value lower than the previous sample cannot be a real decrease, so it must be a reset to zero at restart; the events since then equal the current value. Corruption and overflow are not the usual explanation."
     },
     {
       "stage": "check",
       "question": "In a log-linear histogram with 128 sub-buckets per power of two, what is the maximum relative error of any percentile estimate above the exact range, and why?",
-      "options": ["About 1/128, because each bucket's width is at most 1/128 of its lower bound", "About 1/256, because the point estimate is the bucket midpoint", "It depends on the value: small values have large error and large values small error", "Zero, because every value is stored in its own bucket"],
+      "options": [
+        "About 1/128, because each bucket's width is at most 1/128 of its lower bound",
+        "About 1/256, because the point estimate is the bucket midpoint",
+        "It depends on the value: small values have large error and large values small error",
+        "Zero, because every value is stored in its own bucket"
+      ],
       "correct": 0,
       "explanation": "Within [2^e, 2^(e+1)) each sub-bucket is 2^(e-7) wide and its lower bound is at least 2^e, so width over lower bound is at most 2^-7 = 1/128 regardless of e. That constant relative error at every magnitude is the property that linear and purely logarithmic layouts lack. The implementation reports the upper bound, not the midpoint."
     },
     {
       "stage": "check",
       "question": "For a bucket layout to be correct, which property must hold for every bucket index i?",
-      "options": ["lowerBound(i) is a power of two and upperBound(i) is one less than a power of two", "indexOf(lowerBound(i)) == i, indexOf(upperBound(i)) == i, and lowerBound(i+1) == upperBound(i) + 1", "indexOf(v) is strictly increasing in v and every bucket has the same width", "upperBound(i) - lowerBound(i) is equal to i, so the bucket count equals the maximum value"],
-      "correct": 1,
+      "options": [
+        "lowerBound(i) is a power of two and upperBound(i) is one less than a power of two",
+        "indexOf(v) is strictly increasing in v and every bucket has the same width",
+        "upperBound(i) - lowerBound(i) is equal to i, so the bucket count equals the maximum value",
+        "indexOf(lowerBound(i)) == i, indexOf(upperBound(i)) == i, and lowerBound(i+1) == upperBound(i) + 1"
+      ],
+      "correct": 3,
       "explanation": "indexOf and lowerBound must be exact inverses at both ends of every bucket, and consecutive buckets must tile the range with no gaps or overlaps. Without these, values land in the wrong bucket and percentiles drift silently. Buckets are not all the same width, and only the first bucket in each power-of-two range starts at a power of two."
     },
     {
       "stage": "post",
       "question": "Host A (90,000 requests) reports p99 = 38 ms and host B (10,000 requests) reports p99 = 2.9 s. What is the correct way to obtain the fleet p99, and why is averaging wrong?",
-      "options": ["Weight each p99 by request count: (90,000 * 38 + 10,000 * 2900) / 100,000", "Merge the two histograms bucket by bucket and read p99 from the merged counts", "Take the maximum, since the fleet cannot be better than its worst host", "Take the median of per-host p99s once more than two hosts report"],
-      "correct": 1,
+      "options": [
+        "Weight each p99 by request count: (90,000 * 38 + 10,000 * 2900) / 100,000",
+        "Take the maximum, since the fleet cannot be better than its worst host",
+        "Merge the two histograms bucket by bucket and read p99 from the merged counts",
+        "Take the median of per-host p99s once more than two hosts report"
+      ],
+      "correct": 2,
       "explanation": "A percentile is a property of the whole distribution, and only the merged histogram reconstructs that distribution. Host A's 38 ms says nothing about what rank host B's slow samples hold in the combined population, so no weighting of per-host percentiles recovers the answer; in the demo the correct fleet p99 is under 0.9 s while the average is 1.5 s and the max is 2.9 s."
     },
     {
       "stage": "post",
       "question": "A team exports latency as a Prometheus classic histogram with boundaries 0.1, 0.5, 1, 2.5, and 5 seconds. Their p99 lands in the 1 to 2.5 second bucket. What can they conclude?",
-      "options": ["The p99 is exactly 1.75 s, the midpoint, since Prometheus interpolates linearly", "The p99 is between 1 and 2.5 s; finer resolution needs more boundaries or an exponential layout", "The p99 is 2.5 s, because Prometheus reports the upper bound of the bucket", "The histogram is misconfigured, because a p99 should never fall in a bucket that wide"],
-      "correct": 1,
+      "options": [
+        "The p99 is exactly 1.75 s, the midpoint, since Prometheus interpolates linearly",
+        "The p99 is 2.5 s, because Prometheus reports the upper bound of the bucket",
+        "The histogram is misconfigured, because a p99 should never fall in a bucket that wide",
+        "The p99 is between 1 and 2.5 s; finer resolution needs more boundaries or an exponential layout"
+      ],
+      "correct": 3,
       "explanation": "Fixed boundaries give resolution only where boundaries are dense. histogram_quantile interpolates inside the bucket, but the interpolation is a guess, not a measurement; the honest statement is the bucket range. A log-linear or exponential layout bounds the relative error at every magnitude, which is why native and OpenTelemetry exponential histograms exist."
     }
   ]

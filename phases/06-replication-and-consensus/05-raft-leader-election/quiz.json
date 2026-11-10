@@ -7,11 +7,11 @@
       "question": "A standby node has missed three heartbeats from the primary and promotes itself. What has the node actually learned from the missed heartbeats?",
       "options": [
         "That the primary has crashed and its process is no longer running",
-        "That it has not heard from the primary; the primary may be alive and partitioned",
         "That a majority of the cluster has also stopped hearing from the primary",
-        "That the primary has already stepped down and stopped accepting writes"
+        "That the primary has already stepped down and stopped accepting writes",
+        "That it has not heard from the primary; the primary may be alive and partitioned"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A timeout is local evidence of silence, nothing more. From inside a minority partition a live primary looks identical to a dead one, which is why promotion on a local timeout alone eventually produces two primaries. Raft replaces the local decision with a majority vote and a term number so a stale primary can be recognised and rejected."
     },
     {

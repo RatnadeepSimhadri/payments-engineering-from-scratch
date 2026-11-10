@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "A service commits a payment row to its database and then publishes an event to a broker. The broker is unreachable at that moment. What is the lasting result?",
-      "options": ["The database commit is undone when the publish fails", "The row exists and the event never does; downstream systems never learn of the payment", "The broker queues the publish locally and delivers it when it recovers", "The HTTP client retries, which republishes the event once the broker returns"],
+      "options": [
+        "The database commit is undone when the publish fails",
+        "The row exists and the event never does; downstream systems never learn of the payment",
+        "The broker queues the publish locally and delivers it when it recovers",
+        "The HTTP client retries, which republishes the event once the broker returns"
+      ],
       "correct": 1,
       "explanation": "The commit is final; the publish failing afterwards cannot roll it back. Nothing persistent records that an event was owed, so when the broker returns no one resends it. A client retry hits the idempotency store and returns the original success without republishing. This is the orphan-row half of the dual-write problem."
     },
     {
       "stage": "check",
       "question": "Why does writing the outbox row in the same transaction as the payment row fix the dual-write problem?",
-      "options": ["Because the database notifies the broker as part of its commit protocol", "Because the outbox row is written first and the payment row only if the broker accepts it", "Because atomicity across tables in one database means both rows exist or neither does", "Because the outbox table is replicated to the broker by the database's own replication"],
+      "options": [
+        "Because the database notifies the broker as part of its commit protocol",
+        "Because the outbox row is written first and the payment row only if the broker accepts it",
+        "Because atomicity across tables in one database means both rows exist or neither does",
+        "Because the outbox table is replicated to the broker by the database's own replication"
+      ],
       "correct": 2,
       "explanation": "A single database transaction is atomic across every table it touches, so the business row and its outbox row commit together or not at all. The broker is not involved in the request path; a separate relay moves outbox rows to it later. Databases do not talk to brokers during commit, and replication to a broker is what the relay or CDC adds afterwards."
     },
     {
       "stage": "check",
       "question": "The relay publishes a row, then marks it published. It crashes between the two. What does the next poll do, and why is that the right order?",
-      "options": ["Skips the row because the broker already has it; marking first would be equivalent", "Publishes the row again, producing a duplicate; marking first could lose the event forever", "Publishes the row again and the broker rejects it as a duplicate by event id", "Rolls back the earlier publish so the row can be published exactly once"],
+      "options": [
+        "Skips the row because the broker already has it; marking first would be equivalent",
+        "Publishes the row again, producing a duplicate; marking first could lose the event forever",
+        "Publishes the row again and the broker rejects it as a duplicate by event id",
+        "Rolls back the earlier publish so the row can be published exactly once"
+      ],
       "correct": 1,
       "explanation": "The mark never committed, so the row still looks pending and is republished with the same eventId. That is at-least-once. If the relay marked first and crashed before publishing, the row would say published while the broker never got it, and no component could detect the loss. Duplicates are detectable; losses are not. Brokers do not roll back publishes or dedupe by an application-level id."
     },
     {
       "stage": "check",
       "question": "Why must the event id be assigned by the producer and stored in the outbox row, rather than using the broker's offset?",
-      "options": ["Offsets are per partition, so two partitions could assign the same number to different events", "A republished row receives a new offset, so the consumer cannot recognise it as a repeat", "The broker's offset is not available to the producer until after the consumer has read it", "Offsets are 64-bit integers and the consumer's dedupe set requires string keys"],
-      "correct": 1,
+      "options": [
+        "Offsets are per partition, so two partitions could assign the same number to different events",
+        "The broker's offset is not available to the producer until after the consumer has read it",
+        "Offsets are 64-bit integers and the consumer's dedupe set requires string keys",
+        "A republished row receives a new offset, so the consumer cannot recognise it as a repeat"
+      ],
+      "correct": 3,
       "explanation": "Deduplication needs an identity that is identical every time the same event is sent. The outbox row's eventId is written once, before commit, and travels unchanged on every republish. The broker assigns a fresh offset to each publish, so two copies of the same event have different offsets. Partition scope and key types are not the issue."
     },
     {
       "stage": "post",
       "question": "The relay reads a batch of five rows in seq order and the broker rejects the second one. What should the relay do with rows three to five?",
-      "options": ["Publish them, since they are independent rows and a stall harms latency", "Leave them pending and stop the batch, so later rows cannot overtake the failed one", "Mark them published to keep the queue short and rely on the consumer to request them", "Publish them to a dead-letter topic so that nothing is lost while row two is retried"],
-      "correct": 1,
+      "options": [
+        "Leave them pending and stop the batch, so later rows cannot overtake the failed one",
+        "Publish them, since they are independent rows and a stall harms latency",
+        "Mark them published to keep the queue short and rely on the consumer to request them",
+        "Publish them to a dead-letter topic so that nothing is lost while row two is retried"
+      ],
+      "correct": 0,
       "explanation": "Ordering per aggregate is only preserved if the relay never lets a later row reach the broker before an earlier one. Stopping the batch costs latency but keeps a refund from arriving before its payment. Publishing around the failure breaks order; marking rows as published that were not is a loss. A dead-letter table is for rows that fail permanently after a retry budget, not for a transient broker error."
     },
     {
       "stage": "post",
       "question": "A consumer applies an event to its ledger, then records the event id in a processed-events table in a separate transaction, and crashes between the two. What happens on restart, and what prevents it?",
-      "options": ["The event is skipped because the broker offset was committed; nothing prevents it", "The event is applied again, double-crediting; apply and record must share one transaction", "The event is applied again but the ledger detects the duplicate posting by amount", "The event is applied again; the relay's mark prevents a second delivery"],
-      "correct": 1,
+      "options": [
+        "The event is skipped because the broker offset was committed; nothing prevents it",
+        "The event is applied again but the ledger detects the duplicate posting by amount",
+        "The event is applied again; the relay's mark prevents a second delivery",
+        "The event is applied again, double-crediting; apply and record must share one transaction"
+      ],
+      "correct": 3,
       "explanation": "On restart the consumer re-reads from its last committed position, finds no record of the event id, and applies it a second time. This is the dual-write problem mirrored on the consumer side. The fix is the same: write the ledger effect and the processed-event marker in one transaction. Matching by amount is unreliable, and the relay's mark controls publishing, not consumption."
     }
   ]

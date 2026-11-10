@@ -56,22 +56,22 @@
       "options": [
         "Red-black is slower because it performs more total operations",
         "AVL should always be preferred because its worst-case height bound is lower",
-        "Red-black does less pointer work per update, which is why update-heavy libraries chose it",
-        "The two trees are equivalent and the choice is a matter of taste"
+        "The two trees are equivalent and the choice is a matter of taste",
+        "Red-black does less pointer work per update, which is why update-heavy libraries chose it"
       ],
-      "correct": 2,
+      "correct": 3,
       "explanation": "A recolouring is a one-byte write; a rotation rewrites three pointers and invalidates cache lines. Fewer rotations with cheap recolourings is exactly the trade TreeMap, std::map, and the Linux scheduler made. AVL's lower height bound matters for lookup-dominated workloads, not always."
     },
     {
       "stage": "post",
       "question": "A hold-expiry sweeper needs 'all holds expiring before now' every second, for 4 million holds. Which structure and operation fit?",
       "options": [
-        "A HashMap keyed by hold id, scanned fully each second",
         "An ordered tree keyed by expiry, using range or pollFirstEntry from the smallest key",
+        "A HashMap keyed by hold id, scanned fully each second",
         "A HashMap keyed by expiry instant, looked up for each possible millisecond",
         "A plain BST keyed by expiry, since expiries arrive in random order"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Range and predecessor queries are what ordered trees provide and hash maps cannot; the sweep costs O(log n + k) for k expired holds. A full scan is O(n) per second, a per-millisecond lookup is O(window), and a plain BST degenerates because expiries arrive in nearly sorted order."
     }
   ]

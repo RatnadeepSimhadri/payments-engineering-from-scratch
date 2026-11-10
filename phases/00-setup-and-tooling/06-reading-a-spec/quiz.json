@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "An acquirer's documentation says its interface is 'ISO 8583 (1987)'. Which document actually fixes which fields each message must carry, how the bitmap is encoded, and how the MAC is computed?",
-      "options": ["ISO 8583 itself, which defines a complete interoperable wire format for every network", "The acquirer's implementation guide, which overrides the standard wherever the two differ", "ISO 4217, since the amount and currency fields determine the rest of the message layout", "RFC 2104, which every card network adopts as the normative definition of its MAC"],
+      "options": [
+        "ISO 8583 itself, which defines a complete interoperable wire format for every network",
+        "The acquirer's implementation guide, which overrides the standard wherever the two differ",
+        "ISO 4217, since the amount and currency fields determine the rest of the message layout",
+        "RFC 2104, which every card network adopts as the normative definition of its MAC"
+      ],
       "correct": 1,
       "explanation": "ISO 8583 is a framework: it catalogues data elements and message structure but leaves field presence per message type, encoding, framing, and security to each network or acquirer, which publishes them in an implementation guide. ISO 4217 only supplies currency codes and exponents; RFC 2104 defines HMAC, which networks may or may not use."
     },
     {
       "stage": "check",
       "question": "Under BCP 14 (RFC 2119 as clarified by RFC 8174), which statement about SHOULD is correct?",
-      "options": ["SHOULD is purely optional; an implementation may ignore it with no justification", "SHOULD means do it unless you have understood the full implications and have a valid reason not to", "SHOULD and should carry the same force whether or not the word is capitalised", "SHOULD is a requirement identical to MUST but reserved for security-relevant behaviour"],
+      "options": [
+        "SHOULD is purely optional; an implementation may ignore it with no justification",
+        "SHOULD means do it unless you have understood the full implications and have a valid reason not to",
+        "SHOULD and should carry the same force whether or not the word is capitalised",
+        "SHOULD is a requirement identical to MUST but reserved for security-relevant behaviour"
+      ],
       "correct": 1,
       "explanation": "RFC 2119 defines SHOULD as a recommendation that may be ignored only with full understanding and a valid reason, which a reviewer should ask for. MAY is the truly optional level. RFC 8174 states that only the capitalised forms carry the special meaning, so lower-case should is ordinary English."
     },
     {
       "stage": "check",
       "question": "RFC 2104 was published in February 1997 with no BCP 14 boilerplate and says a key shorter than the hash output 'is strongly discouraged'. How should an implementer treat that sentence?",
-      "options": ["As ordinary English with no force, because RFC 8174 says only capitalised keywords carry meaning", "As a MUST NOT, because every RFC statement about keys is a conformance requirement by default", "As a strong recommendation whose force must be judged from the sentence itself, since the document predates the keyword vocabulary", "As informative text that applies only to the sample code in the appendix of the RFC"],
+      "options": [
+        "As ordinary English with no force, because RFC 8174 says only capitalised keywords carry meaning",
+        "As a MUST NOT, because every RFC statement about keys is a conformance requirement by default",
+        "As a strong recommendation whose force must be judged from the sentence itself, since the document predates the keyword vocabulary",
+        "As informative text that applies only to the sample code in the appendix of the RFC"
+      ],
       "correct": 2,
       "explanation": "RFC 2104 predates RFC 2119 by a month and uses no defined keywords, so each statement of force has to be weighed as written; 'strongly discouraged' is a strong recommendation, appropriate for a documented minimum in your API rather than a conformance failure. RFC 8174's capitalisation rule applies only to documents that adopt its boilerplate."
     },
     {
       "stage": "check",
       "question": "An ISO 8583 message carries DE 4 = 000000001999 and DE 49 = 392. What is the transaction amount?",
-      "options": ["19.99 units, because DE 4 always carries two implied decimal places", "1,999 JPY, because the currency code 392 has an ISO 4217 exponent of zero", "1.999 units, because a twelve-digit amount field implies three decimal places", "199.9 units, because the 1987 edition of the standard specifies one implied decimal"],
-      "correct": 1,
+      "options": [
+        "19.99 units, because DE 4 always carries two implied decimal places",
+        "1.999 units, because a twelve-digit amount field implies three decimal places",
+        "199.9 units, because the 1987 edition of the standard specifies one implied decimal",
+        "1,999 JPY, because the currency code 392 has an ISO 4217 exponent of zero"
+      ],
+      "correct": 3,
       "explanation": "The field table says only n 12. The number of implied decimals comes from the currency in DE 49 via ISO 4217: 392 is JPY with exponent 0, so the amount is 1,999 yen. The same bytes with 840 (USD) would be 19.99; hard-coding two decimals is the bug in The Problem."
     },
     {
       "stage": "post",
       "question": "A primary bitmap begins with the hexadecimal byte 0x72 and bit 1 of the bitmap is clear. What does this tell you about the message?",
-      "options": ["Data elements 2, 3, 4, and 7 are present and there is no secondary bitmap, so no element above 64 appears", "Data elements 1, 2, 3, and 6 are present and a secondary bitmap follows the primary one", "The message is a 1993-edition message, because 0x72 is the version marker for that revision", "Data elements 2, 3, 4, and 7 are present and DE 128 may still appear in a trailing MAC field"],
+      "options": [
+        "Data elements 2, 3, 4, and 7 are present and there is no secondary bitmap, so no element above 64 appears",
+        "Data elements 1, 2, 3, and 6 are present and a secondary bitmap follows the primary one",
+        "The message is a 1993-edition message, because 0x72 is the version marker for that revision",
+        "Data elements 2, 3, 4, and 7 are present and DE 128 may still appear in a trailing MAC field"
+      ],
       "correct": 0,
       "explanation": "0x72 is 0111 0010 with bit 1 as the most significant bit, so bits 2, 3, 4, and 7 are set. Bit 1 clear means no secondary bitmap, and every element from 65 to 128, including DE 128, lives in the secondary bitmap, so none can appear. The edition is given by the MTI's first digit, not the bitmap."
     },
     {
       "stage": "post",
       "question": "During certification the acquirer rejects messages that follow its own implementation guide and accepts a variant its support team confirms by email. What is the correct engineering response?",
-      "options": ["Follow the guide exactly and escalate until the acquirer changes its system to conform", "Accept and send the variant, record it as a documented deviation citing the confirmation, and keep the guide as the reference for everything else", "Fall back to the ISO 8583 standard text, since it is the root authority when the guide and the system disagree", "Implement both forms and choose between them at runtime based on which one the acquirer last accepted"],
-      "correct": 1,
+      "options": [
+        "Follow the guide exactly and escalate until the acquirer changes its system to conform",
+        "Fall back to the ISO 8583 standard text, since it is the root authority when the guide and the system disagree",
+        "Implement both forms and choose between them at runtime based on which one the acquirer last accepted",
+        "Accept and send the variant, record it as a documented deviation citing the confirmation, and keep the guide as the reference for everything else"
+      ],
+      "correct": 3,
       "explanation": "The counterparty's confirmed behaviour wins over both the guide and the standard when they conflict, but only with a paper trail: the deviation goes in your documentation with the ticket reference. The standard cannot settle a question the guide already decided, and silently switching formats at runtime hides the discrepancy from the next engineer."
     }
   ]

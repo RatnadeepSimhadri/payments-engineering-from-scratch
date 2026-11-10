@@ -55,11 +55,11 @@
       "question": "An outbound queue of payment instructions to a card network fills up during a traffic spike. Which overflow policy is correct, and what must the producer do?",
       "options": [
         "DROP_OLDEST, because the newest instructions are the most urgent and old ones can be re-sent later",
-        "REJECT, so the producer sees a false return and must slow down, retry later, or shed load upstream",
         "Grow the queue, because payment instructions must never be refused by a transport layer",
-        "DROP_OLDEST with a larger capacity, so the drops become rare enough not to matter"
+        "DROP_OLDEST with a larger capacity, so the drops become rare enough not to matter",
+        "REJECT, so the producer sees a false return and must slow down, retry later, or shed load upstream"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "A payment instruction cannot be silently lost, so the only acceptable response to a full queue is backpressure: the producer learns it was refused and the overload propagates toward something that can slow down. Growing the queue recreates the OutOfMemoryError failure. DROP_OLDEST is right for metrics and market data where the latest value supersedes older ones, never for commands."
     },
     {
@@ -67,11 +67,11 @@
       "question": "A Kafka consumer stored offset 2 for a partition whose log start offset is now 4 and end offset is 12. In ring-buffer terms, what happened and what can the consumer do?",
       "options": [
         "The consumer is 10 messages behind and can read offset 2 next, since Kafka retains everything",
-        "The consumer fell below head: messages 2 and 3 were evicted by retention, and it must reset to 4 (earliest) or 12 (latest)",
         "The partition wrapped around, so offset 2 now refers to the message formerly at offset 10",
-        "The consumer committed a future offset by mistake and must rewind to 0"
+        "The consumer committed a future offset by mistake and must rewind to 0",
+        "The consumer fell below head: messages 2 and 3 were evicted by retention, and it must reset to 4 (earliest) or 12 (latest)"
       ],
-      "correct": 1,
+      "correct": 3,
       "explanation": "The log start offset is the ring's head; offsets below it are gone. The consumer's lag was tail - 2 = 10 but two of those messages no longer exist, so auto.offset.reset decides whether it resumes at head (earliest) and processes 8 messages or jumps to tail (latest) and skips them all. Offsets are sequences, not slot indices, so they never wrap or get reassigned."
     }
   ]

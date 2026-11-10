@@ -68,10 +68,10 @@
       "options": [
         "Yes, because a linearizable read guarantees that both services observe the most recent acknowledged debit before deciding",
         "Yes, provided the debit is also written to the leader, since the leader serialises all writes and applies them in order",
-        "No, because both reads can return the same balance before either debit lands; the check and the debit must be one atomic step",
-        "No, because linearizability constrains only the order of writes and says nothing at all about the value a read returns"
+        "No, because linearizability constrains only the order of writes and says nothing at all about the value a read returns",
+        "No, because both reads can return the same balance before either debit lands; the check and the debit must be one atomic step"
       ],
-      "correct": 2,
+      "correct": 3,
       "explanation": "Linearizability says what each read means, not that a read and a later write form one step. Both reads can legitimately return 150 if they both precede both debits, and each debit then succeeds. Preventing the double-spend needs a conditional write or a transaction that makes check-then-debit atomic; the leader serialising writes does not make the preceding reads part of them."
     }
   ]

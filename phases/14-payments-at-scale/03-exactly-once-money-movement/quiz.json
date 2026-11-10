@@ -5,43 +5,73 @@
     {
       "stage": "pre",
       "question": "A consumer reads a message, inserts a ledger row, commits, and is killed before acknowledging the message. What can the message bus know about the ledger row?",
-      "options": ["That the row was committed, because the commit happened before the crash", "That the row was not committed, because no acknowledgement arrived", "Nothing; it must redeliver and rely on the consumer to recognise the repeat", "That the row is in doubt, so it moves the message to a dead-letter queue"],
+      "options": [
+        "That the row was committed, because the commit happened before the crash",
+        "That the row was not committed, because no acknowledgement arrived",
+        "Nothing; it must redeliver and rely on the consumer to recognise the repeat",
+        "That the row is in doubt, so it moves the message to a dead-letter queue"
+      ],
       "correct": 2,
       "explanation": "The bus sees only a missing acknowledgement, which looks identical whether the crash happened before or after the commit. It must redeliver, and only the consumer, by consulting a record it wrote in the same transaction as the row, can tell that the effect already exists. Treating the missing ack as 'not committed' is the assumption that produces double posts."
     },
     {
       "stage": "check",
       "question": "The gateway writes the payment row and commits, then writes the outbox row in a second transaction. A crash lands between them. Which harness invariant reports it?",
-      "options": ["one-payment-per-key, because the retry creates a second payment", "payment-has-outbox-row, because a payment exists that no event will ever announce", "posted-once-downstream, because the event is eventually published twice", "trial-balance, because the gateway ledger entry has no matching credit"],
+      "options": [
+        "one-payment-per-key, because the retry creates a second payment",
+        "payment-has-outbox-row, because a payment exists that no event will ever announce",
+        "posted-once-downstream, because the event is eventually published twice",
+        "trial-balance, because the gateway ledger entry has no matching credit"
+      ],
       "correct": 1,
       "explanation": "This is the dual-write anti-pattern. The payment and its ledger entry committed but the outbox row did not, so the downstream ledger never hears about the payment and the structural check finds a payment with no outbox row. The gateway's own trial balance is still zero, because the ledger entry itself was balanced; that is why balance alone is not enough."
     },
     {
       "stage": "check",
       "question": "Why does the outbox relay publish to the bus first and only then mark the row as published, even though a crash between the two steps causes a duplicate?",
-      "options": ["Because marking first would hold a database lock while waiting on the bus", "Because the bus confirms publication faster than the database confirms a write", "Because marking first and crashing loses the event, which nothing downstream can repair", "Because the relay is the only component that is allowed to retry a failed publish"],
+      "options": [
+        "Because marking first would hold a database lock while waiting on the bus",
+        "Because the bus confirms publication faster than the database confirms a write",
+        "Because marking first and crashing loses the event, which nothing downstream can repair",
+        "Because the relay is the only component that is allowed to retry a failed publish"
+      ],
       "correct": 2,
       "explanation": "Mark-then-publish turns a crash into a lost event: the row says published, nothing is on the bus, and the only fix is a reconciliation break found later by hand. Publish-then-mark turns the same crash into a duplicate, which the consumer inbox absorbs for free because it must exist anyway to cope with bus-level duplicates. Lock duration and latency are not the deciding factors."
     },
     {
       "stage": "check",
       "question": "A client retries with the same idempotency key but a different amount. What should the API return?",
-      "options": ["The stored payment, since the key identifies the request and the body is advisory", "A new payment, since a different body is by definition a different request", "A conflict error, since the same key with a different body indicates a client bug", "The stored payment with the amount updated to the value in the new request"],
-      "correct": 2,
+      "options": [
+        "The stored payment, since the key identifies the request and the body is advisory",
+        "A new payment, since a different body is by definition a different request",
+        "The stored payment with the amount updated to the value in the new request",
+        "A conflict error, since the same key with a different body indicates a client bug"
+      ],
+      "correct": 3,
       "explanation": "The fingerprint check exists for exactly this case. Replaying the stored payment would silently charge an amount the client did not just ask for; creating a new payment would defeat the key; updating the amount would mutate a committed record. Surfacing a conflict makes the client bug visible, which is what Stripe's idempotency_error does."
     },
     {
       "stage": "post",
       "question": "The consumer inbox insert and the downstream ledger posting are moved into two separate transactions, inbox first. Which fault point now causes a lost posting rather than a duplicate?",
-      "options": ["CONSUMER_BEFORE_COMMIT, because the inbox record is rolled back with the posting", "A crash between the two commits, because the inbox says done and redelivery is skipped", "BUS_DUPLICATE, because the second copy arrives before the inbox insert is visible", "RELAY_AFTER_PUBLISH, because the republished event carries a different event id"],
+      "options": [
+        "CONSUMER_BEFORE_COMMIT, because the inbox record is rolled back with the posting",
+        "A crash between the two commits, because the inbox says done and redelivery is skipped",
+        "BUS_DUPLICATE, because the second copy arrives before the inbox insert is visible",
+        "RELAY_AFTER_PUBLISH, because the republished event carries a different event id"
+      ],
       "correct": 1,
       "explanation": "With the inbox committed first, a crash before the posting commits leaves a record claiming the event was handled. When the bus redelivers, the consumer sees the record and skips the message, so the posting never happens and money-conserved fails. Writing both in one transaction is the whole point of the inbox pattern; BUS_DUPLICATE and RELAY_AFTER_PUBLISH produce duplicates, not losses, and the event id is stable across republishes."
     },
     {
       "stage": "post",
       "question": "After a 3,000-operation run both ledgers have a zero trial balance. What does that prove about the pipeline?",
-      "options": ["Every payment was posted exactly once in each ledger", "Every journal entry that was posted had equal debits and credits", "No idempotency key was ever mapped to more than one payment", "The number of downstream entries equals the number of accepted payments"],
-      "correct": 1,
+      "options": [
+        "Every journal entry that was posted had equal debits and credits",
+        "Every payment was posted exactly once in each ledger",
+        "No idempotency key was ever mapped to more than one payment",
+        "The number of downstream entries equals the number of accepted payments"
+      ],
+      "correct": 0,
       "explanation": "A trial balance of zero is the double-entry invariant: each posted entry was balanced. A payment posted three times is three balanced entries and still sums to zero, so the trial balance says nothing about exactly-once. The count and conservation checks (posted-once, money-conserved, one-payment-per-key) are separate invariants for that reason, and the harness without consumer dedupe fails them while keeping a zero trial balance."
     }
   ]

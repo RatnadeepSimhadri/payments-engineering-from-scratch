@@ -42,12 +42,12 @@
       "stage": "check",
       "question": "Why does every benchmark body hand its result to a Blackhole whose consume writes a volatile field?",
       "options": [
-        "To warm the memory subsystem so that the first measured iteration is not a cold-cache outlier",
         "Because a computation whose result has no observable effect may be deleted by the JIT, leaving an empty loop",
+        "To warm the memory subsystem so that the first measured iteration is not a cold-cache outlier",
         "To force a garbage collection between iterations so GC pauses land outside the timed region",
         "Because System.nanoTime is only accurate when a memory barrier separates consecutive reads"
       ],
-      "correct": 1,
+      "correct": 0,
       "explanation": "Dead-code elimination removes work whose result nobody reads. A volatile write is a side effect the compiler must preserve, so the computation feeding it survives. The blackhole has nothing to do with caches, GC timing, or nanoTime accuracy."
     },
     {
