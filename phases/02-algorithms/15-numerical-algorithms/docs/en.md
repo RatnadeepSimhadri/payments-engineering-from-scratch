@@ -324,8 +324,70 @@ Every number in both tables is identical in Java, Python, and Go, because the ra
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design as module-level functions in `snake_case`, with four differences. **`%` is already non-negative for a positive modulus**, so `mod` is a one-liner kept only so the three designs match; `//` floors rather than truncates, which changes the Bezout coefficients for negative inputs but not the identity, and the lesson's inputs are non-negative so the coefficients match Java and Go exactly. **`pow(base, exp, m)` is built in** and is what production code should call; the lesson's `mod_pow` exists to show the squaring loop, and the test checks it against `pow`. **`str.isdigit()` accepts Unicode digits** such as Arabic-Indic numerals, so the validators also check `isascii()`; without it `"٤٥٣٩"` would pass the type check and then fail arithmetic in a confusing place. **Validators are plain callables** (`Callable[[str], bool]`) rather than an interface. The seeded LCG masks its state with `& MASK` after every step because Python ints do not wrap.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Euclid, extended
+
+Tuple assignment replaces the three `tmp` shuffles: each `old_r, r = r, old_r - q * r` line advances one pair in lockstep. `q = old_r // r` floors, which agrees with Java's truncating `/` whenever both operands are non-negative, as they are for every input in this lesson. `Bezout` is a frozen dataclass.
+
+```python
+@dataclass(frozen=True)
+class Bezout:
+    """g = gcd(a, b) together with x, y such that a*x + b*y = g."""
+
+    g: int
+    x: int
+    y: int
+
+
+def extended_gcd(a: int, b: int) -> Bezout:
+    """Extended Euclid: carries the coefficient pairs alongside the remainders."""
+    old_r, r = a, b
+    old_x, x = 1, 0
+    old_y, y = 0, 1
+    while r != 0:
+        q = old_r // r  # floor division; identical to Java/Go truncation for the non-negative inputs used here
+        old_r, r = r, old_r - q * r
+        old_x, x = x, old_x - q * x
+        old_y, y = y, old_y - q * y
+    if old_r < 0:
+        return Bezout(-old_r, -old_x, -old_y)
+    return Bezout(old_r, old_x, old_y)
+```
+
+#### Step 2: The inverse
+
+`mod` is `a % m`, already in `0..m-1` for positive `m`, so the helper exists for symmetry with Java and Go rather than necessity. A non-unit raises `ArithmeticError`, the counterpart of `ArithmeticException`; a bad modulus raises `ValueError`.
+
+```python
+def mod(a: int, m: int) -> int:
+    """Result in 0..m-1 regardless of sign. Python's % already does this for positive m; kept for symmetry."""
+    if m <= 0:
+        raise ValueError("modulus must be positive")
+    return a % m
+
+
+def mod_inverse(a: int, m: int) -> int:
+    """The x in 0..m-1 with a*x = 1 (mod m); exists iff gcd(a, m) = 1."""
+    if m <= 1:
+        raise ValueError("modulus must be > 1")
+    b = extended_gcd(mod(a, m), m)
+    if b.g != 1:
+        raise ArithmeticError(f"{a} has no inverse modulo {m} (gcd = {b.g})")
+    return mod(b.x, m)
+```
+
+#### Step 3: Remainders of long strings
+
+Horner's rule over the characters; `ord(c) - 48` is the digit value (`48` is `ord("0")`), and the chained comparison `"0" <= c <= "9"` is the digit test. Python ints could hold the whole 30-digit number, but the point is that `r` never exceeds `10m + 9`.
+
 ```python
 def mod_of_decimal_string(digits: str, m: int) -> int:
+    """Remainder of an arbitrarily long decimal string by Horner's rule: r = (r*10 + digit) mod m."""
+    if not digits:
+        raise ValueError("empty digit string")
     r = 0
     for i, c in enumerate(digits):
         if not "0" <= c <= "9":
@@ -334,28 +396,394 @@ def mod_of_decimal_string(digits: str, m: int) -> int:
     return r
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 4: Luhn
 
-- **`%` is already non-negative for a positive modulus**, so `mod` is a one-liner kept only so the three designs match. `//` floors rather than truncates, which changes the Bezout coefficients for negative inputs but not the identity; the lesson's inputs are non-negative and the coefficients match Java and Go exactly.
-- **`pow(base, exp, m)` is built in** and is what production code should call; the lesson's `mod_pow` exists to show the squaring loop, and the test checks it against `pow`.
-- **`str.isdigit()` accepts Unicode digits** such as Arabic-Indic numerals, so the validators also check `isascii()`; without it `"٤٥٣٩"` would pass the type check and then fail arithmetic in a confusing place.
-- **Validators are plain callables** (`Callable[[str], bool]`) rather than an interface.
+`range(len(digits) - 1, -1, -1)` walks right to left. The validator adds the `isascii()` guard because `isdigit()` alone accepts non-ASCII numerals, then runs the shared weighted sum with `double_first=False`; the check-digit builder calls it with `True`.
+
+```python
+def _luhn_weighted_sum(digits: str, double_first: bool) -> int:
+    total = 0
+    dbl = double_first
+    for i in range(len(digits) - 1, -1, -1):
+        c = digits[i]
+        if not "0" <= c <= "9":
+            raise ValueError(f"not a digit at {i}: {c}")
+        d = ord(c) - 48
+        if dbl:
+            d *= 2
+            if d > 9:
+                d -= 9  # digit sum of a two-digit product: 16 -> 1 + 6 = 7 = 16 - 9
+        total += d
+        dbl = not dbl
+    return total
+
+
+def luhn_check_digit(payload: str) -> int:
+    """The digit c such that payload + c validates (ISO/IEC 7812-1 Annex B)."""
+    if not payload:
+        raise ValueError("empty payload")
+    return (10 - _luhn_weighted_sum(payload, True) % 10) % 10
+
+
+def luhn_validate(pan: str) -> bool:
+    if len(pan) < 2 or not pan.isdigit() or not pan.isascii():
+        return False
+    return _luhn_weighted_sum(pan, False) % 10 == 0
+```
+
+#### Step 5: MOD 97-10 and the IBAN rearrangement
+
+Slicing (`s[4:] + s[:4]`) does the rearrangement, letters become `str(ord(c) - ord("A") + 10)`, and the two check digits are formatted with `:02d` so a single-digit result is zero-padded. `validate_iban` catches the `ValueError` from a bad character and answers `False`.
+
+```python
+def iban_to_numeric(iban: str) -> str:
+    """Move the first four characters to the end, then replace each letter with two digits (A=10 .. Z=35)."""
+    s = iban.replace(" ", "").upper()
+    if len(s) < 5:
+        raise ValueError(f"IBAN too short: {iban}")
+    out = []
+    for c in s[4:] + s[:4]:
+        if "0" <= c <= "9":
+            out.append(c)
+        elif "A" <= c <= "Z":
+            out.append(str(ord(c) - ord("A") + 10))
+        else:
+            raise ValueError(f"invalid IBAN character: {c}")
+    return "".join(out)
+
+
+def iban_check_digits(country_code: str, bban: str) -> str:
+    """Two check digits: compute with "00" in the check position, then 98 - remainder, zero-padded."""
+    r = mod_of_decimal_string(iban_to_numeric(country_code + "00" + bban), 97)
+    return f"{98 - r:02d}"
+```
+
+#### Step 6: Damm
+
+`DAMM_TABLE` is a tuple of tuples (immutable, like a `final` array that nobody reassigns); the interim walk is a lookup per digit. `damm_validate` has the same `isdigit()`/`isascii()` pair as Luhn.
+
+```python
+def _damm_interim(digits: str) -> int:
+    state = 0
+    for i, c in enumerate(digits):
+        if not "0" <= c <= "9":
+            raise ValueError(f"not a digit at {i}: {c}")
+        state = DAMM_TABLE[state][ord(c) - 48]
+    return state
+
+
+def damm_check_digit(payload: str) -> int:
+    """The final interim value; appending it drives the state to 0 because TABLE[s][s] = 0."""
+    if not payload:
+        raise ValueError("empty payload")
+    return _damm_interim(payload)
+
+
+def damm_validate(identifier: str) -> bool:
+    if not identifier or not identifier.isdigit() or not identifier.isascii():
+        return False
+    return _damm_interim(identifier) == 0
+```
+
+#### Step 7: Exhaustive error injection
+
+`Validator` is a type alias for `Callable[[str], bool]`, so `luhn_validate` itself is passed in. `analyse` keeps the guard that the sample must validate before it is corrupted. `SeededRandom` is the same LCG with explicit `& MASK` wraparound so the 200 aggregate payloads are the same strings as in Java and Go.
+
+```python
+def analyse(validator: Validator, valid: str, cls: ErrorClass) -> Report:
+    if not validator(valid):
+        raise ValueError(f"the sample must validate before it is corrupted: {valid}")
+    missed: list[str] = []
+    tried = caught = 0
+    for bad in corruptions(valid, cls):
+        tried += 1
+        if validator(bad):
+            missed.append(bad)
+        else:
+            caught += 1
+    return Report(cls, tried, caught, missed)
+
+
+class SeededRandom:
+    MASK = (1 << 64) - 1
+
+    def __init__(self, seed: int) -> None:
+        self.state = seed & self.MASK
+
+    def next_int(self, bound: int) -> int:
+        self.state = (self.state * 6364136223846793005 + 1442695040888963407) & self.MASK
+        return (self.state >> 33) % bound
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/02-algorithms/15-numerical-algorithms/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Every number in both tables matches the Java run; only Python's list and boolean formatting differ:
+
+```console
+== Which errors does each scheme catch? Exhaustive on one sample ==
+error class              Luhn       MOD 97-10  Damm
+SINGLE_DIGIT             144/144    180/180    144/144
+ADJACENT_TRANSPOSITION   10/13      15/15      13/13
+TWIN                     16/18      36/36      15/18
+JUMP_TRANSPOSITION       0/11       16/16      6/11
+Luhn misses (adjacent): ['4530990122234563', '4539900122234563', '4539009122234563']
+Luhn misses (twin)    : ['4539090155234563', '4539090125534563']
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design with four differences. **The LCG uses `uint64` so the multiply wraps modulo 2^64 by definition:** Java gets the same bits from a signed `long` because two's-complement wrapping is identical; Python needs an explicit `& MASK`. This is the one place the three languages had to be made to agree on purpose. **Errors are values:** `ModInverse`, `ModPow`, `LuhnCheckDigit`, and the IBAN builders return `(value, error)`; `ErrNoInverse` is a sentinel. Validators return a bare `bool` because the question is yes/no. **`Validator` is a named function type**, `type Validator func(string) bool`, which lets plain functions be passed where Java needs a method reference. **Byte indexing** (`digits[i]`) is used because every valid input is ASCII; a `range` loop over runes would be needed for arbitrary Unicode, and the IBAN path uses one so a stray non-ASCII character is rejected cleanly.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Euclid, extended
+
+Go's parallel assignment makes the three-pair advance three lines, with no temporaries. `/` truncates toward zero exactly as Java's does, so the coefficients agree for every input, negative ones included. `Bezout` is a plain struct.
+
 ```go
-func (r *SeededRandom) NextInt(bound int) int {
-    r.state = r.state*6364136223846793005 + 1442695040888963407
-    return int((r.state >> 33) % uint64(bound))
+type Bezout struct{ G, X, Y int64 }
+
+// ExtendedGcd carries the coefficient pairs alongside the remainders.
+func ExtendedGcd(a, b int64) Bezout {
+	oldR, r := a, b
+	oldX, x := int64(1), int64(0)
+	oldY, y := int64(0), int64(1)
+	for r != 0 {
+		q := oldR / r
+		oldR, r = r, oldR-q*r
+		oldX, x = x, oldX-q*x
+		oldY, y = y, oldY-q*y
+	}
+	if oldR < 0 {
+		return Bezout{-oldR, -oldX, -oldY}
+	}
+	return Bezout{oldR, oldX, oldY}
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The inverse
 
-- **The LCG uses `uint64` so the multiply wraps modulo 2^64 by definition.** Java gets the same bits from a signed `long` because two's-complement wrapping is identical; Python needs an explicit `& MASK`. This is the one place the three languages had to be made to agree on purpose.
-- **Errors are values**: `ModInverse`, `ModPow`, `LuhnCheckDigit`, and the IBAN builders return `(value, error)`; `ErrNoInverse` is a sentinel. Validators return a bare `bool` because the question is yes/no.
-- **`Validator` is a named function type**, `type Validator func(string) bool`, which lets plain functions be passed where Java needs a method reference.
-- **Byte indexing** (`digits[i]`) is used because every valid input is ASCII; a `range` loop over runes would be needed for arbitrary Unicode, and the IBAN path uses one so a stray non-ASCII character is rejected cleanly.
+Go's `%` keeps the dividend's sign like Java's, so `Mod` is load-bearing: it lifts a negative remainder by `m`. A non-unit returns an error wrapping `ErrNoInverse`, which callers test with `errors.Is`.
+
+```go
+func Mod(a, m int64) int64 {
+	r := a % m
+	if r < 0 {
+		r += m
+	}
+	return r
+}
+
+// ErrNoInverse is returned when a and m are not coprime.
+var ErrNoInverse = errors.New("no modular inverse")
+
+// ModInverse is the x in 0..m-1 with a*x = 1 (mod m); exists iff gcd(a, m) = 1.
+func ModInverse(a, m int64) (int64, error) {
+	if m <= 1 {
+		return 0, errors.New("modulus must be > 1")
+	}
+	b := ExtendedGcd(Mod(a, m), m)
+	if b.G != 1 {
+		return 0, fmt.Errorf("%w: %d modulo %d (gcd = %d)", ErrNoInverse, a, m, b.G)
+	}
+	return Mod(b.X, m), nil
+}
+```
+
+#### Step 3: Remainders of long strings
+
+Byte indexing is safe because any non-ASCII byte fails the `'0'..'9'` test and is reported as an error. `int64(c-'0')` is the digit value; the Horner step is identical.
+
+```go
+func ModOfDecimalString(digits string, m int64) (int64, error) {
+	if digits == "" {
+		return 0, errors.New("empty digit string")
+	}
+	var r int64
+	for i := 0; i < len(digits); i++ {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("not a digit at %d: %c", i, c)
+		}
+		r = (r*10 + int64(c-'0')) % m
+	}
+	return r, nil
+}
+```
+
+#### Step 4: Luhn
+
+The shared `luhnWeightedSum` returns an error for a non-digit so `LuhnCheckDigit` can propagate it; `LuhnValidate` pre-checks with `allDigits` and then discards the error it knows cannot occur.
+
+```go
+func luhnWeightedSum(digits string, doubleFirst bool) (int, error) {
+	sum := 0
+	dbl := doubleFirst
+	for i := len(digits) - 1; i >= 0; i-- {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("not a digit at %d: %c", i, c)
+		}
+		d := int(c - '0')
+		if dbl {
+			d *= 2
+			if d > 9 {
+				d -= 9 // digit sum of a two-digit product: 16 -> 1 + 6 = 7 = 16 - 9
+			}
+		}
+		sum += d
+		dbl = !dbl
+	}
+	return sum, nil
+}
+
+func LuhnCheckDigit(payload string) (int, error) {
+	if payload == "" {
+		return 0, errors.New("empty payload")
+	}
+	sum, err := luhnWeightedSum(payload, true)
+	if err != nil {
+		return 0, err
+	}
+	return (10 - sum%10) % 10, nil
+}
+
+func LuhnValidate(pan string) bool {
+	if len(pan) < 2 || !allDigits(pan) {
+		return false
+	}
+	sum, _ := luhnWeightedSum(pan, false)
+	return sum%10 == 0
+}
+```
+
+#### Step 5: MOD 97-10 and the IBAN rearrangement
+
+`IbanToNumeric` ranges over runes (not bytes) so a stray non-ASCII character hits the `default` arm and is rejected cleanly; letters are written through `fmt.Sprintf("%d", ...)`. `IbanCheckDigits` threads two errors and formats with `%02d`.
+
+```go
+func IbanToNumeric(iban string) (string, error) {
+	s := strings.ToUpper(strings.ReplaceAll(iban, " ", ""))
+	if len(s) < 5 {
+		return "", fmt.Errorf("IBAN too short: %s", iban)
+	}
+	var out strings.Builder
+	for _, c := range s[4:] + s[:4] {
+		switch {
+		case c >= '0' && c <= '9':
+			out.WriteRune(c)
+		case c >= 'A' && c <= 'Z':
+			out.WriteString(fmt.Sprintf("%d", int(c-'A')+10))
+		default:
+			return "", fmt.Errorf("invalid IBAN character: %c", c)
+		}
+	}
+	return out.String(), nil
+}
+
+func IbanCheckDigits(countryCode, bban string) (string, error) {
+	numeric, err := IbanToNumeric(countryCode + "00" + bban)
+	if err != nil {
+		return "", err
+	}
+	r, err := ModOfDecimalString(numeric, 97)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%02d", 98-r), nil
+}
+```
+
+#### Step 6: Damm
+
+`DammTable` is a `[10][10]int` array value. `dammInterim` returns an error for a non-digit, `DammCheckDigit` passes it through, and `DammValidate` pre-screens with `allDigits` as Luhn does.
+
+```go
+func dammInterim(digits string) (int, error) {
+	state := 0
+	for i := 0; i < len(digits); i++ {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("not a digit at %d: %c", i, c)
+		}
+		state = DammTable[state][c-'0']
+	}
+	return state, nil
+}
+
+// DammCheckDigit is the final interim value; appending it drives the state to 0 because Table[s][s] = 0.
+func DammCheckDigit(payload string) (int, error) {
+	if payload == "" {
+		return 0, errors.New("empty payload")
+	}
+	return dammInterim(payload)
+}
+
+func DammValidate(identifier string) bool {
+	if identifier == "" || !allDigits(identifier) {
+		return false
+	}
+	state, _ := dammInterim(identifier)
+	return state == 0
+}
+```
+
+#### Step 7: Exhaustive error injection
+
+`Validator` is a named function type, so `LuhnValidate` is passed directly. `Analyse` returns an error instead of throwing when the sample does not validate, and builds the `Report` in place. `SeededRandom` needs no masking: `uint64` arithmetic wraps by definition.
+
+```go
+func Analyse(v Validator, valid string, cls ErrorClass) (Report, error) {
+	if !v(valid) {
+		return Report{}, fmt.Errorf("the sample must validate before it is corrupted: %s", valid)
+	}
+	r := Report{Class: cls, Missed: []string{}}
+	for _, bad := range Corruptions(valid, cls) {
+		r.Tried++
+		if v(bad) {
+			r.Missed = append(r.Missed, bad)
+		} else {
+			r.Caught++
+		}
+	}
+	return r, nil
+}
+
+type SeededRandom struct{ state uint64 }
+
+func NewSeededRandom(seed int64) *SeededRandom { return &SeededRandom{uint64(seed)} }
+
+func (r *SeededRandom) NextInt(bound int) int {
+	r.state = r.state*6364136223846793005 + 1442695040888963407
+	return int((r.state >> 33) % uint64(bound))
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/02-algorithms/15-numerical-algorithms/code/go
+go run .
+go test ./...
+```
+
+```console
+== Luhn (ISO/IEC 7812) ==
+payload 453909012223456 -> check digit 3 -> PAN 4539090122234563 valid=true
+4539 1488 0343 6467 (a test PAN) valid=true; with one digit changed valid=false
+
+== ISO 7064 MOD 97-10 (IBAN) ==
+DE89370400440532013000 -> numeric 370400440532013000131489
+mod 97 = 1  valid=true
+```
+
+Both error-class tables print the same counts as the Java run, because the LCG produces the same 200 payloads and the arithmetic is integer arithmetic.
 
 ## Use It
 

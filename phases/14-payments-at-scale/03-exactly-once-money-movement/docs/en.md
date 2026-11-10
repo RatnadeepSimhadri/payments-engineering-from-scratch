@@ -351,39 +351,660 @@ Read the seed-1 line as a sentence: three thousand client operations needed 3,42
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with three differences. **Exceptions carry the fault point:** `CrashError(point)` mirrors Java's `CrashException`, and `IdempotencyConflictError` is a `ValueError`; the harness catches `CrashError` only, so any other exception is a genuine bug and propagates. **Closures over loop variables:** the relay's `mark` function binds `event` through a default argument (`def mark(event=event)`), because Python closures capture variables, not values, and a late-bound `event` would mark the wrong row; Java's lambdas capture effectively-final values and have no such trap. **`random.Random(seed)` is Mersenne Twister**, not Java's LCG, so the per-seed counts differ from Java's; the invariants do not. `Defences` is a frozen dataclass and `without("api_dedupe")` takes the snake_case name.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Faults as first-class values
+
+`FaultPoint` is an `Enum`, `CrashError` a `RuntimeError` that remembers its point. `FaultInjector.fire` draws from one `random.Random` and counts the hits; `disarm` stops new faults so a run can drain.
+
 ```python
-def deliver(self, handler: Callable[[PaymentEvent], None], batch_size: int) -> int:
-    ...
-    except CrashError:
-        for j in range(len(batch) - 1, i - 1, -1):
-            self._queue.appendleft(batch[j])
-        self.redelivered += 1
-        raise
+class FaultPoint(Enum):
+    """Where the harness may crash a component. Each point is a real place a process dies in production."""
+
+    API_BEFORE_COMMIT = "api_before_commit"            # nothing is written
+    API_AFTER_COMMIT = "api_after_commit"              # committed, response lost: the client will retry
+    RELAY_AFTER_PUBLISH = "relay_after_publish"        # published but row not marked: a duplicate will follow
+    BUS_DUPLICATE = "bus_duplicate"                    # the bus delivers the same message twice
+    BUS_REORDER = "bus_reorder"                        # the bus delivers a batch out of order
+    CONSUMER_BEFORE_COMMIT = "consumer_before_commit"  # nothing written, the message is redelivered
+    CONSUMER_AFTER_COMMIT = "consumer_after_commit"    # committed but ack lost: redelivered anyway
+
+
+class CrashError(RuntimeError):
+    def __init__(self, point: FaultPoint) -> None:
+        super().__init__(f"crash at {point.name}")
+        self.point = point
+
+
+class FaultInjector:
+    """Seeded fault injector: the only source of randomness in the pipeline, so every run is replayable by seed."""
+
+    def __init__(self, seed: int, rates: dict[FaultPoint, float]) -> None:
+        self.random = random.Random(seed)
+        self.rates = dict(rates)
+        self.fired: dict[FaultPoint, int] = {}
+        self.armed = True
+
+    def fire(self, point: FaultPoint) -> bool:
+        if not self.armed:
+            return False
+        rate = self.rates.get(point, 0.0)
+        if rate <= 0:
+            return False
+        hit = self.random.random() < rate
+        if hit:
+            self.fired[point] = self.fired.get(point, 0) + 1
+        return hit
+
+    def disarm(self) -> None:
+        """Stop injecting faults so a run can drain to quiescence; counts are kept."""
+        self.armed = False
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The gateway store and its one honest promise
 
-- **Exceptions carry the fault point.** `CrashError(point)` mirrors Java's `CrashException`; `IdempotencyConflictError` is a `ValueError`. The harness catches `CrashError` only, so any other exception is a genuine bug and propagates.
-- **Closures over loop variables.** The relay's `mark` function binds `event` through a default argument (`def mark(event=event)`), because Python closures capture variables, not values, and a late-bound `event` would mark the wrong row. Java's lambdas capture effectively-final values and have no such trap.
-- **`random.Random(seed)`** is Mersenne Twister, not Java's LCG, so the per-seed counts differ from Java's; the invariants do not. `Defences` is a frozen dataclass and `without("api_dedupe")` takes the snake_case name.
+Three dicts (insertion-ordered, like the Java `LinkedHashMap`) and a ledger. `transaction` takes `Optional` fault points and a callable: a crash is raised strictly before `writes()` or strictly after, never in the middle.
+
+```python
+class GatewayStore:
+    """In-memory stand-in for the gateway's database. The only thing it models faithfully is atomicity:
+    transaction() applies every write or none, and a crash is only possible strictly before or after commit."""
+
+    def __init__(self) -> None:
+        self.payments: dict[str, Payment] = {}          # payment_id -> payment
+        self.idempotency_keys: dict[str, str] = {}      # key -> payment_id (unique index)
+        self.outbox: dict[str, OutboxRow] = {}          # event_id -> row, insertion order
+        self.ledger = Ledger(USD)                       # the gateway's own books
+        self.commits = 0
+
+    def transaction(self, faults: FaultInjector, before: FaultPoint | None, after: FaultPoint | None,
+                    writes: Callable[[], None]) -> None:
+        if before is not None and faults.fire(before):
+            raise CrashError(before)
+        writes()
+        self.commits += 1
+        if after is not None and faults.fire(after):
+            raise CrashError(after)
+
+    def unpublished(self) -> list[PaymentEvent]:
+        return [row.event for row in self.outbox.values() if not row.published]
+```
+
+#### Step 3: The idempotent API handler
+
+The replay path compares fingerprints, not just keys. `record` and `enqueue` are nested functions so they can run in one transaction (`both`) or, in the dual-write anti-pattern, in two.
+
+```python
+    def create_payment(self, request: PaymentRequest) -> Response:
+        store = self.store
+        if self.defences.api_dedupe:
+            existing_id = store.idempotency_keys.get(request.idempotency_key)
+            if existing_id is not None:
+                existing = store.payments[existing_id]
+                if existing.fingerprint() != request.fingerprint():
+                    raise IdempotencyConflictError(request.idempotency_key)
+                return Response(existing, True)
+        self._sequence += 1
+        payment_id = f"pay-{self._sequence:06d}"
+        payment = Payment(payment_id, request.idempotency_key, request.customer_id, request.merchant_id, request.amount)
+        event = PaymentEvent.accepted(payment)
+        entry = JournalEntry.transfer(payment_id, RECEIVABLE + request.customer_id, GATEWAY_CLEARING, request.amount)
+
+        def record() -> None:
+            store.payments[payment_id] = payment
+            store.idempotency_keys[request.idempotency_key] = payment_id
+            store.ledger.post(entry)
+
+        def enqueue() -> None:
+            store.outbox[event.event_id] = OutboxRow(event, False)
+
+        if self.defences.atomic_outbox:
+            def both() -> None:
+                record()
+                enqueue()
+            store.transaction(self.faults, FaultPoint.API_BEFORE_COMMIT, FaultPoint.API_AFTER_COMMIT, both)
+        else:
+            # The dual-write anti-pattern: record, then enqueue in a second transaction. A crash between them
+            # (API_AFTER_COMMIT) leaves a payment that no downstream system will ever hear about.
+            store.transaction(self.faults, FaultPoint.API_BEFORE_COMMIT, FaultPoint.API_AFTER_COMMIT, record)
+            store.transaction(self.faults, None, None, enqueue)
+        return Response(payment, False)
+```
+
+#### Step 4: The relay that is allowed to repeat itself
+
+Publish, then mark. The `mark` closure takes `event` as a default argument so each iteration marks its own row; a crash between publish and mark leaves the row unpublished for the next pass.
+
+```python
+    def relay_once(self) -> int:
+        published = 0
+        for event in self.store.unpublished():
+            self.bus.publish(event)
+            published += 1
+            if self.faults.fire(FaultPoint.RELAY_AFTER_PUBLISH):
+                raise CrashError(FaultPoint.RELAY_AFTER_PUBLISH)
+
+            def mark(event: PaymentEvent = event) -> None:
+                self.store.outbox[event.event_id] = OutboxRow(event, True)
+
+            self.store.transaction(self.faults, None, None, mark)
+        return published
+```
+
+#### Step 5: A bus that behaves badly on purpose
+
+`deliver` pops a batch from a `deque`, may shuffle it with the injector's `Random`, and on a `CrashError` pushes the unacknowledged tail back onto the left of the queue in order before re-raising.
+
+```python
+    def deliver(self, handler: Callable[[PaymentEvent], None], batch_size: int) -> int:
+        batch: list[PaymentEvent] = []
+        while self._queue and len(batch) < batch_size:
+            batch.append(self._queue.popleft())
+        if len(batch) > 1 and self.faults.fire(FaultPoint.BUS_REORDER):
+            self.faults.random.shuffle(batch)
+            self.reordered_batches += 1
+        ok = 0
+        for i, event in enumerate(batch):
+            try:
+                handler(event)
+                self.delivered += 1
+                ok += 1
+            except CrashError:
+                # nothing from this message on was acknowledged: put the rest back, in order, for redelivery
+                for j in range(len(batch) - 1, i - 1, -1):
+                    self._queue.appendleft(batch[j])
+                self.redelivered += 1
+                raise
+        return ok
+```
+
+#### Step 6: The consumer with an inbox
+
+`handle` returns early when the inbox already holds the event id; otherwise the inbox insert and the ledger posting run inside one `transaction`, which is what makes `CONSUMER_AFTER_COMMIT` harmless.
+
+```python
+    def handle(self, event: PaymentEvent) -> None:
+        if self.defences.consumer_dedupe and event.event_id in self.store.inbox:
+            self.skipped_duplicates += 1
+            return
+        entry = JournalEntry.transfer(event.event_id, DOWNSTREAM_CLEARING, PAYABLE + event.merchant_id, event.amount)
+
+        def writes() -> None:
+            self.store.inbox.add(event.event_id)
+            self.store.ledger.post(entry)
+
+        self.store.transaction(self.faults, FaultPoint.CONSUMER_BEFORE_COMMIT, FaultPoint.CONSUMER_AFTER_COMMIT, writes)
+```
+
+#### Step 7: Invariants as code
+
+Each violation is a string prefixed with its invariant name in brackets; this excerpt covers the posted-once and money-conserved checks. `sorted(...)` on the dict items keeps the report order stable.
+
+```python
+    # 3. Every accepted payment is posted exactly once in each ledger; nothing else is posted.
+    for p in gateway.payments.values():
+        g = books.count_entries(p.payment_id)
+        if g != 1:
+            violations.append(f"[posted-once-gateway] {p.payment_id} posted {g} times")
+        d = downstream.count_entries(f"evt-{p.payment_id}")
+        if d != 1:
+            violations.append(f"[posted-once-downstream] {p.payment_id} posted {d} times downstream")
+    if len(books.journal) != len(gateway.payments):
+        violations.append(f"[posted-once-gateway] gatewayEntries={len(books.journal)} payments={len(gateway.payments)}")
+    if len(downstream.journal) != len(gateway.payments):
+        violations.append(f"[posted-once-downstream] downstreamEntries={len(downstream.journal)} payments={len(gateway.payments)}")
+
+    # 4. Money is conserved: both trial balances are zero and the clearing amounts agree with the accepted total.
+    if not books.trial_balance().is_zero():
+        violations.append(f"[trial-balance] gateway {books.trial_balance()}")
+    if not downstream.trial_balance().is_zero():
+        violations.append(f"[trial-balance] downstream {downstream.trial_balance()}")
+    accepted = Money.zero(USD)
+    for p in gateway.payments.values():
+        accepted = accepted.plus(p.amount)
+    gateway_clearing = books.credit_total(GATEWAY_CLEARING)
+    payables = downstream.credit_total(PAYABLE)
+    if gateway_clearing != accepted:
+        violations.append(f"[money-conserved] gateway clearing {gateway_clearing} != accepted {accepted}")
+    if payables != accepted:
+        violations.append(f"[money-conserved] merchant payables {payables} != accepted {accepted}")
+```
+
+#### Step 8: The harness
+
+A second `random.Random` drives the workload so the fault schedule does not change which payments are requested; 15% of operations re-send an old key. Relay and consumer are interleaved at different cadences, faults are disarmed, the pipeline drains, and only then are the invariants checked.
+
+```python
+def run_harness(cfg: HarnessConfig) -> HarnessReport:
+    """Drive thousands of operations through the pipeline under injected faults and check the invariants."""
+    faults = FaultInjector(cfg.seed, cfg.rates)
+    workload = random.Random(cfg.seed * 1_000_003 + 17)
+    gateway = GatewayStore()
+    api = PaymentApi(gateway, faults, cfg.defences)
+    bus = Bus(faults)
+    relay = OutboxRelay(gateway, bus, faults)
+    downstream = LedgerStore()
+    consumer = LedgerConsumer(downstream, faults, cfg.defences)
+
+    issued: list[PaymentRequest] = []            # every distinct request a client ever made
+    acknowledged: dict[str, Payment] = {}        # key -> payment the client saw
+    api_calls = crashes = client_requests = 0
+
+    for i in range(cfg.operations):
+        if issued and workload.randrange(100) < 15:
+            request = issued[workload.randrange(len(issued))]   # a client re-sends an old key (retry storm)
+        else:
+            amount = Money.of_minor(100 + workload.randrange(20_000), USD)
+            request = PaymentRequest(f"key-{len(issued)}", f"cust-{workload.randrange(50)}",
+                                     f"merch-{workload.randrange(8)}", amount)
+            issued.append(request)
+        client_requests += 1
+        for _attempt in range(MAX_CLIENT_ATTEMPTS):
+            api_calls += 1
+            try:
+                acknowledged[request.idempotency_key] = api.create_payment(request).payment
+                break
+            except CrashError:
+                crashes += 1   # the client saw a timeout and retries with the same key
+        if i % 3 == 0:
+            crashes += _step(relay.relay_once)
+        if i % 5 == 0:
+            crashes += _step(lambda: bus.deliver(consumer.handle, 8))
+
+    faults.disarm()
+    while gateway.unpublished() or bus.pending() > 0:
+        relay.relay_once()
+        bus.deliver(consumer.handle, 64)
+
+    violations = check_invariants(gateway, downstream.ledger, issued, acknowledged)
+    return HarnessReport(cfg.seed, client_requests, api_calls, crashes, len(gateway.payments), bus.published,
+                         bus.duplicated, bus.redelivered, len(gateway.ledger.journal), len(downstream.ledger.journal),
+                         consumer.skipped_duplicates, gateway.ledger.trial_balance(), downstream.ledger.trial_balance(),
+                         violations)
+```
+
+#### Step 9: Run it
+
+```bash
+cd phases/14-payments-at-scale/03-exactly-once-money-movement/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The counts differ from Java because the generator differs; the verdicts do not:
+
+```console
+== Seeded fault-injection harness: 3000 operations, 8% fault rate at every seam ==
+PASS seed=1 requests=3000 apiCalls=3426 crashes=1038 accepted=2571 published=2784 dup=210 redelivered=399 gatewayEntries=2571 downstreamEntries=2571 skipped=619 trial=0.00 USD/0.00 USD violations=0
+
+== Remove one defence at a time: the harness names the invariant that breaks ==
+FAIL without api_dedupe      -> [one-payment-per-key] key-0 has 4 payments
+FAIL without atomic_outbox   -> [payment-has-outbox-row] pay-000003 has no outbox row
+FAIL without consumer_dedupe -> [posted-once-downstream] pay-000003 posted 3 times downstream
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`, tests in `main_test.go`) keeps the design with three differences. **Errors are values:** every operation that can crash returns `error`; `IsCrash(err)` uses `errors.As` to distinguish an injected crash from a programming error, and the harness panics on the latter so a bug cannot hide inside a crash count; `ErrIdempotencyConflict` is a sentinel for `errors.Is`. **Maps are unordered:** `GatewayStore` keeps an `outboxOrder` slice alongside the `Outbox` map so `Unpublished()` returns rows in insertion order; iterating a Go map directly would make the relay's publish order, and therefore the run, non-deterministic, and `CheckInvariants` sorts keys before reporting for the same reason. **No nullable enum:** `Transaction` takes `hasBefore`/`hasAfter` booleans where Java passes `null` for "no fault here". `go test -race ./...` passes because nothing is shared between goroutines; the lesson is single-threaded by design.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Faults as first-class values
+
+`FaultPoint` is an `iota` enum; `CrashError` is an error type and `IsCrash` finds it at any wrapping depth. `Fire` draws from a `*rand.Rand` seeded once.
+
 ```go
+type FaultPoint int
+
+const (
+	ApiBeforeCommit      FaultPoint = iota // handler dies before the transaction commits: nothing is written
+	ApiAfterCommit                         // transaction committed, response lost: the client will retry
+	RelayAfterPublish                      // relay published to the bus but died before marking the row: a duplicate will follow
+	BusDuplicate                           // the bus delivers the same message twice
+	BusReorder                             // the bus delivers a batch out of order
+	ConsumerBeforeCommit                   // consumer died mid-handle: nothing written, the message is redelivered
+	ConsumerAfterCommit                    // consumer committed but died before acknowledging: redelivered anyway
+	numFaultPoints
+)
+
+var faultPointNames = [...]string{"API_BEFORE_COMMIT", "API_AFTER_COMMIT", "RELAY_AFTER_PUBLISH", "BUS_DUPLICATE",
+	"BUS_REORDER", "CONSUMER_BEFORE_COMMIT", "CONSUMER_AFTER_COMMIT"}
+
+type CrashError struct{ Point FaultPoint }
+
+func (c *CrashError) Error() string { return "crash at " + c.Point.String() }
+
+// IsCrash reports whether err is a CrashError (at any wrapping depth).
+func IsCrash(err error) bool {
+	var c *CrashError
+	return errors.As(err, &c)
+}
+
+func (f *FaultInjector) Fire(point FaultPoint) bool {
+	if !f.armed {
+		return false
+	}
+	rate := f.rates[point]
+	if rate <= 0 {
+		return false
+	}
+	hit := f.Random.Float64() < rate
+	if hit {
+		f.fired[point]++
+	}
+	return hit
+}
+
+// Disarm stops injecting faults so a run can drain to quiescence; counts are kept.
+func (f *FaultInjector) Disarm() { f.armed = false }
+```
+
+#### Step 2: The gateway store and its one honest promise
+
+`Transaction` returns a `*CrashError` strictly before or after `writes()`. `putOutbox` appends to `outboxOrder` on first sight so `Unpublished` iterates in insertion order.
+
+```go
+type GatewayStore struct {
+	Payments        map[string]Payment   // paymentID -> payment
+	IdempotencyKeys map[string]string    // key -> paymentID (unique index)
+	Outbox          map[string]OutboxRow // eventID -> row
+	outboxOrder     []string             // insertion order of eventIDs (Go maps are unordered)
+	Ledger          *Ledger
+	Commits         int
+}
+
+func NewGatewayStore() *GatewayStore {
+	return &GatewayStore{Payments: map[string]Payment{}, IdempotencyKeys: map[string]string{},
+		Outbox: map[string]OutboxRow{}, Ledger: NewLedger(USD)}
+}
+
 func (s *GatewayStore) Transaction(faults *FaultInjector, before, after FaultPoint, hasBefore, hasAfter bool, writes func()) error {
-    if hasBefore && faults.Fire(before) { return &CrashError{before} }
-    writes()
-    s.Commits++
-    if hasAfter && faults.Fire(after) { return &CrashError{after} }
-    return nil
+	if hasBefore && faults.Fire(before) {
+		return &CrashError{before}
+	}
+	writes()
+	s.Commits++
+	if hasAfter && faults.Fire(after) {
+		return &CrashError{after}
+	}
+	return nil
+}
+
+func (s *GatewayStore) putOutbox(row OutboxRow) {
+	if _, exists := s.Outbox[row.Event.EventID]; !exists {
+		s.outboxOrder = append(s.outboxOrder, row.Event.EventID)
+	}
+	s.Outbox[row.Event.EventID] = row
+}
+
+// Unpublished returns outbox rows not yet marked published, in insertion order.
+func (s *GatewayStore) Unpublished() []PaymentEvent {
+	var out []PaymentEvent
+	for _, id := range s.outboxOrder {
+		if row := s.Outbox[id]; !row.Published {
+			out = append(out, row.Event)
+		}
+	}
+	return out
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: The idempotent API handler
 
-- **Errors are values.** Every operation that can crash returns `error`; `IsCrash(err)` uses `errors.As` to distinguish an injected crash from a programming error, and the harness panics on the latter so a bug cannot hide inside a crash count. `ErrIdempotencyConflict` is a sentinel for `errors.Is`.
-- **Maps are unordered.** `GatewayStore` keeps an `outboxOrder` slice alongside the `Outbox` map so `Unpublished()` returns rows in insertion order; iterating a Go map directly would make the relay's publish order, and therefore the run, non-deterministic. `CheckInvariants` sorts keys before reporting for the same reason.
-- **No nullable enum.** `Transaction` takes `hasBefore`/`hasAfter` booleans where Java passes `null` for "no fault here". `go test -race ./...` passes because nothing is shared between goroutines; the lesson is single-threaded by design.
+`CreatePayment` returns `(Response, error)`: the conflict wraps `ErrIdempotencyConflict`, a crash propagates as the `*CrashError` from `Transaction`. The `record`/`enqueue` closures and the dual-write `else` branch are the same as Java; the "no fault here" transaction passes `false, false`.
+
+```go
+func (a *PaymentApi) CreatePayment(request PaymentRequest) (Response, error) {
+	store := a.store
+	if a.defences.ApiDedupe {
+		if existingID, ok := store.IdempotencyKeys[request.IdempotencyKey]; ok {
+			existing := store.Payments[existingID]
+			if existing.Fingerprint() != request.Fingerprint() {
+				return Response{}, fmt.Errorf("%w: %s", ErrIdempotencyConflict, request.IdempotencyKey)
+			}
+			return Response{existing, true}, nil
+		}
+	}
+	a.sequence++
+	paymentID := fmt.Sprintf("pay-%06d", a.sequence)
+	payment := Payment{paymentID, request.IdempotencyKey, request.CustomerID, request.MerchantID, request.Amount}
+	event := Accepted(payment)
+	entry, err := Transfer(paymentID, Receivable+request.CustomerID, GatewayClearing, request.Amount)
+	if err != nil {
+		return Response{}, err
+	}
+	record := func() {
+		store.Payments[paymentID] = payment
+		store.IdempotencyKeys[request.IdempotencyKey] = paymentID
+		if err := store.Ledger.Post(entry); err != nil {
+			panic(err) // the entry was built balanced; this cannot happen
+		}
+	}
+	enqueue := func() { store.putOutbox(OutboxRow{event, false}) }
+	if a.defences.AtomicOutbox {
+		if err := store.Transaction(a.faults, ApiBeforeCommit, ApiAfterCommit, true, true, func() { record(); enqueue() }); err != nil {
+			return Response{}, err
+		}
+	} else {
+		// The dual-write anti-pattern: record, then enqueue in a second transaction. A crash between them
+		// (ApiAfterCommit) leaves a payment that no downstream system will ever hear about.
+		if err := store.Transaction(a.faults, ApiBeforeCommit, ApiAfterCommit, true, true, record); err != nil {
+			return Response{}, err
+		}
+		if err := store.Transaction(a.faults, 0, 0, false, false, enqueue); err != nil {
+			return Response{}, err
+		}
+	}
+	return Response{payment, false}, nil
+}
+```
+
+#### Step 4: The relay that is allowed to repeat itself
+
+`RelayOnce` returns the publish count alongside the error; `event := event` re-binds the loop variable for the closure, the Go spelling of the same late-binding concern the Python port handles with a default argument.
+
+```go
+func (r *OutboxRelay) RelayOnce() (int, error) {
+	published := 0
+	for _, event := range r.store.Unpublished() {
+		r.bus.Publish(event)
+		published++
+		if r.faults.Fire(RelayAfterPublish) {
+			return published, &CrashError{RelayAfterPublish}
+		}
+		event := event
+		if err := r.store.Transaction(r.faults, 0, 0, false, false, func() { r.store.putOutbox(OutboxRow{event, true}) }); err != nil {
+			return published, err
+		}
+	}
+	return published, nil
+}
+```
+
+#### Step 5: A bus that behaves badly on purpose
+
+`Deliver` slices the batch off the queue, may `Shuffle` it with the injector's generator, and on a crash prepends `batch[i:]` to the queue before returning the error.
+
+```go
+func (b *Bus) Deliver(handler EventHandler, batchSize int) (int, error) {
+	n := batchSize
+	if n > len(b.queue) {
+		n = len(b.queue)
+	}
+	batch := make([]PaymentEvent, n)
+	copy(batch, b.queue[:n])
+	b.queue = b.queue[n:]
+	if len(batch) > 1 && b.faults.Fire(BusReorder) {
+		b.faults.Random.Shuffle(len(batch), func(i, j int) { batch[i], batch[j] = batch[j], batch[i] })
+		b.ReorderedBatches++
+	}
+	ok := 0
+	for i, event := range batch {
+		if err := handler(event); err != nil {
+			if IsCrash(err) {
+				// nothing from this message on was acknowledged: put the rest back, in order, for redelivery
+				b.queue = append(append([]PaymentEvent{}, batch[i:]...), b.queue...)
+				b.Redelivered++
+			}
+			return ok, err
+		}
+		b.Delivered++
+		ok++
+	}
+	return ok, nil
+}
+```
+
+#### Step 6: The consumer with an inbox
+
+`Handle` returns `nil` for a known event id and otherwise runs the inbox insert and the ledger post inside one `Transaction`; a `Post` error is a panic because the entry was built balanced.
+
+```go
+func (c *LedgerConsumer) Handle(event PaymentEvent) error {
+	if c.defences.ConsumerDedupe && c.store.Inbox[event.EventID] {
+		c.SkippedDuplicates++
+		return nil
+	}
+	entry, err := Transfer(event.EventID, DownstreamClearing, Payable+event.MerchantID, event.Amount)
+	if err != nil {
+		return err
+	}
+	return c.store.Transaction(c.faults, ConsumerBeforeCommit, ConsumerAfterCommit, func() {
+		c.store.Inbox[event.EventID] = true
+		if err := c.store.Ledger.Post(entry); err != nil {
+			panic(err)
+		}
+	})
+}
+```
+
+#### Step 7: Invariants as code
+
+The posted-once and money-conserved checks iterate `paymentIDs` (sorted) so the first reported violation is deterministic; `MustPlus` is safe because every amount is USD.
+
+```go
+			violations = append(violations, fmt.Sprintf("[posted-once-gateway] %s posted %d times", id, g))
+		}
+		if d := downstream.CountEntries("evt-" + id); d != 1 {
+			violations = append(violations, fmt.Sprintf("[posted-once-downstream] %s posted %d times downstream", id, d))
+		}
+	}
+	if len(books.Journal) != len(gateway.Payments) {
+		violations = append(violations, fmt.Sprintf("[posted-once-gateway] gatewayEntries=%d payments=%d", len(books.Journal), len(gateway.Payments)))
+	}
+	if len(downstream.Journal) != len(gateway.Payments) {
+		violations = append(violations, fmt.Sprintf("[posted-once-downstream] downstreamEntries=%d payments=%d", len(downstream.Journal), len(gateway.Payments)))
+	}
+
+	// 4. Money is conserved: both trial balances are zero and the clearing amounts agree with the accepted total.
+	if !books.TrialBalance().IsZero() {
+		violations = append(violations, fmt.Sprintf("[trial-balance] gateway %v", books.TrialBalance()))
+	}
+	if !downstream.TrialBalance().IsZero() {
+		violations = append(violations, fmt.Sprintf("[trial-balance] downstream %v", downstream.TrialBalance()))
+	}
+	accepted := Zero(USD)
+	for _, id := range paymentIDs {
+		accepted = accepted.MustPlus(gateway.Payments[id].Amount)
+	}
+	if gatewayClearing := books.CreditTotal(GatewayClearing); gatewayClearing != accepted {
+		violations = append(violations, fmt.Sprintf("[money-conserved] gateway clearing %v != accepted %v", gatewayClearing, accepted))
+	}
+	if payables := downstream.CreditTotal(Payable); payables != accepted {
+		violations = append(violations, fmt.Sprintf("[money-conserved] merchant payables %v != accepted %v", payables, accepted))
+	}
+```
+
+#### Step 8: The harness
+
+`RunHarness` panics on any non-crash error from the API, counts crashes from `step(err)`, disarms, drains (panicking if anything still fails), and then checks invariants.
+
+```go
+func RunHarness(cfg HarnessConfig) HarnessReport {
+	faults := NewFaultInjector(cfg.Seed, cfg.Rates)
+	workload := rand.New(rand.NewSource(cfg.Seed*1_000_003 + 17))
+	gateway := NewGatewayStore()
+	api := NewPaymentApi(gateway, faults, cfg.Defences)
+	bus := NewBus(faults)
+	relay := NewOutboxRelay(gateway, bus, faults)
+	downstream := NewLedgerStore()
+	consumer := NewLedgerConsumer(downstream, faults, cfg.Defences)
+
+	var issued []PaymentRequest             // every distinct request a client ever made
+	acknowledged := map[string]Payment{}    // key -> payment the client saw
+	apiCalls, crashes, clientRequests := 0, 0, 0
+
+	for i := 0; i < cfg.Operations; i++ {
+		var request PaymentRequest
+		if len(issued) > 0 && workload.Intn(100) < 15 {
+			request = issued[workload.Intn(len(issued))] // a client re-sends an old key (retry storm)
+		} else {
+			amount := OfMinor(int64(100+workload.Intn(20_000)), USD)
+			request = PaymentRequest{fmt.Sprintf("key-%d", len(issued)), fmt.Sprintf("cust-%d", workload.Intn(50)),
+				fmt.Sprintf("merch-%d", workload.Intn(8)), amount}
+			issued = append(issued, request)
+		}
+		clientRequests++
+		for attempt := 0; attempt < MaxClientAttempts; attempt++ {
+			apiCalls++
+			resp, err := api.CreatePayment(request)
+			if err == nil {
+				acknowledged[request.IdempotencyKey] = resp.Payment
+				break
+			}
+			if !IsCrash(err) {
+				panic(err)
+			}
+			crashes++ // the client saw a timeout and retries with the same key
+		}
+		if i%3 == 0 {
+			_, err := relay.RelayOnce()
+			crashes += step(err)
+		}
+		if i%5 == 0 {
+			_, err := bus.Deliver(consumer.Handle, 8)
+			crashes += step(err)
+		}
+	}
+
+	faults.Disarm()
+	for len(gateway.Unpublished()) > 0 || bus.Pending() > 0 {
+		if _, err := relay.RelayOnce(); err != nil {
+			panic(err)
+		}
+		if _, err := bus.Deliver(consumer.Handle, 64); err != nil {
+			panic(err)
+		}
+	}
+
+	violations := CheckInvariants(gateway, downstream.Ledger, issued, acknowledged)
+	return HarnessReport{cfg.Seed, clientRequests, apiCalls, crashes, len(gateway.Payments), bus.Published,
+		bus.Duplicated, bus.Redelivered, len(gateway.Ledger.Journal), len(downstream.Ledger.Journal),
+		consumer.SkippedDuplicates, gateway.Ledger.TrialBalance(), downstream.Ledger.TrialBalance(), violations}
+}
+```
+
+#### Step 9: Run it
+
+```bash
+cd phases/14-payments-at-scale/03-exactly-once-money-movement/code/go
+go run .
+go test ./...
+```
+
+`math/rand` gives different counts from Java's and Python's generators; the invariants hold and break in the same ways:
+
+```console
+== Seeded fault-injection harness: 3000 operations, 8% fault rate at every seam ==
+PASS seed=1 requests=3000 apiCalls=3398 crashes=1003 accepted=2527 published=2761 dup=241 redelivered=371 gatewayEntries=2527 downstreamEntries=2527 skipped=651 trial=0.00 USD/0.00 USD violations=0
+
+== Remove one defence at a time: the harness names the invariant that breaks ==
+FAIL without apiDedupe      -> [one-payment-per-key] key-0 has 3 payments
+FAIL without atomicOutbox   -> [payment-has-outbox-row] pay-000009 has no outbox row
+FAIL without consumerDedupe -> [posted-once-downstream] pay-000007 posted 2 times downstream
+```
 
 ## Use It
 

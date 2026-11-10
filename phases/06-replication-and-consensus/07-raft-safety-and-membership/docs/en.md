@@ -375,7 +375,7 @@ Expected output, abbreviated:
 
 ```console
 == Why you cannot just swap the configuration (Figure 10) ==
-disjoint majorities possible with a direct switch? true   e.g. {0,1} is a majority of C_old and {2,3,4} is a majority of C_new
+disjoint majorities possible with a direct switch? true   e.g. {0,1} is a majority of C_old and {2,3,4} is a majority of C_new: two leaders in one term
 adding exactly one server, 3 -> 4: disjoint majorities possible? false
 joint C_old,new = [0, 1, 2]->[0, 1, 2, 3, 4]: {0,1} has quorum? false; {2,3,4}? false; {0,1,3,4}? true  (needs a majority of BOTH)
 
@@ -396,61 +396,577 @@ no Election Safety, Leader Completeness, Log Matching, or State Machine Safety c
 
 ### In Python
 
+`code/python/main.py` is Lesson 06's Python port with the same additions as the Java, and the demo prints the same trace line for line. Four things differ. **Sets are `frozenset`, iteration is `sorted`:** `Configuration` is a frozen dataclass, so `==` compares members exactly like the Java record and `decode(encode(c)) == c` holds; Java iterates `TreeSet`s and Python sets have no order, so `all()` and `replication_targets()` return sorted lists, and the order matters because it decides which RequestVote and AppendEntries hit the network first and therefore which seeded delay each one draws. **`Snapshot` copies its data:** `__post_init__` replaces `data` with a fresh `dict` (the Java `new TreeMap<>(data)`), so the leader's live `KVStore.data` keeps changing without corrupting a snapshot it already sent; `Snapshot` and `Message` are `eq=False` because the checker compares `LogEntry`s and `Configuration`s, never snapshots. **No constructor overloads:** Java has `Cluster(size, initialMembers, seed, drop, delay, config)` and `Cluster(size, seed, drop, delay)`, Python has one `Cluster(size, seed, drop_rate, max_delay, config=DEFAULT_CONFIG, initial_members=None)`, where `None` means every server starts in the configuration. **Errors:** `IllegalStateException` (a compacted `term_at`, two leaders, every Figure 3 violation) is `RuntimeError`, bad timing configs are `ValueError`, and booleans are printed through `fmt_bool` so the demo says `true`, as the Java does.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Configurations and the quorum rule
+
+`Configuration` holds two `frozenset`s, the second `None` for a simple configuration. `majority_of` counts only members that appear in `acks`, and `has_quorum` demands a majority of the old set and, when joint, of the new set too. `all()` returns the sorted union so iteration order matches the Java `TreeSet`.
+
 ```python
 @dataclass(frozen=True)
 class Configuration:
     old_members: frozenset
     new_members: Optional[frozenset] = None
 
+    @staticmethod
+    def simple(members: Iterable[int]) -> "Configuration":
+        return Configuration(frozenset(members), None)
+
+    @staticmethod
+    def joint(old: Iterable[int], nxt: Iterable[int]) -> "Configuration":
+        return Configuration(frozenset(old), frozenset(nxt))
+
+    def is_joint(self) -> bool:
+        return self.new_members is not None
+
     def all(self) -> list[int]:
         s = set(self.old_members)
         if self.new_members is not None:
             s |= self.new_members
         return sorted(s)
+
+    @staticmethod
+    def majority_of(members: Iterable[int], acks: set) -> bool:
+        members = list(members)
+        count = sum(1 for m in members if m in acks)
+        return count >= len(members) // 2 + 1
+
+    def has_quorum(self, acks: set) -> bool:
+        if not Configuration.majority_of(self.old_members, acks):
+            return False
+        return self.new_members is None or Configuration.majority_of(self.new_members, acks)
 ```
 
-`code/python/main.py` is Lesson 06's Python port with the same additions as the Java, and the demo prints the same trace line for line. What differs:
+#### Step 2: The disjoint-majority checker
 
-- **Sets are `frozenset`, iteration is `sorted`.** `Configuration` is a frozen dataclass, so `==` compares members exactly like the Java record and `decode(encode(c)) == c` holds. Java iterates `TreeSet`s; Python sets have no order, so `all()` and `replication_targets()` return sorted lists. The order matters: it decides which RequestVote and AppendEntries hit the network first, and therefore which seeded delay each one draws.
-- **`Snapshot` copies its data.** `__post_init__` replaces `data` with a fresh `dict` (the Java `new TreeMap<>(data)`), so the leader's live `KVStore.data` keeps changing without corrupting a snapshot it already sent. `Snapshot` and `Message` are `eq=False`: the checker compares `LogEntry`s and `Configuration`s, never snapshots.
-- **No constructor overloads.** Java has `Cluster(size, initialMembers, seed, drop, delay, config)` and `Cluster(size, seed, drop, delay)`; Python has one `Cluster(size, seed, drop_rate, max_delay, config=DEFAULT_CONFIG, initial_members=None)`, where `None` means every server starts in the configuration.
-- **Errors.** `IllegalStateException` (a compacted `term_at`, two leaders, every Figure 3 violation) is `RuntimeError`; bad timing configs are `ValueError`. Booleans are printed through `fmt_bool` so the demo says `true`, as the Java does.
+The same double loop over bitmasks of the sorted union. `_subset` builds the set for a mask with a comprehension, and `mask_a & mask_b` being non-zero means the two candidate quorums overlap and are skipped.
 
-Run it from `code/python/`:
+```python
+    @staticmethod
+    def disjoint_quorums_possible(a: Iterable[int], b: Iterable[int]) -> bool:
+        a, b = frozenset(a), frozenset(b)
+        union = sorted(a | b)
+        n = len(union)
+        for mask_a in range(1 << n):
+            qa = Configuration._subset(union, mask_a)
+            if not Configuration.majority_of(a, qa):
+                continue
+            for mask_b in range(1 << n):
+                if mask_a & mask_b:
+                    continue
+                if Configuration.majority_of(b, Configuration._subset(union, mask_b)):
+                    return True
+        return False
+
+    @staticmethod
+    def _subset(items: list[int], mask: int) -> set:
+        return {items[i] for i in range(len(items)) if mask & (1 << i)}
+```
+
+#### Step 3: Storage that can forget its prefix
+
+`term_at` answers from `snapshot_term` at the boundary, raises `RuntimeError` below it, and otherwise translates by `index - snapshot_index`. `compact` rebuilds `entries` as a new sentinel followed by the kept tail using a list comprehension and concatenation; `replace_with_snapshot` is the same with nothing kept.
+
+```python
+    def term_at(self, index: int) -> int:
+        if index == self.snapshot_index:
+            return self.snapshot_term
+        if index < self.snapshot_index:
+            raise RuntimeError(f"index {index} is compacted (snapshot at {self.snapshot_index})")
+        return self.entries[index - self.snapshot_index].term
+
+    def compact(self, s: Snapshot) -> None:
+        keep = [self.get(i) for i in range(s.last_included_index + 1, self.last_index() + 1)]
+        self.entries = [LogEntry(s.last_included_term, "<sentinel>")] + keep
+        self.snapshot_index = s.last_included_index
+        self.snapshot_term = s.last_included_term
+        self.snapshot = s
+        self.writes += 1
+
+    def replace_with_snapshot(self, s: Snapshot) -> None:
+        self.entries = [LogEntry(s.last_included_term, "<sentinel>")]
+        self.snapshot_index = s.last_included_index
+        self.snapshot_term = s.last_included_term
+        self.snapshot = s
+        self.writes += 1
+```
+
+#### Step 4: The node uses the latest configuration it has
+
+`configuration()` may return `None` for a spare server that has not yet learned any membership, so `is_member` guards on it. `tick` keeps the Lesson 06 shape and adds the one rule: a non-member whose timer fires just redraws the timer instead of campaigning.
+
+```python
+    def configuration(self) -> Optional[Configuration]:
+        return self.storage.config_at(self.storage.last_index(), self.bootstrap)
+
+    def is_member(self) -> bool:
+        c = self.configuration()
+        return c is not None and self.id in c.all()
+
+    def tick(self, now: int) -> list[Message]:
+        if self.role == Role.LEADER:
+            return self.replicate_all(now) if now >= self.next_heartbeat else []
+        if now < self.election_deadline:
+            return []
+        if not self.is_member():   # joining or removed servers never campaign
+            self.reset_election_timer(now)
+            return []
+        return self.start_election(now)
+```
+
+#### Step 5: Starting a change, and finishing one
+
+`change_membership` refuses unless the node leads, the current configuration is simple, and the latest configuration entry is committed, then proposes the encoded joint configuration. `after_commit` is called by `advance_commit_index` and performs the two automatic steps; the tracer lines are omitted from the chunk.
+
+```python
+    def change_membership(self, new_members: Iterable[int]) -> int:
+        if self.role != Role.LEADER:
+            return -1
+        current = self.configuration()
+        if current.is_joint() or self.storage.latest_config_index() > self.commit_index:
+            return -1
+        return self.propose(Configuration.joint(current.old_members, new_members).encode())
+
+    def after_commit(self, now: int) -> list[Message]:
+        c = self.configuration()
+        cfg_idx = self.storage.latest_config_index()
+        latest_config_committed = cfg_idx == -1 or cfg_idx <= self.commit_index
+        if c.is_joint() and latest_config_committed:
+            nxt = Configuration.simple(c.new_members)
+            self.propose(nxt.encode())
+            return self.replicate_all(now)
+        if not c.is_joint() and latest_config_committed and self.id not in c.all():
+            self.stepped_down_after_removal = True
+            final_beat = self.replicate_all(now)   # one last round so departing followers learn the commit index
+            self.role = Role.FOLLOWER
+            self.leader_id = -1
+            return final_beat
+        return []
+```
+
+#### Step 6: Replication targets include the departing
+
+The target set starts as the current configuration's union. When the latest configuration is simple and sits at `cfg_idx`, every member of the configuration just before it whose `match_index` has not reached `cfg_idx` is added back; `dict.get(m, 0)` covers peers the leader has never heard from. The result is sorted so the fan-out order matches Java.
+
+```python
+    def replication_targets(self) -> list[int]:
+        c = self.configuration()
+        if c is None:
+            return []
+        targets = set(c.all())
+        cfg_idx = self.storage.latest_config_index()
+        if not c.is_joint() and cfg_idx > 0:
+            before = self.storage.config_at(cfg_idx - 1, self.bootstrap)
+            if before is not None:
+                for m in before.all():
+                    if self.match_index.get(m, 0) < cfg_idx:
+                        targets.add(m)
+        targets.discard(self.id)
+        return sorted(targets)
+```
+
+#### Step 7: Taking and sending snapshots
+
+`take_snapshot` builds a `Snapshot` from `last_applied`, its term, the live state machine map (copied in `__post_init__`), and the configuration at that index, then compacts. `append_entries_for` lazily initialises `next_index`/`match_index` for a peer it has not met (a joining server) and sends `InstallSnapshot` when the peer's `nxt` is at or below the snapshot boundary.
+
+```python
+    def take_snapshot(self, now: int) -> None:
+        s = Snapshot(self.last_applied, self.storage.term_at(self.last_applied), self.state_machine.data,
+                     self.storage.config_at(self.last_applied, self.bootstrap))
+        self.storage.compact(s)
+        self.snapshots_taken += 1
+
+    def append_entries_for(self, peer: int) -> Message:
+        if peer not in self.next_index:
+            self.next_index[peer] = self.last_log_index() + 1
+        nxt = self.next_index[peer]
+        self.match_index.setdefault(peer, 0)
+        if nxt <= self.storage.snapshot_index:
+            self.snapshots_sent += 1
+            return Message.install_snapshot(self.id, peer, self.storage.current_term, self.storage.snapshot)
+        prev = nxt - 1
+        entries = [self.storage.get(i) for i in range(nxt, self.last_log_index() + 1)]
+        return Message.append_entries(self.id, peer, self.storage.current_term, prev, self.storage.term_at(prev), entries, self.commit_index)
+```
+
+#### Step 8: Installing a snapshot
+
+Figure 13's receiver with the same rule numbers. A snapshot no newer than the one already held is acknowledged without work. Rule 6 keeps the log tail when the entry at `last_included_index` matches; rule 7 replaces the log; rule 8 resets the state machine only if it has not already applied past the snapshot. The two tracer calls are omitted.
+
+```python
+    def on_install_snapshot(self, m: Message, now: int) -> list[Message]:
+        if m.term < self.storage.current_term:
+            return [Message.snapshot_reply(self.id, m.from_, self.storage.current_term, 0)]
+        if self.role == Role.CANDIDATE:
+            self.role = Role.FOLLOWER
+            self.votes_granted = set()
+        self.leader_id = m.from_
+        self.reset_election_timer(now)
+        s = m.snapshot
+        if s.last_included_index <= self.storage.snapshot_index:
+            return [Message.snapshot_reply(self.id, m.from_, self.storage.current_term, self.storage.snapshot_index)]   # already have it
+        self.snapshots_installed += 1
+        if self.storage.has(s.last_included_index) and self.storage.term_at(s.last_included_index) == s.last_included_term:
+            self.storage.compact(s)                                                                                       # 6
+        else:
+            self.storage.replace_with_snapshot(s)                                                                         # 7
+        if self.last_applied < s.last_included_index:                                                                     # 8
+            self.state_machine.reset(s.data)
+            self.last_applied = s.last_included_index
+        self.commit_index = max(self.commit_index, s.last_included_index)
+        return [Message.snapshot_reply(self.id, m.from_, self.storage.current_term, s.last_included_index)]
+```
+
+#### Step 9: The checker
+
+The Leader Completeness block of `check_invariants`: the first time a term's leader is observed, every entry in `committed_by_index` above its snapshot boundary must be present and equal. `set.add` returning nothing in Python, the port checks membership and then adds, and iterates the committed indexes in sorted order for a stable error message.
+
+```python
+            # Leader Completeness: every entry committed before this leader's term is in its log (or inside its snapshot).
+            if n.current_term not in self.completeness_checked:
+                self.completeness_checked.add(n.current_term)
+                for k in sorted(self.committed_by_index):
+                    v = self.committed_by_index[k]
+                    if k <= n.storage.snapshot_index:
+                        continue
+                    if not n.storage.has(k) or n.storage.get(k) != v:
+                        raise RuntimeError(f"LEADER COMPLETENESS: leader {n.id} of term {n.current_term} lacks committed entry {k}={v}")
+```
+
+#### Step 10: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/07-raft-safety-and-membership/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+Line for line the Java trace, down to the final sweep:
+
+```console
+== Why you cannot just swap the configuration (Figure 10) ==
+C_old = [0, 1, 2] (majority 2), C_new = [0, 1, 2, 3, 4] (majority 3)
+disjoint majorities possible with a direct switch? true   e.g. {0,1} is a majority of C_old and {2,3,4} is a majority of C_new: two leaders in one term
+
+== Safety checker over 12 seeds: 20% drops, delay 1-10, membership 3->5->4, crash+restart, snapshots every 8 entries ==
+seeds converged on all writes in the final configuration: 12/12; membership changes completed: 24/24; InstallSnapshot handled: 54
+no Election Safety, Leader Completeness, Log Matching, or State Machine Safety check fired (each would have thrown)
+```
+
 ### In Go
+
+`code/go/main.go` is Lesson 06's Go port with the same additions as the Java, and the demo prints the same trace line for line. Four things differ. **Sets are sorted slices or `map[int]bool`:** member sets are kept sorted (what Java's `TreeSet` iterates as), so `All()` and `ReplicationTargets()` return the same order the Java does, and that order decides which RequestVote and AppendEntries hit the network first and therefore which seeded delay each one draws; vote and ack sets are `map[int]bool`, and the trace sorts them before printing. Slices have no `==`, so `Configuration.Equal` is written by hand and the checker compares `LogEntry` structs, which do. **`nil` is the missing configuration:** a spare server is created with a `*Configuration` bootstrap of `nil`, `Storage.ConfigAt` returns `nil` when neither the log nor the snapshot knows one, and `cfgString` prints `null` where the Java would; `Snapshot` is a pointer that `NewSnapshot` fills with a copy of the state machine's map, and `Message.Snapshot` is `nil` on every other kind. **Programming errors panic; the checker panics too:** `TermAt` below the snapshot, `Get` of a missing index, two leaders in one term, and each Figure 3 violation are `panic`s, as in Lesson 06, because there is no correct value to return, and the test recovers them with `checkPanics`; bad timing configs are the one runtime error, `NewConfig` returning `(Config, error)`. **No constructor overloads:** `NewClusterWithMembers(size, initialMembers, seed, drop, delay, config)` is the full constructor and `NewCluster(size, seed, drop, delay)` starts every server in the configuration with `DefaultConfig`; `KVStore.Get` returns `(string, bool)`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Configurations and the quorum rule
+
+Members are sorted `[]int` slices, `NewMembers` being `nil` for a simple configuration. Acks arrive as a `map[int]bool`, so `MajorityOf` is a loop over members with a map lookup, and `HasQuorum` is the two-majority rule.
 
 ```go
 type Configuration struct {
-    OldMembers []int // sorted
-    NewMembers []int // nil for a simple configuration
+	OldMembers []int
+	NewMembers []int
+}
+
+func MajorityOf(members []int, acks map[int]bool) bool {
+	count := 0
+	for _, m := range members {
+		if acks[m] {
+			count++
+		}
+	}
+	return count >= len(members)/2+1
 }
 
 func (c Configuration) HasQuorum(acks map[int]bool) bool {
-    if !MajorityOf(c.OldMembers, acks) {
-        return false
-    }
-    return c.NewMembers == nil || MajorityOf(c.NewMembers, acks)
+	if !MajorityOf(c.OldMembers, acks) {
+		return false
+	}
+	return c.NewMembers == nil || MajorityOf(c.NewMembers, acks)
 }
 ```
 
-`code/go/main.go` is Lesson 06's Go port with the same additions as the Java, and the demo prints the same trace line for line. What differs:
+#### Step 2: The disjoint-majority checker
 
-- **Sets are sorted slices or `map[int]bool`.** Member sets are kept sorted (what Java's `TreeSet` iterates as), so `All()` and `ReplicationTargets()` return the same order the Java does; that order decides which RequestVote and AppendEntries hit the network first and therefore which seeded delay each one draws. Vote and ack sets are `map[int]bool`, and the trace sorts them before printing. Slices have no `==`, so `Configuration.Equal` is written by hand and the checker compares `LogEntry` structs, which do.
-- **`nil` is the missing configuration.** A spare server is created with a `*Configuration` bootstrap of `nil`, `Storage.ConfigAt` returns `nil` when neither the log nor the snapshot knows one, and `cfgString` prints `null` where the Java would. `Snapshot` is a pointer that `NewSnapshot` fills with a copy of the state machine's map; `Message.Snapshot` is `nil` on every other kind.
-- **Programming errors panic; the checker panics too.** `TermAt` below the snapshot, `Get` of a missing index, two leaders in one term, and each Figure 3 violation are `panic`s, as in Lesson 06, because there is no correct value to return; the test recovers them with `checkPanics`. Bad timing configs are the one runtime error: `NewConfig` returns `(Config, error)`.
-- **No constructor overloads.** `NewClusterWithMembers(size, initialMembers, seed, drop, delay, config)` is the full constructor; `NewCluster(size, seed, drop, delay)` starts every server in the configuration with `DefaultConfig`. `KVStore.Get` returns `(string, bool)`.
+The union is built by appending both slices into a fresh one and deduplicating with `sortedSet`. `subset` returns a `map[int]bool` so it can be fed straight to `MajorityOf`.
 
-Run it from `code/go/`:
+```go
+func DisjointQuorumsPossible(a, b []int) bool {
+	union := sortedSet(append(append([]int(nil), a...), b...))
+	n := len(union)
+	for maskA := 0; maskA < (1 << n); maskA++ {
+		qa := subset(union, maskA)
+		if !MajorityOf(a, qa) {
+			continue
+		}
+		for maskB := 0; maskB < (1 << n); maskB++ {
+			if maskA&maskB != 0 {
+				continue
+			}
+			if MajorityOf(b, subset(union, maskB)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func subset(items []int, mask int) map[int]bool {
+	s := map[int]bool{}
+	for i, it := range items {
+		if mask&(1<<i) != 0 {
+			s[it] = true
+		}
+	}
+	return s
+}
+```
+
+#### Step 3: Storage that can forget its prefix
+
+`TermAt` panics for a compacted index. `Compact` builds a new `keep` slice starting with the sentinel and copies the tail entry by entry through `Get`, which allocates a fresh backing array and avoids the aliasing a reslice would create; `ReplaceWithSnapshot` keeps only the sentinel.
+
+```go
+func (s *Storage) TermAt(index int) int64 {
+	if index == s.SnapshotIndex {
+		return s.SnapshotTerm
+	}
+	if index < s.SnapshotIndex {
+		panic(fmt.Sprintf("index %d is compacted (snapshot at %d)", index, s.SnapshotIndex))
+	}
+	return s.Entries[index-s.SnapshotIndex].Term
+}
+
+func (s *Storage) Compact(snap *Snapshot) {
+	keep := []LogEntry{{snap.LastIncludedTerm, "<sentinel>"}}
+	for i := snap.LastIncludedIndex + 1; i <= s.LastIndex(); i++ {
+		keep = append(keep, s.Get(i))
+	}
+	s.Entries = keep
+	s.SnapshotIndex = snap.LastIncludedIndex
+	s.SnapshotTerm = snap.LastIncludedTerm
+	s.Snapshot = snap
+	s.Writes++
+}
+
+func (s *Storage) ReplaceWithSnapshot(snap *Snapshot) {
+	s.Entries = []LogEntry{{snap.LastIncludedTerm, "<sentinel>"}}
+	s.SnapshotIndex = snap.LastIncludedIndex
+	s.SnapshotTerm = snap.LastIncludedTerm
+	s.Snapshot = snap
+	s.Writes++
+}
+```
+
+#### Step 4: The node uses the latest configuration it has
+
+`Configuration()` returns a `*Configuration` that is `nil` for a server that knows nothing yet; `IsMember` guards on that and uses `Contains`. `Tick` adds the non-member branch that only redraws the timer.
+
+```go
+func (n *RaftNode) Configuration() *Configuration {
+	return n.Storage.ConfigAt(n.Storage.LastIndex(), n.bootstrap)
+}
+
+func (n *RaftNode) IsMember() bool {
+	c := n.Configuration()
+	return c != nil && c.Contains(n.id)
+}
+
+func (n *RaftNode) Tick(now int) []Message {
+	if n.Role == Leader {
+		if now >= n.NextHeartbeat {
+			return n.ReplicateAll(now)
+		}
+		return nil
+	}
+	if now < n.ElectionDeadline {
+		return nil
+	}
+	if !n.IsMember() { // joining or removed servers never campaign
+		n.ResetElectionTimer(now)
+		return nil
+	}
+	return n.StartElection(now)
+}
+```
+
+#### Step 5: Starting a change, and finishing one
+
+`ChangeMembership` and `afterCommit` are the Java methods with `nil` for "no messages". `Joint` and `Simple` build sorted configurations, and `Contains` replaces `all().contains(id)`. Tracer lines are omitted from the chunk.
+
+```go
+func (n *RaftNode) ChangeMembership(newMembers []int) int {
+	if n.Role != Leader {
+		return -1
+	}
+	current := n.Configuration()
+	if current.IsJoint() || n.Storage.LatestConfigIndex() > n.CommitIndex {
+		return -1
+	}
+	return n.Propose(Joint(current.OldMembers, newMembers).Encode())
+}
+
+func (n *RaftNode) afterCommit(now int) []Message {
+	c := n.Configuration()
+	cfgIdx := n.Storage.LatestConfigIndex()
+	latestConfigCommitted := cfgIdx == -1 || cfgIdx <= n.CommitIndex
+	if c.IsJoint() && latestConfigCommitted {
+		next := Simple(c.NewMembers)
+		n.Propose(next.Encode())
+		return n.ReplicateAll(now)
+	}
+	if !c.IsJoint() && latestConfigCommitted && !c.Contains(n.id) {
+		n.SteppedDownAfterRemoval = true
+		finalBeat := n.ReplicateAll(now) // one last round so departing followers learn the commit index
+		n.Role = Follower
+		n.LeaderID = -1
+		return finalBeat
+	}
+	return nil
+}
+```
+
+#### Step 6: Replication targets include the departing
+
+Targets accumulate in a `map[int]bool`; a missing `MatchIndex` entry reads as 0, which is what `getOrDefault(m, 0)` gives in Java. The map keys are copied out and sorted so the fan-out order is deterministic.
+
+```go
+func (n *RaftNode) ReplicationTargets() []int {
+	c := n.Configuration()
+	if c == nil {
+		return nil
+	}
+	targets := map[int]bool{}
+	for _, m := range c.All() {
+		targets[m] = true
+	}
+	cfgIdx := n.Storage.LatestConfigIndex()
+	if !c.IsJoint() && cfgIdx > 0 {
+		if before := n.Storage.ConfigAt(cfgIdx-1, n.bootstrap); before != nil {
+			for _, m := range before.All() {
+				if n.MatchIndex[m] < cfgIdx {
+					targets[m] = true
+				}
+			}
+		}
+	}
+	delete(targets, n.id)
+	out := make([]int, 0, len(targets))
+	for m := range targets {
+		out = append(out, m)
+	}
+	sort.Ints(out)
+	return out
+}
+```
+
+#### Step 7: Taking and sending snapshots
+
+`NewSnapshot` copies the state machine map. `AppendEntriesFor` uses two-value map reads to initialise `NextIndex` and `MatchIndex` for an unknown peer, sends `installSnapshot` when `next` is inside the compacted prefix, and otherwise collects the tail entries through `Get` into a new slice.
+
+```go
+func (n *RaftNode) takeSnapshot(now int) {
+	s := NewSnapshot(n.LastApplied, n.Storage.TermAt(n.LastApplied), n.StateMachine.Data, n.Storage.ConfigAt(n.LastApplied, n.bootstrap))
+	n.Storage.Compact(s)
+	n.SnapshotsTaken++
+}
+
+func (n *RaftNode) AppendEntriesFor(peer int) Message {
+	next, ok := n.NextIndex[peer]
+	if !ok {
+		next = n.LastLogIndex() + 1
+		n.NextIndex[peer] = next
+	}
+	if _, ok := n.MatchIndex[peer]; !ok {
+		n.MatchIndex[peer] = 0
+	}
+	if next <= n.Storage.SnapshotIndex {
+		n.SnapshotsSent++
+		return installSnapshot(n.id, peer, n.Storage.CurrentTerm, n.Storage.Snapshot)
+	}
+	prev := next - 1
+	entries := []LogEntry{}
+	for i := next; i <= n.LastLogIndex(); i++ {
+		entries = append(entries, n.Storage.Get(i))
+	}
+	return appendEntries(n.id, peer, n.Storage.CurrentTerm, prev, n.Storage.TermAt(prev), entries, n.CommitIndex)
+}
+```
+
+#### Step 8: Installing a snapshot
+
+Figure 13 with the same numbered comments; `m.Snapshot` is a pointer that is non-nil only for this message kind. `maxInt` stands in for `Math.max`. The tracer lines are omitted.
+
+```go
+func (n *RaftNode) onInstallSnapshot(m Message, now int) []Message {
+	if m.Term < n.Storage.CurrentTerm {
+		return []Message{snapshotReply(n.id, m.From, n.Storage.CurrentTerm, 0)}
+	}
+	if n.Role == Candidate {
+		n.Role = Follower
+		n.votesGranted = map[int]bool{}
+	}
+	n.LeaderID = m.From
+	n.ResetElectionTimer(now)
+	s := m.Snapshot
+	if s.LastIncludedIndex <= n.Storage.SnapshotIndex {
+		return []Message{snapshotReply(n.id, m.From, n.Storage.CurrentTerm, n.Storage.SnapshotIndex)} // already have it
+	}
+	n.SnapshotsInstalled++
+	if n.Storage.Has(s.LastIncludedIndex) && n.Storage.TermAt(s.LastIncludedIndex) == s.LastIncludedTerm {
+		n.Storage.Compact(s) // 6
+	} else {
+		n.Storage.ReplaceWithSnapshot(s) // 7
+	}
+	if n.LastApplied < s.LastIncludedIndex { // 8
+		n.StateMachine.Reset(s.Data)
+		n.LastApplied = s.LastIncludedIndex
+	}
+	n.CommitIndex = maxInt(n.CommitIndex, s.LastIncludedIndex)
+	return []Message{snapshotReply(n.id, m.From, n.Storage.CurrentTerm, s.LastIncludedIndex)}
+}
+```
+
+#### Step 9: The checker
+
+The Leader Completeness block of `CheckInvariants`. `completenessChecked` is a `map[int64]bool`, the committed indexes are sorted before the walk because map order is random, and `LogEntry` struct comparison with `!=` checks term and command together. A failure panics.
+
+```go
+		// Leader Completeness: every entry committed before this leader's term is in its log (or inside its snapshot).
+		if !c.completenessChecked[n.CurrentTerm()] {
+			c.completenessChecked[n.CurrentTerm()] = true
+			keys := make([]int, 0, len(c.CommittedByIndex))
+			for k := range c.CommittedByIndex {
+				keys = append(keys, k)
+			}
+			sort.Ints(keys)
+			for _, k := range keys {
+				if k <= n.Storage.SnapshotIndex {
+					continue
+				}
+				if !n.Storage.Has(k) || n.Storage.Get(k) != c.CommittedByIndex[k] {
+					panic(fmt.Sprintf("LEADER COMPLETENESS: leader %d of term %d lacks committed entry %d=%s", n.id, n.CurrentTerm(), k, c.CommittedByIndex[k]))
+				}
+			}
+```
+
+#### Step 10: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/07-raft-safety-and-membership/code/go
 go run .
 go test ./...
+```
+
+The same output as the Java and Python runs:
+
+```console
+== Safety checker over 12 seeds: 20% drops, delay 1-10, membership 3->5->4, crash+restart, snapshots every 8 entries ==
+seeds converged on all writes in the final configuration: 12/12; membership changes completed: 24/24; InstallSnapshot handled: 54
+no Election Safety, Leader Completeness, Log Matching, or State Machine Safety check fired (each would have thrown)
 ```
 
 ## Use It

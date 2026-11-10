@@ -295,62 +295,363 @@ Read down the `delivered` column first: every strategy delivers 18,150, because 
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`collections.deque` without `maxlen`:** `deque(maxlen=n)` is a built-in `DROP_OLDEST` that evicts silently and never reports it; the whole point of `BoundedQueue` is that the policy is explicit and counted, so the deque is unbounded and the capacity check lives in `offer`. **Saturation is kept on purpose:** Python `int` cannot overflow, so `demand + n` would never wrap; `request` still clamps to `LONG_MAX` (`2**63 - 1`) because "demand is effectively unbounded at `Long.MAX_VALUE`" is the Reactive Streams contract (rule 3.17), not an accident of 64-bit arithmetic, and `try_consume_one` leaves saturated demand untouched exactly as the Java does. **The seeded run reproduces `java.util.Random`:** `random.Random(42)` would pick different jitter, amounts, and stalls and the table would not match. `JavaRandom` implements the 48-bit LCG including `nextInt(bound)`'s power-of-two fast path and rejection loop (the `bits - val + (bound - 1) < 0` overflow test becomes `> INT_MAX`), so every count in the demo, down to `rejectedOffers=1977`, is identical in both languages; the test file pins those counts. **`Integer.MAX_VALUE` is the constant `INT_MAX`** for the "unbounded" capacity, `OverflowPolicy`, `OfferResult`, and `Strategy` are `Enum`s, `Stats` is a frozen dataclass (so `==` gives the determinism check for free), and `ValueError`/`TypeError` replace `IllegalArgumentException`/`NullPointerException`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The bounded queue with an explicit overflow policy
+
+A `Generic[T]` class over a plain `deque`. `offer` returns an `OfferResult` rather than a boolean, so the caller can tell "take it back and retry" (`REJECTED_FULL`) from "the queue took responsibility" (the other three); the `switch` becomes an `if` chain on the `OverflowPolicy` enum, with `popleft()` as the eviction.
+
 ```python
 class BoundedQueue(Generic[T]):
     def __init__(self, capacity: int, policy: OverflowPolicy) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
-        self._items: Deque[T] = deque()      # never deque(maxlen=n): that drops oldest silently
-        ...
+        if policy is None:
+            raise TypeError("policy")
+        self._items: Deque[T] = deque()
+        self._capacity = capacity
+        self._policy = policy
+        self._dropped = 0
+        self._max_depth = 0
 
+    def offer(self, item: T) -> OfferResult:
+        if item is None:
+            raise TypeError("item")
+        if len(self._items) < self._capacity:
+            self._items.append(item)
+            self._max_depth = max(self._max_depth, len(self._items))
+            return OfferResult.ACCEPTED
+        if self._policy is OverflowPolicy.BLOCK:
+            return OfferResult.REJECTED_FULL
+        if self._policy is OverflowPolicy.DROP_NEWEST:
+            self._dropped += 1
+            return OfferResult.DROPPED_NEWEST
+        self._items.popleft()
+        self._dropped += 1
+        self._items.append(item)
+        return OfferResult.EVICTED_OLDEST
+```
+
+#### Step 2: Demand
+
+Three rules in nine lines: `request(0)` and negatives are `ValueError` (rule 3.9), demand is additive (rule 3.17), and the sum saturates at `LONG_MAX` with `min` instead of the wrap test, since Python has no wrap to detect. `try_consume_one` leaves a saturated subscription at `LONG_MAX`.
+
+```python
 class DemandSubscription:
+    def __init__(self) -> None:
+        self._demand = 0
+
     def request(self, n: int) -> None:
         if n <= 0:
             raise ValueError("request(n) requires n > 0 (Reactive Streams rule 3.9)")
         self._demand = min(self._demand + n, LONG_MAX)  # saturate, never wrap
+
+    def has_demand(self) -> bool:
+        return self._demand > 0
+
+    def try_consume_one(self) -> bool:
+        if self._demand <= 0:
+            return False
+        if self._demand != LONG_MAX:
+            self._demand -= 1
+        return True
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 3: The producer loop
 
-- **`collections.deque` without `maxlen`.** `deque(maxlen=n)` is a built-in `DROP_OLDEST` that evicts silently and never reports it; the whole point of `BoundedQueue` is that the policy is explicit and counted, so the deque is unbounded and the capacity check lives in `offer`.
-- **Saturation is kept on purpose.** Python `int` cannot overflow, so `demand + n` would never wrap; `request` still clamps to `LONG_MAX` (`2**63 - 1`) because "demand is effectively unbounded at `Long.MAX_VALUE`" is the Reactive Streams contract (rule 3.17), not an accident of 64-bit arithmetic, and `try_consume_one` leaves saturated demand untouched exactly as the Java does.
-- **The seeded run reproduces `java.util.Random`.** `random.Random(42)` would pick different jitter, amounts, and stalls and the table would not match. `JavaRandom` implements the 48-bit LCG including `nextInt(bound)`'s power-of-two fast path and rejection loop (the `bits - val + (bound - 1) < 0` overflow test becomes `> INT_MAX`), so every count in the demo, down to `rejectedOffers=1977`, is identical in both languages; the test file pins those counts.
-- **`Integer.MAX_VALUE` is the constant `INT_MAX`** for the "unbounded" capacity, `OverflowPolicy`, `OfferResult`, and `Strategy` are `Enum`s, `Stats` is a frozen dataclass (so `==` gives the determinism check for free), and `ValueError`/`TypeError` replace `IllegalArgumentException`/`NullPointerException`.
+The top of each tick retries `in_flight`, then each of the `want` requests is an upstream caller. The amount is drawn from `JavaRandom` for every request, admitted or not, so all five strategies see byte-identical load. Under `PULL` the demand check happens before the event is built; under `BLOCK` the refused event becomes `in_flight` and the following callers are throttled.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. Both tables match the Java output number for number.
+```python
+            if in_flight is not None:
+                if queue.offer(in_flight) is OfferResult.REJECTED_FULL:
+                    rejected += 1
+                    blocked_this_tick = True
+                else:
+                    in_flight = None
+
+            # Producer, step 2: admit this tick's requests, one at a time, until blocked.
+            want = self._producer_rate + (0 if self._producer_jitter == 0 else rnd.next_int(self._producer_jitter + 1))
+            for _ in range(want):
+                offered += 1
+                cents = 100 + rnd.next_int(9900)  # drawn for every request so all strategies see the identical load
+                if in_flight is not None:                      # BLOCK: handler is stuck, caller sees 429 / slow accept
+                    throttled += 1
+                    continue
+                if strategy is Strategy.PULL and not subscription.try_consume_one():  # PULL: no demand, refuse before producing
+                    throttled += 1
+                    blocked_this_tick = True
+                    continue
+                e = PaymentEvent(next_id, tick, Money.of_minor(cents, USD))
+                next_id += 1
+                produced += 1
+                r = queue.offer(e)
+                if r is OfferResult.REJECTED_FULL:
+                    rejected += 1
+                    in_flight = e
+                    blocked_this_tick = True
+```
+
+#### Step 4: The consumer and the demand signal
+
+A seeded `next_double()` decides the stall; on a normal tick the consumer polls up to `consumer_rate` events, recording latency in ticks and summing the `Money`. The last line is the demand signal: request exactly what was freed, no more.
+
+```python
+            stalled = rnd.next_double() < self._consumer_stall_probability
+            processed = 0
+            if not stalled:
+                for _ in range(self._consumer_rate):
+                    e = queue.poll()
+                    if e is None:
+                        break
+                    delivered += 1
+                    processed += 1
+                    latencies.append(tick - e.produced_at_tick)
+                    delivered_amount = delivered_amount.plus(e.amount)
+            if strategy is Strategy.PULL and processed > 0:
+                subscription.request(processed)  # demand = capacity just freed
+```
+
+#### Step 5: Statistics and the conservation check
+
+`Stats` is a frozen dataclass with the same fourteen fields; `conserves()` is the two accounting identities. Because it is a dataclass, two runs with the same seed compare equal with `==`, which is how the test checks determinism.
+
+```python
+@dataclass(frozen=True)
+class Stats:
+    strategy: Strategy
+    offered_load: int
+    produced: int
+    throttled: int
+    delivered: int
+    dropped: int
+    in_flight: int
+    in_queue: int
+    rejected_offers: int
+    producer_blocked_ticks: int
+    max_queue_depth: int
+    max_latency_ticks: int
+    p99_latency_ticks: int
+    delivered_amount: Money
+
+    def conserves(self) -> bool:
+        return (self.offered_load == self.produced + self.throttled
+                and self.produced == self.delivered + self.dropped + self.in_flight + self.in_queue)
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/08-messaging-and-streams/09-backpressure/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Both tables match the Java output number for number:
+
+```console
+UNBOUNDED    offered= 23969 produced= 23969 throttled=    0 delivered= 18150 dropped=    0 inQueue= 5819 rejectedOffers=    0 maxDepth=  5829 maxLat=  489 p99Lat= 483  conserves=true
+DROP_NEWEST  offered= 23969 produced= 23969 throttled=    0 delivered= 18150 dropped= 5765 inQueue=   54 rejectedOffers=    0 maxDepth=    64 maxLat=   12 p99Lat=   9  conserves=true
+DROP_OLDEST  offered= 23969 produced= 23969 throttled=    0 delivered= 18150 dropped= 5765 inQueue=   54 rejectedOffers=    0 maxDepth=    64 maxLat=    6 p99Lat=   5  conserves=true
+BLOCK        offered= 23969 produced= 18205 throttled= 5764 delivered= 18150 dropped=    0 inQueue=   54 rejectedOffers= 1977 maxDepth=    64 maxLat=   12 p99Lat=   9  conserves=true
+PULL         offered= 23969 produced= 18204 throttled= 5765 delivered= 18150 dropped=    0 inQueue=   54 rejectedOffers=    0 maxDepth=    64 maxLat=   12 p99Lat=   9  conserves=true
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`, `code/go/javarandom.go`, and `code/go/money.go`) keeps the design with four differences. **The queue is a generic slice, not a buffered channel:** `BoundedQueue[T any]` keeps the capacity check and the overflow policy explicit and counted; a channel with `select { default: }` is a built-in `DROP_NEWEST` that never reports the drop, and a blocking send hides `BLOCK` inside the scheduler. `Poll` returns `(T, bool)` where Java returns `null`, and the Go type system cannot refuse a nil `T`, so the Java `NullPointerException` test has no counterpart. **Saturation uses the same wrap test:** `int64` overflows silently like Java's `long`, so `next < 0` after the addition is exactly the Java check; `TryConsumeOne` leaves `math.MaxInt64` untouched (rule 3.17), and `Request(n <= 0)` returns `ErrInvalidDemand` instead of throwing. **The seeded run reproduces `java.util.Random`:** `math/rand` would pick different jitter, amounts, and stalls and the table would not match. `JavaRandom` is the 48-bit LCG with `NextInt(bound)`'s power-of-two fast path and rejection loop (the `bits-val+(bound-1) < 0` overflow test works unchanged on `int32`) and `NextDouble`, so every count in the demo, down to `rejectedOffers=1977`, is identical; the test pins those counts. **Two enums share names in one package:** Java has `OverflowPolicy.BLOCK` and `Strategy.BLOCK` in separate types; Go constants live in one namespace, so the strategies are `Unbounded`, `StrategyDropNewest`, `StrategyDropOldest`, `StrategyBlock`, `Pull` and `String()` prints the Java names. `Stats` is a plain struct of comparable fields, so `==` gives the determinism check for free.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The bounded queue with an explicit overflow policy
+
+A generic struct over a slice; `NewBoundedQueue` validates the capacity and returns an error. `Offer` is the Java switch with `BLOCK` as the `default` arm, and eviction reslices the head off. `Poll` zeroes the vacated slot so the garbage collector can reclaim the event before the slice is resliced.
+
 ```go
 type BoundedQueue[T any] struct {
-    items    []T
-    capacity int
-    policy   OverflowPolicy
-    dropped  int64
-    maxDepth int
+	items    []T
+	capacity int
+	policy   OverflowPolicy
+	dropped  int64
+	maxDepth int
 }
 
-func (s *DemandSubscription) Request(n int64) error {
-    if n <= 0 {
-        return ErrInvalidDemand
-    }
-    next := s.demand + n
-    if next < 0 { // wrapped: saturate, never wrap
-        next = math.MaxInt64
-    }
-    s.demand = next
-    return nil
+func (q *BoundedQueue[T]) Offer(item T) OfferResult {
+	if len(q.items) < q.capacity {
+		q.items = append(q.items, item)
+		q.maxDepth = max(q.maxDepth, len(q.items))
+		return Accepted
+	}
+	switch q.policy {
+	case DropNewest:
+		q.dropped++
+		return DroppedNewest
+	case DropOldest:
+		q.items = q.items[1:]
+		q.dropped++
+		q.items = append(q.items, item)
+		return EvictedOldest
+	default:
+		return RejectedFull
+	}
+}
+
+func (q *BoundedQueue[T]) Poll() (T, bool) {
+	var zero T
+	if len(q.items) == 0 {
+		return zero, false
+	}
+	head := q.items[0]
+	q.items[0] = zero // let the GC reclaim it
+	q.items = q.items[1:]
+	return head, true
 }
 ```
 
-Differences, all in `code/go/main.go`, `code/go/javarandom.go`, and `code/go/money.go`:
+#### Step 2: Demand
 
-- **The queue is a generic slice, not a buffered channel.** `BoundedQueue[T any]` keeps the capacity check and the overflow policy explicit and counted; a channel with `select { default: }` is a built-in `DROP_NEWEST` that never reports the drop, and a blocking send hides `BLOCK` inside the scheduler. `Poll` returns `(T, bool)` where Java returns `null`. The Go type system cannot refuse a nil `T`, so the Java `NullPointerException` test has no counterpart.
-- **Saturation uses the same wrap test.** `int64` overflows silently like Java's `long`, so `next < 0` after the addition is exactly the Java check; `TryConsumeOne` leaves `math.MaxInt64` untouched (rule 3.17). `Request(n <= 0)` returns `ErrInvalidDemand` instead of throwing.
-- **The seeded run reproduces `java.util.Random`.** `math/rand` would pick different jitter, amounts, and stalls and the table would not match. `JavaRandom` is the 48-bit LCG with `NextInt(bound)`'s power-of-two fast path and rejection loop (the `bits-val+(bound-1) < 0` overflow test works unchanged on `int32`) and `NextDouble`, so every count in the demo, down to `rejectedOffers=1977`, is identical; the test pins those counts.
-- **Two enums share names in one package.** Java has `OverflowPolicy.BLOCK` and `Strategy.BLOCK` in separate types; Go constants live in one namespace, so the strategies are `Unbounded`, `StrategyDropNewest`, `StrategyDropOldest`, `StrategyBlock`, `Pull` and `String()` prints the Java names. `Stats` is a plain struct of comparable fields, so `==` gives the determinism check for free.
+Identical arithmetic to Java: two non-negative `int64`s wrap negative exactly when the true sum exceeds `math.MaxInt64`, so `next < 0` is the saturation test. The invalid-demand case is a returned sentinel rather than a thrown exception.
 
-Run it from `code/go/` with `go run .`; test with `go test ./...`. Both tables match the Java output number for number.
+```go
+type DemandSubscription struct {
+	demand int64
+}
+
+func (s *DemandSubscription) Request(n int64) error {
+	if n <= 0 {
+		return ErrInvalidDemand
+	}
+	next := s.demand + n
+	if next < 0 { // wrapped: saturate, never wrap
+		next = math.MaxInt64
+	}
+	s.demand = next
+	return nil
+}
+
+func (s *DemandSubscription) TryConsumeOne() bool {
+	if s.demand <= 0 {
+		return false
+	}
+	if s.demand != math.MaxInt64 {
+		s.demand--
+	}
+	return true
+}
+```
+
+#### Step 3: The producer loop
+
+`inFlight` is a `*PaymentEvent` so that `nil` can mean "nothing held"; `&e` is safe because `e` is a fresh variable per iteration. `JavaRandom.NextInt` takes an `int32` bound, so the jitter is cast; everything else is the Java loop with the same comments.
+
+```go
+		if inFlight != nil {
+			if queue.Offer(*inFlight) == RejectedFull {
+				rejected++
+				blockedThisTick = true
+			} else {
+				inFlight = nil
+			}
+		}
+
+		// Producer, step 2: admit this tick's requests, one at a time, until blocked.
+		want := f.producerRate
+		if f.producerJitter != 0 {
+			want += int(f.random.NextInt(int32(f.producerJitter) + 1))
+		}
+		for i := 0; i < want; i++ {
+			offered++
+			cents := 100 + int64(f.random.NextInt(9900)) // drawn for every request so all strategies see the identical load
+			if inFlight != nil {                         // BLOCK: handler is stuck, caller sees 429 / slow accept
+				throttled++
+				continue
+			}
+			if f.strategy == Pull && !subscription.TryConsumeOne() { // PULL: no demand, refuse before producing
+				throttled++
+				blockedThisTick = true
+				continue
+			}
+			e := PaymentEvent{nextID, int64(tick), OfMinor(cents, USD)}
+			nextID++
+			produced++
+			if queue.Offer(e) == RejectedFull {
+				rejected++
+				inFlight = &e
+				blockedThisTick = true
+			}
+			// Accepted, DroppedNewest, EvictedOldest: the queue took responsibility for the event
+		}
+```
+
+#### Step 4: The consumer and the demand signal
+
+`Poll`'s `ok` replaces the null check. `must(...)` unwraps the `Money.Plus` and `Request` results because inside the simulation neither can fail (one currency, positive demand). The demand signal is the same: request exactly `processed`.
+
+```go
+		stalled := f.random.NextDouble() < f.consumerStallProbability
+		processed := 0
+		if !stalled {
+			for i := 0; i < f.consumerRate; i++ {
+				e, ok := queue.Poll()
+				if !ok {
+					break
+				}
+				delivered++
+				processed++
+				latencies = append(latencies, int64(tick)-e.ProducedAtTick)
+				deliveredAmount = must(deliveredAmount.Plus(e.Amount))
+			}
+		}
+		if f.strategy == Pull && processed > 0 {
+			must(0, subscription.Request(int64(processed))) // demand = capacity just freed
+		}
+```
+
+#### Step 5: Statistics and the conservation check
+
+A struct of comparable fields (`Money` is itself comparable), so two `Stats` from the same seed are `==`. `Conserves` is the two identities on one line.
+
+```go
+type Stats struct {
+	Strategy             Strategy
+	OfferedLoad          int64
+	Produced             int64
+	Throttled            int64
+	Delivered            int64
+	Dropped              int64
+	InFlight             int64
+	InQueue              int64
+	RejectedOffers       int64
+	ProducerBlockedTicks int64
+	MaxQueueDepth        int
+	MaxLatencyTicks      int64
+	P99LatencyTicks      int64
+	DeliveredAmount      Money
+}
+
+func (s Stats) Conserves() bool {
+	return s.OfferedLoad == s.Produced+s.Throttled && s.Produced == s.Delivered+s.Dropped+s.InFlight+s.InQueue
+}
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/08-messaging-and-streams/09-backpressure/code/go
+go run .
+go test ./...
+```
+
+Both tables match the Java output number for number:
+
+```console
+UNBOUNDED    offered= 23969 produced= 23969 throttled=    0 delivered= 18150 dropped=    0 inQueue= 5819 rejectedOffers=    0 maxDepth=  5829 maxLat=  489 p99Lat= 483  conserves=true
+DROP_NEWEST  offered= 23969 produced= 23969 throttled=    0 delivered= 18150 dropped= 5765 inQueue=   54 rejectedOffers=    0 maxDepth=    64 maxLat=   12 p99Lat=   9  conserves=true
+DROP_OLDEST  offered= 23969 produced= 23969 throttled=    0 delivered= 18150 dropped= 5765 inQueue=   54 rejectedOffers=    0 maxDepth=    64 maxLat=    6 p99Lat=   5  conserves=true
+BLOCK        offered= 23969 produced= 18205 throttled= 5764 delivered= 18150 dropped=    0 inQueue=   54 rejectedOffers= 1977 maxDepth=    64 maxLat=   12 p99Lat=   9  conserves=true
+PULL         offered= 23969 produced= 18204 throttled= 5765 delivered= 18150 dropped=    0 inQueue=   54 rejectedOffers=    0 maxDepth=    64 maxLat=   12 p99Lat=   9  conserves=true
+```
 
 ## Use It
 

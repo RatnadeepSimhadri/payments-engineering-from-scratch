@@ -393,24 +393,166 @@ The test file checks 41 assertions: both orders satisfy the validator, Kahn's or
 
 ### In Python
 
+`Digraph`, `TopoSort`, `CycleException`, and `DagScheduler` keep their names and their algorithms in `code/python/main.py`; three things differ. **Insertion order is free:** a `dict` preserves insertion order (guaranteed since 3.7), so `Digraph` needs no `LinkedHashMap`, and `schedule` uses a `dict` with `None` values as the insertion-ordered set that `LinkedHashSet` provides; `successors` returns a tuple and `nodes` a keys view, the read-only counterparts of `Collections.unmodifiableList` and `unmodifiableSet`. **The iterative DFS is still required, for a different reason:** CPython stops at `sys.getrecursionlimit()` (1,000 frames by default) long before the JVM's stack runs out, so a recursive DFS would fail on the 100,000-node chain at depth 1,000; the explicit stack of `_Frame` objects (with `__slots__`) is the same code as the Java. **Exceptions:** `CycleException` subclasses `RuntimeError`, the closest built-in to `IllegalStateException`, and carries the cycle the same way; argument errors (`unknown node`, a missing duration, a negative duration) raise `ValueError`, and a test checks that a cycle is not reported as a `ValueError`. Durations are summed with `add_exact`, which raises `ArithmeticError` where `Math.addExact` would, because Python ints never overflow on their own.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo output is identical to the Java run; the suite covers the Java's 41 checks plus 2.
+
+#### Step 1: A directed graph that remembers insertion order
+
+A plain `dict` of lists is the `LinkedHashMap`. `setdefault` is `computeIfAbsent`, `add_edge` keeps the duplicate check so a repeated dependency does not inflate the in-degree, and the parameter is `from_` because `from` is a keyword. `in_degrees` builds its dict from the adjacency keys first so that isolated nodes appear with degree 0.
+
 ```python
-in_degree = g.in_degrees()
-ready: deque[str] = deque(node for node, d in in_degree.items() if d == 0)
-order: list[str] = []
-while ready:
-    node = ready.popleft()
-    order.append(node)
-    for nxt in g.successors(node):
-        in_degree[nxt] -= 1
-        if in_degree[nxt] == 0:
-            ready.append(nxt)
+class Digraph:
+    def __init__(self) -> None:
+        self._adjacency: dict[str, list[str]] = {}
+
+    def add_node(self, node: str) -> Digraph:
+        if node is None:
+            raise TypeError("node")
+        self._adjacency.setdefault(node, [])
+        return self
+
+    def add_edge(self, from_: str, to: str) -> Digraph:
+        """Adds the edge from_ -> to, meaning "from_ must finish before to can start"."""
+        self.add_node(from_)
+        self.add_node(to)
+        out = self._adjacency[from_]
+        if to not in out:
+            out.append(to)
+        return self
+
+    def in_degrees(self) -> dict[str, int]:
+        in_ = {node: 0 for node in self._adjacency}
+        for out in self._adjacency.values():
+            for to in out:
+                in_[to] += 1
+        return in_
 ```
 
-`Digraph`, `TopoSort`, `CycleException`, and `DagScheduler` keep their names and their algorithms; three things differ, all in `code/python/main.py`:
+#### Step 2: Kahn's algorithm
 
-- **Insertion order is free.** A `dict` preserves insertion order (guaranteed since 3.7), so `Digraph` needs no `LinkedHashMap`, and `schedule` uses a `dict` with `None` values as the insertion-ordered set that `LinkedHashSet` provides. `successors` returns a tuple and `nodes` a keys view, the read-only counterparts of `Collections.unmodifiableList` and `unmodifiableSet`. The Kahn order, the DFS order, the levels, and every slack value match the Java run.
-- **The iterative DFS is still required, for a different reason.** CPython stops at `sys.getrecursionlimit()` (1,000 frames by default) long before the JVM's stack runs out, so a recursive DFS would fail on the 100,000-node chain at depth 1,000 rather than around ten thousand. The explicit stack of `_Frame` objects (with `__slots__`, holding the node and the next successor index) is the same code as the Java.
-- **Exceptions.** `CycleException` subclasses `RuntimeError`, the closest built-in to `IllegalStateException`, and carries the cycle the same way; argument errors (`unknown node`, a missing duration, a negative duration) raise `ValueError`. A test checks that a cycle is not reported as a `ValueError`, so callers can tell a bad graph from a bad argument. Durations are summed with `add_exact`, which raises `ArithmeticError` where `Math.addExact` would.
+`collections.deque` is the `ArrayDeque`; `popleft` is `poll`. Python has no `merge` that returns the new value, so the decrement and the zero test are two statements, which reads closer to the hand trace anyway. The size check at the end is the cycle test, and `find_cycle` names the loop.
+
+```python
+    @staticmethod
+    def kahn(g: Digraph) -> list[str]:
+        in_degree = g.in_degrees()
+        ready: deque[str] = deque(node for node, d in in_degree.items() if d == 0)
+        order: list[str] = []
+        while ready:
+            node = ready.popleft()
+            order.append(node)
+            for nxt in g.successors(node):
+                in_degree[nxt] -= 1
+                if in_degree[nxt] == 0:
+                    ready.append(nxt)
+        if len(order) != g.node_count():
+            # every node still holding in-degree > 0 lies on or downstream of a cycle; find one to report
+            raise CycleException(TopoSort.find_cycle(g))
+        return order
+```
+
+#### Step 3: Iterative DFS with three colours
+
+A Python list is the stack, `stack[-1]` is `peek`, and `_Frame` carries the node plus the index of its next unexplored successor. `_Color` is an `Enum`, compared with `is`. The recursion limit is why this loop is not a recursive function: the test's 100,000-node chain would die at depth 1,000 otherwise.
+
+```python
+        color = {n: _Color.WHITE for n in g.nodes()}
+        parent: dict[str, str] = {}
+        finished: list[str] = []
+
+        for root in g.nodes():
+            if color[root] is not _Color.WHITE:
+                continue
+            stack = [_Frame(root)]
+            color[root] = _Color.GRAY
+            while stack:
+                top = stack[-1]
+                succ = g.successors(top.node)
+                if top.next < len(succ):
+                    child = succ[top.next]
+                    top.next += 1
+                    c = color[child]
+                    if c is _Color.WHITE:
+                        color[child] = _Color.GRAY
+                        parent[child] = top.node
+                        stack.append(_Frame(child))
+                    elif c is _Color.GRAY:
+                        raise CycleException(TopoSort._walk_back(top.node, child, parent))
+                    # BLACK: already finished, a cross or forward edge, safe to ignore
+                else:
+                    color[top.node] = _Color.BLACK
+                    finished.append(top.node)
+                    stack.pop()
+        finished.reverse()
+        return finished
+```
+
+#### Step 4: Walking back the cycle
+
+The same parent walk, with `list.reverse()` in place of `Collections.reverse`. A self-loop gives `from_ == to`, so the `while` never runs and the cycle is `[to]`. `CycleException.__init__` builds the `a -> b -> a` message and keeps the cycle as a tuple so the exception cannot be mutated after it is raised.
+
+```python
+    @staticmethod
+    def _walk_back(from_: str, to: str, parent: dict[str, str]) -> list[str]:
+        """From the GRAY node `from_` back up the DFS tree to `to`, then reverse into edge order."""
+        path: list[str] = []
+        cur = from_
+        while cur != to:
+            path.append(cur)
+            cur = parent[cur]
+        path.append(to)
+        path.reverse()
+        return path
+```
+
+#### Step 5: Levels, for parallel rounds
+
+Processing Kahn's order makes `depth[from_]` safe to read. `max(depth.values(), default=-1)` is the stream's `orElse(-1)`, and the list comprehension `[[] for _ in range(max_depth + 1)]` allocates one bucket per level (not `[[]] * n`, which would alias one list). The predecessor scan is `O(V * E)` here, as in Java, because the graph stores only out-edges.
+
+```python
+    def levels(self) -> list[list[str]]:
+        depth: dict[str, int] = {}
+        for n in TopoSort.kahn(self._graph):
+            d = 0
+            for from_ in self._graph.nodes():
+                if n in self._graph.successors(from_):
+                    d = max(d, depth[from_] + 1)
+            depth[n] = d
+        max_depth = max(depth.values(), default=-1)
+        out: list[list[str]] = [[] for _ in range(max_depth + 1)]
+        for n in self._graph.nodes():
+            out[depth[n]].append(n)
+        return out
+```
+
+#### Step 6: Forward pass, backward pass, slack
+
+The forward pass keeps the strict `>` so the first predecessor in insertion order wins ties, and adds durations through `add_exact`, the hand-written `Math.addExact` that raises `ArithmeticError` outside the signed 64-bit range. The backward pass is `for n in reversed(order)`, and the critical path is collected into a `dict` used as an ordered set.
+
+```python
+        for n in order:
+            start = -1
+            for from_ in self._predecessors(n):
+                f = earliest_finish[from_]
+                if f > start:  # strict: first predecessor wins ties, deterministically
+                    start = f
+                    critical_predecessor[n] = from_
+            if start < 0:
+                start = 0  # no predecessors: can start at time zero
+            earliest_start[n] = start
+            earliest_finish[n] = add_exact(start, self._tasks[n].minutes)
+        makespan = max(earliest_finish.values(), default=0)
+
+        latest_finish: dict[str, int] = {}
+        for n in reversed(order):
+            lf = makespan
+            for to in self._graph.successors(n):
+                lf = min(lf, latest_finish[to] - self._tasks[to].minutes)
+            latest_finish[n] = lf
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/10-topological-sort-and-dags/code/python
@@ -418,32 +560,241 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 41 checks plus 2.
+The demo formats lists with a small `jstr` helper so the output matches the Java run character for character:
+
+```console
+== Settlement batch: 9 jobs, 10 dependencies ==
+Kahn order: [ingest-captures, fetch-fx-rates, compute-fees, fx-fixing, net-positions, generate-payout-file, post-ledger, reconcile, submit-to-bank]
+DFS order:  [fetch-fx-rates, ingest-captures, fx-fixing, compute-fees, net-positions, post-ledger, reconcile, generate-payout-file, submit-to-bank]
+both valid: true true
+
+makespan = 115 minutes; critical path = [ingest-captures, compute-fees, net-positions, post-ledger, reconcile, submit-to-bank]
+
+== A cycle: reconcile now waits for submit-to-bank ==
+rejected: cycle detected: submit-to-bank -> reconcile -> submit-to-bank
+```
 
 ### In Go
 
+`Digraph`, `Kahn`, `DFS`, and `DagScheduler` keep their names and their algorithms in `code/go/main.go`; three things differ. **Insertion order is kept by hand:** Go maps iterate in deliberately randomized order, so `Digraph` holds a `[]string` of nodes beside the `map[string][]string` adjacency, and every loop that Java runs over `LinkedHashMap` keys runs over that slice; `Schedule.Slots` is a plain map and the demo iterates `g.Nodes()` to print it in order. **A cycle is an error value with data:** `CycleError` carries the cycle and implements `error`; `Kahn`, `DFS`, `Levels`, and `Schedule` return it, and `errors.As` recovers the slice where Java's `catch (CycleException e)` reads `e.cycle()`. Argument problems are the sentinels `ErrUnknownNode`, `ErrNoDuration`, and `ErrNegativeDuration`, so `errors.Is` tells a bad graph from a bad argument. **The iterative DFS stays, and `int64` needs the overflow check:** a goroutine stack grows to 1 GB, so a recursive DFS would survive the 100,000-node chain, but the explicit `frame` stack is the same code as the Java and the test keeps it honest. Go's `+` wraps, so the forward pass adds durations with `addChecked`, which returns `ErrOverflow` where `Math.addExact` throws; a test schedules two `1 << 62`-minute tasks to see it fire.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo output is identical to the Java run; the suite covers the Java's 41 checks plus 7 for insertion order, the DFS order, the error-kind distinction, levelling a cyclic graph, and the overflow guard.
+
+#### Step 1: A directed graph that remembers insertion order
+
+The `order` slice is the part a Go map cannot give you. `AddNode` appends to it only on first sight, `AddEdge` uses `slices.Contains` for the duplicate check, and `InDegrees` seeds every node with 0 from `order` before counting. `Successors` returns `ErrUnknownNode` for callers; the unexported `succ` skips the check for nodes the algorithms already know exist.
+
 ```go
-// CycleError is returned when a graph that must be a DAG contains a cycle.
-type CycleError struct {
-    Cycle []string // one cycle, in edge order, without repeating the first node
+type Digraph struct {
+	order     []string
+	adjacency map[string][]string
 }
 
-func (e *CycleError) Error() string {
-    return "cycle detected: " + strings.Join(e.Cycle, " -> ") + " -> " + e.Cycle[0]
+func (g *Digraph) AddNode(node string) *Digraph {
+	if _, ok := g.adjacency[node]; !ok {
+		g.adjacency[node] = []string{}
+		g.order = append(g.order, node)
+	}
+	return g
 }
 
-order, err := Kahn(g)
-var ce *CycleError
-if errors.As(err, &ce) {
-    fmt.Println("rejected:", ce.Cycle)
+func (g *Digraph) AddEdge(from, to string) *Digraph {
+	g.AddNode(from)
+	g.AddNode(to)
+	if !slices.Contains(g.adjacency[from], to) {
+		g.adjacency[from] = append(g.adjacency[from], to)
+	}
+	return g
+}
+
+func (g *Digraph) InDegrees() map[string]int {
+	in := make(map[string]int, len(g.order))
+	for _, node := range g.order {
+		in[node] = 0
+	}
+	for _, out := range g.adjacency {
+		for _, to := range out {
+			in[to]++
+		}
+	}
+	return in
 }
 ```
 
-`Digraph`, `Kahn`, `DFS`, and `DagScheduler` keep their names and their algorithms; three things differ, all in `code/go/main.go`:
+#### Step 2: Kahn's algorithm
 
-- **Insertion order is kept by hand.** Go maps iterate in deliberately randomized order, so `Digraph` holds a `[]string` of nodes beside the `map[string][]string` adjacency, and every loop that Java runs over `LinkedHashMap` keys runs over that slice. The Kahn order, the DFS order, the levels, and every slack value match the Java run; drop the slice and a scheduler built on bare map iteration would print a different valid order on every run, which the lesson's audit argument forbids. `Schedule.Slots` is a plain map; the demo iterates `g.Nodes()` to print it in order.
-- **A cycle is an error value with data.** `CycleError` carries the cycle and implements `error`; `Kahn`, `DFS`, `Levels`, and `Schedule` return it, and `errors.As` recovers the slice where Java's `catch (CycleException e)` reads `e.cycle()`. Argument problems are the sentinels `ErrUnknownNode`, `ErrNoDuration`, and `ErrNegativeDuration`, so a caller can tell a bad graph from a bad argument with `errors.Is`.
-- **The iterative DFS stays, and `int64` needs the overflow check.** A goroutine stack grows to 1 GB, so a recursive DFS would survive the 100,000-node chain, but the explicit `frame` stack is the same code as the Java and the test keeps it honest. Go's `+` wraps, so the forward pass adds durations with `addChecked`, which returns `ErrOverflow` where `Math.addExact` throws; a test schedules two `1 << 62`-minute tasks to see it fire. Kahn's FIFO ready queue is a slice with a moving head index rather than an `ArrayDeque`.
+The FIFO ready queue is a slice with a moving `head` index: nodes are appended at the back and the loop condition `head < len(ready)` re-evaluates every iteration, so nodes released mid-loop are picked up. The initial scan runs over `g.order`, not the in-degree map, which is what makes the output deterministic. A shortfall returns `&CycleError{FindCycle(g)}` instead of throwing.
+
+```go
+func Kahn(g *Digraph) ([]string, error) {
+	inDegree := g.InDegrees()
+	var ready []string
+	for _, node := range g.order {
+		if inDegree[node] == 0 {
+			ready = append(ready, node)
+		}
+	}
+	order := make([]string, 0, g.NodeCount())
+	for head := 0; head < len(ready); head++ { // ready[head:] is the FIFO queue
+		node := ready[head]
+		order = append(order, node)
+		for _, next := range g.succ(node) {
+			inDegree[next]--
+			if inDegree[next] == 0 {
+				ready = append(ready, next)
+			}
+		}
+	}
+	if len(order) != g.NodeCount() {
+		// Every node still holding in-degree > 0 lies on or downstream of a cycle; find one to report.
+		return nil, &CycleError{FindCycle(g)}
+	}
+	return order, nil
+}
+```
+
+#### Step 3: Iterative DFS with three colours
+
+`colors` is a map whose zero value is `white`, so unvisited nodes need no initialisation. `top := &stack[len(stack)-1]` takes a pointer into the slice so `top.next++` mutates the frame in place; the `switch` on colour has no `black` arm because that edge is ignored. The frame slice is popped by reslicing.
+
+```go
+	for _, root := range g.order {
+		if colors[root] != white {
+			continue
+		}
+		stack := []frame{{root, 0}}
+		colors[root] = gray
+		for len(stack) > 0 {
+			top := &stack[len(stack)-1]
+			succ := g.succ(top.node)
+			if top.next < len(succ) {
+				child := succ[top.next]
+				top.next++
+				switch colors[child] {
+				case white:
+					colors[child] = gray
+					parent[child] = top.node
+					stack = append(stack, frame{child, 0})
+				case gray:
+					return nil, &CycleError{walkBack(top.node, child, parent)}
+				}
+				// black: already finished, a cross or forward edge, safe to ignore
+			} else {
+				colors[top.node] = black
+				finished = append(finished, top.node)
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+	slices.Reverse(finished)
+	return finished, nil
+```
+
+#### Step 4: Walking back the cycle
+
+The parent walk fits a three-clause `for`. `CycleError` is a pointer type that implements `error`, and its `Error()` renders the same `a -> b -> a` text as the Java constructor so the demo's `rejected:` line is identical.
+
+```go
+type CycleError struct {
+	// Cycle is the nodes of one cycle, in edge order, without repeating the first node at the end.
+	Cycle []string
+}
+
+func (e *CycleError) Error() string {
+	return "cycle detected: " + strings.Join(e.Cycle, " -> ") + " -> " + e.Cycle[0]
+}
+
+func walkBack(from, to string, parent map[string]string) []string {
+	var path []string
+	for cur := from; cur != to; cur = parent[cur] {
+		path = append(path, cur)
+	}
+	path = append(path, to)
+	slices.Reverse(path)
+	return path
+}
+```
+
+#### Step 5: Levels, for parallel rounds
+
+`Levels` first propagates Kahn's `CycleError`, then tracks `maxDepth` as it goes instead of scanning the map afterwards. The buckets are allocated with `make([][]string, maxDepth+1)` and each filled with an empty (non-nil) slice so a level prints as `[]` rather than `null`-ish; nodes are then placed in `g.order`.
+
+```go
+func (s *DagScheduler) Levels() ([][]string, error) {
+	order, err := Kahn(s.graph)
+	if err != nil {
+		return nil, err
+	}
+	depth := make(map[string]int, len(order))
+	maxDepth := -1
+	for _, n := range order {
+		d := 0
+		for _, from := range s.graph.order {
+			if slices.Contains(s.graph.succ(from), n) {
+				d = max(d, depth[from]+1)
+			}
+		}
+		depth[n] = d
+		maxDepth = max(maxDepth, d)
+	}
+	out := make([][]string, maxDepth+1)
+	for i := range out {
+		out[i] = []string{}
+	}
+	for _, n := range s.graph.order {
+		out[depth[n]] = append(out[depth[n]], n)
+	}
+	return out, nil
+}
+```
+
+#### Step 6: Forward pass, backward pass, slack
+
+The forward pass is the Java loop with `addChecked` in place of `Math.addExact` and the makespan accumulated inline with the built-in `max`. The backward pass walks `order` by index from the end. `addChecked` detects overflow by the sign rule: two operands of the same sign whose sum has the other sign.
+
+```go
+	for _, n := range order {
+		start := int64(-1)
+		for _, from := range s.predecessors(n) {
+			if f := earliestFinish[from]; f > start { // strict: first predecessor wins ties, deterministically
+				start = f
+				criticalPredecessor[n] = from
+			}
+		}
+		if start < 0 { // no predecessors: can start at time zero
+			start = 0
+		}
+		earliestStart[n] = start
+		finish, err := addChecked(start, s.tasks[n].Minutes)
+		if err != nil {
+			return Schedule{}, err
+		}
+		earliestFinish[n] = finish
+		makespan = max(makespan, finish)
+	}
+
+	latestFinish := map[string]int64{}
+	for i := len(order) - 1; i >= 0; i-- {
+		n := order[i]
+		lf := makespan
+		for _, to := range s.graph.succ(n) {
+			lf = min(lf, latestFinish[to]-s.tasks[to].Minutes)
+		}
+		latestFinish[n] = lf
+	}
+```
+
+```go
+func addChecked(a, b int64) (int64, error) {
+	sum := a + b
+	if (a >= 0) == (b >= 0) && (sum >= 0) != (a >= 0) {
+		return 0, ErrOverflow
+	}
+	return sum, nil
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/10-topological-sort-and-dags/code/go
@@ -451,7 +802,17 @@ go run .
 go test ./...
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 41 checks plus 7 for insertion order, the DFS order, the error-kind distinction, levelling a cyclic graph, and the overflow guard.
+`jstr` joins slices with `", "` inside brackets so the lines match Java's `List.toString`:
+
+```console
+== Settlement batch: 9 jobs, 10 dependencies ==
+Kahn order: [ingest-captures, fetch-fx-rates, compute-fees, fx-fixing, net-positions, generate-payout-file, post-ledger, reconcile, submit-to-bank]
+DFS order:  [fetch-fx-rates, ingest-captures, fx-fixing, compute-fees, net-positions, post-ledger, reconcile, generate-payout-file, submit-to-bank]
+both valid: true true
+
+== A cycle: reconcile now waits for submit-to-bank ==
+rejected: cycle detected: submit-to-bank -> reconcile -> submit-to-bank
+```
 
 ## Use It
 

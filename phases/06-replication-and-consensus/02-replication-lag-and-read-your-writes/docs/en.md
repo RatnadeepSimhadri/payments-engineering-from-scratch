@@ -333,66 +333,402 @@ Read the last block as a cost table. `ANY_REPLICA` is free and wrong 72% of the 
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **The in-flight queue is `heapq` on `(arrive_at, lsn, record)` tuples;** LSNs are unique, so ties on arrival time never fall through to comparing `LogRecord`s. The reorder buffer is a plain `dict`: in-order mode only asks "is `applied_lsn + 1` here?", and on-arrival mode sorts the keys, which is what Java's `TreeMap.pollFirstEntry` loop does. **SplitMix64 is masked by hand:** Python integers do not wrap, so `Rng` applies `& MASK64` after every addition and multiplication, and the per-replica seed `seed * 7919 + 1000003 * (i + 1)` is masked too; with the masks in place the demo prints exactly the same lines as the Java version, and dropping one changes every delay. **No overloads:** Java has `write(key, value)` and `write(Session, key, value)`; Python names the second one `write_session`. LSNs are unbounded `int`s, so there is no overflow to guard, and `Money` uses `divmod` on the absolute value so negative amounts format like Java. **Absent values are `None`:** `Replica.read` returns `Optional[str]`, and `AnomalyDetector.observe_pair` checks `is None` exactly where the Java checks `== null`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The log and the leader
+
+`LogRecord` is a frozen dataclass and `Leader` keeps the log in a list, so the LSN of a new record is simply `len(self.log) + 1` and `lsn()` is `len(self.log)`. `since(k)` slices the list from index `k`, which works because LSNs are 1-based and list indexes are 0-based; a watermark outside the log raises `ValueError` where Java throws `IllegalArgumentException`.
+
 ```python
-def tick(self, now: int) -> None:
-    while self._inbox and self._inbox[0][0] <= now:
-        _, lsn, record = heapq.heappop(self._inbox)
-        self._arrived[lsn] = record
-    if self.apply_in_order:
-        while self.applied_lsn + 1 in self._arrived:
-            self._apply(self._arrived.pop(self.applied_lsn + 1))
-    else:
-        for lsn in sorted(self._arrived):
-            self._apply(self._arrived.pop(lsn))
+@dataclass(frozen=True)
+class LogRecord:
+    lsn: int
+    key: str
+    value: str
+
+
+class Leader:
+    def __init__(self) -> None:
+        self.log: list[LogRecord] = []
+        self.data: dict[str, str] = {}
+
+    def lsn(self) -> int:
+        return len(self.log)
+
+    def write(self, key: str, value: str) -> int:
+        r = LogRecord(len(self.log) + 1, key, value)
+        self.log.append(r)
+        self.data[key] = value
+        return r.lsn
+
+    def read(self, key: str) -> Optional[str]:
+        return self.data.get(key)
+
+    def since(self, after_lsn: int) -> list[LogRecord]:
+        if after_lsn < 0 or after_lsn > len(self.log):
+            raise ValueError(f"lsn out of range: {after_lsn}")
+        return list(self.log[after_lsn:])
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: A replica with seeded lag and a reorder buffer
 
-- **The in-flight queue is `heapq` on `(arrive_at, lsn, record)` tuples.** LSNs are unique, so ties on arrival time never fall through to comparing `LogRecord`s. The reorder buffer is a plain `dict`; in-order mode only asks "is `applied_lsn + 1` here?", and on-arrival mode sorts the keys, which is what Java's `TreeMap.pollFirstEntry` loop does.
-- **SplitMix64 is masked by hand.** Python integers do not wrap, so `Rng` applies `& MASK64` after every addition and multiplication, and the per-replica seed `seed * 7919 + 1000003 * (i + 1)` is masked too. With the masks in place the demo prints exactly the same lines as the Java version; drop one and every delay changes.
-- **No overloads.** Java has `write(key, value)` and `write(Session, key, value)`; Python names the second one `write_session`. LSNs are unbounded `int`s, so there is no overflow to guard, and `Money` uses `divmod` on the absolute value so negative amounts format like Java.
-- **Absent values are `None`.** `Replica.read` returns `Optional[str]`, and `AnomalyDetector.observe_pair` checks `is None` exactly where the Java checks `== null`.
+The inbox is a `heapq` list of `(arrive_at, lsn, record)` tuples, ordered first by arrival tick and then by LSN, exactly the Java comparator. `receive` draws the delay from the replica's own `Rng` and pushes; `tick` pops everything due into the `_arrived` dict and then applies according to the mode. In-order mode loops while the next expected LSN is a key of the dict; on-arrival mode walks the keys in sorted order, which drains the buffer completely each tick.
 
-Run it from `code/python/`:
+```python
+    def receive(self, r: LogRecord, now: int) -> None:
+        delay = self.min_delay + self._rng.next_int(self.max_delay - self.min_delay + 1)
+        heapq.heappush(self._inbox, (now + delay, r.lsn, r))
+
+    def tick(self, now: int) -> None:
+        while self._inbox and self._inbox[0][0] <= now:
+            _, lsn, record = heapq.heappop(self._inbox)
+            self._arrived[lsn] = record
+        if self.apply_in_order:
+            while self.applied_lsn + 1 in self._arrived:
+                self._apply(self._arrived.pop(self.applied_lsn + 1))
+        else:
+            for lsn in sorted(self._arrived):
+                self._apply(self._arrived.pop(lsn))
+```
+
+#### Step 3: The watermark
+
+`_apply` is identical in both modes: count an out-of-order apply when the LSN is not the next expected one, install the value, remember the LSN in `_applied_set`, and then advance `applied_lsn` only across a contiguous run. That last loop is what keeps the watermark honest in on-arrival mode: applying `#18` with `#17` still in flight leaves `applied_lsn` at 16.
+
+```python
+    def _apply(self, r: LogRecord) -> None:
+        if r.lsn != self.applied_lsn + 1:
+            self.out_of_order_applies += 1
+        self.data[r.key] = r.value
+        self._applied_set.add(r.lsn)
+        self.applied += 1
+        while self.applied_lsn + 1 in self._applied_set:
+            self.applied_lsn += 1
+```
+
+#### Step 4: Sessions and floors
+
+`ReadMode` is an `Enum` and `Session` holds the two integers. Python has no `switch` expression, so `floor` is an `if` ladder with the same five arms: `ANY_REPLICA` and `LEADER` give 0, `READ_YOUR_WRITES` the last write, `MONOTONIC` the last read, and `SESSION` the maximum of both.
+
+```python
+class ReadMode(Enum):
+    ANY_REPLICA = "ANY_REPLICA"
+    READ_YOUR_WRITES = "READ_YOUR_WRITES"
+    MONOTONIC = "MONOTONIC"
+    SESSION = "SESSION"
+    LEADER = "LEADER"
+
+
+class Session:
+    def __init__(self, id: int) -> None:
+        self.id = id
+        self.last_write_lsn = 0
+        self.last_read_lsn = 0
+
+    def floor(self, mode: ReadMode) -> int:
+        if mode in (ReadMode.ANY_REPLICA, ReadMode.LEADER):
+            return 0
+        if mode == ReadMode.READ_YOUR_WRITES:
+            return self.last_write_lsn
+        if mode == ReadMode.MONOTONIC:
+            return self.last_read_lsn
+        return max(self.last_write_lsn, self.last_read_lsn)
+```
+
+#### Step 5: The router
+
+`read` is the pick-check-redirect-fall-back sequence with the same counters. `pick_replica` is sticky (`s.id % len(self.replicas)`) for `MONOTONIC` and `SESSION` and a seeded random choice otherwise. `_finish` counts a stale read whenever the served LSN is below the leader's, and advances `last_read_lsn` with `max` so it never moves backwards. The `ReadResult` is a frozen dataclass whose `value` is `None` when the key is absent.
+
+```python
+    def read(self, s: Session, key: str, mode: ReadMode) -> ReadResult:
+        self.reads += 1
+        if mode == ReadMode.LEADER:
+            self.leader_reads += 1
+            return self._finish(s, ReadResult(self.leader.read(key), "leader", self.leader.lsn(), False))
+        floor = s.floor(mode)
+        chosen = self.pick_replica(mode, s)
+        if chosen.applied_lsn >= floor:
+            return self._finish(s, ReadResult(chosen.read(key), chosen.name, chosen.applied_lsn, False))
+        for r in self.replicas:
+            if r.applied_lsn >= floor:
+                self.redirects += 1
+                return self._finish(s, ReadResult(r.read(key), r.name, r.applied_lsn, True))
+        self.redirects += 1
+        self.leader_reads += 1
+        return self._finish(s, ReadResult(self.leader.read(key), "leader", self.leader.lsn(), True))
+
+    def _finish(self, s: Session, result: ReadResult) -> ReadResult:
+        if result.at_lsn < self.leader.lsn():
+            self.stale_reads += 1
+        s.last_read_lsn = max(s.last_read_lsn, result.at_lsn)
+        return result
+```
+
+#### Step 6: The anomaly detector
+
+Two counters and a high-water mark. `observe` counts every read served below the highest LSN this session has seen; `observe_pair` takes the two `Optional[str]` values read from one replica at one tick and counts the impossible case, later present and earlier `None`.
+
+```python
+class AnomalyDetector:
+    def __init__(self) -> None:
+        self.monotonic_violations = 0
+        self.prefix_violations = 0
+        self._high_water = 0
+
+    def observe(self, r: ReadResult) -> None:
+        if r.at_lsn < self._high_water:
+            self.monotonic_violations += 1
+        self._high_water = max(self._high_water, r.at_lsn)
+
+    def observe_pair(self, earlier: Optional[str], later: Optional[str]) -> None:
+        if later is not None and earlier is None:
+            self.prefix_violations += 1
+```
+
+#### Step 7: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/02-replication-lag-and-read-your-writes/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+Because the SplitMix64 stream is masked to 64 bits, the output is the Java output line for line:
+
+```console
+== The bug: a customer pays, refreshes, and sees no payment (seed 3, replicas with max delay 4, 12, 40) ==
+t=0  POST /payments -> leader appends #1, returns 201 with lsn token 1
+t=2  leader lsn=1, r0 applied=0 (lag 1), r1 applied=0 (lag 1), r2 applied=0 (lag 1)
+t=2  GET /payments/p-1001 (any replica)       -> <nothing>  (served by r0 at lsn 0)
+t=3  GET /payments/p-1001 (any replica)       -> CAPTURED 49.99 USD  (served by r0 at lsn 1)
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **The in-flight queue is `container/heap`:** `pendingHeap` implements `Len/Less/Swap/Push/Pop`, and `Less` orders by `(arriveAt, lsn)`, the Java comparator. The reorder buffer is a `map[int64]LogRecord`; in-order mode only asks "is `AppliedLsn + 1` here?", and on-arrival mode sorts the keys because Go maps have no order and `TreeMap.pollFirstEntry` does. **Absent values are `(string, bool)`:** `Leader.Read` and `Replica.Read` return a found flag instead of a nullable string, `ReadResult` carries `Found`, and `AnomalyDetector.ObservePair` takes the two flags; the demo prints `<nothing>` exactly where Java prints it. **Errors are values:** `Leader.Since`, `NewReplica`, `NewReplicatedStore`, and `Money.Plus` return errors (`ErrLsnOutOfRange`, `ErrBadDelay`, `ErrDelayRanges`, `ErrCurrencyMismatch`) that tests check with `errors.Is`, while `Of(...)` panics on a bad delay because it is a demo helper whose inputs are literals. **SplitMix64 runs on `uint64`:** the multiplications wrap for free, and `int64(seed)*7919 + 1000003*int64(i+1)` wraps exactly like Java's `long`, so every replica gets the same delay stream and the output matches line for line. `write(Session, ...)` is `WriteSession` because Go has no overloads.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The log and the leader
+
+`Leader` holds a slice and a map. `Write` appends and returns the LSN; `Read` returns the `(value, found)` pair that replaces Java's nullable `String`; `Since` copies the tail of the slice so callers cannot alias the leader's log, and returns `ErrLsnOutOfRange` wrapped with the offending number.
+
 ```go
-func (r *Replica) Tick(now int) {
-    for len(r.inbox) > 0 && r.inbox[0].arriveAt <= now {
-        p := heap.Pop(&r.inbox).(pending)
-        r.arrived[p.lsn] = p.record
-    }
-    if r.ApplyInOrder {
-        for {
-            rec, ok := r.arrived[r.AppliedLsn+1]
-            if !ok {
-                break
-            }
-            delete(r.arrived, rec.Lsn)
-            r.apply(rec)
-        }
-    } else { /* sort the keys, then apply in LSN order */ }
+type LogRecord struct {
+	Lsn   int64
+	Key   string
+	Value string
+}
+
+type Leader struct {
+	Log  []LogRecord
+	Data map[string]string
+}
+
+func (l *Leader) Lsn() int64 { return int64(len(l.Log)) }
+
+func (l *Leader) Write(key, value string) int64 {
+	r := LogRecord{int64(len(l.Log)) + 1, key, value}
+	l.Log = append(l.Log, r)
+	l.Data[key] = value
+	return r.Lsn
+}
+
+func (l *Leader) Read(key string) (string, bool) {
+	v, ok := l.Data[key]
+	return v, ok
+}
+
+func (l *Leader) Since(afterLsn int64) ([]LogRecord, error) {
+	if afterLsn < 0 || afterLsn > int64(len(l.Log)) {
+		return nil, fmt.Errorf("%w: %d", ErrLsnOutOfRange, afterLsn)
+	}
+	out := make([]LogRecord, len(l.Log)-int(afterLsn))
+	copy(out, l.Log[afterLsn:])
+	return out, nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: A replica with seeded lag and a reorder buffer
 
-- **The in-flight queue is `container/heap`.** `pendingHeap` implements `Len/Less/Swap/Push/Pop`; `Less` orders by `(arriveAt, lsn)`, the Java comparator. The reorder buffer is a `map[int64]LogRecord`; in-order mode only asks "is `AppliedLsn + 1` here?", and on-arrival mode sorts the keys because Go maps have no order and `TreeMap.pollFirstEntry` does.
-- **Absent values are `(string, bool)`.** `Leader.Read` and `Replica.Read` return a found flag instead of a nullable string, `ReadResult` carries `Found`, and `AnomalyDetector.ObservePair` takes the two flags. The demo prints `<nothing>` exactly where Java prints it.
-- **Errors are values.** `Leader.Since`, `NewReplica`, `NewReplicatedStore`, and `Money.Plus` return errors (`ErrLsnOutOfRange`, `ErrBadDelay`, `ErrDelayRanges`, `ErrCurrencyMismatch`) that tests check with `errors.Is`. `Of(...)` panics on a bad delay because it is a demo helper whose inputs are literals.
-- **SplitMix64 on `uint64`.** The multiplications wrap for free; `int64(seed)*7919 + 1000003*int64(i+1)` wraps exactly like Java's `long`, so every replica gets the same delay stream and the demo output matches line for line. `write(Session, ...)` is `WriteSession` because Go has no overloads.
+`Receive` pushes a `pending` onto the heap with a delay from the replica's own `Rng`. `Tick` pops everything due into the `arrived` map, then branches on `ApplyInOrder`: the in-order loop looks up `AppliedLsn+1` with the two-value map read and stops at the first gap; the on-arrival branch collects the keys, sorts them, and applies every record that has landed. The heap's `Less` method, shown first, is the ordering the Java `PriorityQueue` gets from its comparator.
 
-Run it from `code/go/`:
+```go
+func (h pendingHeap) Less(i, j int) bool {
+	if h[i].arriveAt != h[j].arriveAt {
+		return h[i].arriveAt < h[j].arriveAt
+	}
+	return h[i].lsn < h[j].lsn
+}
+
+func (r *Replica) Receive(rec LogRecord, now int) {
+	delay := r.MinDelay + r.rng.NextInt(r.MaxDelay-r.MinDelay+1)
+	heap.Push(&r.inbox, pending{now + delay, rec.Lsn, rec})
+}
+
+func (r *Replica) Tick(now int) {
+	for len(r.inbox) > 0 && r.inbox[0].arriveAt <= now {
+		p := heap.Pop(&r.inbox).(pending)
+		r.arrived[p.lsn] = p.record
+	}
+	if r.ApplyInOrder {
+		for {
+			rec, ok := r.arrived[r.AppliedLsn+1]
+			if !ok {
+				break
+			}
+			delete(r.arrived, rec.Lsn)
+			r.apply(rec)
+		}
+	} else {
+		keys := make([]int64, 0, len(r.arrived))
+		for k := range r.arrived {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+		for _, k := range keys {
+			rec := r.arrived[k]
+			delete(r.arrived, k)
+			r.apply(rec)
+		}
+	}
+}
+```
+
+#### Step 3: The watermark
+
+`apply` is the shared tail of both modes. `appliedSet` is a `map[int64]bool`, and reading a missing key yields `false`, so the final `for` loop advances `AppliedLsn` across exactly the contiguous run of applied LSNs and no further.
+
+```go
+func (r *Replica) apply(rec LogRecord) {
+	if rec.Lsn != r.AppliedLsn+1 {
+		r.OutOfOrderApplies++
+	}
+	r.Data[rec.Key] = rec.Value
+	r.appliedSet[rec.Lsn] = true
+	r.Applied++
+	for r.appliedSet[r.AppliedLsn+1] {
+		r.AppliedLsn++
+	}
+}
+```
+
+#### Step 4: Sessions and floors
+
+`ReadMode` is an `int` enum built with `iota`; two of the names carry a `Mode` suffix (`SessionMode`, `LeaderMode`) so they do not collide with the `Session` type and the `Leader` type. `Floor` is a `switch` whose `default` arm covers both floor-0 modes, and `max64` stands in for `Math.max` on `int64`.
+
+```go
+const (
+	AnyReplica ReadMode = iota
+	ReadYourWrites
+	Monotonic
+	SessionMode
+	LeaderMode
+)
+
+type Session struct {
+	ID           int64
+	LastWriteLsn int64
+	LastReadLsn  int64
+}
+
+func (s *Session) Floor(mode ReadMode) int64 {
+	switch mode {
+	case ReadYourWrites:
+		return s.LastWriteLsn
+	case Monotonic:
+		return s.LastReadLsn
+	case SessionMode:
+		return max64(s.LastWriteLsn, s.LastReadLsn)
+	default: // AnyReplica, LeaderMode
+		return 0
+	}
+}
+```
+
+#### Step 5: The router
+
+Same four stages as the Java. Every read goes through the `(v, ok)` pair and builds a `ReadResult` with `Found` set from `ok`, so the demo can print `<nothing>` without a nil string. `finish` updates the stale-read counter and the session's `LastReadLsn` exactly as in Java.
+
+```go
+func (s *ReplicatedStore) Read(sess *Session, key string, mode ReadMode) ReadResult {
+	s.Reads++
+	if mode == LeaderMode {
+		s.LeaderReads++
+		v, ok := s.Leader.Read(key)
+		return s.finish(sess, ReadResult{v, ok, "leader", s.Leader.Lsn(), false})
+	}
+	floor := sess.Floor(mode)
+	chosen := s.PickReplica(mode, sess)
+	if chosen.AppliedLsn >= floor {
+		v, ok := chosen.Read(key)
+		return s.finish(sess, ReadResult{v, ok, chosen.Name, chosen.AppliedLsn, false})
+	}
+	for _, r := range s.Replicas {
+		if r.AppliedLsn >= floor {
+			s.Redirects++
+			v, ok := r.Read(key)
+			return s.finish(sess, ReadResult{v, ok, r.Name, r.AppliedLsn, true})
+		}
+	}
+	s.Redirects++
+	s.LeaderReads++
+	v, ok := s.Leader.Read(key)
+	return s.finish(sess, ReadResult{v, ok, "leader", s.Leader.Lsn(), true})
+}
+
+func (s *ReplicatedStore) finish(sess *Session, result ReadResult) ReadResult {
+	if result.AtLsn < s.Leader.Lsn() {
+		s.StaleReads++
+	}
+	sess.LastReadLsn = max64(sess.LastReadLsn, result.AtLsn)
+	return result
+}
+```
+
+#### Step 6: The anomaly detector
+
+`Observe` is the Java method with `max64`. `ObservePair` takes the two found flags rather than two nullable strings, so the impossible case reads as `laterFound && !earlierFound`.
+
+```go
+type AnomalyDetector struct {
+	MonotonicViolations int
+	PrefixViolations    int
+	highWater           int64
+}
+
+func (d *AnomalyDetector) Observe(r ReadResult) {
+	if r.AtLsn < d.highWater {
+		d.MonotonicViolations++
+	}
+	d.highWater = max64(d.highWater, r.AtLsn)
+}
+
+func (d *AnomalyDetector) ObservePair(earlierFound, laterFound bool) {
+	if laterFound && !earlierFound {
+		d.PrefixViolations++
+	}
+}
+```
+
+#### Step 7: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/02-replication-lag-and-read-your-writes/code/go
 go run .
 go test ./...
+```
+
+The `uint64` SplitMix64 produces the Java delay stream, so the output matches line for line:
+
+```console
+== The bug: a customer pays, refreshes, and sees no payment (seed 3, replicas with max delay 4, 12, 40) ==
+t=0  POST /payments -> leader appends #1, returns 201 with lsn token 1
+t=2  leader lsn=1, r0 applied=0 (lag 1), r1 applied=0 (lag 1), r2 applied=0 (lag 1)
+t=2  GET /payments/p-1001 (any replica)       -> <nothing>  (served by r0 at lsn 0)
+t=3  GET /payments/p-1001 (any replica)       -> CAPTURED 49.99 USD  (served by r0 at lsn 1)
 ```
 
 ## Use It

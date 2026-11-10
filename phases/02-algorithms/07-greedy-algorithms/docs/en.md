@@ -343,24 +343,147 @@ The test run prints `41 passed, 0 failed`.
 
 ### In Python
 
+Same classes, same algorithms, same tests; three things differ in `code/python/main.py`. **Heaps are `heapq` over tuples:** the Huffman heap holds `(weight, order, node)` tuples, so the tuple comparison is the `comparingLong(weight).thenComparingLong(order)` comparator, and `order` is unique, so a comparison never reaches the `Node` itself. The lane heap in `min_resources` is a plain list of `int` end times. Sorting uses `key=lambda iv: (iv.end, iv.start)` in place of the `Comparator` chain. **`TreeMap` becomes `sorted(frequencies)`:** a `dict` preserves insertion order, not key order, so `build` iterates `sorted(frequencies)` to assign `order` in ascending symbol order. The "deterministic across builds" test passes the same table in reversed insertion order and expects identical codes. **Sentinels and identity:** `optimal_table` marks impossible amounts with `LONG_MAX` (`2**63 - 1`) so the "impossible" assertion reads the same as Java's `Long.MAX_VALUE`; `greedy` returns `None` instead of `null`. `Node` is a frozen dataclass with `eq=False`, so `decode`'s "back at the root" check is an identity test (`is not root`), the same as Java's `!=` on references.
+
+The test file carries a small port of `java.util.Random` so the 300 interval instances and 200 USD amounts are the same random inputs as the Java run. Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v` (the same 41 checks).
+
+#### Step 1: Earliest finish first
+
+`sorted` with a tuple key is the comparator chain, and it returns a new list so the caller's order survives. `-(2**63)` plays `Long.MIN_VALUE`; `Interval.__post_init__` rejects `end <= start`.
+
 ```python
-pq: list[tuple[int, int, Node]] = []  # (weight, order, node): heapq compares tuples left to right
-...
-while len(pq) > 1:
-    a = heapq.heappop(pq)[2]  # the two lightest: the greedy choice
-    b = heapq.heappop(pq)[2]
-    merged = Node(a.weight + b.weight, -1, a, b, order)
-    heapq.heappush(pq, (merged.weight, merged.order, merged))
-    order += 1
+    @staticmethod
+    def max_non_overlapping(intervals: list[Interval]) -> list[Interval]:
+        """Maximum number of pairwise non-overlapping intervals: always take the one that ends earliest. O(n log n)."""
+        sorted_ = sorted(intervals, key=lambda iv: (iv.end, iv.start))
+        chosen: list[Interval] = []
+        last_end = -(2**63)
+        for iv in sorted_:
+            if iv.start >= last_end:  # compatible: take it
+                chosen.append(iv)
+                last_end = iv.end
+        return chosen
 ```
 
-Same classes, same algorithms, same tests; three things differ, all in `code/python/main.py`:
+#### Step 2: The wrong greedy, kept for the test
 
-- **Heaps are `heapq` over tuples.** The Huffman heap holds `(weight, order, node)` tuples, so the tuple comparison is the `comparingLong(weight).thenComparingLong(order)` comparator, and `order` is unique, so a comparison never reaches the `Node` itself. The lane heap in `min_resources` is a plain list of `int` end times. Sorting uses `key=lambda iv: (iv.end, iv.start)` in place of the `Comparator` chain.
-- **`TreeMap` becomes `sorted(frequencies)`.** A `dict` preserves insertion order, not key order, so `build` iterates `sorted(frequencies)` to assign `order` in ascending symbol order. The "deterministic across builds" test passes the same table in reversed insertion order and expects identical codes.
-- **Sentinels and identity.** `optimal_table` marks impossible amounts with `LONG_MAX` (`2**63 - 1`) so the "impossible" assertion reads the same as Java's `Long.MAX_VALUE`; `greedy` returns `None` instead of `null`. `Node` is a frozen dataclass with `eq=False`, so `decode`'s "back at the root" check is an identity test (`is not root`), the same as Java's `!=` on references.
+Same shape, duration as the key, and an `all(...)` generator for the pairwise overlap check. The test asserts it picks one interval where earliest-end picks two.
 
-The test file carries a small port of `java.util.Random` so the 300 interval instances and 200 USD amounts are the same random inputs as the Java run.
+```python
+    @staticmethod
+    def shortest_first(intervals: list[Interval]) -> list[Interval]:
+        """The tempting wrong greedy: take the shortest interval first. Kept to show it fail."""
+        sorted_ = sorted(intervals, key=lambda iv: (iv.end - iv.start, iv.start))
+        chosen: list[Interval] = []
+        for iv in sorted_:
+            compatible = all(not (iv.start < c.end and c.start < iv.end) for c in chosen)
+            if compatible:
+                chosen.append(iv)
+        return chosen
+```
+
+#### Step 3: Minimum lanes with a heap
+
+`heapq` operates on a plain list; `ends[0]` is the peek. Reuse the earliest-ending lane when it is already free (`<=`, half-open), then push the new end time either way.
+
+```python
+    @staticmethod
+    def min_resources(intervals: list[Interval]) -> int:
+        sorted_ = sorted(intervals, key=lambda iv: (iv.start, iv.end))
+        ends: list[int] = []
+        for iv in sorted_:
+            if ends and ends[0] <= iv.start:
+                heapq.heappop(ends)  # reuse the lane that frees up first
+            heapq.heappush(ends, iv.end)
+        return len(ends)
+```
+
+#### Step 4: Huffman's tree
+
+The heap entries are `(weight, order, node)` tuples; because `order` is unique the comparison never falls through to the `Node`, which has no ordering. `sorted(frequencies)` gives ascending symbol order for the leaves, matching Java's `TreeMap` iteration, so the resulting codes are identical.
+
+```python
+    @staticmethod
+    def build(frequencies: dict[int, int]) -> Node:
+        """Build the tree. `order` breaks weight ties by creation sequence so the tree, and the code, are deterministic."""
+        if not frequencies:
+            raise ValueError("no symbols")
+        pq: list[tuple[int, int, Node]] = []  # (weight, order, node): heapq compares tuples left to right
+        order = 0
+        for symbol in sorted(frequencies):  # TreeMap iteration: ascending symbol
+            weight = frequencies[symbol]
+            if weight <= 0:
+                raise ValueError(f"frequency must be positive: {symbol}")
+            heapq.heappush(pq, (weight, order, Node(weight, symbol, None, None, order)))
+            order += 1
+        if len(pq) == 1:  # a one-symbol alphabet still needs a one-bit code
+            only = heapq.heappop(pq)[2]
+            return Node(only.weight, -1, only, None, order)
+        while len(pq) > 1:
+            a = heapq.heappop(pq)[2]  # the two lightest: the greedy choice
+            b = heapq.heappop(pq)[2]
+            merged = Node(a.weight + b.weight, -1, a, b, order)
+            heapq.heappush(pq, (merged.weight, merged.order, merged))
+            order += 1
+        return heapq.heappop(pq)[2]
+```
+
+#### Step 5: Codes, encoding, decoding, and the prefix check
+
+`decode` walks the tree a character at a time. The final check is `cur is not root`, an identity comparison, because `Node` was declared with `eq=False` so that two structurally equal nodes are not confused. Invalid and truncated bit strings raise `ValueError`.
+
+```python
+    @staticmethod
+    def decode(bits: str, root: Node) -> list[int]:
+        """Decode by walking the tree; a prefix code needs no separators."""
+        out: list[int] = []
+        cur: Node | None = root
+        for ch in bits:
+            assert cur is not None
+            cur = cur.left if ch == "0" else cur.right
+            if cur is None:
+                raise ValueError("invalid bit string")
+            if cur.is_leaf():
+                out.append(cur.symbol)
+                cur = root
+        if cur is not root:
+            raise ValueError("truncated bit string")
+        return out
+```
+
+#### Step 6: Change-making and the canonicality test
+
+`greedy` iterates `sorted(denominations, reverse=True)` and maps each back to its input index with `list.index`; `//` agrees with Java's `/` because amounts are non-negative. `is_canonical` runs the Kozen-Zaks loop against `optimal_table`, the Lesson 06 dynamic program, with `LONG_MAX` as the impossible marker.
+
+```python
+    @staticmethod
+    def greedy(denominations: list[int], amount: int) -> list[int] | None:
+        """Largest first. Counts per denomination (same order as input), or None if the amount cannot be made."""
+        count = [0] * len(denominations)
+        remaining = amount
+        for d in sorted(denominations, reverse=True):
+            idx = denominations.index(d)
+            count[idx] = remaining // d  # amounts are non-negative: // and Java's / agree
+            remaining %= d
+        return count if remaining == 0 else None
+```
+
+```python
+    @staticmethod
+    def is_canonical(denominations: list[int]) -> bool:
+        sorted_ = sorted(denominations)
+        if sorted_[0] != 1:
+            return False
+        limit = sorted_[-1] + sorted_[-2] if len(sorted_) >= 2 else sorted_[0]
+        optimal = ChangeMaking.optimal_table(denominations, limit)
+        for amount in range(1, limit):
+            g = ChangeMaking.greedy(denominations, amount)
+            if g is None or ChangeMaking.total(g) != optimal[amount]:
+                return False
+        return True
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/07-greedy-algorithms/code/python
@@ -368,9 +491,126 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo output is identical to the Java run, and the suite runs the same 41 checks.
+```console
+== Interval scheduling: settlement windows that need an exclusive lane ==
+earliest-end-first picks 3: [card-settle, payout-run, reporting]
+shortest-first picks     2: [wire-cutoff, reporting]
+lanes needed to run all 8 windows: 4
+
+== Huffman: a prefix code for ISO 8583 response codes by frequency ==
+  code  0  freq  850,000  bits 1
+  code  5  freq   60,000  bits 00
+  code 96  freq    3,000  bits 011100
+fixed 3-bit code: 3,000,000 bits; Huffman: 1,320,000 bits (44.0% of fixed); prefix-free: true
+
+== Change-making: greedy is optimal for some denomination sets and wrong for others ==
+USD-like [1, 5, 10, 25, 100, 500, 1000, 2000, 5000, 10000] canonical? true
+{1,3,4}  canonical? false: amount 6 -> greedy 3 coins, optimal 2
+pre-1971 UK pence canonical? false: amount 48 -> greedy 3 coins (30+12+6), optimal 2 (24+24)
+pay 187.41 USD greedily: 11 pieces {1x10000 1x5000 1x2000 1x1000 1x500 2x100 1x25 1x10 1x5 1x1}
+```
+
+The output is identical to the Java run, including every Huffman code, because the `(weight, order)` tie-break makes the tree a pure function of the frequency table.
 
 ### In Go
+
+Same types, same algorithms, same tests; three things differ in `code/go/main.go`. **Heaps are `container/heap` over a slice type:** the package supplies the sift operations; the slice type supplies `Len/Less/Swap/Push/Pop`, which is where the `(weight, order)` tie-break lives. Because `order` is unique the ordering is total, so the tree is the same whatever heap implementation builds it, and the demo's codes match Java's bit for bit. `MinResources` uses the same pattern over `[]int64` end times. Sorting uses `slices.SortStableFunc` with `cmp.Or(cmp.Compare(a.End, b.End), cmp.Compare(a.Start, b.Start))` in place of the `Comparator` chain. **Maps have no order:** Java iterates a `TreeMap` so the leaves receive `order` in ascending symbol order; Go's `Build` collects the keys, sorts them with `sort.Ints`, and then assigns `order`. Skip that step and the tie-break depends on map iteration order, which Go randomizes on purpose; the "deterministic across builds" test would fail intermittently. **Errors and absence are values:** `NewInterval`, `Build`, `Decode`, and `OptimalTable` return `(T, error)` with the sentinels `ErrBadInterval`, `ErrNoSymbols`, `ErrBadFrequency`, `ErrInvalidBits`, `ErrTruncated`, and `ErrNegative`; `Greedy` returns `(counts, ok)` instead of `null`, and `Impossible` is `math.MaxInt64`, the same sentinel as `Long.MAX_VALUE`. `OptimalCount` panics on a negative amount because the Java method cannot fail there either; the caller already validated.
+
+The test file replays `java.util.Random(21)` through `javarandom.go`, so the 300 interval instances and 200 USD amounts are the same random inputs as the Java run. Run it from `code/go/` with `go run .`; test with `go test ./...` (the Java's 41 checks plus 3 that pin the demo's codes and the two new error sentinels).
+
+#### Step 1: Earliest finish first
+
+`slices.Clone` then `slices.SortStableFunc` with a `cmp.Or` chain is the Java sort; `math.MinInt64` is the initial `lastEnd`. A struct literal cannot validate itself, so `NewInterval` is the constructor that returns `ErrBadInterval`.
+
+```go
+// NewInterval validates end > start.
+func NewInterval(name string, start, end int64) (Interval, error) {
+	if end <= start {
+		return Interval{}, fmt.Errorf("%w: %s", ErrBadInterval, name)
+	}
+	return Interval{name, start, end}, nil
+}
+
+// MaxNonOverlapping is the maximum number of pairwise non-overlapping intervals: always take the one that ends earliest. O(n log n).
+func MaxNonOverlapping(intervals []Interval) []Interval {
+	sorted := slices.Clone(intervals)
+	slices.SortStableFunc(sorted, func(a, b Interval) int {
+		return cmp.Or(cmp.Compare(a.End, b.End), cmp.Compare(a.Start, b.Start))
+	})
+	chosen := []Interval{}
+	lastEnd := int64(math.MinInt64)
+	for _, iv := range sorted {
+		if iv.Start >= lastEnd { // compatible: take it
+			chosen = append(chosen, iv)
+			lastEnd = iv.End
+		}
+	}
+	return chosen
+}
+```
+
+#### Step 2: The wrong greedy, kept for the test
+
+Duration as the primary key, an inner loop for the overlap check. Same counterexample, same test.
+
+```go
+// ShortestFirst is the tempting wrong greedy: take the shortest interval first. Kept to show it fail.
+func ShortestFirst(intervals []Interval) []Interval {
+	sorted := slices.Clone(intervals)
+	slices.SortStableFunc(sorted, func(a, b Interval) int {
+		return cmp.Or(cmp.Compare(a.End-a.Start, b.End-b.Start), cmp.Compare(a.Start, b.Start))
+	})
+	chosen := []Interval{}
+	for _, iv := range sorted {
+		compatible := true
+		for _, c := range chosen {
+			if iv.Start < c.End && c.Start < iv.End {
+				compatible = false
+				break
+			}
+		}
+		if compatible {
+			chosen = append(chosen, iv)
+		}
+	}
+	return chosen
+}
+```
+
+#### Step 3: Minimum lanes with a heap
+
+`int64Heap` implements `heap.Interface` plus a `Peek`; `heap.Push` and `heap.Pop` do the sifting. The reuse test and the final `Len()` are the Java logic.
+
+```go
+// int64Heap is a min-heap of end times for container/heap.
+type int64Heap []int64
+
+func (h int64Heap) Len() int           { return len(h) }
+func (h int64Heap) Less(i, j int) bool { return h[i] < h[j] }
+func (h int64Heap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *int64Heap) Push(x any)        { *h = append(*h, x.(int64)) }
+func (h *int64Heap) Pop() any          { old := *h; v := old[len(old)-1]; *h = old[:len(old)-1]; return v }
+func (h int64Heap) Peek() int64        { return h[0] }
+
+func MinResources(intervals []Interval) int {
+	sorted := slices.Clone(intervals)
+	slices.SortStableFunc(sorted, func(a, b Interval) int {
+		return cmp.Or(cmp.Compare(a.Start, b.Start), cmp.Compare(a.End, b.End))
+	})
+	ends := &int64Heap{}
+	for _, iv := range sorted {
+		if ends.Len() > 0 && ends.Peek() <= iv.Start { // reuse the lane that frees up first
+			heap.Pop(ends)
+		}
+		heap.Push(ends, iv.End)
+	}
+	return ends.Len()
+}
+```
+
+#### Step 4: Huffman's tree
+
+`nodeHeap.Less` is the `(weight, order)` comparator. The keys are collected and sorted with `sort.Ints` before `order` is assigned, which is the `TreeMap` step; without it the tie-break would depend on Go's randomised map iteration. The merge loop pops two, pushes one, `n - 1` times.
 
 ```go
 // nodeHeap orders by weight, then by creation order: a total order, so the tree is deterministic.
@@ -378,20 +618,121 @@ type nodeHeap []*Node
 
 func (h nodeHeap) Len() int { return len(h) }
 func (h nodeHeap) Less(i, j int) bool {
-    return cmp.Or(cmp.Compare(h[i].Weight, h[j].Weight), cmp.Compare(h[i].Order, h[j].Order)) < 0
+	return cmp.Or(cmp.Compare(h[i].Weight, h[j].Weight), cmp.Compare(h[i].Order, h[j].Order)) < 0
 }
 func (h nodeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *nodeHeap) Push(x any)   { *h = append(*h, x.(*Node)) }
 func (h *nodeHeap) Pop() any     { old := *h; v := old[len(old)-1]; *h = old[:len(old)-1]; return v }
+
+// Build constructs the tree. `order` breaks weight ties by creation sequence so the tree, and the code, are deterministic.
+func Build(frequencies map[int]int64) (*Node, error) {
+	if len(frequencies) == 0 {
+		return nil, ErrNoSymbols
+	}
+	symbols := make([]int, 0, len(frequencies)) // Java iterates a TreeMap: ascending symbol order
+	for s := range frequencies {
+		symbols = append(symbols, s)
+	}
+	sort.Ints(symbols)
+	pq := &nodeHeap{}
+	var order int64
+	for _, s := range symbols {
+		if frequencies[s] <= 0 {
+			return nil, fmt.Errorf("%w: %d", ErrBadFrequency, s)
+		}
+		heap.Push(pq, &Node{frequencies[s], s, nil, nil, order})
+		order++
+	}
+	if pq.Len() == 1 { // a one-symbol alphabet still needs a one-bit code
+		only := heap.Pop(pq).(*Node)
+		return &Node{only.Weight, -1, only, nil, order}, nil
+	}
+	for pq.Len() > 1 {
+		a, b := heap.Pop(pq).(*Node), heap.Pop(pq).(*Node) // the two lightest: the greedy choice
+		heap.Push(pq, &Node{a.Weight + b.Weight, -1, a, b, order})
+		order++
+	}
+	return heap.Pop(pq).(*Node), nil
+}
 ```
 
-Same types, same algorithms, same tests; three things differ, all in `code/go/main.go`:
+#### Step 5: Codes, encoding, decoding, and the prefix check
 
-- **Heaps are `container/heap` over a slice type.** The package supplies the sift operations; the slice type supplies `Len/Less/Swap/Push/Pop`, which is where the `(weight, order)` tie-break lives. Because `order` is unique the ordering is total, so the tree is the same whatever heap implementation builds it, and the demo's codes match Java's bit for bit. `MinResources` uses the same pattern over `[]int64` end times. Sorting uses `slices.SortStableFunc` with `cmp.Or(cmp.Compare(a.End, b.End), cmp.Compare(a.Start, b.Start))` in place of the `Comparator` chain.
-- **Maps have no order.** Java iterates a `TreeMap` so the leaves receive `order` in ascending symbol order; Go's `Build` collects the keys, sorts them with `sort.Ints`, and then assigns `order`. Skip that step and the tie-break depends on map iteration order, which Go randomizes on purpose; the "deterministic across builds" test would fail intermittently.
-- **Errors and absence are values.** `NewInterval`, `Build`, `Decode`, and `OptimalTable` return `(T, error)` with the sentinels `ErrBadInterval`, `ErrNoSymbols`, `ErrBadFrequency`, `ErrInvalidBits`, `ErrTruncated`, and `ErrNegative`; `Greedy` returns `(counts, ok)` instead of `null`, and `Impossible` is `math.MaxInt64`, the same sentinel as `Long.MAX_VALUE`. `OptimalCount` panics on a negative amount because the Java method cannot fail there either; the caller already validated.
+`Decode` indexes the string bytewise (the bits are ASCII) and returns `ErrInvalidBits` or `ErrTruncated` instead of throwing. The "back at the root" check compares pointers, as Java compares references.
 
-The test file replays `java.util.Random(21)` through `javarandom.go`, so the 300 interval instances and 200 USD amounts are the same random inputs as the Java run.
+```go
+// Decode walks the tree; a prefix code needs no separators.
+func Decode(bits string, root *Node) ([]int, error) {
+	out := []int{}
+	cur := root
+	for i := 0; i < len(bits); i++ {
+		if bits[i] == '0' {
+			cur = cur.Left
+		} else {
+			cur = cur.Right
+		}
+		if cur == nil {
+			return nil, ErrInvalidBits
+		}
+		if cur.IsLeaf() {
+			out = append(out, cur.Symbol)
+			cur = root
+		}
+	}
+	if cur != root {
+		return nil, ErrTruncated
+	}
+	return out, nil
+}
+```
+
+#### Step 6: Change-making and the canonicality test
+
+`Greedy` returns `(counts, ok)` with `slices.Index` mapping each sorted denomination back to its input position. `IsCanonical` computes the Kozen-Zaks limit and compares greedy against `OptimalTable` for every amount below it; the table cannot fail for a positive limit, so its error is discarded.
+
+```go
+// Greedy: largest first. Returns counts per denomination (same order as input); ok is false if the amount cannot be made.
+func Greedy(denominations []int64, amount int64) (counts []int64, ok bool) {
+	sorted := slices.Clone(denominations)
+	slices.Sort(sorted)
+	count := make([]int64, len(denominations))
+	remaining := amount
+	for i := len(sorted) - 1; i >= 0; i-- {
+		d := sorted[i]
+		idx := slices.Index(denominations, d)
+		count[idx] = remaining / d
+		remaining %= d
+	}
+	if remaining != 0 {
+		return nil, false
+	}
+	return count, true
+}
+```
+
+```go
+func IsCanonical(denominations []int64) bool {
+	sorted := slices.Clone(denominations)
+	slices.Sort(sorted)
+	if sorted[0] != 1 {
+		return false
+	}
+	limit := sorted[0]
+	if len(sorted) >= 2 {
+		limit = sorted[len(sorted)-1] + sorted[len(sorted)-2]
+	}
+	optimal, _ := OptimalTable(denominations, limit) // limit >= 1: cannot fail
+	for amount := int64(1); amount < limit; amount++ {
+		g, ok := Greedy(denominations, amount)
+		if !ok || Total(g) != optimal[amount] {
+			return false
+		}
+	}
+	return true
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/07-greedy-algorithms/code/go
@@ -399,7 +740,26 @@ go run .
 go test ./...
 ```
 
-The demo output is identical to the Java run; the suite runs the Java's 41 checks plus 3 that pin the demo's codes and the two new error sentinels.
+```console
+== Interval scheduling: settlement windows that need an exclusive lane ==
+earliest-end-first picks 3: [card-settle, payout-run, reporting]
+shortest-first picks     2: [wire-cutoff, reporting]
+lanes needed to run all 8 windows: 4
+
+== Huffman: a prefix code for ISO 8583 response codes by frequency ==
+  code  0  freq  850,000  bits 1
+  code  5  freq   60,000  bits 00
+  code 96  freq    3,000  bits 011100
+fixed 3-bit code: 3,000,000 bits; Huffman: 1,320,000 bits (44.0% of fixed); prefix-free: true
+
+== Change-making: greedy is optimal for some denomination sets and wrong for others ==
+USD-like [1, 5, 10, 25, 100, 500, 1000, 2000, 5000, 10000] canonical? true
+{1,3,4}  canonical? false: amount 6 -> greedy 3 coins, optimal 2
+pre-1971 UK pence canonical? false: amount 48 -> greedy 3 coins (30+12+6), optimal 2 (24+24)
+pay 187.41 USD greedily: 11 pieces {1x10000 1x5000 1x2000 1x1000 1x500 2x100 1x25 1x10 1x5 1x1}
+```
+
+The Go and Python outputs are byte-identical, including every Huffman code: the `sort.Ints` step in `Build` is what makes that true across Go's randomised map iteration.
 
 ## Use It
 

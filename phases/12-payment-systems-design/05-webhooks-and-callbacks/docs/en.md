@@ -356,20 +356,227 @@ The test file includes the RFC 4231 test vector for HMAC-SHA256 (`key = 0x0b * 2
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **The crypto is `hmac` + `hashlib`, not `javax.crypto`:** `hmac_sha256`, `hex_of` (`bytes.hex()`) and `unhex` (`bytes.fromhex`) are module-level functions that `WebhookSigner`/`WebhookVerifier` also expose as static methods, so `WebhookSigner.hmac_sha256(...)` reads like the Java; the constant-time comparison is `hmac.compare_digest` rather than a hand-rolled XOR loop, because `==` on `bytes` short-circuits, and it returns `False` on a length mismatch, which the test checks. **Header parsing is stricter about what Java took for granted:** `int(v)` accepts underscores and surrounding whitespace, so the timestamp is matched against `[+-]?\d+` first; `str.split(",")` keeps trailing empty strings where Java's `split` drops them, so they are popped before the loop; a missing header arrives as `None` from `headers.get(...)`, exactly as the Java `Map.get` returned `null`. **Overloads become defaults:** `WebhookVerifier(secret, clock, tolerance_seconds=300)` and `WebhookDispatcher(..., backoff_seconds=None)` replace the two-constructor pairs, and the backoff schedule is a tuple so nobody can mutate it after construction (the Java cloned the array for the same reason). **`IllegalArgumentException` is `ValueError`** (short secret, negative clock advance, missing JSON field) and `Handled` is a frozen dataclass compared with `assertEqual`, as the Java record was with `equals`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The event and its deterministic bytes
+
+`Event` is a frozen dataclass; `to_json` is one f-string with the keys in a fixed order, so the bytes are deterministic. `from_json` is a static method built on a tiny `_field` scanner that reads exactly the shape `to_json` emits and raises `ValueError` on a missing key.
+
 ```python
+@dataclass(frozen=True)
+class Event:
+    id: str
+    type: str
+    object_id: str
+    sequence: int
+    created_at: int
+    status: str
+
+    def to_json(self) -> str:
+        """A fixed-shape JSON document. Keys are always emitted in this order so the bytes are deterministic."""
+        return (f'{{"id":"{self.id}","type":"{self.type}","object":"{self.object_id}",'
+                f'"sequence":{self.sequence},"created":{self.created_at},"status":"{self.status}"}}')
+
+    @staticmethod
+    def from_json(json: str) -> "Event":
+        """Parses exactly the shape to_json emits. Not a general JSON parser; the lesson is not about parsing."""
+        return Event(_field(json, "id"), _field(json, "type"), _field(json, "object"),
+                     int(_field(json, "sequence")), int(_field(json, "created")), _field(json, "status"))
+```
+
+#### Step 2: Signing
+
+The three primitives are module-level functions (`signed_payload`, `hmac_sha256`, `hex_of`), and `WebhookSigner` re-exports them as static methods for symmetry with the Java class. `hmac.new(key, message, hashlib.sha256).digest()` is RFC 2104; the constructor refuses secrets under 16 characters with `ValueError`.
+
+```python
+def signed_payload(timestamp: int, payload: str) -> str:
+    """The bytes that are authenticated. Binding the timestamp into the MAC is what makes replay detectable."""
+    return f"{timestamp}.{payload}"
+
+
 def hmac_sha256(key: bytes, message: bytes) -> bytes:
     return hmac.new(key, message, hashlib.sha256).digest()
 
-def constant_time_equals(a: bytes, b: bytes) -> bool:
-    return hmac.compare_digest(a, b)
+
+def hex_of(data: bytes) -> str:
+    return data.hex()
+
+
+def unhex(text: str) -> bytes:
+    return bytes.fromhex(text)
+
+
+class WebhookSigner:
+    HEADER_NAME = HEADER_NAME
+
+    def __init__(self, secret: str, clock: Clock) -> None:
+        if secret is None or len(secret) < 16:
+            raise ValueError("secret must be at least 16 characters")
+        self._secret = secret.encode("utf-8")
+        self._clock = clock
+
+    signed_payload = staticmethod(signed_payload)
+    hmac_sha256 = staticmethod(hmac_sha256)
+    hex = staticmethod(hex_of)
+
+    def signature(self, timestamp: int, payload: str) -> str:
+        return hex_of(hmac_sha256(self._secret, signed_payload(timestamp, payload).encode("utf-8")))
+
+    def header(self, payload: str) -> str:
+        """Header value for a payload signed now."""
+        ts = self._clock.now_seconds()
+        return f"t={ts},v1={self.signature(ts, payload)}"
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 3: Verification
 
-- **The crypto is `hmac` + `hashlib`, not `javax.crypto`.** `hmac_sha256`, `hex_of` (`bytes.hex()`) and `unhex` (`bytes.fromhex`) are module-level functions that `WebhookSigner`/`WebhookVerifier` also expose as static methods, so `WebhookSigner.hmac_sha256(...)` reads like the Java. The constant-time comparison is `hmac.compare_digest` rather than a hand-rolled XOR loop, because `==` on `bytes` short-circuits; it returns `False` on a length mismatch, which the test checks.
-- **Header parsing is stricter about what Java took for granted.** `int(v)` accepts underscores and surrounding whitespace, so the timestamp is matched against `[+-]?\d+` first; `str.split(",")` keeps trailing empty strings where Java's `split` drops them, so they are popped before the loop. A missing header arrives as `None` from `headers.get(...)`, exactly as the Java `Map.get` returned `null`.
-- **Overloads become defaults.** `WebhookVerifier(secret, clock, tolerance_seconds=300)` and `WebhookDispatcher(..., backoff_seconds=None)` replace the two-constructor pairs; the backoff schedule is a tuple so nobody can mutate it after construction (the Java cloned the array for the same reason).
-- **`IllegalArgumentException` is `ValueError`** (short secret, negative clock advance, missing JSON field) and `Handled` is a frozen dataclass compared with `assertEqual`, as the Java record was with `equals`.
+`parse` returns `None` for a malformed header after the stricter checks described above: a regex for the timestamp, a 64-hex regex for each `v1`, and trailing empty parts dropped. `verify` recomputes the MAC over the *received* timestamp and compares each candidate with `hmac.compare_digest`, which supports secret rotation the same way the Java loop does.
+
+```python
+def constant_time_equals(a: bytes, b: bytes) -> bool:
+    """Comparison whose running time does not depend on where the first difference is (hmac.compare_digest)."""
+    return hmac.compare_digest(a, b)
+
+    @staticmethod
+    def parse(header: Optional[str]) -> Optional[ParsedHeader]:
+        """Parses "t=123,v1=abc,v1=def" into timestamp and candidate signatures. Returns None when malformed."""
+        if header is None or header == "":
+            return None
+        ts: Optional[int] = None
+        sigs: list[str] = []
+        parts = header.split(",")
+        while parts and parts[-1] == "":  # Java's String.split drops trailing empty strings
+            parts.pop()
+        for part in parts:
+            eq = part.find("=")
+            if eq <= 0:
+                return None
+            k, v = part[:eq].strip(), part[eq + 1:].strip()
+            if k == "t":
+                if not _INT.fullmatch(v):
+                    return None
+                ts = int(v)
+            elif k == "v1":
+                if not _HEX64.fullmatch(v):
+                    return None
+                sigs.append(v)
+            # unknown schemes (v0, v2) are ignored so the producer can rotate schemes without breaking consumers
+        if ts is None or not sigs:
+            return None
+        return ParsedHeader(ts, tuple(sigs))
+
+    constant_time_equals = staticmethod(constant_time_equals)
+    unhex = staticmethod(unhex)
+
+    def verify(self, payload: str, header: Optional[str]) -> Verification:
+        parsed = WebhookVerifier.parse(header)
+        if parsed is None:
+            return Verification.MALFORMED_HEADER
+        age = self._clock.now_seconds() - parsed.timestamp
+        if abs(age) > self._tolerance_seconds:
+            return Verification.STALE_TIMESTAMP
+        expected = hmac_sha256(self._secret, signed_payload(parsed.timestamp, payload).encode("utf-8"))
+        for candidate in parsed.signatures:
+            if constant_time_equals(expected, unhex(candidate)):
+                return Verification.OK
+        return Verification.BAD_SIGNATURE
+```
+
+#### Step 4: The scripted endpoint
+
+`FakeEndpoint` keeps the scripted statuses in a `deque` and records only successful deliveries in `received`. `fail_with` returns `self` so a test can chain it onto the constructor.
+
+```python
+class FakeEndpoint:
+    """An endpoint whose failures are scripted per attempt, so a retry schedule can be tested exactly."""
+
+    def __init__(self) -> None:
+        self.received: list[str] = []
+        self.received_headers: list[dict[str, str]] = []
+        self._scripted_statuses: deque[int] = deque()
+        self.calls = 0
+
+    def fail_with(self, *statuses: int) -> "FakeEndpoint":
+        """The next calls return these statuses in order; after the script is exhausted every call returns 200."""
+        self._scripted_statuses.extend(statuses)
+        return self
+
+    def receive(self, payload: str, headers: dict[str, str]) -> int:
+        self.calls += 1
+        status = self._scripted_statuses.popleft() if self._scripted_statuses else 200
+        if 200 <= status < 300:
+            self.received.append(payload)
+            self.received_headers.append(headers)
+        return status
+```
+
+#### Step 5: The dispatcher and its schedule
+
+`tick` attempts everything due exactly once, signing at send time. Headers are a plain `dict` (insertion-ordered, like the Java `LinkedHashMap`); the attempt count, statuses, and times are recorded before the state decision; `max_attempts()` is `len(self._backoff) + 1`.
+
+```python
+    def max_attempts(self) -> int:
+        return len(self._backoff) + 1
+
+    def enqueue(self, event: Event) -> Delivery:
+        d = Delivery(event, self._clock.now_seconds())
+        self.deliveries.append(d)
+        return d
+
+    def tick(self) -> int:
+        """Attempts every delivery that is due. Signs at send time so the timestamp reflects the retry, not the enqueue."""
+        attempted = 0
+        for d in self.deliveries:
+            if d.state is not DeliveryState.PENDING or d.next_attempt_at > self._clock.now_seconds():
+                continue
+            attempted += 1
+            headers = {
+                HEADER_NAME: self._signer.header(d.payload),
+                "Webhook-Id": d.event.id,
+                "Webhook-Attempt": str(d.attempts + 1),
+            }
+            status = self._endpoint.receive(d.payload, headers)
+            d.attempts += 1
+            d.statuses.append(status)
+            d.attempt_times.append(self._clock.now_seconds())
+            if 200 <= status < 300:
+                d.state = DeliveryState.DELIVERED
+            elif d.attempts >= self.max_attempts():
+                d.state = DeliveryState.DEAD_LETTERED
+                self.dead_letters.append(d)
+            else:
+                d.next_attempt_at = self._clock.now_seconds() + self._backoff[d.attempts - 1]
+        return attempted
+```
+
+#### Step 6: The consumer
+
+`handle` verifies on the raw bytes first and answers `400` on any failure, then dedupes by event id, then enforces per-object ordering, then applies. The `set` membership test and `add` are two statements here where Java's `Set.add` did both in one; the lesson's single-threaded dispatcher makes that safe.
+
+```python
+    def handle(self, payload: str, headers: dict[str, str]) -> Handled:
+        v = self._verifier.verify(payload, headers.get(HEADER_NAME))
+        if v is not Verification.OK:
+            self.log.append(f"rejected {v.name}")
+            return Handled(400, Outcome.REJECTED, v)  # 4xx: the producer should not retry a forgery
+        e = Event.from_json(payload)
+        if e.id in self._seen_event_ids:
+            self.log.append(f"duplicate {e.id}")
+            return Handled(200, Outcome.DUPLICATE, v)  # 200: tell the producer to stop retrying
+        self._seen_event_ids.add(e.id)
+        latest = self.latest_sequence.get(e.object_id, -1)
+        if e.sequence <= latest:
+            self.log.append(f"out-of-order {e.id} seq {e.sequence} <= {latest}")
+            return Handled(200, Outcome.OUT_OF_ORDER, v)
+        self.latest_sequence[e.object_id] = e.sequence
+        self.object_status[e.object_id] = e.status
+        self.log.append(f"applied {e.id} -> {e.object_id}={e.status}")
+        return Handled(200, Outcome.ACCEPTED, v)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/12-payment-systems-design/05-webhooks-and-callbacks/code/python
@@ -377,36 +584,266 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### In Go
+The output is identical to the Java run, including the header value, because HMAC-SHA256 over the same bytes is the same MAC:
 
-```go
-func HmacSha256(key, message []byte) []byte {
-    mac := hmac.New(sha256.New, key)
-    mac.Write(message)
-    return mac.Sum(nil)
-}
-
-// ConstantTimeEquals: running time does not depend on where the first difference is.
-func ConstantTimeEquals(a, b []byte) bool {
-    return subtle.ConstantTimeCompare(a, b) == 1
-}
-
-// Parse reads "t=123,v1=abc,v1=def"; ok is false when the header is malformed.
-func Parse(header string) (ParsedHeader, bool) {
+```console
+== Signing and verifying ==
+header:  t=1700000000,v1=1d0988920c13b08e0b43efaca51cc7060f6d4bae51b6deb47b3605c9d207b1c4
+verify untouched        -> OK
+verify tampered payload -> BAD_SIGNATURE
+verify wrong secret     -> BAD_SIGNATURE
+verify 301s later       -> STALE_TIMESTAMP (tolerance 300s: replay window closed)
 ```
 
-Differences, all in `code/go/main.go` and `main_test.go`:
+### In Go
 
-- **The crypto is `crypto/hmac` + `crypto/sha256`, and the compare is `crypto/subtle`.** `hmac.New(sha256.New, key)` replaces `Mac.getInstance("HmacSHA256")`; there is no checked exception to swallow because the algorithm is part of the language's standard library, not a provider lookup. `subtle.ConstantTimeCompare` returns `1` on equality and `0` on any difference, including a length mismatch, which the test pins. `encoding/hex` handles `Hex`/`Unhex`.
-- **`null` becomes the zero value or a `bool`.** `Parse` returns `(ParsedHeader, bool)` instead of `null`; a header the consumer never received reads from the `map[string]string` as `""`, which `Parse` rejects as `MALFORMED_HEADER`, so the Java `null` test and the Java empty-string test collapse into the same path. `EventFromJSON` returns `(Event, error)`, and `FakeClock.Advance` returns an `error` for a negative step instead of throwing.
-- **Overloads become two constructors.** `NewWebhookVerifier(secret, clock, tolerance)` and `NewDefaultWebhookVerifier(secret, clock)`; `NewWebhookDispatcher(..., backoff)` and `NewDefaultWebhookDispatcher(...)`. The backoff slice is copied on construction, as the Java cloned the array, so a caller cannot change the schedule after the fact.
-- **`strings.Split` keeps trailing empty strings** where Java's `split` drops them, so `Parse` trims them before the loop; otherwise `"t=1,v1=...,"` would be rejected in Go and accepted in Java. `strconv.ParseInt` is as strict as `Long.parseLong`, so no extra regex is needed for the timestamp.
-- **No mutex, by design.** The consumer's `seenEventIDs` set and `LatestSequence` map are plain maps because the dispatcher is single-threaded here; a server that calls `Handle` from several goroutines wraps it in a `sync.Mutex`, and `go test -race ./...` passes as shipped.
+The Go port (`code/go/main.go`, tests in `main_test.go`) keeps the design with five differences. **The crypto is `crypto/hmac` + `crypto/sha256`, and the compare is `crypto/subtle`:** `hmac.New(sha256.New, key)` replaces `Mac.getInstance("HmacSHA256")`, with no checked exception to swallow because the algorithm is part of the standard library, not a provider lookup; `subtle.ConstantTimeCompare` returns `1` on equality and `0` on any difference, including a length mismatch, which the test pins, and `encoding/hex` handles `Hex`/`Unhex`. **`null` becomes the zero value or a `bool`:** `Parse` returns `(ParsedHeader, bool)`; a header the consumer never received reads from the `map[string]string` as `""`, which `Parse` rejects as `MALFORMED_HEADER`, so the Java `null` test and empty-string test collapse into one path; `EventFromJSON` returns `(Event, error)`, and `FakeClock.Advance` returns an `error` for a negative step instead of throwing. **Overloads become two constructors:** `NewWebhookVerifier`/`NewDefaultWebhookVerifier` and `NewWebhookDispatcher`/`NewDefaultWebhookDispatcher`; the backoff slice is copied on construction, as the Java cloned the array. **`strings.Split` keeps trailing empty strings** where Java's `split` drops them, so `Parse` trims them before the loop; `strconv.ParseInt` is as strict as `Long.parseLong`, so no extra regex is needed for the timestamp. **No mutex, by design:** the consumer's `seenEventIDs` set and `LatestSequence` map are plain maps because the dispatcher is single-threaded here; a server that calls `Handle` from several goroutines wraps it in a `sync.Mutex`, and `go test -race ./...` passes as shipped.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The event and its deterministic bytes
+
+`ToJSON` is a single `fmt.Sprintf` with a fixed key order. `EventFromJSON` returns `(Event, error)` and assigns each field in turn from the `field` scanner, so a missing key surfaces as an error rather than a panic.
+
+```go
+type Event struct {
+	ID        string
+	Type      string
+	ObjectID  string
+	Sequence  int64
+	CreatedAt int64
+	Status    string
+}
+
+// ToJSON is a fixed-shape JSON document. Keys are always emitted in this order so the bytes are deterministic.
+func (e Event) ToJSON() string {
+	return fmt.Sprintf(`{"id":"%s","type":"%s","object":"%s","sequence":%d,"created":%d,"status":"%s"}`,
+		e.ID, e.Type, e.ObjectID, e.Sequence, e.CreatedAt, e.Status)
+}
+
+// EventFromJSON parses exactly the shape ToJSON emits. Not a general JSON parser; the lesson is not about parsing.
+func EventFromJSON(json string) (Event, error) {
+	var e Event
+	var err error
+	if e.ID, err = field(json, "id"); err != nil {
+		return Event{}, err
+```
+
+#### Step 2: Signing
+
+`NewWebhookSigner` wraps `ErrInvalidArgument` for a short secret. `SignedPayload`, `HmacSha256`, and `Hex` are package functions; `hmac.New(sha256.New, key)` plus `Sum(nil)` is the whole MAC, and `Header` signs with the clock's current second.
+
+```go
+func NewWebhookSigner(secret string, clock Clock) (*WebhookSigner, error) {
+	if len(secret) < 16 {
+		return nil, fmt.Errorf("%w: secret must be at least 16 characters", ErrInvalidArgument)
+	}
+	return &WebhookSigner{secret: []byte(secret), clock: clock}, nil
+}
+
+// SignedPayload is the bytes that are authenticated. Binding the timestamp into the MAC is what makes replay detectable.
+func SignedPayload(timestamp int64, payload string) string {
+	return strconv.FormatInt(timestamp, 10) + "." + payload
+}
+
+func HmacSha256(key, message []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(message)
+	return mac.Sum(nil)
+}
+
+func Hex(bytes []byte) string { return hex.EncodeToString(bytes) }
+
+func (s *WebhookSigner) Signature(timestamp int64, payload string) string {
+	return Hex(HmacSha256(s.secret, []byte(SignedPayload(timestamp, payload))))
+}
+
+// Header is the header value for a payload signed now.
+func (s *WebhookSigner) Header(payload string) string {
+	ts := s.clock.NowSeconds()
+	return "t=" + strconv.FormatInt(ts, 10) + ",v1=" + s.Signature(ts, payload)
+}
+```
+
+#### Step 3: Verification
+
+`Parse` uses a `*int64` to distinguish "no `t` seen" from a zero timestamp and returns `false` on any malformed part. `Verify` recomputes over the received timestamp; the tolerance check is written as two comparisons rather than `math.Abs` to stay in integers. `ConstantTimeEquals` is `subtle.ConstantTimeCompare`.
+
+```go
+func Parse(header string) (ParsedHeader, bool) {
+	if header == "" {
+		return ParsedHeader{}, false
+	}
+	var ts *int64
+	var sigs []string
+	// Java's split drops trailing empty strings; strings.Split keeps them, so trim them first.
+	parts := strings.Split(header, ",")
+	for len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	for _, part := range parts {
+		eq := strings.IndexByte(part, '=')
+		if eq <= 0 {
+			return ParsedHeader{}, false
+		}
+		k, v := strings.TrimSpace(part[:eq]), strings.TrimSpace(part[eq+1:])
+		switch k {
+		case "t":
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return ParsedHeader{}, false
+			}
+			ts = &n
+		case "v1":
+			if !hexSig.MatchString(v) {
+				return ParsedHeader{}, false
+			}
+			sigs = append(sigs, v)
+		}
+		// unknown schemes (v0, v2) are ignored so the producer can rotate schemes without breaking consumers
+	}
+	if ts == nil || len(sigs) == 0 {
+		return ParsedHeader{}, false
+	}
+	return ParsedHeader{*ts, sigs}, true
+}
+
+// ConstantTimeEquals is a byte-wise comparison whose running time does not depend on where the first difference is.
+func ConstantTimeEquals(a, b []byte) bool {
+	return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+func (v *WebhookVerifier) Verify(payload, header string) Verification {
+	parsed, ok := Parse(header)
+	if !ok {
+		return MALFORMED_HEADER
+	}
+	age := v.clock.NowSeconds() - parsed.Timestamp
+	if age > v.toleranceSeconds || -age > v.toleranceSeconds {
+		return STALE_TIMESTAMP
+	}
+	expected := HmacSha256(v.secret, []byte(SignedPayload(parsed.Timestamp, payload)))
+	for _, candidate := range parsed.Signatures {
+		if ConstantTimeEquals(expected, Unhex(candidate)) {
+			return OK
+		}
+	}
+	return BAD_SIGNATURE
+}
+```
+
+#### Step 4: The scripted endpoint
+
+The scripted statuses are a slice consumed from the front; a `200` is the default once the script is exhausted, and only successes are appended to `Received`.
+
+```go
+func (f *FakeEndpoint) FailWith(statuses ...int) *FakeEndpoint {
+	f.scriptedStatus = append(f.scriptedStatus, statuses...)
+	return f
+}
+
+func (f *FakeEndpoint) Receive(payload string, headers map[string]string) int {
+	f.Calls++
+	status := 200
+	if len(f.scriptedStatus) > 0 {
+		status, f.scriptedStatus = f.scriptedStatus[0], f.scriptedStatus[1:]
+	}
+	if status >= 200 && status < 300 {
+		f.Received = append(f.Received, payload)
+		f.ReceivedHeaders = append(f.ReceivedHeaders, headers)
+	}
+	return status
+}
+```
+
+#### Step 5: The dispatcher and its schedule
+
+`Tick` is the Java loop line for line with a map literal for the headers. `Deliveries` holds pointers, so the state written here is the state the demo and tests read back.
+
+```go
+func (w *WebhookDispatcher) Tick() int {
+	attempted := 0
+	for _, d := range w.Deliveries {
+		if d.State != PENDING || d.NextAttemptAt > w.clock.NowSeconds() {
+			continue
+		}
+		attempted++
+		headers := map[string]string{
+			HEADER_NAME:       w.signer.Header(d.Payload),
+			"Webhook-Id":      d.Event.ID,
+			"Webhook-Attempt": strconv.Itoa(d.Attempts + 1),
+		}
+		status := w.endpoint.Receive(d.Payload, headers)
+		d.Attempts++
+		d.Statuses = append(d.Statuses, status)
+		d.AttemptTimes = append(d.AttemptTimes, w.clock.NowSeconds())
+		if status >= 200 && status < 300 {
+			d.State = DELIVERED
+		} else if d.Attempts >= w.MaxAttempts() {
+			d.State = DEAD_LETTERED
+			w.DeadLetters = append(w.DeadLetters, d)
+		} else {
+			d.NextAttemptAt = w.clock.NowSeconds() + w.backoff[d.Attempts-1]
+		}
+	}
+	return attempted
+}
+```
+
+#### Step 6: The consumer
+
+`Handle` reads the header from the map (a missing key is `""`, rejected by `Parse`), rejects a malformed event body as a second `400` path that Java did not need because `fromJson` threw, and then runs dedupe, ordering, and apply. The `ok` from the `LatestSequence` lookup replaces `getOrDefault(..., -1L)`.
+
+```go
+func (c *WebhookConsumer) Handle(payload string, headers map[string]string) Handled {
+	v := c.verifier.Verify(payload, headers[HEADER_NAME]) // a missing header reads as "", which Parse rejects
+	if v != OK {
+		c.Log = append(c.Log, "rejected "+v.String())
+		return Handled{400, REJECTED, v} // 4xx: the producer should not retry a forgery
+	}
+	e, err := EventFromJSON(payload)
+	if err != nil {
+		c.Log = append(c.Log, "rejected malformed event: "+err.Error())
+		return Handled{400, REJECTED, v}
+	}
+	if c.seenEventIDs[e.ID] {
+		c.Log = append(c.Log, "duplicate "+e.ID)
+		return Handled{200, DUPLICATE, v} // 200: tell the producer to stop retrying
+	}
+	c.seenEventIDs[e.ID] = true
+	latest, ok := c.LatestSequence[e.ObjectID]
+	if !ok {
+		latest = -1
+	}
+	if e.Sequence <= latest {
+		c.Log = append(c.Log, fmt.Sprintf("out-of-order %s seq %d <= %d", e.ID, e.Sequence, latest))
+		return Handled{200, OUT_OF_ORDER, v}
+	}
+	c.LatestSequence[e.ObjectID] = e.Sequence
+	c.ObjectStatus[e.ObjectID] = e.Status
+	c.Log = append(c.Log, fmt.Sprintf("applied %s -> %s=%s", e.ID, e.ObjectID, e.Status))
+	return Handled{200, ACCEPTED, v}
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/12-payment-systems-design/05-webhooks-and-callbacks/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run; the delivery sections read:
+
+```console
+== At-least-once delivery with backoff ==
+attempts: 3, statuses: [503, 500, 200], state: DELIVERED
+attempt offsets (s): [0, 30, 150]  <- 0, +30, +150
+
+== Dead letter after 6 attempts ==
+attempt offsets (s): [0, 30, 150, 750, 4350, 25950]
+state: DEAD_LETTERED, dead letters: 1, total wall time: 7.21h
 ```
 
 ## Use It

@@ -353,6 +353,43 @@ Keep this output. The one-million-additions line is the evidence you show a coll
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **No overflow:** Python integers are arbitrary precision, so `addExact` has no equivalent and `2**63` is a legal balance; the tests assert this rather than an overflow error. **`//` floors, Java's `/` truncates:** `-125 // 10` is `-13` in Python but `-12` in Java and Go, so `divide_rounded` works on magnitudes with `divmod` and reapplies the sign, and all three languages agree on every input (the single most likely source of a cross-service penny discrepancy in a polyglot payments stack). **Floats are rejected at construction:** Python would happily accept `Money(10.0, USD)`, so `__post_init__` turns it into a `TypeError` in the first test rather than in reconciliation; `bool` is excluded because `True` is an `int`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The currency
+
+A frozen dataclass plays the role of the Java record: two fields, validation in `__post_init__`, and the constants as module-level names. `minor_units_per_major` is `10 ** exponent`, which Python computes exactly for any exponent.
+
+```python
+@dataclass(frozen=True)
+class Currency:
+    """ISO 4217 currency: a three-letter code and the number of decimals in its minor unit."""
+
+    code: str
+    exponent: int
+
+    def __post_init__(self) -> None:
+        if len(self.code) != 3 or not self.code.isalpha() or not self.code.isupper():
+            raise ValueError(f"currency code must be three uppercase letters: {self.code!r}")
+        if not 0 <= self.exponent <= 4:
+            raise ValueError(f"exponent must be 0..4: {self.exponent}")
+
+    def minor_units_per_major(self) -> int:
+        """10**exponent: 100 for USD, 1 for JPY, 1000 for KWD."""
+        return 10 ** self.exponent
+
+
+USD = Currency("USD", 2)
+EUR = Currency("EUR", 2)
+JPY = Currency("JPY", 0)
+KWD = Currency("KWD", 3)
+```
+
+#### Step 2: The value type and its one invariant
+
+`Money` is also a frozen dataclass, so every operation returns a new value. The invariant "same currency or fail" lives in `_require_same_currency`, which raises `CurrencyMismatchError` (a `ValueError` subclass, so callers that only know about `ValueError` still fail loudly). Because Python ints cannot overflow, `plus` and `minus` are one line each; the type check in `__post_init__` is the Python-specific guard.
+
 ```python
 @dataclass(frozen=True)
 class Money:
@@ -362,36 +399,345 @@ class Money:
     def __post_init__(self) -> None:
         if not isinstance(self.minor_units, int) or isinstance(self.minor_units, bool):
             raise TypeError("minor_units must be an int; never construct Money from a float")
+
+    def _require_same_currency(self, other: "Money") -> None:
+        if self.currency != other.currency:
+            raise CurrencyMismatchError(self.currency, other.currency)
+
+    def plus(self, other: "Money") -> "Money":
+        self._require_same_currency(other)
+        return Money(self.minor_units + other.minor_units, self.currency)
+
+    def minus(self, other: "Money") -> "Money":
+        self._require_same_currency(other)
+        return Money(self.minor_units - other.minor_units, self.currency)
+
+    def negate(self) -> "Money":
+        return Money(-self.minor_units, self.currency)
 ```
 
-Three differences, all in `code/python/main.py`:
+#### Step 3: Parsing with precision as validation
 
-- **No overflow.** Python integers are arbitrary precision, so `addExact` has no equivalent and `2**63` is a legal balance. The test suite asserts this rather than asserting an overflow error.
-- **`//` floors, `/` in Java truncates.** `-125 // 10` is `-13` in Python but `-125 / 10` is `-12` in Java and Go. `divide_rounded` therefore computes on `abs()` values with `divmod` and reapplies the sign, so all three languages agree on every input. This is the single most likely source of a cross-service penny discrepancy in a polyglot payments stack.
-- **Floats are rejected at construction.** Python will happily let you write `Money(10.0, USD)`; the `__post_init__` check turns that into a `TypeError` so the mistake fails in the first test rather than in reconciliation. `bool` is excluded because `True` is an `int` in Python.
+`str.partition(".")` splits the text once; the fractional part is checked against the currency's exponent *before* any arithmetic, which is the whole point of the step: `"1.5"` for JPY is rejected, not rounded. Excess precision raises `ArithmeticError` to mirror the Java exception; a malformed string raises `ValueError`.
+
+```python
+    @staticmethod
+    def parse(text: str, currency: Currency) -> "Money":
+        """Parse "12.34", "-0.5", "1200" exactly; reject more decimals than the currency allows."""
+        s = text.strip()
+        negative = s.startswith("-")
+        if negative or s.startswith("+"):
+            s = s[1:]
+        if not s:
+            raise ValueError("empty amount")
+        whole, _, frac = s.partition(".")
+        whole = whole or "0"
+        if not whole.isdigit() or (frac and not frac.isdigit()):
+            raise ValueError(f"not a decimal amount: {text!r}")
+        if len(frac) > currency.exponent:
+            raise ArithmeticError(f"{text} has more decimals than {currency.code} allows ({currency.exponent})")
+        frac = frac.ljust(currency.exponent, "0")
+        minor = int(whole) * currency.minor_units_per_major() + (int(frac) if frac else 0)
+        return Money(-minor if negative else minor, currency)
+```
+
+#### Step 4: Rounded division, the only place a fraction exists
+
+This is where Python's floor division would silently diverge from Java and Go on negative amounts, so the function never divides a signed number: it takes the sign out, uses `divmod` on magnitudes, applies the rounding rule to the remainder, and puts the sign back. `times` multiplies by an exact rational and rounds exactly once.
+
+```python
+def divide_rounded(dividend: int, divisor: int, rounding: Rounding) -> int:
+    if divisor == 0:
+        raise ZeroDivisionError("divisor must not be zero")
+    sign = -1 if (dividend < 0) != (divisor < 0) else 1
+    abs_dividend, abs_divisor = abs(dividend), abs(divisor)
+    quotient, remainder = divmod(abs_dividend, abs_divisor)
+    if remainder == 0:
+        return sign * quotient
+    twice = remainder * 2
+    if rounding is Rounding.DOWN:
+        pass
+    elif rounding is Rounding.UP:
+        quotient += 1
+    elif rounding is Rounding.HALF_UP:
+        if twice >= abs_divisor:
+            quotient += 1
+    elif rounding is Rounding.HALF_EVEN:
+        if twice > abs_divisor or (twice == abs_divisor and quotient % 2 == 1):
+            quotient += 1
+    return sign * quotient
+```
+
+```python
+    def times(self, numerator: int, denominator: int, rounding: Rounding) -> "Money":
+        """Multiply by an exact rational (2.9% is 29/1000) and round once, the way you asked."""
+        if denominator <= 0:
+            raise ArithmeticError("denominator must be positive")
+        return Money(divide_rounded(self.minor_units * numerator, denominator, rounding), self.currency)
+```
+
+#### Step 5: Allocation that conserves every minor unit
+
+Largest-remainder allocation in Python reads almost like the specification: integer shares with `//`, remainders with `%`, and the leftover units handed to the largest remainders. `sorted(..., key=lambda i: -remainders[i])` is stable, so ties keep index order exactly as the Java comparator does; the tests pin `[33.34, 33.33, 33.33]`.
+
+```python
+    def allocate(self, *ratios: int) -> list["Money"]:
+        """Split in the given ratios so the parts sum exactly to the whole (largest-remainder method)."""
+        if not ratios:
+            raise ValueError("need at least one ratio")
+        if any(r < 0 for r in ratios):
+            raise ValueError("ratios must be non-negative")
+        total = sum(ratios)
+        if total == 0:
+            raise ValueError("ratios must not all be zero")
+        magnitude = abs(self.minor_units)
+        shares = [magnitude * r // total for r in ratios]
+        remainders = [magnitude * r % total for r in ratios]
+        leftover = magnitude - sum(shares)
+        order = sorted(range(len(ratios)), key=lambda i: -remainders[i])  # stable: ties keep index order
+        for i in order[:leftover]:
+            shares[i] += 1
+        sign = -1 if self.minor_units < 0 else 1
+        return [Money(sign * s, self.currency) for s in shares]
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/10-money-and-ledgers/01-representing-money/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output matches the Java run line for line except the first section's label (`as float` rather than `as double`), because the float bug is the same IEEE 754 bug:
+
+```console
+== Why floats lose money ==
+0.10 + 0.20 as float = 0.30000000000000004441
+one million additions of 0.01 as float = 10000.0000001719 (should be exactly 10000)
+
+== Exact arithmetic in minor units ==
+19.99 USD x 3 = 59.97 USD
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes how failure is reported. **Errors are values:** `Plus`, `Minus`, `Times`, `Allocate`, and `Parse` return `(Money, error)`; the sentinels `ErrCurrencyMismatch` and `ErrOverflow` work with `errors.Is`. `Compare` panics on a currency mismatch because a comparison that cannot return an error has no other honest option, and the mismatch is a programming error. **Overflow is checked by hand:** `+` and `*` on `int64` wrap silently like Java primitives, and there is no `Math.addExact`, so `addChecked` and `mulChecked` implement the checks you will write again in the WAL lesson. **Constant folding hides the float bug:** `fmt.Println(0.10 + 0.20)` prints `0.3` because Go evaluates constant expressions exactly at compile time; the demo stores the values in variables first so the runtime `float64` addition is what you see.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The currency
+
+A struct with exported fields and package-level values for the common currencies. There is no constructor-time validation on a struct literal, so `NewCurrency` is the validating path and the constants are known-good. `MinorUnitsPerMajor` returns `int64` so it composes with amounts without a conversion.
+
 ```go
-type Money struct {
-    MinorUnits int64
-    Currency   Currency
+type Currency struct {
+	Code     string
+	Exponent int
 }
 
-func (m Money) Plus(other Money) (Money, error) {
-    if err := m.requireSameCurrency(other); err != nil {
-        return Money{}, err
-    }
-    sum, err := addChecked(m.MinorUnits, other.MinorUnits)
-    return Money{sum, m.Currency}, err
+var (
+	USD = Currency{"USD", 2}
+	EUR = Currency{"EUR", 2}
+	JPY = Currency{"JPY", 0}
+	KWD = Currency{"KWD", 3}
+)
+
+// NewCurrency validates the code and exponent; the package-level constants are known-good.
+func NewCurrency(code string, exponent int) (Currency, error) {
+	if len(code) != 3 || strings.ToUpper(code) != code || strings.Trim(code, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "" {
+		return Currency{}, fmt.Errorf("currency code must be three uppercase letters: %q", code)
+	}
+	if exponent < 0 || exponent > 4 {
+		return Currency{}, fmt.Errorf("exponent must be 0..4: %d", exponent)
+	}
+	return Currency{code, exponent}, nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The value type and its one invariant
 
-- **Errors are values.** `Plus`, `Minus`, `Times`, `Allocate`, and `Parse` return `(Money, error)`; the sentinel errors `ErrCurrencyMismatch` and `ErrOverflow` support `errors.Is`. `Compare` panics on a currency mismatch because a comparison that cannot return an error has no other honest option, and the mismatch is a programming error.
-- **Overflow is checked by hand.** Go's `+` and `*` on `int64` wrap silently like Java's primitives, but there is no `Math.addExact`. `addChecked` and `mulChecked` implement the checks; read them, because they are the kind of code you will write again in the WAL lesson.
-- **Constant folding hides the float bug.** `fmt.Println(0.10 + 0.20)` prints `0.3` because Go evaluates constant expressions with arbitrary precision at compile time. The demo stores the values in variables first so the runtime `float64` addition is what you see.
+`Money` is a plain value struct; copying it is cheap and there is nothing to mutate. The invariant is enforced by `requireSameCurrency`, and because Go's `int64` wraps, `Plus` goes through `addChecked`, which detects a sign flip and returns `ErrOverflow` instead of a wrong balance.
+
+```go
+type Money struct {
+	MinorUnits int64
+	Currency   Currency
+}
+
+func (m Money) requireSameCurrency(other Money) error {
+	if m.Currency != other.Currency {
+		return fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, m.Currency.Code, other.Currency.Code)
+	}
+	return nil
+}
+
+func addChecked(a, b int64) (int64, error) {
+	sum := a + b
+	if (a > 0 && b > 0 && sum < 0) || (a < 0 && b < 0 && sum >= 0) {
+		return 0, ErrOverflow
+	}
+	return sum, nil
+}
+
+func (m Money) Plus(other Money) (Money, error) {
+	if err := m.requireSameCurrency(other); err != nil {
+		return Money{}, err
+	}
+	sum, err := addChecked(m.MinorUnits, other.MinorUnits)
+	return Money{sum, m.Currency}, err
+}
+```
+
+#### Step 3: Parsing with precision as validation
+
+`strings.Cut` splits on the first `.`; the fractional length is checked against the exponent before any digits are accumulated. Go has no big integers in the fast path, so the digit loop also watches for `int64` wraparound and returns `ErrOverflow` for absurdly long inputs, something the Java version gets from `Long.parseLong` for free.
+
+```go
+func Parse(text string, currency Currency) (Money, error) {
+	s := strings.TrimSpace(text)
+	negative := strings.HasPrefix(s, "-")
+	if negative || strings.HasPrefix(s, "+") {
+		s = s[1:]
+	}
+	if s == "" {
+		return Money{}, errors.New("empty amount")
+	}
+	whole, frac, _ := strings.Cut(s, ".")
+	if whole == "" {
+		whole = "0"
+	}
+	if !allDigits(whole) || (frac != "" && !allDigits(frac)) {
+		return Money{}, fmt.Errorf("not a decimal amount: %q", text)
+	}
+	if len(frac) > currency.Exponent {
+		return Money{}, fmt.Errorf("%s has more decimals than %s allows (%d)", text, currency.Code, currency.Exponent)
+	}
+	frac += strings.Repeat("0", currency.Exponent-len(frac))
+	var minor int64
+	for _, ch := range whole + frac {
+		next := minor*10 + int64(ch-'0')
+		if next < minor {
+			return Money{}, ErrOverflow
+		}
+		minor = next
+	}
+	if negative {
+		minor = -minor
+	}
+	return Money{minor, currency}, nil
+}
+```
+
+#### Step 4: Rounded division, the only place a fraction exists
+
+Go's `/` and `%` truncate toward zero exactly like Java's, so `DivideRounded` can work on the signed quotient directly and only needs the magnitudes of the remainder and divisor to decide the tie. `HalfEven` is the `default` arm: ties go to the even neighbour, which is what keeps a million rounded fees unbiased.
+
+```go
+func DivideRounded(dividend, divisor int64, rounding Rounding) int64 {
+	quotient := dividend / divisor
+	remainder := dividend % divisor
+	if remainder == 0 {
+		return quotient
+	}
+	sign := int64(1)
+	if (dividend < 0) != (divisor < 0) {
+		sign = -1
+	}
+	twice := abs64(remainder) * 2
+	absDivisor := abs64(divisor)
+	switch rounding {
+	case Down:
+		return quotient
+	case Up:
+		return quotient + sign
+	case HalfUp:
+		if twice >= absDivisor {
+			return quotient + sign
+		}
+		return quotient
+	default: // HalfEven
+		if twice > absDivisor {
+			return quotient + sign
+		}
+		if twice < absDivisor {
+			return quotient
+		}
+		if quotient%2 == 0 {
+			return quotient
+		}
+		return quotient + sign
+	}
+}
+```
+
+#### Step 5: Allocation that conserves every minor unit
+
+The same largest-remainder method, with two Go-specific details: `magnitude * r` goes through `mulChecked` because a large balance times a large ratio can overflow `int64`, and `sort.SliceStable` on an index slice gives the stable tie-break the Java comparator provides. Every error path returns `(nil, error)`; the happy path conserves the sum by construction.
+
+```go
+func (m Money) Allocate(ratios ...int64) ([]Money, error) {
+	if len(ratios) == 0 {
+		return nil, errors.New("need at least one ratio")
+	}
+	var total int64
+	for _, r := range ratios {
+		if r < 0 {
+			return nil, errors.New("ratios must be non-negative")
+		}
+		total += r
+	}
+	if total == 0 {
+		return nil, errors.New("ratios must not all be zero")
+	}
+	magnitude := abs64(m.MinorUnits)
+	shares := make([]int64, len(ratios))
+	remainders := make([]int64, len(ratios))
+	var distributed int64
+	for i, r := range ratios {
+		scaled, err := mulChecked(magnitude, r)
+		if err != nil {
+			return nil, err
+		}
+		shares[i] = scaled / total
+		remainders[i] = scaled % total
+		distributed += shares[i]
+	}
+	leftover := magnitude - distributed
+	order := make([]int, len(ratios))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return remainders[order[a]] > remainders[order[b]] })
+	for k := int64(0); k < leftover; k++ {
+		shares[order[k]]++
+	}
+	result := make([]Money, len(ratios))
+	for i, s := range shares {
+		if m.MinorUnits < 0 {
+			s = -s
+		}
+		result[i] = Money{s, m.Currency}
+	}
+	return result, nil
+}
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/10-money-and-ledgers/01-representing-money/code/go
+go run .
+go test ./...
+```
+
+```console
+== Why floats lose money ==
+0.10 + 0.20 as float64 = 0.30000000000000004441
+one million additions of 0.01 as float64 = 10000.0000001719 (should be exactly 10000)
+```
+
+The rest of the output is identical to the Java run. If the first line ever prints `0.3`, you are looking at constant folding: the two operands were literals, not variables.
 
 ## Use It
 

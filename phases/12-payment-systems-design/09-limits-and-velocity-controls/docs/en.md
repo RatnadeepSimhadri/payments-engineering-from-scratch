@@ -365,25 +365,295 @@ The test harness runs 52 assertions, including the half-open boundary, the soft-
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **`synchronized` is an explicit `threading.Lock`:** the GIL does not make read-decide-write atomic, so `check`, `release`, `open_exposure` and `window_count` all run under `with self._lock:`, and the 32-thread race test still admits exactly 5; `FakeClock` guards its counter with its own lock in place of `AtomicLong`. **The window is a `collections.deque`** of frozen `Entry` dataclasses with `popleft()`/`append()`; `next_expiry_millis` returns `Optional[int]` and `Reason.retry_after_millis` is `Optional[int]`, because zero is a legitimate value and only "no expiry" is `None`. **Money stays integer minor units:** `Money.parse` is the Phase 10 parser; `retry_after_seconds` rounds up with `(best + 999) // 1000` and `explain` prints `window_millis // 1000`, both integer divisions on non-negative values. **Exceptions:** `IllegalArgumentException` becomes `ValueError` (bad limits, zero amounts, clock going backwards, duplicate or unknown limit ids); `CurrencyMismatchError` is a `ValueError` subclass; `LimitPolicy.limits_for` returns a tuple in default-declaration order, as the unmodifiable list did.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The attempt and the scope key
+
+`Attempt` is a frozen dataclass that rejects a non-positive amount in `__post_init__`. `LimitScope.key_for` is an `if` chain over the enum in place of the Java `switch`; the prefixes keep keys from different scopes from colliding.
+
 ```python
-def check(self, attempt: Attempt) -> Decision:
-    with self._lock:                                  # check-and-record is one critical section
-        now = self._clock.now_millis()
-        reasons: list[Reason] = []
-        outcome = Outcome.ALLOW
-        for limit in self._policy.limits_for(attempt.merchant_id):
-            ...
-        if outcome is not Outcome.DENY:
-            self._record(attempt, now)
-        return Decision(outcome, tuple(reasons))
+@dataclass(frozen=True)
+class Attempt:
+    """One authorization attempt as the limit engine sees it. The card is identified by a fingerprint, never a PAN."""
+
+    attempt_id: str
+    merchant_id: str
+    card_fingerprint: str
+    amount: Money
+
+    def __post_init__(self) -> None:
+        if not self.amount.is_positive():
+            raise ValueError(f"amount must be positive: {self.amount}")
+
+
+class LimitScope(Enum):
+    """What a limit counts against. The scope key is the string the window is bucketed by."""
+
+    CARD = "card"
+    MERCHANT = "merchant"
+    CARD_AT_MERCHANT = "card_at_merchant"
+    GLOBAL = "global"
+
+    def key_for(self, a: Attempt) -> str:
+        if self is LimitScope.CARD:
+            return f"card:{a.card_fingerprint}"
+        if self is LimitScope.MERCHANT:
+            return f"merchant:{a.merchant_id}"
+        if self is LimitScope.CARD_AT_MERCHANT:
+            return f"merchant:{a.merchant_id}|card:{a.card_fingerprint}"
+        return "global"
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: The limit
 
-- **`synchronized` is an explicit `threading.Lock`.** The GIL does not make read-decide-write atomic, so `check`, `release`, `open_exposure` and `window_count` all run under `with self._lock:`; the 32-thread race test still admits exactly 5. `FakeClock` guards its counter with its own lock in place of `AtomicLong`.
-- **The window is a `collections.deque`** of frozen `Entry` dataclasses with `popleft()`/`append()`; `next_expiry_millis` returns `Optional[int]` and `Reason.retry_after_millis` is `Optional[int]`, because zero is a legitimate value and only "no expiry" is `None`.
-- **Money stays integer minor units.** `Money.parse` is the Phase 10 parser; `retry_after_seconds` rounds up with `(best + 999) // 1000` and `explain` prints `window_millis // 1000`, both integer divisions on non-negative values.
-- **Exceptions:** `IllegalArgumentException` becomes `ValueError` (bad limits, zero amounts, clock going backwards, duplicate or unknown limit ids); `CurrencyMismatchError` is a `ValueError` subclass. `LimitPolicy.limits_for` returns a tuple in default-declaration order, as the unmodifiable list did.
+One frozen dataclass, three static factories. `max_amount` is `Optional[Money]` (`None` for a `COUNT` limit), and `__post_init__` enforces the same three construction rules as the Java compact constructor. `applies` is the currency rule.
+
+```python
+@dataclass(frozen=True)
+class Limit:
+    """A limit: at most `threshold` units (attempts, or minor units of money) per scope key within
+    `window_millis`. `max_amount` is not None for AMOUNT and EXPOSURE limits, and the currency it
+    carries is the only currency the limit can judge: a limit in USD does not see EUR attempts."""
+
+    id: str
+    scope: LimitScope
+    kind: LimitKind
+    window_millis: int
+    max_count: int
+    max_amount: Optional[Money]
+    severity: Severity
+
+    def __post_init__(self) -> None:
+        if self.kind is LimitKind.COUNT and self.max_count <= 0:
+            raise ValueError("COUNT limit needs max_count > 0")
+        if self.kind is not LimitKind.COUNT and (self.max_amount is None or not self.max_amount.is_positive()):
+            raise ValueError(f"{self.kind.name} limit needs a positive max_amount")
+        if self.kind is not LimitKind.EXPOSURE and self.window_millis <= 0:
+            raise ValueError(f"window must be positive for {self.kind.name}")
+
+    @staticmethod
+    def count(id: str, scope: LimitScope, window_millis: int, max_count: int, severity: Severity) -> "Limit":
+        return Limit(id, scope, LimitKind.COUNT, window_millis, max_count, None, severity)
+
+    @staticmethod
+    def amount(id: str, scope: LimitScope, window_millis: int, max_amount: Money, severity: Severity) -> "Limit":
+        return Limit(id, scope, LimitKind.AMOUNT, window_millis, 0, max_amount, severity)
+
+    @staticmethod
+    def exposure(id: str, scope: LimitScope, max_amount: Money, severity: Severity) -> "Limit":
+        return Limit(id, scope, LimitKind.EXPOSURE, 0, 0, max_amount, severity)
+
+    def applies(self, a: Attempt) -> bool:
+        """Does this limit apply to the attempt at all? Money limits only judge their own currency."""
+        return self.kind is LimitKind.COUNT or (self.max_amount is not None and self.max_amount.currency == a.amount.currency)
+```
+
+#### Step 3: The sliding window
+
+A `deque` of `Entry` with a running `_sum_minor`. `evict` pops from the left while the head is at or before the cutoff (the half-open interval); `add` refuses a clock that went backwards with `ValueError`; Python ints cannot overflow, so there is no `addExact`.
+
+```python
+class SlidingWindow:
+    def __init__(self, window_millis: int) -> None:
+        if window_millis <= 0:
+            raise ValueError("window must be positive")
+        self._window_millis = window_millis
+        self._entries: deque[Entry] = deque()
+        self._sum_minor = 0  # maintained incrementally so sum() is O(evicted), not O(n)
+
+    def evict(self, now: int) -> None:
+        """Drop every entry that has fallen out of (now - W, now]. Amortized O(1) per entry ever added."""
+        cutoff = now - self._window_millis
+        while self._entries and self._entries[0].at_millis <= cutoff:
+            self._sum_minor -= self._entries.popleft().amount_minor
+
+    def add(self, now: int, amount_minor: int) -> None:
+        if self._entries and now < self._entries[-1].at_millis:
+            raise ValueError("entries must be appended in time order; clock went backwards")
+        self.evict(now)
+        self._entries.append(Entry(now, amount_minor))
+        self._sum_minor += amount_minor
+
+    def count(self, now: int) -> int:
+        self.evict(now)
+        return len(self._entries)
+
+    def sum_minor(self, now: int) -> int:
+        self.evict(now)
+        return self._sum_minor
+
+    def next_expiry_millis(self, now: int) -> Optional[int]:
+        """When the oldest entry leaves the window, i.e. the earliest instant a COUNT breach can clear. None if empty."""
+        self.evict(now)
+        return None if not self._entries else self._entries[0].at_millis + self._window_millis
+```
+
+#### Step 4: Exposure
+
+A dict of dicts, scope key to attempt id to amount; `release` uses `pop(attempt_id, None)` so removing an id twice removes it once. `open` sums only the amounts in the requested currency.
+
+```python
+class ExposureTracker:
+    def __init__(self) -> None:
+        self._open_by_scope_key: dict[str, dict[str, Money]] = {}  # scope_key -> attempt_id -> amount
+
+    def open(self, scope_key: str, currency: Currency) -> Money:
+        total = Money.zero(currency)
+        for m in self._open_by_scope_key.get(scope_key, {}).values():
+            if m.currency == currency:
+                total = total.plus(m)
+        return total
+
+    def add(self, scope_key: str, attempt_id: str, amount: Money) -> None:
+        self._open_by_scope_key.setdefault(scope_key, {})[attempt_id] = amount
+
+    def release(self, scope_key: str, attempt_id: str) -> None:
+        """Capture, void, or expiry releases the exposure. Unknown ids are ignored: release is idempotent."""
+        open_ = self._open_by_scope_key.get(scope_key)
+        if open_ is not None:
+            open_.pop(attempt_id, None)
+```
+
+#### Step 5: Reasons and decisions
+
+`Reason.explain` builds the same line as Java with f-strings and `//` for the seconds. `Decision.retry_after_seconds` collects the `HARD` reasons that carry a retry time and rounds up the minimum; a decision with only `SOFT` reasons returns 0.
+
+```python
+@dataclass(frozen=True)
+class Reason:
+    """One limit's verdict on one attempt: what was observed, what the attempt would make it, and the threshold."""
+
+    limit_id: str
+    scope: LimitScope
+    scope_key: str
+    kind: LimitKind
+    severity: Severity
+    observed: str
+    would_be: str
+    threshold: str
+    window_millis: int
+    retry_after_millis: Optional[int]
+
+    def breached(self) -> bool:
+        return self.severity is not None
+
+    def explain(self) -> str:
+        window = "open" if self.kind is LimitKind.EXPOSURE else f"in {self.window_millis // 1000}s"
+        retry = "" if self.retry_after_millis is None else f", clears in {self.retry_after_millis // 1000}s"
+        return (f"{self.limit_id} [{self.severity.name}] {self.scope_key}: {self.observed} -> {self.would_be} "
+                f"exceeds {self.threshold} {window}{retry}")
+
+@dataclass(frozen=True)
+class Decision:
+    outcome: Outcome
+    reasons: tuple[Reason, ...]
+
+    def allowed(self) -> bool:
+        return self.outcome is not Outcome.DENY
+
+    def explanations(self) -> list[str]:
+        """The explanation a support engineer, a merchant dashboard, or an audit log needs. One line per breached limit."""
+        return [r.explain() for r in self.reasons]
+
+    def retry_after_seconds(self) -> int:
+        """Seconds until the earliest HARD breach clears, for a Retry-After header. 0 if nothing is time-bound."""
+        candidates = [r.retry_after_millis for r in self.reasons
+                      if r.severity is Severity.HARD and r.retry_after_millis is not None]
+        if not candidates:
+            return 0
+        return (min(candidates) + 999) // 1000
+```
+
+#### Step 6: The hierarchy
+
+Python dicts preserve insertion order, so `_defaults` plays the role of the `LinkedHashMap` directly. `override` refuses an id that has no default, and `limits_for` substitutes overrides position by position into a tuple.
+
+```python
+class LimitPolicy:
+    def __init__(self) -> None:
+        self._defaults: dict[str, Limit] = {}
+        self._merchant_overrides: dict[str, dict[str, Limit]] = {}
+
+    def add_default(self, limit: Limit) -> "LimitPolicy":
+        if limit.id in self._defaults:
+            raise ValueError(f"duplicate limit id {limit.id}")
+        self._defaults[limit.id] = limit
+        return self
+
+    def override(self, merchant_id: str, limit: Limit) -> "LimitPolicy":
+        """A merchant override replaces the default with the same id; it never relaxes a limit the default does not have."""
+        if limit.id not in self._defaults:
+            raise ValueError(f"no default limit to override: {limit.id}")
+        self._merchant_overrides.setdefault(merchant_id, {})[limit.id] = limit
+        return self
+
+    def limits_for(self, merchant_id: str) -> tuple[Limit, ...]:
+        """The effective limits for a merchant, in the order the defaults were declared."""
+        overrides = self._merchant_overrides.get(merchant_id, {})
+        return tuple(overrides.get(d.id, d) for d in self._defaults.values())
+```
+
+#### Step 7: The engine
+
+`check` is one critical section: `now` read once, every applicable limit evaluated, outcome escalated to `REVIEW` or `DENY`, and `_record` run only when not denied. `_evaluate` returns a `Reason` or `None`; the count branch is shown here, and the amount and exposure branches follow the same shape.
+
+```python
+    def check(self, attempt: Attempt) -> Decision:
+        """Judge one attempt against every effective limit and, if not denied, record it in every window
+        and in exposure. Check-and-record is one critical section so two concurrent attempts cannot
+        both see "4 of 5" and both pass. All breaches are collected, not just the first: a denial
+        must name every limit it tripped so the explanation is complete."""
+        with self._lock:
+            now = self._clock.now_millis()
+            reasons: list[Reason] = []
+            outcome = Outcome.ALLOW
+            for limit in self._policy.limits_for(attempt.merchant_id):
+                if not limit.applies(attempt):
+                    continue
+                r = self._evaluate(limit, attempt, now)
+                if r is None:
+                    continue
+                reasons.append(r)
+                if limit.severity is Severity.HARD:
+                    outcome = Outcome.DENY
+                elif outcome is Outcome.ALLOW:
+                    outcome = Outcome.REVIEW
+            if outcome is not Outcome.DENY:
+                self._record(attempt, now)
+            return Decision(outcome, tuple(reasons))
+
+    def _evaluate(self, limit: Limit, attempt: Attempt, now: int) -> Optional[Reason]:
+        scope_key = limit.scope.key_for(attempt)
+        if limit.kind is LimitKind.COUNT:
+            w = self._window_for(limit, scope_key)
+            observed = w.count(now)
+            if observed + 1 <= limit.max_count:
+                return None
+            expiry = w.next_expiry_millis(now)
+            return Reason(limit.id, limit.scope, scope_key, limit.kind, limit.severity,
+                          f"{observed} attempts", f"{observed + 1} attempts", f"{limit.max_count} attempts",
+                          limit.window_millis, None if expiry is None else expiry - now)
+```
+
+#### Step 8: Release
+
+`release` pops the open attempt under the lock and touches exposure only; velocity history is left alone, because capturing a payment does not un-attempt it.
+
+```python
+    def release(self, attempt_id: str) -> None:
+        """Capture, void, or authorization expiry: the attempt no longer counts toward exposure. Velocity history is untouched."""
+        with self._lock:
+            attempt = self._open_attempts.pop(attempt_id, None)
+            if attempt is None:
+                return
+            for limit in self._policy.limits_for(attempt.merchant_id):
+                if limit.kind is LimitKind.EXPOSURE:
+                    self._exposure.release(limit.scope.key_for(attempt), attempt_id)
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/12-payment-systems-design/09-limits-and-velocity-controls/code/python
@@ -391,36 +661,403 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run:
+
+```console
+== Card testing: 5 attempts per card per hour, hard ==
+attempt 1 (1.00 USD) -> ALLOW
+attempt 2 (1.00 USD) -> ALLOW
+attempt 3 (1.00 USD) -> ALLOW
+attempt 4 (1.00 USD) -> ALLOW
+attempt 5 (1.00 USD) -> ALLOW
+attempt 6 (1.00 USD) -> DENY
+    card-attempts-1h [HARD] card:fp_4242: 5 attempts -> 6 attempts exceeds 5 attempts in 3600s, clears in 3550s
+    Retry-After: 3550s
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`, `money.go`, tests in `main_test.go`) keeps the design with four differences. **`synchronized` is a `sync.Mutex`:** `Check`, `Release`, `OpenExposure`, and `WindowCount` each take `e.mu`; the 32-goroutine race test releases every goroutine on one closed channel and must admit exactly 5 under `go test -race`; `FakeClock` uses `atomic.Int64` in place of `AtomicLong`. **Construction errors are values:** `CountLimit`, `AmountLimit`, `ExposureLimit`, `NewAttempt`, and `NewSlidingWindow` return `(T, error)`, and `LimitPolicy.AddDefault`/`Override` return `error`, all wrapping the sentinel `ErrInvalidArgument` so tests use `errors.Is`; `standardPolicy()` unwraps them with a generic `must[T]`, because a typo in a literal policy is a bug, not a runtime condition. **Null becomes an explicit absence:** `SlidingWindow.NextExpiryMillis` returns `(int64, bool)` and `Reason.RetryAfterMillis` is a `*int64`, since zero milliseconds is a legitimate value and only "no expiry" is `nil`. **The window is a slice used as a queue:** eviction re-slices from the front (`w.entries = w.entries[1:]`), append grows the tail, and the half-open `(now - W, now]` rule is the same `<= cutoff` comparison; `LinkedHashMap` order in `LimitPolicy` and `ExposureTracker` is kept with an explicit key slice beside the map.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The attempt and the scope key
+
+`NewAttempt` is the validating constructor. `LimitScope` is an `iota` enum whose `KeyFor` is a `switch` with `GLOBAL` as the `default` arm.
+
 ```go
-func (e *LimitEngine) Check(attempt Attempt) Decision {
-    e.mu.Lock()                                   // check-and-record is one critical section
-    defer e.mu.Unlock()
-    now := e.clock.NowMillis()
-    reasons := []Reason{}
-    outcome := ALLOW
-    for _, limit := range e.policy.LimitsFor(attempt.MerchantID) {
-        ...
-    }
-    if outcome != DENY {
-        e.record(attempt, now)
-    }
-    return Decision{outcome, reasons}
+type Attempt struct {
+	AttemptID       string
+	MerchantID      string
+	CardFingerprint string
+	Amount          Money
+}
+
+func NewAttempt(attemptID, merchantID, cardFingerprint string, amount Money) (Attempt, error) {
+	if !amount.IsPositive() {
+		return Attempt{}, fmt.Errorf("%w: amount must be positive: %v", ErrInvalidArgument, amount)
+	}
+	return Attempt{attemptID, merchantID, cardFingerprint, amount}, nil
+}
+
+func (s LimitScope) KeyFor(a Attempt) string {
+	switch s {
+	case CARD:
+		return "card:" + a.CardFingerprint
+	case MERCHANT:
+		return "merchant:" + a.MerchantID
+	case CARD_AT_MERCHANT:
+		return "merchant:" + a.MerchantID + "|card:" + a.CardFingerprint
+	default:
+		return "global"
+	}
 }
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+#### Step 2: The limit
 
-- **`synchronized` is a `sync.Mutex`.** `Check`, `Release`, `OpenExposure`, and `WindowCount` each take `e.mu`; the 32-goroutine race test releases every goroutine on one closed channel and must admit exactly 5 under `go test -race`. `FakeClock` uses `atomic.Int64` in place of `AtomicLong`.
-- **Construction errors are values.** `CountLimit`, `AmountLimit`, `ExposureLimit`, `NewAttempt`, and `NewSlidingWindow` return `(T, error)`, and `LimitPolicy.AddDefault`/`Override` return `error`, all wrapping the sentinel `ErrInvalidArgument` so tests use `errors.Is`. `standardPolicy()` unwraps them with a generic `must[T]`, because a typo in a literal policy is a bug, not a runtime condition.
-- **Null becomes an explicit absence.** `SlidingWindow.NextExpiryMillis` returns `(int64, bool)` and `Reason.RetryAfterMillis` is a `*int64`, since zero milliseconds is a legitimate value and only "no expiry" is `nil`.
-- **The window is a slice used as a queue.** Eviction re-slices from the front (`w.entries = w.entries[1:]`), append grows the tail; the half-open `(now - W, now]` rule is the same `<= cutoff` comparison. `LinkedHashMap` order in `LimitPolicy` and `ExposureTracker` is kept with an explicit key slice beside the map.
+`NewLimit` carries the three construction rules and the three factories call it; a `COUNT` limit passes the zero `Money{}` for `MaxAmount`, which `Applies` never reads because the `Kind == COUNT` test short-circuits first.
+
+```go
+type Limit struct {
+	ID           string
+	Scope        LimitScope
+	Kind         LimitKind
+	WindowMillis int64
+	MaxCount     int64
+	MaxAmount    Money
+	Severity     Severity
+}
+
+func NewLimit(id string, scope LimitScope, kind LimitKind, windowMillis, maxCount int64, maxAmount Money, severity Severity) (Limit, error) {
+	if kind == COUNT && maxCount <= 0 {
+		return Limit{}, fmt.Errorf("%w: COUNT limit needs maxCount > 0", ErrInvalidArgument)
+	}
+	if kind != COUNT && !maxAmount.IsPositive() {
+		return Limit{}, fmt.Errorf("%w: %v limit needs a positive maxAmount", ErrInvalidArgument, kind)
+	}
+	if kind != EXPOSURE && windowMillis <= 0 {
+		return Limit{}, fmt.Errorf("%w: window must be positive for %v", ErrInvalidArgument, kind)
+	}
+	return Limit{id, scope, kind, windowMillis, maxCount, maxAmount, severity}, nil
+}
+
+func CountLimit(id string, scope LimitScope, windowMillis, maxCount int64, severity Severity) (Limit, error) {
+	return NewLimit(id, scope, COUNT, windowMillis, maxCount, Money{}, severity)
+}
+func AmountLimit(id string, scope LimitScope, windowMillis int64, maxAmount Money, severity Severity) (Limit, error) {
+	return NewLimit(id, scope, AMOUNT, windowMillis, 0, maxAmount, severity)
+}
+func ExposureLimit(id string, scope LimitScope, maxAmount Money, severity Severity) (Limit, error) {
+	return NewLimit(id, scope, EXPOSURE, 0, 0, maxAmount, severity)
+}
+
+// Applies: does this limit apply to the attempt at all? Money limits only judge their own currency.
+func (l Limit) Applies(a Attempt) bool {
+	return l.Kind == COUNT || l.MaxAmount.Currency == a.Amount.Currency
+}
+```
+
+#### Step 3: The sliding window
+
+`Evict` re-slices from the front; `Add` returns an error both for a backwards clock and for an `int64` overflow of the running sum via `addChecked`, which is the Go spelling of `Math.addExact`. `NextExpiryMillis` returns `(0, false)` for an empty window.
+
+```go
+type SlidingWindow struct {
+	windowMillis int64
+	entries      []Entry // head at entries[0]; evicted entries are sliced off the front
+	sumMinor     int64   // maintained incrementally so Sum is O(evicted), not O(n)
+}
+
+func NewSlidingWindow(windowMillis int64) (*SlidingWindow, error) {
+	if windowMillis <= 0 {
+		return nil, fmt.Errorf("%w: window must be positive", ErrInvalidArgument)
+	}
+	return &SlidingWindow{windowMillis: windowMillis}, nil
+}
+
+// Evict drops every entry that has fallen out of (now - W, now]. Amortized O(1) per entry ever added.
+func (w *SlidingWindow) Evict(now int64) {
+	cutoff := now - w.windowMillis
+	for len(w.entries) > 0 && w.entries[0].AtMillis <= cutoff {
+		w.sumMinor -= w.entries[0].AmountMinor
+		w.entries = w.entries[1:]
+	}
+}
+
+func (w *SlidingWindow) Add(now, amountMinor int64) error {
+	if len(w.entries) > 0 && now < w.entries[len(w.entries)-1].AtMillis {
+		return fmt.Errorf("%w: entries must be appended in time order; clock went backwards", ErrInvalidArgument)
+	}
+	w.Evict(now)
+	w.entries = append(w.entries, Entry{now, amountMinor})
+	sum, err := addChecked(w.sumMinor, amountMinor)
+	if err != nil {
+		return err
+	}
+	w.sumMinor = sum
+	return nil
+}
+
+func (w *SlidingWindow) Count(now int64) int      { w.Evict(now); return len(w.entries) }
+func (w *SlidingWindow) SumMinor(now int64) int64 { w.Evict(now); return w.sumMinor }
+
+// NextExpiryMillis is when the oldest entry leaves the window, i.e. the earliest instant a COUNT
+// breach can clear. The bool is false if the window is empty (Java returns null).
+func (w *SlidingWindow) NextExpiryMillis(now int64) (int64, bool) {
+	w.Evict(now)
+	if len(w.entries) == 0 {
+		return 0, false
+	}
+	return w.entries[0].AtMillis + w.windowMillis, true
+}
+```
+
+#### Step 4: Exposure
+
+Each scope key holds an `openSet`, a map plus an insertion-order slice so `Open` sums in the order the Java `LinkedHashMap` would. `Release` returns early when the id is absent, which is what makes it idempotent.
+
+```go
+type openSet struct {
+	order   []string // insertion order, like Java's LinkedHashMap
+	amounts map[string]Money
+}
+
+type ExposureTracker struct {
+	openByScopeKey map[string]*openSet // scopeKey -> attemptId -> amount
+}
+
+func NewExposureTracker() *ExposureTracker {
+	return &ExposureTracker{openByScopeKey: map[string]*openSet{}}
+}
+
+func (e *ExposureTracker) Open(scopeKey string, currency Currency) Money {
+	total := Zero(currency)
+	if set, ok := e.openByScopeKey[scopeKey]; ok {
+		for _, id := range set.order {
+			if m := set.amounts[id]; m.Currency == currency {
+				total = mustPlus(total, m)
+			}
+		}
+	}
+	return total
+}
+
+func (e *ExposureTracker) Add(scopeKey, attemptID string, amount Money) {
+	set, ok := e.openByScopeKey[scopeKey]
+	if !ok {
+		set = &openSet{amounts: map[string]Money{}}
+		e.openByScopeKey[scopeKey] = set
+	}
+	if _, present := set.amounts[attemptID]; !present {
+		set.order = append(set.order, attemptID)
+	}
+	set.amounts[attemptID] = amount
+}
+
+// Release: capture, void, or expiry releases the exposure. Unknown ids are ignored: release is idempotent.
+func (e *ExposureTracker) Release(scopeKey, attemptID string) {
+	set, ok := e.openByScopeKey[scopeKey]
+	if !ok {
+		return
+	}
+	if _, present := set.amounts[attemptID]; !present {
+		return
+	}
+	delete(set.amounts, attemptID)
+	for i, id := range set.order {
+		if id == attemptID {
+			set.order = append(set.order[:i], set.order[i+1:]...)
+			break
+		}
+	}
+}
+```
+
+#### Step 5: Reasons and decisions
+
+`Reason.RetryAfterMillis` is a `*int64` and `Explain` dereferences it only when non-nil. `RetryAfterSeconds` tracks `best` and `found` explicitly in place of the Java `Long.MAX_VALUE` sentinel, then rounds up.
+
+```go
+type Reason struct {
+	LimitID          string
+	Scope            LimitScope
+	ScopeKey         string
+	Kind             LimitKind
+	Severity         Severity
+	Observed         string
+	WouldBe          string
+	Threshold        string
+	WindowMillis     int64
+	RetryAfterMillis *int64
+}
+
+func (r Reason) Explain() string {
+	window := "open"
+	if r.Kind != EXPOSURE {
+		window = fmt.Sprintf("in %ds", r.WindowMillis/1000)
+	}
+	retry := ""
+	if r.RetryAfterMillis != nil {
+		retry = fmt.Sprintf(", clears in %ds", *r.RetryAfterMillis/1000)
+	}
+	return fmt.Sprintf("%s [%v] %s: %s -> %s exceeds %s %s%s", r.LimitID, r.Severity, r.ScopeKey, r.Observed, r.WouldBe, r.Threshold, window, retry)
+}
+
+type Decision struct {
+	Outcome Outcome
+	Reasons []Reason
+}
+
+func (d Decision) Allowed() bool { return d.Outcome != DENY }
+
+// Explanations: what a support engineer, a merchant dashboard, or an audit log needs. One line per breached limit.
+func (d Decision) Explanations() []string {
+	out := make([]string, 0, len(d.Reasons))
+	for _, r := range d.Reasons {
+		out = append(out, r.Explain())
+	}
+	return out
+}
+
+// RetryAfterSeconds: seconds until the earliest HARD breach clears, for a Retry-After header. 0 if nothing is time-bound.
+func (d Decision) RetryAfterSeconds() int64 {
+	best, found := int64(0), false
+	for _, r := range d.Reasons {
+		if r.Severity == HARD && r.RetryAfterMillis != nil && (!found || *r.RetryAfterMillis < best) {
+			best, found = *r.RetryAfterMillis, true
+		}
+	}
+	if !found {
+		return 0
+	}
+	return (best + 999) / 1000
+}
+```
+
+#### Step 6: The hierarchy
+
+`defaultOrder` beside the `defaults` map gives the declaration order a Go map cannot; `AddDefault` and `Override` return `ErrInvalidArgument` for a duplicate or unknown id, and `LimitsFor` substitutes overrides position by position.
+
+```go
+type LimitPolicy struct {
+	defaultOrder      []string // declaration order, like Java's LinkedHashMap
+	defaults          map[string]Limit
+	merchantOverrides map[string]map[string]Limit
+}
+
+func NewLimitPolicy() *LimitPolicy {
+	return &LimitPolicy{defaults: map[string]Limit{}, merchantOverrides: map[string]map[string]Limit{}}
+}
+
+func (p *LimitPolicy) AddDefault(limit Limit) error {
+	if _, dup := p.defaults[limit.ID]; dup {
+		return fmt.Errorf("%w: duplicate limit id %s", ErrInvalidArgument, limit.ID)
+	}
+	p.defaults[limit.ID] = limit
+	p.defaultOrder = append(p.defaultOrder, limit.ID)
+	return nil
+}
+
+// Override replaces the default with the same id for one merchant; it never relaxes a limit the default does not have.
+func (p *LimitPolicy) Override(merchantID string, limit Limit) error {
+	if _, ok := p.defaults[limit.ID]; !ok {
+		return fmt.Errorf("%w: no default limit to override: %s", ErrInvalidArgument, limit.ID)
+	}
+	overrides, ok := p.merchantOverrides[merchantID]
+	if !ok {
+		overrides = map[string]Limit{}
+		p.merchantOverrides[merchantID] = overrides
+	}
+	overrides[limit.ID] = limit
+	return nil
+}
+
+// LimitsFor returns the effective limits for a merchant, in the order the defaults were declared.
+func (p *LimitPolicy) LimitsFor(merchantID string) []Limit {
+	overrides := p.merchantOverrides[merchantID]
+	effective := make([]Limit, 0, len(p.defaultOrder))
+	for _, id := range p.defaultOrder {
+		if o, ok := overrides[id]; ok {
+			effective = append(effective, o)
+		} else {
+			effective = append(effective, p.defaults[id])
+		}
+	}
+	return effective
+}
+```
+
+#### Step 7: The engine
+
+`Check` holds `e.mu` for the whole read-decide-write; `evaluate` returns `(Reason, bool)` in place of a nullable reason, and `record` runs only when the outcome is not `DENY`.
+
+```go
+func (e *LimitEngine) Check(attempt Attempt) Decision {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := e.clock.NowMillis()
+	reasons := []Reason{}
+	outcome := ALLOW
+	for _, limit := range e.policy.LimitsFor(attempt.MerchantID) {
+		if !limit.Applies(attempt) {
+			continue
+		}
+		r, breached := e.evaluate(limit, attempt, now)
+		if !breached {
+			continue
+		}
+		reasons = append(reasons, r)
+		if limit.Severity == HARD {
+			outcome = DENY
+		} else if outcome == ALLOW {
+			outcome = REVIEW
+		}
+	}
+	if outcome != DENY {
+		e.record(attempt, now)
+	}
+	return Decision{outcome, reasons}
+}
+```
+
+#### Step 8: Release
+
+`Release` deletes the open attempt under the mutex and releases exposure for every `EXPOSURE` limit in the merchant's effective list; windows are untouched.
+
+```go
+func (e *LimitEngine) Release(attemptID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	attempt, ok := e.openAttempts[attemptID]
+	if !ok {
+		return
+	}
+	delete(e.openAttempts, attemptID)
+	for _, limit := range e.policy.LimitsFor(attempt.MerchantID) {
+		if limit.Kind == EXPOSURE {
+			e.exposure.Release(limit.Scope.KeyFor(attempt), attemptID)
+		}
+	}
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/12-payment-systems-design/09-limits-and-velocity-controls/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run; the last section reads:
+
+```console
+== A denial names every limit it tripped ==
+card fp_4242, 1,400.00 USD -> DENY
+    card-amount-24h [SOFT] card:fp_4242: 6.00 USD -> 1406.00 USD exceeds 500.00 USD in 86400s, clears in 75600s
+    merchant-exposure [HARD] merchant:merchant_acme: 716.00 USD -> 2116.00 USD exceeds 2000.00 USD open
+breached limits: 2
 ```
 
 ## Use It

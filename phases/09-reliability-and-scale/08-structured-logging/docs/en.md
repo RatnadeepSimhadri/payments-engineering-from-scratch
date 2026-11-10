@@ -338,23 +338,182 @@ The last block is the support ticket answered: two records, two services, and th
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **The sampling hash must wrap:** Python ints do not overflow, so `fnv1a` masks every multiply with `& 0xFFFFFFFF` and converts to a signed value at the end; `keep` then uses Python's `%`, which floors like `Math.floorMod`. The same trace id (`1af76519...`) is selected in both languages, so the "records kept: 11 of 37" line matches. **`with` is a keyword**, so the child-logger method is `with_`; `with_trace` reads the same. Varargs `String... kv` become `*kv: str`, and the odd-length check raises `ValueError` where Java throws `IllegalArgumentException`. **The JSON writer is still hand-written:** `json.dumps` would produce the same bytes for these records, but the lesson's point is that the key order and escaping are yours to control; the port builds a list of fragments and joins once, with `f"\\u{ord(c):04x}"` for control characters. `Level` is an `Enum` whose value is `(ordinal, syslog)` so `at_least` compares ordinals as the Java enum does. **The PAN regex is compiled with `re.ASCII`:** Python's `\d` matches any Unicode digit by default; Java's matches only `0-9`, and a redactor that disagrees between services is a compliance gap. `re.finditer` replaces the `Matcher` loop and `LinkedHashMap` is a plain `dict`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The record and its JSON
+
+`fields` is a `dict` copy, which keeps insertion order. `to_json` appends fragments to a list through `Json.pair` and joins once; the four fixed keys come first and `ts` is unquoted so it stays a JSON number.
+
 ```python
-@staticmethod
-def fnv1a(s: str) -> int:
-    """FNV-1a over UTF-16 code units, wrapped to a signed 32-bit int exactly as Java's int arithmetic does."""
-    h = 0x811C9DC5
-    for c in s:
-        h ^= ord(c)
-        h = (h * 0x01000193) & 0xFFFFFFFF
-    return to_int32(h)
+class LogRecord:
+    def __init__(self, timestamp_millis: int, level: Level, service: str, message: str, fields: dict[str, str]) -> None:
+        self.timestamp_millis = timestamp_millis
+        self.level = level
+        self.service = service
+        self.message = message
+        self.fields: dict[str, str] = dict(fields)
+
+    def field(self, key: str) -> Optional[str]:
+        return self.fields.get(key)
+
+    def to_json(self) -> str:
+        out: list[str] = ["{"]
+        Json.pair(out, "ts", str(self.timestamp_millis), False)
+        out.append(",")
+        Json.pair(out, "level", self.level.name, True)
+        out.append(",")
+        Json.pair(out, "service", self.service, True)
+        out.append(",")
+        Json.pair(out, "msg", self.message, True)
+        for k, v in self.fields.items():
+            out.append(",")
+            Json.pair(out, k, v, True)
+        out.append("}")
+        return "".join(out)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The redactor
 
-- **The sampling hash must wrap.** Python ints do not overflow, so `fnv1a` masks every multiply with `& 0xFFFFFFFF` and converts to a signed value at the end; `keep` then uses Python's `%`, which floors like `Math.floorMod`. The same trace id (`1af76519...`) is selected in both languages, so the "records kept: 11 of 37" line matches.
-- **`with` is a keyword**, so the child-logger method is `with_`; `with_trace` reads the same. Varargs `String... kv` become `*kv: str`, and the odd-length check raises `ValueError` where Java throws `IllegalArgumentException`.
-- **The JSON writer is still hand-written.** `json.dumps` would produce the same bytes for these records, but the lesson's point is that the key order and escaping are yours to control; the port builds a list of fragments and joins once, with `f"\\u{ord(c):04x}"` for control characters. `Level` is an `Enum` whose value is `(ordinal, syslog)` so `at_least` compares ordinals as the Java enum does.
-- **The PAN regex is compiled with `re.ASCII`.** Python's `\d` matches any Unicode digit by default; Java's matches only `0-9`, and a redactor that disagrees between services is a compliance gap. `re.finditer` replaces the `Matcher` loop and `LinkedHashMap` is a plain `dict`.
+The same lookaround regex, compiled with `re.ASCII` so `\d` is `0-9`. `finditer` yields the candidates; separators are stripped with `re.sub` before the Luhn check, and a candidate that fails Luhn is copied through untouched.
+
+```python
+    _CANDIDATE = re.compile(r"(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)", re.ASCII)
+
+    def mask_pans(self, text: str) -> str:
+        out = []
+        last = 0
+        for m in self._CANDIDATE.finditer(text):
+            digits = re.sub(r"[ -]", "", m.group())
+            if Redactor.luhn_valid(digits):
+                out.append(text[last:m.start()])
+                out.append(Redactor.mask(digits))
+                last = m.end()
+                self.redactions += 1
+        out.append(text[last:])
+        return "".join(out)
+
+    @staticmethod
+    def luhn_valid(digits: str) -> bool:
+        total = 0
+        dbl = False
+        for ch in reversed(digits):
+            d = ord(ch) - ord("0")
+            if dbl:
+                d *= 2
+                if d > 9:
+                    d -= 9
+            total += d
+            dbl = not dbl
+        return total % 10 == 0
+```
+
+#### Step 3: Trace-consistent sampling
+
+`fnv1a` iterates code points with `ord(c)`, masks after each multiply, and converts to a signed 32-bit int with `to_int32`; `%` on that value floors like `Math.floorMod`, so the same traces are kept.
+
+```python
+    def keep(self, level: Level, trace_id: Optional[str], message: str) -> bool:
+        if level.at_least(Level.WARN):
+            return True
+        rate = self._debug_rate if level == Level.DEBUG else self._info_rate
+        if rate == 1:
+            return True
+        key = trace_id if trace_id is not None else message
+        keep = Sampler.fnv1a(key) % rate == 0  # Python % floors, like Math.floorMod
+        if not keep:
+            self.dropped += 1
+        return keep
+
+    @staticmethod
+    def fnv1a(s: str) -> int:
+        h = 0x811C9DC5
+        for c in s:
+            h ^= ord(c)
+            h = (h * 0x01000193) & 0xFFFFFFFF
+        return to_int32(h)
+```
+
+#### Step 4: The logger
+
+`with_` copies the bound dict and returns a new `Logger`; the original is untouched. `log` keeps the three gates in cost order (level, sampler, redaction) and binds the bound fields before the call-site pairs from `*kv`.
+
+```python
+    def with_(self, key: str, value: str) -> "Logger":
+        nxt = dict(self._bound)
+        nxt[key] = value
+        return Logger(self._service, self._clock, self._minimum, self._redactor, self._sampler, self._store, nxt)
+
+    def with_trace(self, trace_id: str, span_id: str) -> "Logger":
+        return self.with_("trace_id", trace_id).with_("span_id", span_id)
+
+    def log(self, level: Level, message: str, *kv: str) -> None:
+        if len(kv) % 2 != 0:
+            raise ValueError("fields must be key/value pairs")
+        if not level.at_least(self._minimum):
+            return
+        if not self._sampler.keep(level, self._bound.get("trace_id"), message):
+            return
+        fields: dict[str, str] = {}
+        for k, v in self._bound.items():
+            fields[k] = self._redactor.redact_value(k, v)
+        for i in range(0, len(kv), 2):
+            fields[kv[i]] = self._redactor.redact_value(kv[i], kv[i + 1])
+        self._store.write(LogRecord(self._clock.now_millis(), level, self._service, self._redactor.mask_pans(message), fields))
+```
+
+#### Step 4b: Context across a hand-off
+
+The port has no executor in the demo, but the same property holds: a scoped logger is an immutable object, so passing it to a thread, a `concurrent.futures` task, or an `asyncio` coroutine carries its fields, while a logger built inside the task from `self.logger("payments")` knows nothing about the request. The `charge` flow shows the pattern: each service derives its scoped logger once and reuses it.
+
+```python
+        pay = self.logger("payments").with_trace(trace_id, "b2b2b2b2b2b2b2b2").with_("payment_id", payment_id).with_("merchant_id", merchant_id)
+        pay.debug("idempotency key checked", "idempotency_key", "idem_" + payment_id)
+        pay.info("authorize started", "amount_minor", str(amount_minor), "currency", currency)
+```
+
+#### Step 5: The index
+
+Two nested `setdefault` calls are the two `computeIfAbsent`s; `query` is two `dict.get`s with empty defaults.
+
+```python
+    def write(self, r: LogRecord) -> None:
+        self._records.append(r)
+        for f in self._indexed:
+            v = r.field(f)
+            if v is not None:
+                self._index.setdefault(f, {}).setdefault(v, []).append(r)
+
+    def query(self, field: str, value: str) -> list[LogRecord]:
+        return self._index.get(field, {}).get(value, [])
+```
+
+#### Step 6: Six services, one payment
+
+Each service derives its scoped logger from the trace context and the payment id. The careless `raw request body` call is caught by `mask_pans` on the value; the processor adapter's `"pan", raw_pan` is caught by the key rule.
+
+```python
+        pay = self.logger("payments").with_trace(trace_id, "b2b2b2b2b2b2b2b2").with_("payment_id", payment_id).with_("merchant_id", merchant_id)
+        pay.debug("idempotency key checked", "idempotency_key", "idem_" + payment_id)
+        pay.info("authorize started", "amount_minor", str(amount_minor), "currency", currency)
+        # A careless developer logs the raw request body. The redactor must catch the PAN.
+        pay.debug("raw request body", "body", '{"card":"' + raw_pan + '","amount":' + str(amount_minor) + "}")
+        self.clock.advance(3)
+
+        risk = self.logger("risk").with_trace(trace_id, "c3c3c3c3c3c3c3c3").with_("payment_id", payment_id)
+        risk.info("score computed", "score", "12", "decision", "APPROVE")
+        self.clock.advance(23)
+
+        ledger = self.logger("ledger").with_trace(trace_id, "d4d4d4d4d4d4d4d4").with_("payment_id", payment_id)
+        ledger.info("hold posted", "amount_minor", str(amount_minor), "currency", currency, "journal_id", "jrn_" + payment_id)
+        self.clock.advance(6)
+
+        proc = self.logger("processor-adapter").with_trace(trace_id, "e5e5e5e5e5e5e5e5").with_("payment_id", payment_id)
+        proc.debug("iso8583 message built", "mti", "0100", "pan", raw_pan)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/08-structured-logging/code/python
@@ -362,32 +521,280 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The redaction counts and the sampled traces match the Java run:
+
+```console
+== Redaction ==
+records written: 9, redactions applied: 4
+PAN in free text:    declined card 411111******1111 for order 1234567890123
+order id left alone: order 1234567890123 shipped  (fails Luhn)
+secret by key:       [REDACTED]
+
+== A failed payment: ERROR and WARN survive sampling, DEBUG/INFO are sampled 1-in-4 traces ==
+records kept: 11 of 37 emitted
+trace 0af76519...:  0 records kept, 0 WARN/ERROR
+trace 1af76519...:  9 records kept, 0 WARN/ERROR
+trace 2af76519...:  2 records kept, 2 WARN/ERROR
+trace 3af76519...:  0 records kept, 0 WARN/ERROR
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design with five differences. **The sampling hash wraps in `uint32`, then goes signed:** Go's `int32` would wrap too, but the unsigned form makes the intent visible; the result is converted to `int32` so `floorMod` (a four-line port of `Math.floorMod`, because Go's `%` keeps the dividend's sign) selects the same trace `1af76519...` and the demo prints the same "records kept: 11 of 37". Java hashes UTF-16 code units, so the loop runs over `utf16.Encode`, not over bytes or runes. **RE2 has no lookaround, so the PAN matcher is written out:** `(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)` becomes `candidateAt`: start only at a digit not preceded by a digit, follow the digit/separator chain, then back off from 19 digits down to 13 until the next character is not a digit, exactly the regex engine's greedy-then-backtrack order. Two extra tests pin the corner cases (a 20-digit run never matches; a spaced 20-digit chain backs off to 16 at a separator). `\d` is ASCII in both languages; the Go version checks bytes `'0'..'9'`. **Errors are values:** `NewSampler` returns `error` for a rate below 1, and `Log`/`Debug`/`Info`/`Warn`/`Error` return `ErrOddFields` for an odd key/value list (`errors.Is` in the test); the demo's call sites ignore the return because their argument lists are literals. `LogRecord.Field` returns `(string, bool)` instead of `null`, and the sampler takes `""` for "no trace bound". **Ordered maps are explicit:** `LinkedHashMap` becomes the small `Fields` type (a key slice plus a map) used for bound context and record fields, so `With` copies and extends the order and `ToJson` emits bound fields before call-site fields, as the test requires. `Set.of(...)` of indexed fields is a variadic `[]string`; `Level` is an `int` enum with `String()` and `Syslog()` tables. **`with` is a legal method name in Go**, so `With` and `WithTrace` keep the Java names; `String... kv` is `kv ...string`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The record and its JSON
+
+`fields` is a `*Fields` (ordered keys plus a map), copied on construction. `ToJson` writes into a `strings.Builder` through `JsonPair`, fixed keys first, then the fields in key order.
+
 ```go
-// Fnv1a is FNV-1a over UTF-16 code units in wrapping 32-bit arithmetic, bit for bit the Java int version.
-func Fnv1a(s string) int32 {
-    h := uint32(0x811c9dc5)
-    for _, cu := range utf16.Encode([]rune(s)) {
-        h ^= uint32(cu)
-        h *= 0x01000193
-    }
-    return int32(h)
+type LogRecord struct {
+	TimestampMillis int64
+	Level           Level
+	Service         string
+	Message         string
+	fields          *Fields
+}
+
+func NewLogRecord(timestampMillis int64, level Level, service, message string, fields *Fields) *LogRecord {
+	return &LogRecord{timestampMillis, level, service, message, fields.Copy()}
+}
+
+func (r *LogRecord) Field(key string) (string, bool) { return r.fields.Get(key) }
+
+func (r *LogRecord) ToJson() string {
+	var sb strings.Builder
+	sb.WriteByte('{')
+	JsonPair(&sb, "ts", strconv.FormatInt(r.TimestampMillis, 10), false)
+	sb.WriteByte(',')
+	JsonPair(&sb, "level", r.Level.String(), true)
+	sb.WriteByte(',')
+	JsonPair(&sb, "service", r.Service, true)
+	sb.WriteByte(',')
+	JsonPair(&sb, "msg", r.Message, true)
+	for _, k := range r.fields.keys {
+		sb.WriteByte(',')
+		JsonPair(&sb, k, r.fields.values[k], true)
+	}
+	sb.WriteByte('}')
+	return sb.String()
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The redactor
 
-- **The sampling hash wraps in `uint32`, then goes signed.** Go's `int32` would wrap too, but the unsigned form makes the intent visible; the result is converted to `int32` so `floorMod` (a four-line port of `Math.floorMod`, because Go's `%` keeps the dividend's sign) selects the same trace `1af76519...` and the demo prints the same "records kept: 11 of 37". Java hashes UTF-16 code units, so the loop runs over `utf16.Encode`, not over bytes or runes.
-- **RE2 has no lookaround, so the PAN matcher is written out.** `(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)` becomes `candidateAt`: start only at a digit not preceded by a digit, follow the digit/separator chain, then back off from 19 digits down to 13 until the next character is not a digit, exactly the regex engine's greedy-then-backtrack order. Two extra tests pin the corner cases (a 20-digit run never matches; a spaced 20-digit chain backs off to 16 at a separator). `\d` is ASCII in both languages; the Go version checks bytes `'0'..'9'`.
-- **Errors are values.** `NewSampler` returns `error` for a rate below 1, and `Log`/`Debug`/`Info`/`Warn`/`Error` return `ErrOddFields` for an odd key/value list (`errors.Is` in the test); the demo's call sites ignore the return because their argument lists are literals. `LogRecord.Field` returns `(string, bool)` instead of `null`, and the sampler takes `""` for "no trace bound".
-- **Ordered maps are explicit.** `LinkedHashMap` becomes the small `Fields` type (a key slice plus a map) used for bound context and record fields, so `With` copies and extends the order and `ToJson` emits bound fields before call-site fields, as the test requires. `Set.of(...)` of indexed fields is a variadic `[]string`; `Level` is an `int` enum with `String()` and `Syslog()` tables.
-- **`with` is a legal method name in Go**, so `With` and `WithTrace` keep the Java names; `String... kv` is `kv ...string`.
+`candidateAt` is the regex by hand: it records the end offset after each digit of the chain, then tries lengths 19 down to 13 until the character after the candidate is not a digit. `MaskPans` only starts a candidate at a digit not preceded by a digit (the negative lookbehind), strips separators with a `strings.Replacer`, and masks on Luhn success.
+
+```go
+func candidateAt(text string, i int) (int, bool) {
+	ends := []int{i + 1} // ends[k-1] is the offset just past the k-th digit of the chain
+	for j := i + 1; ; {
+		switch {
+		case j < len(text) && isDigit(text[j]):
+			ends = append(ends, j+1)
+			j++
+		case j+1 < len(text) && (text[j] == ' ' || text[j] == '-') && isDigit(text[j+1]):
+			ends = append(ends, j+2)
+			j += 2
+		default:
+			for k := min(len(ends), 19); k >= 13; k-- { // greedy, then back off until the next char is not a digit
+				if e := ends[k-1]; e >= len(text) || !isDigit(text[e]) {
+					return e, true
+				}
+			}
+			return 0, false
+		}
+	}
+}
+
+func (r *Redactor) MaskPans(text string) string {
+	var out strings.Builder
+	last := 0
+	for i := 0; i < len(text); {
+		if !isDigit(text[i]) || (i > 0 && isDigit(text[i-1])) {
+			i++
+			continue
+		}
+		end, ok := candidateAt(text, i)
+		if !ok {
+			i++
+			continue
+		}
+		digits := strings.NewReplacer(" ", "", "-", "").Replace(text[i:end])
+		if LuhnValid(digits) {
+			out.WriteString(text[last:i])
+			out.WriteString(Mask(digits))
+			last = end
+			r.Redactions++
+		}
+		i = end
+	}
+	out.WriteString(text[last:])
+	return out.String()
+}
+```
+
+#### Step 3: Trace-consistent sampling
+
+`Keep` takes `""` for "no trace bound". `Fnv1a` hashes UTF-16 code units in `uint32` and returns `int32`; `floorMod` fixes the sign of Go's `%` so the selection matches `Math.floorMod`.
+
+```go
+func (s *Sampler) Keep(level Level, traceId, message string) bool {
+	if level.AtLeast(WARN) {
+		return true
+	}
+	rate := s.infoRate
+	if level == DEBUG {
+		rate = s.debugRate
+	}
+	if rate == 1 {
+		return true
+	}
+	key := traceId
+	if key == "" {
+		key = message
+	}
+	keep := floorMod(Fnv1a(key), int32(rate)) == 0
+	if !keep {
+		s.Dropped++
+	}
+	return keep
+}
+
+func floorMod(x, y int32) int32 {
+	m := x % y
+	if m != 0 && (m < 0) != (y < 0) {
+		m += y
+	}
+	return m
+}
+
+func Fnv1a(s string) int32 {
+	h := uint32(0x811c9dc5)
+	for _, cu := range utf16.Encode([]rune(s)) {
+		h ^= uint32(cu)
+		h *= 0x01000193
+	}
+	return int32(h)
+}
+```
+
+#### Step 4: The logger
+
+`With` copies the ordered `Fields` and returns a new `Logger` value. `Log` returns `ErrOddFields` instead of throwing, then applies the same three gates; bound keys are iterated in their recorded order so they precede call-site fields in the JSON.
+
+```go
+func (l *Logger) With(key, value string) *Logger {
+	next := l.bound.Copy()
+	next.Put(key, value)
+	return &Logger{l.service, l.clock, l.minimum, l.redactor, l.sampler, l.store, next}
+}
+
+func (l *Logger) WithTrace(traceId, spanId string) *Logger {
+	return l.With("trace_id", traceId).With("span_id", spanId)
+}
+
+func (l *Logger) Log(level Level, message string, kv ...string) error {
+	if len(kv)%2 != 0 {
+		return ErrOddFields
+	}
+	if !level.AtLeast(l.minimum) {
+		return nil
+	}
+	traceId, _ := l.bound.Get("trace_id")
+	if !l.sampler.Keep(level, traceId, message) {
+		return nil
+	}
+	fields := NewFields()
+	for _, k := range l.bound.keys {
+		fields.Put(k, l.redactor.RedactValue(k, l.bound.values[k]))
+	}
+	for i := 0; i < len(kv); i += 2 {
+		fields.Put(kv[i], l.redactor.RedactValue(kv[i], kv[i+1]))
+	}
+	l.store.Write(NewLogRecord(l.clock.NowMillis(), level, l.service, l.redactor.MaskPans(message), fields))
+	return nil
+}
+```
+
+#### Step 4b: Context across a hand-off
+
+A `*Logger` is immutable once built, so a goroutine that closes over `pay` carries the fields, while one that calls `f.Logger("payments")` inside the goroutine does not; in a real service the scoped logger rides in the `context.Context`. The `Charge` flow builds each service's scoped logger once.
+
+```go
+	pay := f.Logger("payments").WithTrace(traceId, "b2b2b2b2b2b2b2b2").With("payment_id", paymentId).With("merchant_id", merchantId)
+	pay.Debug("idempotency key checked", "idempotency_key", "idem_"+paymentId)
+	pay.Info("authorize started", "amount_minor", amount, "currency", currency)
+```
+
+#### Step 5: The index
+
+The inner map is created on first use with a comma-ok check; appending to `byValue[v]` works on a nil slice. `Query` chains two map lookups, each yielding a zero value when absent.
+
+```go
+func (s *LogStore) Write(r *LogRecord) {
+	s.records = append(s.records, r)
+	for _, f := range s.indexed {
+		if v, ok := r.Field(f); ok {
+			byValue, present := s.index[f]
+			if !present {
+				byValue = map[string][]*LogRecord{}
+				s.index[f] = byValue
+			}
+			byValue[v] = append(byValue[v], r)
+		}
+	}
+}
+
+func (s *LogStore) Query(field, value string) []*LogRecord { return s.index[field][value] }
+```
+
+#### Step 6: Six services, one payment
+
+`amount` is formatted once with `strconv.FormatInt`. The careless body log and the `"pan", rawPan` field are both caught by the redactor, one by value scan and one by key; the demo ignores the `error` returns because the argument lists are literals of even length.
+
+```go
+func (f *PaymentFlow) Charge(traceId, paymentId, merchantId string, amountMinor int64, currency, rawPan string, processorFails bool) {
+	amount := strconv.FormatInt(amountMinor, 10)
+	gw := f.Logger("api-gateway").WithTrace(traceId, "a1a1a1a1a1a1a1a1").With("payment_id", paymentId).With("merchant_id", merchantId)
+	gw.Info("request received", "method", "POST", "path", "/charges")
+	f.Clock.Advance(2)
+
+	pay := f.Logger("payments").WithTrace(traceId, "b2b2b2b2b2b2b2b2").With("payment_id", paymentId).With("merchant_id", merchantId)
+	pay.Debug("idempotency key checked", "idempotency_key", "idem_"+paymentId)
+	pay.Info("authorize started", "amount_minor", amount, "currency", currency)
+	// A careless developer logs the raw request body. The redactor must catch the PAN.
+	pay.Debug("raw request body", "body", "{\"card\":\""+rawPan+"\",\"amount\":"+amount+"}")
+	f.Clock.Advance(3)
+
+	risk := f.Logger("risk").WithTrace(traceId, "c3c3c3c3c3c3c3c3").With("payment_id", paymentId)
+	risk.Info("score computed", "score", "12", "decision", "APPROVE")
+	f.Clock.Advance(23)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/08-structured-logging/code/go
 go run .
 go test ./...
+```
+
+The JSON lines, the redaction counts, and the sampled traces match the Java run:
+
+```console
+{"ts":1700000000034,"level":"DEBUG","service":"processor-adapter","msg":"iso8583 message built","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"e5e5e5e5e5e5e5e5","payment_id":"pay_8f3k2","mti":"0100","pan":"[REDACTED]"}
+{"ts":1700000000083,"level":"INFO","service":"notifications","msg":"webhook enqueued","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"f6f6f6f6f6f6f6f6","payment_id":"pay_8f3k2","event":"payment.authorized","secret":"[REDACTED]"}
+
+== Redaction ==
+records written: 9, redactions applied: 4
+PAN in free text:    declined card 411111******1111 for order 1234567890123
+order id left alone: order 1234567890123 shipped  (fails Luhn)
+secret by key:       [REDACTED]
+
+== A failed payment: ERROR and WARN survive sampling, DEBUG/INFO are sampled 1-in-4 traces ==
+records kept: 11 of 37 emitted
 ```
 
 ## Use It

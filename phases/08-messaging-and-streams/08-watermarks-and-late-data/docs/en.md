@@ -347,64 +347,375 @@ every event accounted for exactly once: true
 
 ### In Python
 
-```python
-def current(self) -> Optional[int]:
-    """None before any event has been seen: nothing is known to be complete (Java's Long.MIN_VALUE)."""
-    if self._max_event_time is None:
-        return None
-    return self._max_event_time - self._max_out_of_orderness_millis
+The Python port (`code/python/main.py`) is the same design with four differences. **`Long.MIN_VALUE` is `None`:** "no watermark yet" is `Optional[int]`; `process` checks `wm_before is not None` before comparing, and `hhmm(None)` prints `-inf`. This removes the sentinel-overflow concern (`Long.MIN_VALUE - bound` would wrap in Java if the guard were missing). **No `TreeMap`:** open windows live in a `dict[Window, WindowState]`, and `_advance` iterates `sorted(self._open)` twice, once to fire, once to garbage-collect; `Window` is a frozen dataclass with `order=True`, so sorting by `(start, end)` matches the Java `compareTo` on `start`. The number of open windows is tiny (two in the demo), so sorting per advance costs nothing measurable. **`floorDiv` is `//`:** Python's floor division already rounds toward negative infinity, so `assign(-1)` lands in `[-60 min, 0)` exactly as `Math.floorDiv` does; the test pins this. **`Money` is `int` minor units** and raises `TypeError` on a `float`; a currency mix is a `ValueError`, matching the Java `IllegalArgumentException`. `LateReason` and `FiringKind` are `Enum`s whose `__str__` prints the bare name.
 
-def _advance(self, wm: Optional[int]) -> List[WindowResult]:
-    out: List[WindowResult] = []
-    if wm is None:
-        return out
-    for w in sorted(self._open):
-        if w.end > wm:
-            break
-        ...
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Events with two timestamps
+
+`Event` (a frozen dataclass further up the file) carries both `event_time` and `arrival_time`. `Window` is ordered by `(start, end)` through `order=True`, and `assign` uses `//`, which floors, so negative timestamps land in the correct half-open window without a helper.
+
+```python
+@dataclass(frozen=True, order=True)
+class Window:
+    start: int
+    end: int
+
+
+class TumblingWindowAssigner:
+    def __init__(self, size_millis: int) -> None:
+        if size_millis <= 0:
+            raise ValueError("window size must be positive")
+        self._size_millis = size_millis
+
+    def assign(self, timestamp: int) -> Window:
+        start = (timestamp // self._size_millis) * self._size_millis  # // floors, like Math.floorDiv
+        return Window(start, start + self._size_millis)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The watermark generator
 
-- **`Long.MIN_VALUE` is `None`.** "No watermark yet" is `Optional[int]`; `process` checks `wm_before is not None` before comparing, and `hhmm(None)` prints `-inf`. This removes the sentinel-overflow concern (`Long.MIN_VALUE - bound` would wrap in Java if the guard were missing).
-- **No `TreeMap`.** Open windows live in a `dict[Window, WindowState]`, and `_advance` iterates `sorted(self._open)` twice: once to fire, once to garbage-collect. `Window` is a frozen dataclass with `order=True`, so sorting by `(start, end)` matches the Java `compareTo` on `start`. The number of open windows is tiny (two in the demo), so sorting per advance costs nothing measurable.
-- **`floorDiv` is `//`.** Python's floor division already rounds toward negative infinity, so `assign(-1)` lands in `[-60 min, 0)` exactly as `Math.floorDiv` does; the test pins this.
-- **`Money` is `int` minor units** and raises `TypeError` on a `float`; a currency mix is a `ValueError`, matching the Java `IllegalArgumentException`. `LateReason` and `FiringKind` are `Enum`s whose `__str__` prints the bare name.
+One `Optional[int]` of state. `observe` only ever raises `_max_event_time`, which is what makes the watermark monotonic; `current()` returns `None` until the first event, so there is no sentinel arithmetic to get wrong.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The event-by-event watermark trace and the side output match the Java run line for line.
+```python
+class BoundedOutOfOrdernessWatermark:
+    def __init__(self, max_out_of_orderness_millis: int) -> None:
+        if max_out_of_orderness_millis < 0:
+            raise ValueError("out-of-orderness must be >= 0")
+        self._max_out_of_orderness_millis = max_out_of_orderness_millis
+        self._max_event_time: Optional[int] = None
+
+    def observe(self, event_time: int) -> Optional[int]:
+        if self._max_event_time is None or event_time > self._max_event_time:
+            self._max_event_time = event_time
+        return self.current()
+
+    def current(self) -> Optional[int]:
+        if self._max_event_time is None:
+            return None
+        return self._max_event_time - self._max_out_of_orderness_millis
+```
+
+#### Step 3: Window state and the three outcomes
+
+`WindowState` is a small mutable class (`count`, `sum`, `fired`). `process` keeps the Java order exactly: the lateness decision uses the watermark *before* this event is observed, then too-late goes to the side output, already-fired folds in and emits a `LATE_UPDATE`, otherwise it just folds in; only then is the watermark advanced. `self._open.get(w)` plus assignment is the `computeIfAbsent`.
+
+```python
+    def process(self, e: Event) -> List[WindowResult]:
+        self._events_seen += 1
+        out: List[WindowResult] = []
+        w = self._assigner.assign(e.event_time)
+        wm_before = self._watermark.current()
+
+        if wm_before is not None and wm_before >= w.end + self._allowed_lateness_millis:
+            # The window was fired and then garbage-collected. Side output, never silent drop.
+            self._side_output.append(LateEvent(e, w.start, w.end, wm_before, LateReason.WINDOW_CLOSED))
+            self._watermark.observe(e.event_time)
+            return out
+
+        state = self._open.get(w)
+        if state is None:
+            state = self._open[w] = WindowState(self._currency)
+        state.add(e)
+        if state.fired:
+            # Window already fired on time; this is an allowed-late event. Re-emit a corrected result.
+            out.append(WindowResult(w.start, w.end, state.count, state.sum, FiringKind.LATE_UPDATE))
+
+        wm_after = self._watermark.observe(e.event_time)
+        out.extend(self._advance(wm_after))
+        return out
+```
+
+#### Step 4: Advancing the watermark
+
+Two passes over `sorted(self._open)`. The first fires every unfired window whose end the watermark has passed and breaks at the first that is not ready; the second pops windows past `end + allowed_lateness`, crediting their counts to `_events_in_closed_windows`. The `fired` flag keeps `ON_TIME` to exactly one emission per window.
+
+```python
+    def _advance(self, wm: Optional[int]) -> List[WindowResult]:
+        out: List[WindowResult] = []
+        if wm is None:
+            return out
+        for w in sorted(self._open):
+            if w.end > wm:
+                break  # ordered by start; later windows are not ready
+            s = self._open[w]
+            if not s.fired:
+                s.fired = True
+                out.append(WindowResult(w.start, w.end, s.count, s.sum, FiringKind.ON_TIME))
+        for w in sorted(self._open):
+            if wm >= w.end + self._allowed_lateness_millis:
+                self._events_in_closed_windows += self._open.pop(w).count
+            else:
+                break
+        self._emitted.extend(out)
+        return out
+```
+
+#### Step 5: The accounting invariant
+
+A generator sum over the open states replaces the Java stream. Every scenario in `test_main.py` ends by asserting this.
+
+```python
+    def accounts_for_every_event(self) -> bool:
+        in_open = sum(s.count for s in self._open.values())
+        return self._events_seen == in_open + self._events_in_closed_windows + len(self._side_output)
+```
+
+#### Step 6: The processing-time baseline
+
+Windows keyed by `arrival_time`; no watermark, no lateness, no side output, and the wrong answer for the 11:59 payment. `results()` sorts the dict items so the output order matches Java's `TreeMap`.
+
+```python
+    def process(self, e: Event) -> None:
+        w = self._assigner.assign(e.arrival_time)
+        state = self._windows.get(w)
+        if state is None:
+            state = self._windows[w] = WindowState(self._currency)
+        state.add(e)
+
+    def results(self) -> List[WindowResult]:
+        return [WindowResult(w.start, w.end, s.count, s.sum, FiringKind.ON_TIME) for w, s in sorted(self._windows.items())]
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/08-messaging-and-streams/08-watermarks-and-late-data/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The event-by-event watermark trace and the side output match the Java run line for line:
+
+```console
+  event m-1 @11:59 (arrived 12:03) 77.00 USD    watermark=11:57
+  event m-2 @12:04 (arrived 12:04) 15.00 USD    watermark=11:59
+  event m-1 @12:09 (arrived 12:09) 20.00 USD    watermark=12:04
+    -> fired [11:00, 12:00) count=4 sum=154.49 USD ON_TIME
+  event m-2 @11:57 (arrived 12:10) 9.99 USD     watermark=12:04
+    -> fired [11:00, 12:00) count=5 sum=164.48 USD LATE_UPDATE
+  event m-1 @12:16 (arrived 12:16) 6.00 USD     watermark=12:11
+  event m-2 @11:50 (arrived 12:20) 25.00 USD    watermark=12:11
+```
 
 ### In Go
 
-```go
-// NoWatermark is the watermark before any event has been seen (Java's Long.MIN_VALUE).
-const NoWatermark int64 = math.MinInt64
+The Go port (`code/go/main.go` and `code/go/money.go`) keeps the design with four differences. **The sentinel is a named constant with the same explicit guard:** `NoWatermark` is `math.MinInt64`; `Process` checks `wmBefore != NoWatermark` before comparing, exactly as the Java checks `Long.MIN_VALUE`, because `NoWatermark - bound` would wrap silently in both languages, and `hhmm(NoWatermark)` prints `-inf`. **`Money.Plus` returns `(Money, error)` and the error propagates:** `WindowState.Add` returns it, so `EventTimeWindowOperator.Process` returns `([]WindowResult, error)` and `ProcessingTimeWindowOperator.Process` returns `error`; an event in a foreign currency is refused before it is counted, and the test checks that `AccountsForEveryEvent` still holds afterwards. Constructors return `error` where Java throws `IllegalArgumentException`. **No `TreeMap`:** open windows live in `map[Window]*WindowState`; `advance` takes a sorted snapshot of the keys (`sortedOpen`) once to fire and once to garbage-collect, matching the Java iteration order. **`floorDiv` is written by hand:** Go's `/` truncates toward zero like Java's, so `assign(-1)` needs `Math.floorDiv` semantics to land in `[-60 min, 0)`; the helper is six lines and the test pins it.
 
-func (w *BoundedOutOfOrdernessWatermark) Current() int64 {
-    if w.maxEventTime == NoWatermark {
-        return NoWatermark
-    }
-    return w.maxEventTime - w.maxOutOfOrdernessMillis
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Events with two timestamps
+
+`Window` is a comparable two-field struct, so it works as a map key. `floorDiv` corrects the truncating quotient when the signs differ, which is what keeps a pre-epoch timestamp in the right window; `NewTumblingWindowAssigner` validates where a struct literal cannot.
+
+```go
+type Event struct {
+	Key         string
+	EventTime   int64
+	ArrivalTime int64
+	Amount      Money
 }
 
-func (s *WindowState) Add(e Event) error {
-    sum, err := s.Sum.Plus(e.Amount)
-    if err != nil {
-        return err
-    }
-    s.Count++
-    s.Sum = sum
-    return nil
+type Window struct {
+	Start int64
+	End   int64
+}
+
+func floorDiv(x, y int64) int64 {
+	q := x / y
+	if (x%y != 0) && ((x < 0) != (y < 0)) {
+		q--
+	}
+	return q
+}
+
+func NewTumblingWindowAssigner(sizeMillis int64) (*TumblingWindowAssigner, error) {
+	if sizeMillis <= 0 {
+		return nil, errors.New("window size must be positive")
+	}
+	return &TumblingWindowAssigner{sizeMillis}, nil
+}
+
+func (a *TumblingWindowAssigner) Assign(timestamp int64) Window {
+	start := floorDiv(timestamp, a.sizeMillis) * a.sizeMillis
+	return Window{start, start + a.sizeMillis}
 }
 ```
 
-Differences, all in `code/go/main.go` and `code/go/money.go`:
+#### Step 2: The watermark generator
 
-- **The sentinel is a named constant with the same explicit guard.** `NoWatermark` is `math.MinInt64`; `Process` checks `wmBefore != NoWatermark` before comparing, exactly as the Java checks `Long.MIN_VALUE`, because `NoWatermark - bound` would wrap silently in both languages. `hhmm(NoWatermark)` prints `-inf`.
-- **`Money.Plus` returns `(Money, error)` and the error propagates.** `WindowState.Add` returns it, so `EventTimeWindowOperator.Process` returns `([]WindowResult, error)` and `ProcessingTimeWindowOperator.Process` returns `error`: an event in a foreign currency is refused before it is counted, and the test checks that `AccountsForEveryEvent` still holds afterwards. Constructors return `error` where Java throws `IllegalArgumentException`.
-- **No `TreeMap`.** Open windows live in `map[Window]*WindowState`; `advance` takes a sorted snapshot of the keys (`sortedOpen`) once to fire and once to garbage-collect, matching the Java iteration order. The window count is tiny (two in the demo), so the sort is free.
-- **`floorDiv` is written by hand.** Go's `/` truncates toward zero like Java's, so `assign(-1)` needs `Math.floorDiv` semantics to land in `[-60 min, 0)`; the helper is six lines and the test pins it.
+`maxEventTime` starts at `NoWatermark`, and `Current` returns the sentinel unchanged until the first event rather than subtracting from it. `Observe` only raises the maximum, so the watermark is monotonic.
 
-Run it from `code/go/` with `go run .`; test with `go test ./...`. The event-by-event watermark trace and the side output match the Java run line for line.
+```go
+const NoWatermark int64 = math.MinInt64
+
+type BoundedOutOfOrdernessWatermark struct {
+	maxOutOfOrdernessMillis int64
+	maxEventTime            int64
+}
+
+func NewBoundedOutOfOrdernessWatermark(maxOutOfOrdernessMillis int64) (*BoundedOutOfOrdernessWatermark, error) {
+	if maxOutOfOrdernessMillis < 0 {
+		return nil, errors.New("out-of-orderness must be >= 0")
+	}
+	return &BoundedOutOfOrdernessWatermark{maxOutOfOrdernessMillis, NoWatermark}, nil
+}
+
+func (w *BoundedOutOfOrdernessWatermark) Observe(eventTime int64) int64 {
+	if eventTime > w.maxEventTime {
+		w.maxEventTime = eventTime
+	}
+	return w.Current()
+}
+
+func (w *BoundedOutOfOrdernessWatermark) Current() int64 {
+	if w.maxEventTime == NoWatermark {
+		return NoWatermark
+	}
+	return w.maxEventTime - w.maxOutOfOrdernessMillis
+}
+```
+
+#### Step 3: Window state and the three outcomes
+
+The same ordering of decisions, with one Go-specific branch: if `state.Add` fails (a foreign currency), the event is un-counted, an empty state created for it is removed, and the error is returned, so the accounting invariant survives a refused event. `WindowState.Add` is where `Money.Plus`'s error enters the operator.
+
+```go
+func (s *WindowState) Add(e Event) error {
+	sum, err := s.Sum.Plus(e.Amount)
+	if err != nil {
+		return err
+	}
+	s.Count++
+	s.Sum = sum
+	return nil
+}
+```
+
+```go
+func (o *EventTimeWindowOperator) Process(e Event) ([]WindowResult, error) {
+	o.eventsSeen++
+	out := []WindowResult{}
+	w := o.assigner.Assign(e.EventTime)
+	wmBefore := o.watermark.Current()
+
+	if wmBefore != NoWatermark && wmBefore >= w.End+o.allowedLatenessMillis {
+		// The window was fired and then garbage-collected. Side output, never silent drop.
+		o.sideOutput = append(o.sideOutput, LateEvent{e, w.Start, w.End, wmBefore, WindowClosed})
+		o.watermark.Observe(e.EventTime)
+		return out, nil
+	}
+
+	state, ok := o.open[w]
+	if !ok {
+		state = NewWindowState(o.currency)
+		o.open[w] = state
+	}
+	if err := state.Add(e); err != nil {
+		o.eventsSeen--
+		if state.Count == 0 {
+			delete(o.open, w)
+		}
+		return nil, err
+	}
+	if state.Fired {
+		// Window already fired on time; this is an allowed-late event. Re-emit a corrected result.
+		out = append(out, WindowResult{w.Start, w.End, state.Count, state.Sum, LateUpdate})
+	}
+
+	wmAfter := o.watermark.Observe(e.EventTime)
+	out = append(out, o.advance(wmAfter)...)
+	return out, nil
+}
+```
+
+#### Step 4: Advancing the watermark
+
+`sortedOpen()` returns the open windows ordered by start, so the two passes behave like the Java `TreeMap` walks: fire-and-break, then delete-and-break. Deleting from the map while ranging over the sorted snapshot is safe.
+
+```go
+func (o *EventTimeWindowOperator) advance(wm int64) []WindowResult {
+	out := []WindowResult{}
+	if wm == NoWatermark {
+		return out
+	}
+	for _, w := range o.sortedOpen() {
+		if w.End > wm {
+			break // ordered by start; later windows are not ready
+		}
+		s := o.open[w]
+		if !s.Fired {
+			s.Fired = true
+			out = append(out, WindowResult{w.Start, w.End, s.Count, s.Sum, OnTime})
+		}
+	}
+	for _, w := range o.sortedOpen() {
+		if wm >= w.End+o.allowedLatenessMillis {
+			o.eventsInClosedWindows += int64(o.open[w].Count)
+			delete(o.open, w)
+		} else {
+			break
+		}
+	}
+	o.emitted = append(o.emitted, out...)
+	return out
+}
+```
+
+#### Step 5: The accounting invariant
+
+A plain loop over the map values; order does not matter for a sum. `main_test.go` asserts it at the end of every scenario, including the one where `Process` refused a foreign-currency event.
+
+```go
+func (o *EventTimeWindowOperator) AccountsForEveryEvent() bool {
+	var inOpen int64
+	for _, s := range o.open {
+		inOpen += int64(s.Count)
+	}
+	return o.eventsSeen == inOpen+o.eventsInClosedWindows+int64(len(o.sideOutput))
+}
+```
+
+#### Step 6: The processing-time baseline
+
+Keyed by `ArrivalTime`; the only thing it can do wrong is refuse a foreign currency, which is why it returns `error`. `Results()` (not shown) sorts the windows before returning them.
+
+```go
+func (p *ProcessingTimeWindowOperator) Process(e Event) error {
+	w := p.assigner.Assign(e.ArrivalTime)
+	state, ok := p.windows[w]
+	if !ok {
+		state = NewWindowState(p.currency)
+		p.windows[w] = state
+	}
+	return state.Add(e)
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/08-messaging-and-streams/08-watermarks-and-late-data/code/go
+go run .
+go test ./...
+```
+
+The event-by-event watermark trace and the side output match the Java run line for line:
+
+```console
+== Processing-time windows: the 11:59 payment lands in the 12:00 hour ==
+  [11:00, 12:00) count=3 sum=77.49 USD ON_TIME
+  [12:00, 13:00) count=8 sum=190.99 USD ON_TIME
+  [13:00, 14:00) count=1 sum=1.00 USD ON_TIME
+
+== Event-time windows, watermark = max event time - 5 min, allowed lateness 10 min ==
+  event m-1 @11:40 (arrived 11:40) 19.99 USD    watermark=11:35
+  event m-1 @11:52 (arrived 11:52) 45.00 USD    watermark=11:47
+  event m-2 @11:58 (arrived 11:58) 12.50 USD    watermark=11:53
+  event m-1 @12:01 (arrived 12:01) 8.00 USD     watermark=11:56
+  event m-2 @12:02 (arrived 12:02) 30.00 USD    watermark=11:57
+  event m-1 @11:59 (arrived 12:03) 77.00 USD    watermark=11:57
+```
 
 ## Use It
 

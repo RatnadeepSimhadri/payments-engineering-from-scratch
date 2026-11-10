@@ -362,38 +362,518 @@ The output of `main.py` and `main.go` is byte-identical.
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`int` is the bitmask:** Python integers are unbounded, so the 64-op cap is a design choice kept for parity rather than a language limit, and `int.bit_count()` (3.10+) replaces `Long.bitCount`. **`CheckResult.order` is a tuple,** not a list, so a result cannot be mutated by a caller and compares by value in tests. **`RegisterModel.step` returns `None`** for a rejected op, the idiomatic absent value, where Java returns `null` and Go returns `(state, false)`. **Recursion depth** is bounded by the 64-op cap, well under the default limit of 1000, so no `sys.setrecursionlimit` is needed.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Operations and their real-time relation
+
+`Op` is a frozen dataclass; the compact-constructor check becomes `__post_init__` raising `ValueError`. `precedes` is the strict inequality and `concurrent_with` is its negation both ways.
+
 ```python
-def _search(self, done: int, state: State) -> bool:
-    ...
-    if done.bit_count() == len(self._ops):
-        return True
-    memo_key = f"{done}|{self._model.key(state)}" if self._memoize else ""
+    id: int
+    client: str
+    kind: OpKind
+    key: str
+    value: int
+    invoked_at: int
+    returned_at: int
+
+    def __post_init__(self) -> None:
+        if self.returned_at < self.invoked_at:
+            raise ValueError(f"op {self.id} returned before it was invoked")
+
+    def precedes(self, other: "Op") -> bool:
+        return self.returned_at < other.invoked_at
+
+    def concurrent_with(self, other: "Op") -> bool:
+        return not self.precedes(other) and not other.precedes(self)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The history and its 64-op limit
 
-- **`int` is the bitmask.** Python integers are unbounded, so the 64-op cap is a design choice kept for parity rather than a language limit; `int.bit_count()` (3.10+) replaces `Long.bitCount`.
-- **`CheckResult.order` is a tuple**, not a list, so a result cannot be mutated by a caller and compares by value in tests.
-- **`RegisterModel.step` returns `None`** for a rejected op, the idiomatic absent value, where Java returns `null` and Go returns `(state, false)`.
-- **Recursion depth** is bounded by the 64-op cap, well under the default limit of 1000, so no `sys.setrecursionlimit` is needed.
+`MAX_OPS` is a class attribute. `add` assigns the id from the current length and returns `self`, so the fluent `write`/`read` builders chain; the `ops` property returns a copy of the list so a caller cannot reorder the history under the checker.
+
+```python
+class History:
+    MAX_OPS = 64
+
+    def __init__(self) -> None:
+        self._ops: list[Op] = []
+
+    def add(self, client: str, kind: OpKind, key: str, value: int, invoked_at: int, returned_at: int) -> "History":
+        if len(self._ops) >= History.MAX_OPS:
+            raise ValueError(f"this checker handles at most {History.MAX_OPS} ops per history")
+        self._ops.append(Op(len(self._ops), client, kind, key, value, invoked_at, returned_at))
+        return self
+
+    def write(self, client: str, key: str, value: int, invoked_at: int, returned_at: int) -> "History":
+        return self.add(client, OpKind.WRITE, key, value, invoked_at, returned_at)
+
+    def read(self, client: str, key: str, value: int, invoked_at: int, returned_at: int) -> "History":
+        return self.add(client, OpKind.READ, key, value, invoked_at, returned_at)
+
+    @property
+    def ops(self) -> list[Op]:
+        return list(self._ops)
+```
+
+#### Step 3: Recording with an injected clock
+
+`_invoke` stamps `clock.now()` into a private `_Pending` dataclass; `complete` pops it with `dict.pop(id, None)` and raises on an unknown id. A read takes the completion value, a write keeps the value it was invoked with. `history()` refuses pending ops with `RuntimeError` and rebuilds the history densely in id order.
+
+```python
+    def invoke_write(self, client: str, key: str, value: int) -> int:
+        return self._invoke(client, OpKind.WRITE, key, value)
+
+    def invoke_read(self, client: str, key: str) -> int:
+        return self._invoke(client, OpKind.READ, key, 0)
+
+    def _invoke(self, client: str, kind: OpKind, key: str, value: int) -> int:
+        op_id = self._next_id
+        self._next_id += 1
+        self._pending[op_id] = _Pending(client, kind, key, value, self._clock.now())
+        return op_id
+
+    def complete(self, op_id: int, value: int) -> None:
+        p = self._pending.pop(op_id, None)
+        if p is None:
+            raise ValueError(f"no pending op {op_id}")
+        v = p.value if p.kind == OpKind.WRITE else value
+        self._completed.append(Op(op_id, p.client, p.kind, p.key, v, p.invoked_at, self._clock.now()))
+
+    def history(self) -> History:
+        if self._pending:
+            raise RuntimeError(f"{len(self._pending)} ops never completed; this checker needs a complete history")
+        h = History()
+        for o in sorted(self._completed, key=lambda o: o.id):
+            h.add(o.client, o.kind, o.key, o.value, o.invoked_at, o.returned_at)
+        return h
+```
+
+#### Step 4: The sequential specification
+
+`State` is a type alias for `dict[str, int]`. `step` returns the same dict for an accepted read, `None` for a rejected one, and a copy (`dict(state)`) with the write applied otherwise, so backtracking still has the old state. `key` sorts the items so the memo key is canonical.
+
+```python
+State = dict[str, int]
+
+
+class RegisterModel:
+    def initial(self) -> State:
+        return {}
+
+    def step(self, state: State, op: Op) -> State | None:
+        current = state.get(op.key, 0)
+        if op.kind == OpKind.READ:
+            return state if current == op.value else None
+        nxt = dict(state)
+        nxt[op.key] = op.value
+        return nxt
+
+    def key(self, state: State) -> str:
+        return ",".join(f"{k}={v}" for k, v in sorted(state.items()))
+```
+
+#### Step 5: The search
+
+The same recursive search over an `int` bitmask. The budget check raises `RuntimeError`, the longest prefix is snapshotted with `list(self._order)`, and `done.bit_count()` tests for completion. The memo key is an f-string of the mask and the model key, and a failed configuration is recorded only after every candidate has been tried.
+
+```python
+    def _search(self, done: int, state: State) -> bool:
+        self._explored += 1
+        if self._explored > self._state_budget:
+            raise RuntimeError(f"state budget of {self._state_budget} exceeded; history too concurrent for this checker")
+        if len(self._order) > len(self._longest_prefix):
+            self._longest_prefix = list(self._order)
+        if done.bit_count() == len(self._ops):
+            return True
+        memo_key = f"{done}|{self._model.key(state)}" if self._memoize else ""
+        if self._memoize and memo_key in self._failed_configs:
+            self._memo_hits += 1
+            return False
+        for i, op in enumerate(self._ops):
+            if done & (1 << i) or not self._may_go_next(i, done):
+                continue
+            nxt = self._model.step(state, op)
+            if nxt is None:
+                continue
+            self._order.append(i)
+            if self._search(done | (1 << i), nxt):
+                return True
+            self._order.pop()
+        if self._memoize:
+            self._failed_configs.add(memo_key)
+        return False
+```
+
+#### Step 6: Who may go next
+
+`enumerate` gives both the index for the bitmask test and the op for the comparisons. The linearizable branch asks whether any unlinearized op precedes the candidate in real time; the sequential branch only looks at earlier ops of the same client.
+
+```python
+    def _may_go_next(self, i: int, done: int) -> bool:
+        candidate = self._ops[i]
+        for j, other in enumerate(self._ops):
+            if j == i or done & (1 << j):
+                continue
+            if self._consistency == Consistency.LINEARIZABLE:
+                if other.precedes(candidate):
+                    return False
+            elif other.client == candidate.client and other.invoked_at < candidate.invoked_at:
+                return False
+        return True
+```
+
+#### Step 7: Reporting
+
+`CheckResult` is a frozen dataclass whose `order` and `longest_prefix` are tuples. `describe` builds the same lines as the Java: the witness order on success, the longest prefix and the "no remaining op" line on failure, and the state count either way.
+
+```python
+@dataclass(frozen=True)
+class CheckResult:
+    ok: bool
+    model: Consistency
+    order: tuple[int, ...]
+    longest_prefix: tuple[int, ...]
+    explored: int
+    memo_hits: int
+
+    def describe(self, h: History) -> str:
+        lines = []
+        if self.ok:
+            lines.append(f"{self.model.value}: yes. Witness order:")
+            lines.extend(f"  {h.op(i)}" for i in self.order)
+        else:
+            lines.append(f"{self.model.value}: NO. Longest {self.model.value.lower()} prefix ({len(self.longest_prefix)} of {h.size()} ops):")
+            lines.extend(f"  {h.op(i)}" for i in self.longest_prefix)
+            lines.append("  no remaining op can go next from here")
+        lines.append(f"  ({self.explored} states explored, {self.memo_hits} memo hits)")
+        return "\n".join(lines)
+```
+
+#### Step 8: Generating histories that must pass
+
+The same SplitMix64 `Rng`, masked to 64 bits, draws the same four numbers per op in the same order, so the fifty histories are the Java's. The sequential run is implicit in `value`, which a write updates and a read reports.
+
+```python
+    @staticmethod
+    def linearizable(seed: int, n: int, clients: int, window: int) -> History:
+        rng = Rng(seed)
+        h = History()
+        value = 0
+        for k in range(n):
+            point = 10 * (k + 1)
+            invoked = point - rng.next_int(window)
+            returned = point + rng.next_int(window)
+            client = f"c{rng.next_int(clients)}"
+            if rng.next_int(2) == 0:
+                value = 1 + rng.next_int(9)
+                h.write(client, "x", value, invoked, returned)
+            else:
+                h.read(client, "x", value, invoked, returned)
+        return h
+```
+
+#### Step 9: Run it
+
+```bash
+cd phases/06-replication-and-consensus/12-linearizability-checking/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output is byte-identical to the Java run:
+
+```console
+== Why the memo matters: 8 fully concurrent writes followed by one read ==
+  with memo:    ok=true, 1389 states explored, 924 memo hits
+  without memo: ok=true, 16081 states explored (depth-first in id order keeps retrying permutations that put write(x=1) first)
+
+== 50 generated histories (20 ops, 3 clients, window 15) that are linearizable by construction ==
+  passed 50/50; most states explored by any one check: 21
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **The budget is an error, not a panic:** `search` returns `(bool, error)` and `ErrBudget` propagates up through the recursion, so a caller can `errors.Is` it, where the Java and Python versions throw; `CheckLinearizable` is a convenience that panics on the error for demos and tests where a blown budget is a bug. **`History.Add` returns an error; `Write`/`Read` panic:** hand-built histories are programmer input, and a fluent builder cannot return an error, so the two APIs coexist, `Add` for recorded data and the builders for literals. **`State` is `map[string]int`** and `Step` copies it by hand before a write; maps are reference types, so forgetting the copy would let a backtracked branch see a later branch's write, which the Java `new TreeMap<>(state)` and Python `dict(state)` prevent more quietly. **`bits.OnesCount64`** replaces `Long.bitCount`, and the bitmask is `uint64`, so the shift `1 << uint(i)` needs the explicit conversion.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Operations and their real-time relation
+
+`Op` is a plain struct; the interval validation moves to `History.Add` because a struct literal has no constructor. `Precedes` and `ConcurrentWith` are one-liners.
+
 ```go
-func (c *Checker) Check(h *History, consistency Consistency) (CheckResult, error) {
-    ...
-    ok, err := c.search(0, c.model.Initial())
-    if err != nil {
-        return CheckResult{}, err
-    }
+type Op struct {
+	ID         int
+	Client     string
+	Kind       OpKind
+	Key        string
+	Value      int
+	InvokedAt  int
+	ReturnedAt int
+}
+
+func (o Op) Precedes(other Op) bool { return o.ReturnedAt < other.InvokedAt }
+
+func (o Op) ConcurrentWith(other Op) bool { return !o.Precedes(other) && !other.Precedes(o) }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The history and its 64-op limit
 
-- **The budget is an error, not a panic.** `search` returns `(bool, error)` and `ErrBudget` propagates up through the recursion, so a caller can `errors.Is` it; the Java and Python versions throw. `CheckLinearizable` is a convenience that panics on the error for demos and tests where a blown budget is a bug.
-- **`History.Add` returns an error; `Write`/`Read` panic.** Hand-built histories are programmer input, and a fluent builder cannot return an error, so the two APIs coexist: `Add` for recorded data, the builders for literals.
-- **`State` is `map[string]int`** and `Step` copies it by hand before a write; maps are reference types, so forgetting the copy would let a backtracked branch see a later branch's write. The Java `new TreeMap<>(state)` and Python `dict(state)` do the same thing more quietly.
-- **`bits.OnesCount64`** replaces `Long.bitCount`, and the bitmask is `uint64`, so the shift `1 << uint(i)` needs the explicit conversion.
+`Add` is the validating path and returns `ErrBadOp` for a backwards interval or a full history; `Write` and `Read` wrap it and panic so they can return `*History` for chaining. `Ops()` returns a copy of the slice.
+
+```go
+func (h *History) Add(client string, kind OpKind, key string, value, invokedAt, returnedAt int) error {
+	if returnedAt < invokedAt {
+		return fmt.Errorf("%w: op %d returned before it was invoked", ErrBadOp, len(h.ops))
+	}
+	if len(h.ops) >= MaxOps {
+		return fmt.Errorf("%w: this checker handles at most %d ops per history", ErrBadOp, MaxOps)
+	}
+	h.ops = append(h.ops, Op{len(h.ops), client, kind, key, value, invokedAt, returnedAt})
+	return nil
+}
+
+func (h *History) Write(client, key string, value, invokedAt, returnedAt int) *History {
+	if err := h.Add(client, Write, key, value, invokedAt, returnedAt); err != nil {
+		panic(err)
+	}
+	return h
+}
+
+func (h *History) Read(client, key string, value, invokedAt, returnedAt int) *History {
+	if err := h.Add(client, Read, key, value, invokedAt, returnedAt); err != nil {
+		panic(err)
+	}
+	return h
+}
+
+func (h *History) Ops() []Op    { return append([]Op(nil), h.ops...) }
+```
+
+#### Step 3: Recording with an injected clock
+
+`Complete` and `History` return errors instead of throwing. The two-value map read finds the pending op, `delete` removes it, and a write keeps its invocation value. `History()` sorts a copy of the completed ops by id before rebuilding.
+
+```go
+func (r *HistoryRecorder) invoke(client string, kind OpKind, key string, value int) int {
+	id := r.nextID
+	r.nextID++
+	r.pending[id] = pending{client, kind, key, value, r.clock.Now()}
+	return id
+}
+
+func (r *HistoryRecorder) Complete(id, value int) error {
+	p, ok := r.pending[id]
+	if !ok {
+		return fmt.Errorf("no pending op %d", id)
+	}
+	delete(r.pending, id)
+	v := value
+	if p.kind == Write {
+		v = p.value
+	}
+	r.completed = append(r.completed, Op{id, p.client, p.kind, p.key, v, p.invokedAt, r.clock.Now()})
+	return nil
+}
+
+func (r *HistoryRecorder) History() (*History, error) {
+	if len(r.pending) > 0 {
+		return nil, fmt.Errorf("%d ops never completed; this checker needs a complete history", len(r.pending))
+	}
+	sorted := append([]Op(nil), r.completed...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+	h := NewHistory()
+	for _, o := range sorted {
+		if err := h.Add(o.Client, o.Kind, o.Key, o.Value, o.InvokedAt, o.ReturnedAt); err != nil {
+			return nil, err
+		}
+	}
+	return h, nil
+}
+```
+
+#### Step 4: The sequential specification
+
+`Step` returns `(State, bool)`: the same map and `true` for an accepted read, `false` for a rejected one, and a freshly allocated copy with the write applied otherwise. A missing map key reads as 0, which is the register's initial value. `Key` sorts the keys because map iteration order is random.
+
+```go
+type State map[string]int
+
+type RegisterModel struct{}
+
+func (RegisterModel) Initial() State { return State{} }
+
+func (RegisterModel) Step(state State, op Op) (State, bool) {
+	current := state[op.Key]
+	if op.Kind == Read {
+		return state, current == op.Value
+	}
+	next := make(State, len(state)+1)
+	for k, v := range state {
+		next[k] = v
+	}
+	next[op.Key] = op.Value
+	return next, true
+}
+
+func (RegisterModel) Key(state State) string {
+	keys := make([]string, 0, len(state))
+	for k := range state {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, state[k]))
+	}
+	return strings.Join(parts, ",")
+}
+```
+
+#### Step 5: The search
+
+The recursion returns `(bool, error)`; a budget overrun wraps `ErrBudget` and the `if err != nil || found` line propagates either a result or the error straight up. `bits.OnesCount64` is the population count, the memo is a `map[string]bool`, and the order is truncated with a reslice on backtrack.
+
+```go
+func (c *Checker) search(done uint64, state State) (bool, error) {
+	c.explored++
+	if c.explored > c.stateBudget {
+		return false, fmt.Errorf("%w (budget %d)", ErrBudget, c.stateBudget)
+	}
+	if len(c.order) > len(c.longestPrefix) {
+		c.longestPrefix = append([]int{}, c.order...)
+	}
+	if bits.OnesCount64(done) == len(c.ops) {
+		return true, nil
+	}
+	memoKey := ""
+	if c.memoize {
+		memoKey = fmt.Sprintf("%d|%s", done, c.model.Key(state))
+		if c.failedConfigs[memoKey] {
+			c.memoHits++
+			return false, nil
+		}
+	}
+	for i, op := range c.ops {
+		if done&(1<<uint(i)) != 0 || !c.mayGoNext(i, done) {
+			continue
+		}
+		next, ok := c.model.Step(state, op)
+		if !ok {
+			continue
+		}
+		c.order = append(c.order, i)
+		found, err := c.search(done|(1<<uint(i)), next)
+		if err != nil || found {
+			return found, err
+		}
+		c.order = c.order[:len(c.order)-1]
+	}
+	if c.memoize {
+		c.failedConfigs[memoKey] = true
+	}
+	return false, nil
+}
+```
+
+#### Step 6: Who may go next
+
+The Java loop with `range` and the `uint` shift. The two consistency models differ only in the predicate inside the loop.
+
+```go
+func (c *Checker) mayGoNext(i int, done uint64) bool {
+	candidate := c.ops[i]
+	for j, other := range c.ops {
+		if j == i || done&(1<<uint(j)) != 0 {
+			continue
+		}
+		if c.consistency == Linearizable {
+			if other.Precedes(candidate) {
+				return false
+			}
+		} else if other.Client == candidate.Client && other.InvokedAt < candidate.InvokedAt {
+			return false
+		}
+	}
+	return true
+}
+```
+
+#### Step 7: Reporting
+
+`Describe` writes into a `strings.Builder`; `Consistency` has a `String()` method so `%s` prints `LINEARIZABLE`, and `strings.ToLower` produces the "linearizable prefix" wording.
+
+```go
+type CheckResult struct {
+	OK            bool
+	Model         Consistency
+	Order         []int
+	LongestPrefix []int
+	Explored      int
+	MemoHits      int
+}
+
+func (r CheckResult) Describe(h *History) string {
+	var sb strings.Builder
+	if r.OK {
+		fmt.Fprintf(&sb, "%s: yes. Witness order:", r.Model)
+		for _, id := range r.Order {
+			fmt.Fprintf(&sb, "\n  %s", h.Op(id))
+		}
+	} else {
+		fmt.Fprintf(&sb, "%s: NO. Longest %s prefix (%d of %d ops):", r.Model, strings.ToLower(r.Model.String()), len(r.LongestPrefix), h.Size())
+		for _, id := range r.LongestPrefix {
+			fmt.Fprintf(&sb, "\n  %s", h.Op(id))
+		}
+		sb.WriteString("\n  no remaining op can go next from here")
+	}
+	fmt.Fprintf(&sb, "\n  (%d states explored, %d memo hits)", r.Explored, r.MemoHits)
+	return sb.String()
+}
+```
+
+#### Step 8: Generating histories that must pass
+
+A package-level function rather than a static method; the `uint64` SplitMix64 wraps natively and draws the same stream, so the fifty histories match the other two languages.
+
+```go
+func GenerateLinearizable(seed int64, n, clients, window int) *History {
+	rng := NewRng(seed)
+	h := NewHistory()
+	value := 0
+	for k := 0; k < n; k++ {
+		point := 10 * (k + 1)
+		invoked := point - rng.NextInt(window)
+		returned := point + rng.NextInt(window)
+		client := fmt.Sprintf("c%d", rng.NextInt(clients))
+		if rng.NextInt(2) == 0 {
+			value = 1 + rng.NextInt(9)
+			h.Write(client, "x", value, invoked, returned)
+		} else {
+			h.Read(client, "x", value, invoked, returned)
+		}
+	}
+	return h
+}
+```
+
+#### Step 9: Run it
+
+```bash
+cd phases/06-replication-and-consensus/12-linearizability-checking/code/go
+go run .
+go test ./...
+```
+
+```console
+== 50 generated histories (20 ops, 3 clients, window 15) that are linearizable by construction ==
+  passed 50/50; most states explored by any one check: 21
+```
+
+Every other section of the output is identical to the Java and Python runs, including the memo counts.
 
 ## Use It
 

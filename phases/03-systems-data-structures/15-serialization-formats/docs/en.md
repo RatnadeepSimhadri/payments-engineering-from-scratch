@@ -159,7 +159,7 @@ Rule 5 is the one that no library enforces and the one that bites payments syste
 
 JSON is the right format for a public API and the wrong one for an internal event bus at volume, and the reasons are specific. RFC 8259 says a number is a sequence of digits with optional fraction and exponent and gives no precision guarantee; in practice every JavaScript consumer and most others parse numbers as IEEE 754 doubles, which hold integers exactly only up to 2^53 (9,007,199,254,740,992). A 64-bit id above that is corrupted on parse. The universal fix, used by Twitter (`id_str`), Stripe, and this lesson, is to send 64-bit integers as strings. Decimal amounts have the same problem with `0.1 + 0.2`; the fix from Phase 10, Lesson 01 is integer minor units, and the JSON-specific corollary is to send them as strings too once they can exceed 2^53 (about 90 trillion dollars in cents, so in practice ids are the problem and amounts are not). Binary data needs base64, a 33% expansion. Field names are repeated in every message: `"creditAccount":` is 16 bytes of the 229 in the demo's posting, and the binary encoding carries the same information in one tag byte.
 
-What JSON does give you: human readability in logs, universal parsers, no schema registry to run, and a natural model for optional fields. The size demo in this lesson shows JSON at 2.85x the binary size for a realistic posting; gzip over a batch of 10,000 messages brings the JSON below the uncompressed binary (about 310 KB against 567 KB) because the repeated field names compress almost to nothing, which is why many teams run JSON over compressed transports and never notice the overhead until the CPU cost of compressing and parsing shows up in a profile. A single message compressed alone barely shrinks (233 to 180 bytes), so the comparison depends on batching.
+What JSON does give you: human readability in logs, universal parsers, no schema registry to run, and a natural model for optional fields. The size demo in this lesson shows JSON at 2.89x the binary size for a realistic posting; gzip over a batch of 10,000 messages brings the JSON below the uncompressed binary (about 310 KB against 567 KB) because the repeated field names compress almost to nothing, which is why many teams run JSON over compressed transports and never notice the overhead until the CPU cost of compressing and parsing shows up in a profile. A single message compressed alone barely shrinks (233 to 180 bytes), so the comparison depends on batching.
 
 ### What this codec does not do
 
@@ -324,7 +324,7 @@ Expected output, abbreviated:
   id 9007199254740993 through a JSON parser that uses double -> 9007199254740992  (lost: 1)
 
 == 7. Size over 10,000 random postings ==
-  binary 566960 bytes, json 1618646 bytes, ratio 2.85x; all 10000 round-tripped
+  binary 566960 bytes, json 1638646 bytes, ratio 2.89x; all 10000 round-tripped
 
 == 8. Malformed input is an error, not a guess ==
   last 3 bytes cut off: truncated: nested message of 22 bytes at offset 70
@@ -336,22 +336,142 @@ Read section 4's first bytes against the spec: `08` is field 1 VARINT, `81 80 40
 
 ### In Python
 
-`code/python/main.py` has the same classes (`ByteSink`, `ByteSource`, `Varint`, `WireType`, `Encoder`, `Decoder`, `PostingV1`, `Audit`, `PostingV2`, `Json`) and the same `MalformedMessageException`. It produces the same 94 bytes for the sample posting and the same totals over the 10,000 seeded postings. Three things differ:
+`code/python/main.py` has the same classes (`ByteSink`, `ByteSource`, `Varint`, `WireType`, `Encoder`, `Decoder`, `PostingV1`, `Audit`, `PostingV2`, `Json`) and the same `MalformedMessageException`. It produces the same 94 bytes for the sample posting and the same totals over the 10,000 seeded postings. Three things differ. **A `long` has to be modelled:** Python integers are unbounded, so a value has no sign bit at position 63 until you give it one. Every value that is a Java `long` passes through `to_int64`, and the unsigned view is `value & MASK64`, which stands in for Java's `>>>`. Without that, `zigzag_encode(Long.MIN_VALUE)` returns `2**64 - 1` instead of `-1`, and reading `ff ... 01` returns `2**64 - 1` instead of `-1`; the tests pin both cases. Python's `>>` on a negative `int` is arithmetic, like Java's `>>`, so the ZigZag sign trick ports unchanged. **No overloading:** `ByteSink.write` takes either an `int` or `bytes`, `Decoder(...)` takes either raw bytes or a `ByteSource` slice, and `PostingV1.decode` takes bytes or a `Decoder`. Methods named `bytes` and `bool` on `Encoder` and `Decoder` keep the Java names; they shadow the built-ins only as attributes, not inside method bodies. `ByteSource.slice` is a bounded window over the same buffer, as in Java, so a nested decoder cannot read past its length prefix. **Records print like records:** `PostingV1.__str__` reproduces Java's `PostingV1[id=..., amount=...]`, so the schema-evolution line of the demo matches. `int(float(2**53 + 1))` shows the same lost unit as Java's `(long)(double)` cast. The 10,000 random postings come from `JavaRandom`, with each draw in Java's left-to-right argument order, so the binary and JSON byte totals match.
 
-- **A `long` has to be modelled.** Python integers are unbounded, so a value has no sign bit at position 63 until you give it one. Every value that is a Java `long` passes through `to_int64`, and the unsigned view is `value & MASK64`, which stands in for Java's `>>>`. Without that, `zigzag_encode(Long.MIN_VALUE)` returns `2**64 - 1` instead of `-1`, and reading `ff ... 01` returns `2**64 - 1` instead of `-1`. The tests pin both cases. Python's `>>` on a negative `int` is arithmetic, like Java's `>>`, so the ZigZag sign trick ports unchanged:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Writing and reading a varint
+
+`write_unsigned` first masks to the unsigned 64-bit view, after which `>>= 7` is the logical shift Java spells `>>>=`; `~0x7F` on a non-negative masked value tests "any bit above the low seven". `read_unsigned` keeps both overflow checks and converts the result back to a signed `long` with `to_int64`, so `ff ... 01` decodes to `-1` as in Java.
 
 ```python
-@staticmethod
-def zigzag_encode(n: int) -> int:
-    return to_int64((n << 1) ^ (n >> 63))
+    @staticmethod
+    def write_unsigned(out: ByteSink, value: int) -> None:
+        """Little-endian base-128: 7 payload bits per byte, high bit set on every byte but the last."""
+        value &= MASK64  # the unsigned view; Java's >>> does this implicitly
+        while value & ~0x7F:
+            out.write((value & 0x7F) | 0x80)
+            value >>= 7
+        out.write(value)
 
-@staticmethod
-def zigzag_decode(n: int) -> int:
-    return to_int64(((n & MASK64) >> 1) ^ -(n & 1))
+    @staticmethod
+    def read_unsigned(src: ByteSource) -> int:
+        result = 0
+        for shift in range(0, 64, 7):
+            b = src.read_byte()
+            result |= (b & 0x7F) << shift
+            if b & 0x80 == 0:
+                if shift == 63 and (b & 0x7E) != 0:
+                    raise MalformedMessageException("varint overflows 64 bits")
+                return to_int64(result)
+        raise MalformedMessageException("varint longer than 10 bytes")
 ```
 
-- **No overloading.** `ByteSink.write` takes either an `int` or `bytes`, `Decoder(...)` takes either raw bytes or a `ByteSource` slice, and `PostingV1.decode` takes bytes or a `Decoder`. Methods named `bytes` and `bool` on `Encoder` and `Decoder` keep the Java names. They shadow the built-ins only as attributes, not inside method bodies. `ByteSource.slice` is a bounded window over the same buffer, as in Java, so a nested decoder cannot read past its length prefix.
-- **Records print like records.** `PostingV1.__str__` reproduces Java's `PostingV1[id=..., amount=...]`, so the schema-evolution line of the demo matches. `int(float(2**53 + 1))` shows the same lost unit as Java's `(long)(double)` cast. The 10,000 random postings come from `JavaRandom`, with each draw in Java's left-to-right argument order, so the binary and JSON byte totals match.
+#### Step 2: ZigZag
+
+Python's `>>` on a negative int is arithmetic like Java's `>>`, so `n >> 63` is 0 or -1 as required; the encode result is truncated to a `long` with `to_int64`. Decode takes the unsigned view before the logical shift.
+
+```python
+    @staticmethod
+    def zigzag_encode(n: int) -> int:
+        """0,-1,1,-2,2 -> 0,1,2,3,4. Python's >> on a negative int is arithmetic, like Java's >>."""
+        return to_int64((n << 1) ^ (n >> 63))
+
+    @staticmethod
+    def zigzag_decode(n: int) -> int:
+        return to_int64(((n & MASK64) >> 1) ^ -(n & 1))
+```
+
+#### Step 3: Tags and the encoder
+
+`_tag` validates the field number and writes `(field << 3) | code`. Each typed writer returns `self` so calls chain like the Java builder; `bytes` and `message` keep the Java names, and `string` encodes UTF-8 before delegating.
+
+```python
+    def _tag(self, field: int, type_: WireType) -> None:
+        if field < 1 or field > 536_870_911:
+            raise ValueError(f"field number out of range: {field}")
+        Varint.write_unsigned(self.out, (field << 3) | type_.code)
+
+    def uint64(self, field: int, value: int) -> "Encoder":
+        self._tag(field, WireType.VARINT)
+        Varint.write_unsigned(self.out, value)
+        return self
+
+    def sint64(self, field: int, value: int) -> "Encoder":
+        self._tag(field, WireType.VARINT)
+        Varint.write_signed(self.out, value)
+        return self
+
+    def bytes(self, field: int, value: bytes) -> "Encoder":
+        self._tag(field, WireType.LENGTH_DELIMITED)
+        Varint.write_unsigned(self.out, len(value))
+        self.out.write(value)
+        return self
+
+    def message(self, field: int, nested: "Encoder") -> "Encoder":
+        """A nested message is just bytes: encode it separately, then write it length-delimited."""
+        return self.bytes(field, nested.to_byte_array())
+```
+
+#### Step 4: The decoder and `skip`
+
+`next` reads the tag, takes the unsigned view before shifting out the field number, and rejects field 0. `skip` dispatches on the `WireType` enum with `is` comparisons; the length-delimited arm reads the length as a varint and then that many bytes.
+
+```python
+    def next(self) -> bool:
+        """Advance to the next field. False at end of message."""
+        if not self._in.has_more():
+            return False
+        tag = Varint.read_unsigned(self._in)
+        self._field = to_int32((tag & MASK64) >> 3)
+        if self._field == 0:
+            raise MalformedMessageException("field number 0 is reserved")
+        self._type = WireType.of(tag & 0x7)
+        return True
+
+    def skip(self) -> None:
+        """Skip the current field's value using only its wire type."""
+        self.skipped += 1
+        if self._type is WireType.VARINT:
+            Varint.read_unsigned(self._in)
+        elif self._type is WireType.FIXED64:
+            self._in.read_bytes(8)
+        elif self._type is WireType.FIXED32:
+            self._in.read_bytes(4)
+        elif self._type is WireType.LENGTH_DELIMITED:
+            self._in.read_bytes(to_int32(Varint.read_unsigned(self._in)))
+```
+
+#### Step 5: Two schema versions of a posting
+
+`decode` accepts bytes or a `Decoder` (the Java overload pair) and runs the generated-parser loop: read a tag, dispatch on the field number with an `if`/`elif` chain, default to `skip`. The post-loop currency check is unchanged.
+
+```python
+    @staticmethod
+    def decode(source: Union[bytes, Decoder]) -> "PostingV1":
+        d = source if isinstance(source, Decoder) else Decoder(source)
+        id_ = minor = 0
+        currency = debit = credit = ""
+        while d.next():
+            f = d.field()
+            if f == PostingV1.F_ID:
+                id_ = d.uint64()
+            elif f == PostingV1.F_AMOUNT:
+                minor = d.sint64()
+            elif f == PostingV1.F_CURRENCY:
+                currency = d.string()
+            elif f == PostingV1.F_DEBIT:
+                debit = d.string()
+            elif f == PostingV1.F_CREDIT:
+                credit = d.string()
+            else:
+                d.skip()  # a field from the future: preserve nothing, break nothing
+        if not currency:
+            raise MalformedMessageException("posting without a currency")
+        return PostingV1(id_, Money.of_minor(minor, Currency.of(currency)), debit, credit)
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/03-systems-data-structures/15-serialization-formats/code/python
@@ -359,26 +479,216 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== 1. Varints: 7 bits per byte, little-endian, continuation bit ==
+                     0 -> 00                             (1 byte)
+                     1 -> 01                             (1 byte)
+                   127 -> 7f                             (1 byte)
+                   128 -> 80 01                          (2 bytes)
+
+== 7. Size over 10,000 random postings ==
+  binary 566960 bytes, json 1638646 bytes, ratio 2.89x; all 10000 round-tripped
+```
+
+The 94-byte posting, the spec vectors, and both totals in section 7 are the same numbers the Java program prints.
+
 ### In Go
 
-`code/go/main.go` has the same types (`ByteSink`, `ByteSource`, the `Varint` functions, `WireType`, `Encoder`, `Decoder`, `PostingV1`, `Audit`, `PostingV2`, and the `Json` functions) and produces the same 94 bytes for the sample posting and the same totals over the 10,000 seeded postings. The spec vectors (`08 96 01`, `12 07 74 65 73 74 69 6e 67`, `1a 03 08 96 01`) are pinned in `main_test.go` as the cross-language contract. Three things differ:
+`code/go/main.go` has the same types (`ByteSink`, `ByteSource`, the `Varint` functions, `WireType`, `Encoder`, `Decoder`, `PostingV1`, `Audit`, `PostingV2`, and the `Json` functions) and produces the same 94 bytes for the sample posting and the same totals over the 10,000 seeded postings. The spec vectors (`08 96 01`, `12 07 74 65 73 74 69 6e 67`, `1a 03 08 96 01`) are pinned in `main_test.go` as the cross-language contract. Three things differ. **Unsigned is a type, not a view:** Java carries unsigned varints in a `long` and reads them with `>>>`; Go gives them their own type, so `WriteUnsigned` takes a `uint64` and `ZigzagEncode(int64) uint64` has no sign bit to misread. Java's `writeUnsigned(-1)` is `WriteUnsigned(math.MaxUint64)` here, and the ZigZag table's "all ones" is `math.MaxUint64` instead of `-1L`. **Malformed input is an error value:** every read on `ByteSource` and `Decoder` returns `(value, error)`, and every failure wraps `ErrMalformed`, so the decode loops check `err` after each field and the tests use `errors.Is(err, ErrMalformed)`. The `Encoder` keeps the Java builder chain by remembering the first invalid field number and reporting it from `ToByteArray() ([]byte, error)`; the constant field numbers in `Encode` cannot fail, so those discard the error. **No overloading, no null:** `ByteSink.Write` takes a byte and `WriteBytes` a slice; `NewDecoder` takes bytes and `NewDecoderFrom` a `*ByteSource` view, which is a bounded window over the same buffer so a nested decoder cannot read past its length prefix. `PostingV2.Audit` is a `*Audit` so that "absent" is `nil`, which is why `PostingV2` has an `Equal` method instead of relying on `==`. `0.1 + 0.2` is computed from variables because Go folds constant expressions exactly and would print `0.3`. The 10,000 random postings come from `JavaRandom` (`javarandom.go`), with each draw in Java's left-to-right argument order, so the binary and JSON byte totals match.
 
-- **Unsigned is a type, not a view.** Java carries unsigned varints in a `long` and reads them with `>>>`; Go gives them their own type, so `WriteUnsigned` takes a `uint64` and `ZigzagEncode(int64) uint64` has no sign bit to misread. Java's `writeUnsigned(-1)` is `WriteUnsigned(math.MaxUint64)` here, and the ZigZag table's "all ones" is `math.MaxUint64` instead of `-1L`:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Writing and reading a varint
+
+With a `uint64` the writer is the Java loop with `&^` (bit clear) for `& ~0x7FL` and a plain `>>=`. The reader returns `(uint64, error)`; `malformed(...)` builds an error wrapping `ErrMalformed`, and a short read from `ByteSource` propagates as the same kind of error.
 
 ```go
+func WriteUnsigned(out *ByteSink, value uint64) {
+	for value&^0x7F != 0 {
+		out.Write(byte(value&0x7F | 0x80))
+		value >>= 7
+	}
+	out.Write(byte(value))
+}
+
+func ReadUnsigned(in *ByteSource) (uint64, error) {
+	var result uint64
+	for shift := 0; shift < 64; shift += 7 {
+		b, err := in.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		result |= uint64(b&0x7F) << shift
+		if b&0x80 == 0 {
+			if shift == 63 && b&0x7E != 0 {
+				return 0, malformed("varint overflows 64 bits")
+			}
+			return result, nil
+		}
+	}
+	return 0, malformed("varint longer than 10 bytes")
+}
+```
+
+#### Step 2: ZigZag
+
+The signed-to-unsigned mapping is in the types: `n >> 63` on an `int64` is arithmetic, the conversion to `uint64` reinterprets the bits, and decode shifts the `uint64` logically before converting back.
+
+```go
+// ZigzagEncode maps signed to unsigned so small negatives stay small: 0,-1,1,-2,2 -> 0,1,2,3,4.
 func ZigzagEncode(n int64) uint64 { return uint64((n << 1) ^ (n >> 63)) }
 
 func ZigzagDecode(n uint64) int64 { return int64(n>>1) ^ -int64(n&1) }
 ```
 
-- **Malformed input is an error value.** Every read on `ByteSource` and `Decoder` returns `(value, error)`, and every failure wraps `ErrMalformed`, so the decode loops check `err` after each field and the tests use `errors.Is(err, ErrMalformed)`. The `Encoder` keeps the Java builder chain by remembering the first invalid field number and reporting it from `ToByteArray() ([]byte, error)`; the constant field numbers in `Encode` cannot fail, so those discard the error.
-- **No overloading, no null.** `ByteSink.Write` takes a byte and `WriteBytes` a slice; `NewDecoder` takes bytes and `NewDecoderFrom` a `*ByteSource` view, which is a bounded window over the same buffer so a nested decoder cannot read past its length prefix. `PostingV2.Audit` is a `*Audit` so that "absent" is `nil`, which is why `PostingV2` has an `Equal` method instead of relying on `==`. `0.1 + 0.2` is computed from variables because Go folds constant expressions exactly and would print `0.3`. The 10,000 random postings come from `JavaRandom` (`javarandom.go`), with each draw in Java's left-to-right argument order, so the binary and JSON byte totals match.
+#### Step 3: Tags and the encoder
+
+To keep the chainable builder without exceptions, `tag` records the first bad field number in `e.err` and returns `false`, after which every writer becomes a no-op and `ToByteArray` reports the error. `Message` encodes the nested builder and forwards its error the same way.
+
+```go
+func (e *Encoder) tag(field int, t WireType) bool {
+	if e.err != nil {
+		return false
+	}
+	if field < 1 || field > 536_870_911 {
+		e.err = fmt.Errorf("%w: field number out of range: %d", ErrInvalidArgument, field)
+		return false
+	}
+	WriteUnsigned(&e.out, uint64(field)<<3|uint64(t))
+	return true
+}
+
+func (e *Encoder) Uint64(field int, value uint64) *Encoder {
+	if e.tag(field, VARINT) {
+		WriteUnsigned(&e.out, value)
+	}
+	return e
+}
+
+func (e *Encoder) Sint64(field int, value int64) *Encoder {
+	if e.tag(field, VARINT) {
+		WriteSigned(&e.out, value)
+	}
+	return e
+}
+
+func (e *Encoder) Bytes(field int, value []byte) *Encoder {
+	if e.tag(field, LENGTH_DELIMITED) {
+		WriteUnsigned(&e.out, uint64(len(value)))
+		e.out.WriteBytes(value)
+	}
+	return e
+}
+
+func (e *Encoder) String(field int, value string) *Encoder { return e.Bytes(field, []byte(value)) }
+```
+
+#### Step 4: The decoder and `skip`
+
+`Next` returns `(more, error)` so a decode loop can tell "end of message" from "corrupt tag". `Skip` is a `switch` whose arms return the error of the read they perform; `LENGTH_DELIMITED` is the `default` arm.
+
+```go
+func (d *Decoder) Next() (bool, error) {
+	if !d.in.HasMore() {
+		return false, nil
+	}
+	tag, err := ReadUnsigned(d.in)
+	if err != nil {
+		return false, err
+	}
+	d.field = int(tag >> 3)
+	if d.field == 0 {
+		return false, malformed("field number 0 is reserved")
+	}
+	if d.typ, err = WireTypeOf(int(tag & 0x7)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (d *Decoder) Skip() error {
+	d.Skipped++
+	switch d.typ {
+	case VARINT:
+		_, err := ReadUnsigned(d.in)
+		return err
+	case FIXED64:
+		_, err := d.in.ReadBytes(8)
+		return err
+	case FIXED32:
+		_, err := d.in.ReadBytes(4)
+		return err
+	default: // LENGTH_DELIMITED
+		n, err := ReadUnsigned(d.in)
+		if err != nil {
+			return err
+		}
+		_, err = d.in.ReadBytes(int(n))
+		return err
+	}
+}
+```
+
+#### Step 5: Two schema versions of a posting
+
+The generated-parser loop in Go: `Next` is called at the top of an infinite `for`, the `switch` assigns both the value and `err`, and one `if err != nil` after the switch covers every arm including `Skip`. The missing-currency check returns a `malformed` error.
+
+```go
+func DecodePostingV1From(d *Decoder) (PostingV1, error) {
+	var id uint64
+	var minor int64
+	currency, debit, credit := "", "", ""
+	for {
+		more, err := d.Next()
+		if err != nil {
+			return PostingV1{}, err
+		}
+		if !more {
+			break
+		}
+		switch d.Field() {
+		case F_ID:
+			id, err = d.Uint64()
+		case F_AMOUNT:
+			minor, err = d.Sint64()
+		case F_CURRENCY:
+			currency, err = d.String()
+		case F_DEBIT:
+			debit, err = d.String()
+		case F_CREDIT:
+			credit, err = d.String()
+		default:
+			err = d.Skip() // a field from the future: preserve nothing, break nothing
+		}
+		if err != nil {
+			return PostingV1{}, err
+		}
+	}
+	if currency == "" {
+		return PostingV1{}, malformed("posting without a currency")
+	}
+	return PostingV1{id, OfMinor(minor, CurrencyOf(currency)), debit, credit}, nil
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/03-systems-data-structures/15-serialization-formats/code/go
 go run .
 go test ./...
 ```
+
+```console
+== 7. Size over 10,000 random postings ==
+  binary 566960 bytes, json 1638646 bytes, ratio 2.89x; all 10000 round-tripped
+
+== 8. Malformed input is an error, not a guess ==
+  last 3 bytes cut off: truncated: nested message of 22 bytes at offset 70
+  type changed on field 2: field 2: expected VARINT but found LENGTH_DELIMITED
+```
+
+Sections 1 through 6 print the same varints, tags, 94-byte posting, and schema-evolution lines as the Java program.
 
 ## Use It
 

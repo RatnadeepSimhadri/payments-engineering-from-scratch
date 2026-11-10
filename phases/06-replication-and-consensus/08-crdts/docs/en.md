@@ -338,56 +338,438 @@ The test prints `37 passed, 0 failed`.
 
 ### In Python
 
+`code/python/main.py` has the same types and method names, with four differences. **Overflow is checked by hand:** Python integers are unbounded, so a G-Counter slot could silently grow past `Long.MAX_VALUE` where the Java one throws; `add_exact` and `subtract_exact` keep the 64-bit contract, and the test "gcounter overflow is an error" expects `ArithmeticError` exactly as the Java test expects `ArithmeticException` (`OverflowError` is a subclass). **`java.util.Random` is ported bit for bit:** the property checks draw their random states from `JavaRandom` (the 48-bit LCG with `next(bits)`, `next_int(bound)` and `next_boolean`), and `java_shuffle` is `Collections.shuffle`, so with the same seed the Python version draws the same 500 states and prints the same `493 failures` for the naive sum counter. **Structural equality is explicit:** the CRDTs are mutable (`increment`, `add`), so they define `__eq__` over their internal `dict`s and `set`s rather than being frozen dataclasses; `Tag` and `LWWRegister` are frozen dataclasses, so tags are hashable set members, and the `Crdt` interface is a `Protocol` with one method, `merge`. **Sorted printing:** `fmt_map` reproduces `TreeMap.toString()` (`{A=3, B=6}`) and `ORSet.elements()` returns a sorted list, so the demo output matches the Java line for line.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The interface
+
+Python has no self-referential generic bound, so the contract is a `Protocol` with a single `merge` method; any class that defines `merge` satisfies it structurally, and `CrdtLaws.check` accepts a generator of such values. The overflow helpers that every counter uses live beside it.
+
 ```python
 def add_exact(a: int, b: int) -> int:
     r = a + b
     if r < LONG_MIN or r > LONG_MAX:
         raise OverflowError("long overflow")
     return r
+
+
+class Crdt(Protocol):
+    def merge(self, other): ...
 ```
 
-`code/python/main.py` has the same types and method names; what differs:
+#### Step 2: G-Counter
 
-- **Overflow is checked by hand.** Python integers are unbounded, so a G-Counter slot could silently grow past `Long.MAX_VALUE` where the Java one throws. `add_exact` and `subtract_exact` keep the 64-bit contract, and the test "gcounter overflow is an error" expects `ArithmeticError` exactly as the Java test expects `ArithmeticException`.
-- **`java.util.Random` is ported bit for bit.** The property checks draw their random states from `JavaRandom` (the 48-bit LCG with `next(bits)`, `next_int(bound)` and `next_boolean`), and `java_shuffle` is `Collections.shuffle`. With the same seed the Python version draws the same 500 states, so the demo prints the same `493 failures` for the naive sum counter.
-- **Structural equality is explicit.** The CRDTs are mutable (`increment`, `add`), so they define `__eq__` over their internal `dict`s and `set`s rather than being frozen dataclasses; `Tag` and `LWWRegister` are frozen dataclasses, so tags are hashable set members. The `Crdt` interface is a `Protocol` with one method, `merge`.
-- **Sorted printing.** `fmt_map` reproduces `TreeMap.toString()` (`{A=3, B=6}`), and `ORSet.elements()` returns a sorted list, so the demo output matches the Java line for line.
+Slots live in a plain `dict`; `increment` goes through `add_exact` so the 64-bit discipline survives the port, and rejects negatives with `ValueError`. `merge` copies our slots into a new counter and takes the per-key maximum, keeping keys that only the other side has. `__eq__` compares the dicts, which is what lets the law checker use `!=`.
 
-Run it from `code/python/`:
+```python
+class GCounter:
+    def __init__(self, initial: Optional[dict[str, int]] = None) -> None:
+        self._slots: dict[str, int] = dict(initial or {})
+
+    def increment(self, replica: str, by: int) -> None:
+        if by < 0:
+            raise ValueError(f"a G-Counter only grows; got {by}")
+        self._slots[replica] = add_exact(self._slots.get(replica, 0), by)
+
+    def value(self) -> int:
+        total = 0
+        for v in self._slots.values():
+            total = add_exact(total, v)
+        return total
+
+    def merge(self, other: "GCounter") -> "GCounter":
+        out = GCounter(self._slots)
+        for k, v in other._slots.items():
+            out._slots[k] = max(out._slots[k], v) if k in out._slots else v
+        return out
+
+    def __eq__(self, o: object) -> bool:
+        return isinstance(o, GCounter) and self._slots == o._slots
+```
+
+#### Step 3: PN-Counter as a product
+
+Two G-Counters, defaulted to fresh ones when the constructor is called without arguments. `value` uses `subtract_exact`, and `merge` and `__eq__` are componentwise.
+
+```python
+class PNCounter:
+    def __init__(self, p: Optional[GCounter] = None, n: Optional[GCounter] = None) -> None:
+        self.positive = p if p is not None else GCounter()
+        self.negative = n if n is not None else GCounter()
+
+    def increment(self, replica: str, by: int) -> None:
+        self.positive.increment(replica, by)
+
+    def decrement(self, replica: str, by: int) -> None:
+        self.negative.increment(replica, by)
+
+    def value(self) -> int:
+        return subtract_exact(self.positive.value(), self.negative.value())
+
+    def merge(self, other: "PNCounter") -> "PNCounter":
+        return PNCounter(self.positive.merge(other.positive), self.negative.merge(other.negative))
+
+    def __eq__(self, o: object) -> bool:
+        return isinstance(o, PNCounter) and self.positive == o.positive and self.negative == o.negative
+```
+
+#### Step 4: OR-Set with unique tags
+
+`Tag` is a frozen, ordered dataclass so it can sit in a `set`. `_added` maps element to a set of tags; `remove` unions only the locally observed tags into `_tombstones` (`|=`), which is the add-wins line. `merge` deep-copies our tag sets, unions in the other side's with `setdefault(...).update(...)`, and unions the tombstones.
+
+```python
+@dataclass(frozen=True, order=True)
+class Tag:
+    replica: str
+    seq: int
+
+
+class ORSet(Generic[T]):
+    def __init__(self) -> None:
+        self._added: dict = {}
+        self._tombstones: set[Tag] = set()
+
+    def add(self, e: T, tags: TagSource) -> Tag:
+        t = tags.next()
+        self._added.setdefault(e, set()).add(t)
+        return t
+
+    def remove(self, e: T) -> None:
+        tags = self._added.get(e)
+        if tags is not None:
+            self._tombstones |= tags
+
+    def contains(self, e: T) -> bool:
+        tags = self._added.get(e)
+        if tags is None:
+            return False
+        return any(t not in self._tombstones for t in tags)
+
+    def merge(self, other: "ORSet[T]") -> "ORSet[T]":
+        out: ORSet[T] = ORSet()
+        for k, v in self._added.items():
+            out._added[k] = set(v)
+        for k, v in other._added.items():
+            out._added.setdefault(k, set()).update(v)
+        out._tombstones = self._tombstones | other._tombstones
+        return out
+```
+
+#### Step 5: LWW-Register and the replicated balance
+
+`LWWRegister` is a frozen dataclass, so `merge` returning `self` or `other` is safe and equality is structural. `dominates` compares timestamps, then replica ids as strings. `ReplicatedBalance` wraps a `PNCounter` in the `Money` discipline: `_require_currency` raises `CurrencyMismatchException` (a `ValueError`) and rejects negative amounts, `debit` performs no balance check, and `merge` refuses to combine currencies.
+
+```python
+@dataclass(frozen=True)
+class LWWRegister(Generic[T]):
+    value: T
+    timestamp: int
+    replica: str
+
+    def dominates(self, other: "LWWRegister[T]") -> bool:
+        if self.timestamp != other.timestamp:
+            return self.timestamp > other.timestamp
+        return self.replica > other.replica
+
+    def merge(self, other: "LWWRegister[T]") -> "LWWRegister[T]":
+        return self if self.dominates(other) else other
+```
+
+```python
+    def credit(self, replica: str, amount: Money) -> None:
+        self._require_currency(amount)
+        self.counter.increment(replica, amount.minor_units)
+
+    def debit(self, replica: str, amount: Money) -> None:
+        self._require_currency(amount)
+        self.counter.decrement(replica, amount.minor_units)
+
+    def balance(self) -> Money:
+        return Money.of_minor(self.counter.value(), self.currency)
+
+    def merge(self, other: "ReplicatedBalance") -> "ReplicatedBalance":
+        if other.currency != self.currency:
+            raise CurrencyMismatchException(self.currency, other.currency)
+        return ReplicatedBalance(self.currency, self.counter.merge(other.counter))
+```
+
+#### Step 6: Property-style law checking
+
+`check` takes any zero-argument callable that produces a CRDT value and counts failures of each law with `!=`, which dispatches to the `__eq__` each type defines. The generator closes over a `JavaRandom`, so the states match the Java run; `converges` uses `java_shuffle` for the all-to-all merge orders.
+
+```python
+    @staticmethod
+    def check(gen: Callable[[], Crdt], trials: int) -> Result:
+        comm = assoc = idem = 0
+        for _ in range(trials):
+            a, b, c = gen(), gen(), gen()
+            if a.merge(b) != b.merge(a):
+                comm += 1
+            if a.merge(b).merge(c) != a.merge(b.merge(c)):
+                assoc += 1
+            if a.merge(a) != a:
+                idem += 1
+        return Result(trials, comm, assoc, idem)
+```
+
+#### Step 7: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/08-crdts/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+With the ported `java.util.Random`, the property section matches the Java numbers:
+
+```console
+== Merge laws, property-style (seed 20261013) ==
+G-Counter  500 trials: commutative ok, associative ok, idempotent ok
+PN-Counter 500 trials: commutative ok, associative ok, idempotent ok
+OR-Set     500 trials: commutative ok, associative ok, idempotent ok
+NaiveSum   500 trials: commutative ok, associative ok, idempotent 493 failures  <- merge by addition is not a join
+5 PN-Counter replicas, all-to-all merge in shuffled orders, converge: true
+```
+
 ### In Go
+
+`code/go/main.go` has the same types and method names, with four differences. **The self-referential interface is a generic constraint:** Java's `Crdt<T extends Crdt<T>>` becomes `Crdt[T any]` with `Merge(T) T` and `Equal(T) bool`, and `Check[T Crdt[T]]` and `Converges[T Crdt[T]]` take any type whose methods close over itself; `GSet[E cmp.Ordered]` and `ORSet[E cmp.Ordered]` are generic in the element so `Elements()` can be sorted, and `LWWRegister[V comparable]` gets `Equal` from `==`. **Overflow and bad input are errors:** `Increment`, `Credit`, and `Debit` return `error`, and the sentinels `ErrOverflow`, `ErrNegativeIncrement`, `ErrCurrencyMismatch`, and `ErrNegativeAmount` are checked with `errors.Is`; `addExact` and `subtractExact` are the Phase 10 helpers, and because `Merge` has no error slot a currency mismatch there is a programming error and panics. **`java.util.Random` is ported bit for bit:** `JavaRandom` is the 48-bit LCG with `next(bits)`, `NextInt(bound)` (power-of-two shortcut plus the rejection loop) and `NextBoolean`, and `Shuffle` is `Collections.shuffle`, so with the same seed the Go demo draws the same 500 states and prints the same `493 failures` for the naive sum counter. **Maps have no order and no structural equality:** every CRDT defines `Equal` over its maps by hand, `fmtMap` reproduces `TreeMap.toString()` (`{A=3, B=6}`) by sorting keys, and `GCounter.Merge` keeps a slot that is present at 0, exactly as `TreeMap.merge` would, or the commutativity check fails on states that differ only by an empty slot.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The interface
+
+Go generics express the recursive bound as a type parameter used in the method signatures. `Equal` is part of the interface because Go has no `equals()` on maps, and the law checker needs structural equality for every type. The two sentinel errors replace Java's `ArithmeticException` and `IllegalArgumentException`.
 
 ```go
 type Crdt[T any] interface {
-    Merge(other T) T
-    Equal(other T) bool
+	Merge(other T) T
+	Equal(other T) bool
 }
 
-func Check[T Crdt[T]](gen func() T, trials int) Result {
-    for i := 0; i < trials; i++ {
-        a, b, c := gen(), gen(), gen()
-        if !a.Merge(b).Equal(b.Merge(a)) { comm++ }
-        ...
+// ErrOverflow is Java's ArithmeticException from Math.addExact / subtractExact.
+var ErrOverflow = errors.New("long overflow")
+
+// ErrNegativeIncrement: a G-Counter only grows.
+var ErrNegativeIncrement = errors.New("a G-Counter only grows")
 ```
 
-`code/go/main.go` has the same types and method names; what differs:
+#### Step 2: G-Counter
 
-- **The self-referential interface is a generic constraint.** Java's `Crdt<T extends Crdt<T>>` becomes `Crdt[T any]` with `Merge(T) T` and `Equal(T) bool`, and `Check[T Crdt[T]]` and `Converges[T Crdt[T]]` take any type whose methods close over itself. `GSet[E cmp.Ordered]` and `ORSet[E cmp.Ordered]` are generic in the element so `Elements()` can be sorted; `LWWRegister[V comparable]` gets `Equal` from `==`.
-- **Overflow and bad input are errors.** `Increment`, `Credit`, and `Debit` return `error`; the sentinels `ErrOverflow`, `ErrNegativeIncrement`, `ErrCurrencyMismatch`, and `ErrNegativeAmount` are checked with `errors.Is`. `addExact` and `subtractExact` are the Phase 10 helpers. `Merge` has no error slot, so a currency mismatch there is a programming error and panics.
-- **`java.util.Random` is ported bit for bit.** `JavaRandom` is the 48-bit LCG with `next(bits)`, `NextInt(bound)` (power-of-two shortcut plus the rejection loop) and `NextBoolean`; `Shuffle` is `Collections.shuffle`. With the same seed the Go demo draws the same 500 states and prints the same `493 failures` for the naive sum counter.
-- **Maps have no order and no structural equality.** Every CRDT defines `Equal` over its maps by hand, `fmtMap` reproduces `TreeMap.toString()` (`{A=3, B=6}`) by sorting keys, and `GCounter.Merge` keeps a slot that is present at 0, exactly as `TreeMap.merge` would, or the commutativity check fails on states that differ only by an empty slot.
+`Increment` returns an error for a negative delta or an overflow. `Merge` starts from a copy of our slots and overwrites a key when it is missing or the other side's value is larger; the `!ok` branch is what keeps a zero-valued slot present. `Equal` compares lengths and then every key.
 
-Run it from `code/go/`:
+```go
+type GCounter struct{ slots map[string]int64 }
+
+func (g *GCounter) Increment(replica string, by int64) error {
+	if by < 0 {
+		return fmt.Errorf("%w; got %d", ErrNegativeIncrement, by)
+	}
+	sum, err := addExact(g.slots[replica], by)
+	if err != nil {
+		return err
+	}
+	g.slots[replica] = sum
+	return nil
+}
+
+func (g *GCounter) Merge(other *GCounter) *GCounter {
+	out := NewGCounterFrom(g.slots)
+	for k, v := range other.slots {
+		if cur, ok := out.slots[k]; !ok || v > cur { // a slot at 0 still exists, as TreeMap.merge would keep it
+			out.slots[k] = v
+		}
+	}
+	return out
+}
+
+func (g *GCounter) Equal(other *GCounter) bool {
+	if len(g.slots) != len(other.slots) {
+		return false
+	}
+	for k, v := range g.slots {
+		if ov, ok := other.slots[k]; !ok || ov != v {
+			return false
+		}
+	}
+	return true
+}
+```
+
+#### Step 3: PN-Counter as a product
+
+Two `*GCounter` fields. `Increment` and `Decrement` forward the error; `Value` panics on an overflow of the difference because a value accessor has no error slot and the invariant is already broken. `Merge` and `Equal` are componentwise.
+
+```go
+type PNCounter struct {
+	Positive *GCounter
+	Negative *GCounter
+}
+
+func (c *PNCounter) Increment(replica string, by int64) error {
+	return c.Positive.Increment(replica, by)
+}
+func (c *PNCounter) Decrement(replica string, by int64) error {
+	return c.Negative.Increment(replica, by)
+}
+
+func (c *PNCounter) Value() int64 {
+	v, err := subtractExact(c.Positive.Value(), c.Negative.Value())
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+func (c *PNCounter) Merge(other *PNCounter) *PNCounter {
+	return &PNCounter{c.Positive.Merge(other.Positive), c.Negative.Merge(other.Negative)}
+}
+
+func (c *PNCounter) Equal(other *PNCounter) bool {
+	return c.Positive.Equal(other.Positive) && c.Negative.Equal(other.Negative)
+}
+```
+
+#### Step 4: OR-Set with unique tags
+
+`Tag` is a comparable struct, so it can key a `map[Tag]bool`, which is how both the per-element tag sets and the tombstones are stored. Ranging over a nil inner map is a no-op, so `Remove` and `Contains` need no nil checks. `Merge` loops over both sources and unions tags and tombstones into a fresh set.
+
+```go
+type ORSet[E cmp.Ordered] struct {
+	added      map[E]map[Tag]bool
+	tombstones map[Tag]bool
+}
+
+func (s *ORSet[E]) Add(e E, tags *TagSource) Tag {
+	t := tags.Next()
+	if s.added[e] == nil {
+		s.added[e] = map[Tag]bool{}
+	}
+	s.added[e][t] = true
+	return t
+}
+
+func (s *ORSet[E]) Remove(e E) {
+	for t := range s.added[e] {
+		s.tombstones[t] = true
+	}
+}
+
+func (s *ORSet[E]) Contains(e E) bool {
+	for t := range s.added[e] {
+		if !s.tombstones[t] {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *ORSet[E]) Merge(other *ORSet[E]) *ORSet[E] {
+	out := NewORSet[E]()
+	for _, src := range []*ORSet[E]{s, other} {
+		for e, tags := range src.added {
+			if out.added[e] == nil {
+				out.added[e] = map[Tag]bool{}
+			}
+			for t := range tags {
+				out.added[e][t] = true
+			}
+		}
+		for t := range src.tombstones {
+			out.tombstones[t] = true
+		}
+	}
+	return out
+}
+```
+
+#### Step 5: LWW-Register and the replicated balance
+
+`LWWRegister[V comparable]` is a value struct whose `Equal` is `==`. `ReplicatedBalance` returns errors from `Credit` and `Debit` (currency mismatch, negative amount, overflow) and panics in `Merge` on a currency mismatch, since `Merge` cannot return an error without breaking the `Crdt` interface.
+
+```go
+func (r LWWRegister[V]) Dominates(other LWWRegister[V]) bool {
+	if r.Timestamp != other.Timestamp {
+		return r.Timestamp > other.Timestamp
+	}
+	return r.Replica > other.Replica
+}
+
+func (r LWWRegister[V]) Merge(other LWWRegister[V]) LWWRegister[V] {
+	if r.Dominates(other) {
+		return r
+	}
+	return other
+}
+
+func (r LWWRegister[V]) Equal(other LWWRegister[V]) bool { return r == other }
+```
+
+```go
+func (b *ReplicatedBalance) Credit(replica string, amount Money) error {
+	if err := b.requireCurrency(amount); err != nil {
+		return err
+	}
+	return b.Counter.Increment(replica, amount.MinorUnits)
+}
+
+func (b *ReplicatedBalance) Debit(replica string, amount Money) error {
+	if err := b.requireCurrency(amount); err != nil {
+		return err
+	}
+	return b.Counter.Decrement(replica, amount.MinorUnits)
+}
+
+func (b *ReplicatedBalance) Balance() Money { return OfMinor(b.Counter.Value(), b.Currency) }
+
+func (b *ReplicatedBalance) Merge(other *ReplicatedBalance) *ReplicatedBalance {
+	if other.Currency != b.Currency {
+		panic(fmt.Sprintf("%v: cannot combine %s with %s", ErrCurrencyMismatch, b.Currency.Code, other.Currency.Code))
+	}
+	return &ReplicatedBalance{b.Currency, b.Counter.Merge(other.Counter)}
+}
+```
+
+#### Step 6: Property-style law checking
+
+`Check` is a generic function constrained by `Crdt[T]`, so the same body serves counters, sets, and the naive counter. It calls the type's own `Equal` where Java calls `equals`.
+
+```go
+func Check[T Crdt[T]](gen func() T, trials int) Result {
+	comm, assoc, idem := 0, 0, 0
+	for i := 0; i < trials; i++ {
+		a, b, c := gen(), gen(), gen()
+		if !a.Merge(b).Equal(b.Merge(a)) {
+			comm++
+		}
+		if !a.Merge(b).Merge(c).Equal(a.Merge(b.Merge(c))) {
+			assoc++
+		}
+		if !a.Merge(a).Equal(a) {
+			idem++
+		}
+	}
+	return Result{trials, comm, assoc, idem}
+}
+```
+
+#### Step 7: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/08-crdts/code/go
 go run .
 go test ./...
 ```
+
+```console
+PN-Counter 500 trials: commutative ok, associative ok, idempotent ok
+OR-Set     500 trials: commutative ok, associative ok, idempotent ok
+NaiveSum   500 trials: commutative ok, associative ok, idempotent 493 failures  <- merge by addition is not a join
+5 PN-Counter replicas, all-to-all merge in shuffled orders, converge: true
+```
+
+The rest of the output is identical to the Java run; `fmtMap` is what makes `GCounter{A=3, B=6, C=2}=11` print in the same key order.
 
 ## Use It
 

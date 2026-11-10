@@ -426,43 +426,537 @@ Count the characters in any line: 94. Read the Batch Control line against the la
 
 ### In Python
 
-```python
-@dataclass(frozen=True)
-class Batch:
-    header: BatchHeader
-    entries: tuple[EntryDetail, ...]
+The Python port keeps every record type and method name, with four differences. **Frozen dataclasses stand in for records:** trace assignment in the `Batch` constructor needs `object.__setattr__` because the dataclass is frozen, and `dataclasses.replace` implements `with_addenda` and `with_trace`. **No integer overflow**, so `entry_hash` is a plain `sum(...) % HASH_MODULUS`; the modulus still matters, because it is the format's rule, not a workaround for a 64-bit limit. **Enums carry the code as their value:** `TransactionCode(27)` and `SecCode("WEB")` parse directly, and the parser wraps the `ValueError` from an unknown SEC code into a `NachaFormatError` so callers catch one type. **The clock is a callable** (`Callable[[], datetime]`) rather than `java.time.Clock`; the demo passes `fixed_clock`. `NachaFormatError` extends `ValueError`.
 
-    def __post_init__(self) -> None:
-        traced = tuple(e if e.trace_number else e.with_trace(self.header.odfi_id, i + 1) for i, e in enumerate(self.entries))
-        object.__setattr__(self, "entries", traced)
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Fixed-width fields with the spec's own numbering
+
+The same three decisions: `alpha` truncates and space-fills with `ljust`, `numeric` refuses a value that does not fit and zero-fills with `rjust`, and `field` takes 1-based inclusive positions so the slice is `line[start - 1 : end]`. `require94` is the last call in every `to_line`.
+
+```python
+class Fixed:
+    @staticmethod
+    def alpha(value: Optional[str], width: int) -> str:
+        """Alphameric: left-justify, space-fill, truncate, uppercase."""
+        s = (value or "").upper()[:width]
+        return s.ljust(width)
+
+    @staticmethod
+    def numeric(value: int, width: int) -> str:
+        """Numeric: right-justify, zero-fill; a value that does not fit is an error, never truncated."""
+        if value < 0:
+            raise NachaFormatError(f"numeric field cannot be negative: {value}")
+        s = str(value)
+        if len(s) > width:
+            raise NachaFormatError(f"value {value} does not fit in {width} digits")
+        return s.rjust(width, "0")
+
+    @staticmethod
+    def field(line: str, start: int, end: int) -> str:
+        """Characters start..end inclusive, 1-based, exactly as the Nacha layout tables number them."""
+        return line[start - 1 : end]
+
+    @staticmethod
+    def require94(line: str) -> str:
+        if len(line) != 94:
+            raise NachaFormatError(f"record must be 94 characters, got {len(line)}: {line!r}")
+        return line
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The routing number check digit
 
-- **Frozen dataclasses stand in for records.** Trace assignment in the constructor needs `object.__setattr__` because the dataclass is frozen; `dataclasses.replace` implements `with_addenda` and `with_trace`.
-- **No integer overflow**, so `entry_hash` is a plain `sum(...) % HASH_MODULUS`. The modulus still matters: it is the format's rule, not a workaround for a 64-bit limit.
-- **Enums carry the code as their value.** `TransactionCode(27)` and `SecCode("WEB")` parse directly; the parser wraps the `ValueError` from an unknown SEC code into a `NachaFormatError` so callers catch one type.
-- **The clock is a callable** (`Callable[[], datetime]`) rather than `java.time.Clock`; the demo passes `fixed_clock`.
+`zip(WEIGHTS, first8)` pairs each weight with its digit; the outer `% 10` turns a sum that is already a multiple of ten into a `0` check digit. `require` is what every record constructor calls.
+
+```python
+class RoutingNumber:
+    WEIGHTS = (3, 7, 1, 3, 7, 1, 3, 7)
+
+    @staticmethod
+    def check_digit(first8: str) -> int:
+        """The ninth digit that makes the weighted sum of all nine digits a multiple of ten."""
+        if len(first8) != 8 or not first8.isdigit():
+            raise NachaFormatError(f"routing prefix must be 8 digits: {first8!r}")
+        total = sum(w * int(d) for w, d in zip(RoutingNumber.WEIGHTS, first8))
+        return (10 - total % 10) % 10
+
+    @staticmethod
+    def is_valid(routing: str) -> bool:
+        if len(routing) != 9 or not routing.isdigit():
+            return False
+        return RoutingNumber.check_digit(routing[:8]) == int(routing[8])
+
+    @staticmethod
+    def require(routing: str) -> str:
+        if not RoutingNumber.is_valid(routing):
+            raise NachaFormatError(f"invalid routing number (check digit): {routing}")
+        return routing
+```
+
+#### Step 3: Transaction codes that know their own direction
+
+The two-digit code is the enum value, so `TransactionCode(27)` parses directly, and the direction predicates read the ones digit with chained comparisons.
+
+```python
+    CHECKING_PRENOTE_DEBIT = 28
+    SAVINGS_RETURN_CREDIT = 31
+    SAVINGS_CREDIT = 32
+    SAVINGS_PRENOTE_CREDIT = 33
+    SAVINGS_RETURN_DEBIT = 36
+    SAVINGS_DEBIT = 37
+    SAVINGS_PRENOTE_DEBIT = 38
+
+    @property
+    def code(self) -> int:
+        return self.value
+
+    def is_credit(self) -> bool:
+        return 1 <= self.value % 10 <= 4
+
+    def is_debit(self) -> bool:
+        return 6 <= self.value % 10 <= 9
+
+    def is_prenote(self) -> bool:
+        return self.value % 10 in (3, 8)
+
+    def is_return(self) -> bool:
+        return self.value % 10 in (1, 6)
+```
+
+#### Step 4: The Entry Detail record
+
+`__post_init__` carries the compact constructor's rules (routing check digit, USD only, non-negative, ten digits of cents, zero-amount prenotes). `with_trace` uses `dataclasses.replace`, and `to_line` concatenates the same field widths and ends with `require94`.
+
+```python
+    def __post_init__(self) -> None:
+        RoutingNumber.require(self.receiving_dfi)
+        if not self.account_number.strip() or len(self.account_number) > 17:
+            raise NachaFormatError("account number must be 1-17 characters")
+        if self.amount.currency != USD:
+            raise NachaFormatError("ACH carries USD only")
+        if self.amount.is_negative():
+            raise NachaFormatError("amount must not be negative; direction is the transaction code")
+        if self.amount.minor_units > MAX_AMOUNT_CENTS:
+            raise NachaFormatError("amount exceeds 10 digits of cents")
+        if self.transaction_code.is_prenote() and not self.amount.is_zero():
+            raise NachaFormatError("prenote entries must carry a zero amount")
+        if self.trace_number and len(self.trace_number) != 15:
+            raise NachaFormatError("trace number must be 15 digits")
+
+    def with_trace(self, odfi_id: str, sequence: int) -> "EntryDetail":
+        return replace(self, trace_number=odfi_id + Fixed.numeric(sequence, 7))
+
+    def receiving_dfi_id(self) -> str:
+        """The first eight digits: what the entry hash sums. The check digit is excluded on purpose."""
+        return self.receiving_dfi[:8]
+
+    def to_line(self) -> str:
+        line = (
+            "6" + Fixed.numeric(self.transaction_code.code, 2) + self.receiving_dfi + Fixed.alpha(self.account_number, 17)
+            + Fixed.numeric(self.amount.minor_units, 10) + Fixed.alpha(self.individual_id, 15) + Fixed.alpha(self.individual_name, 22)
+            + Fixed.alpha(self.discretionary_data, 2) + ("0" if self.addenda is None else "1") + self.trace_number
+        )
+        return Fixed.require94(line)
+```
+
+#### Step 5: Return reasons and the return window
+
+`datetime.date` arithmetic with `timedelta`; `d.weekday() < 5` is the Monday-to-Friday test. The sixty-day window is calendar days, the two-day window counts banking days.
+
+```python
+    def window_days(self) -> int:
+        return 60 if self.extended_window else 2
+
+    def deadline(self, settlement_date: date) -> date:
+        """Last date the RDFI may transmit the return. Banking days skip Sat/Sun; Fed holidays are out of scope."""
+        if self.extended_window:
+            return settlement_date + timedelta(days=60)
+        d, remaining = settlement_date, 2
+        while remaining > 0:
+            d += timedelta(days=1)
+            if d.weekday() < 5:
+                remaining -= 1
+        return d
+
+    def is_timely(self, settlement_date: date, return_date: date) -> bool:
+        return return_date <= self.deadline(settlement_date)
+```
+
+#### Step 6: Batch totals and the entry hash
+
+`entry_hash` is a module-level `sum(...) % HASH_MODULUS`. The `Batch.__post_init__` assigns trace numbers (shown here because the frozen dataclass makes it the interesting part), rejects a wrong-direction entry, and `control()` is computed from the entries every time.
+
+```python
+def entry_hash(receiving_dfi_ids: list[str]) -> int:
+    """Sum of the receiving DFI identifiers (8 digits each), keeping only the rightmost 10 digits."""
+    return sum(int(i) for i in receiving_dfi_ids) % HASH_MODULUS
+```
+
+```python
+    def __post_init__(self) -> None:
+        if not self.entries:
+            raise NachaFormatError("a batch needs at least one entry")
+        traced = tuple(
+            e if e.trace_number else e.with_trace(self.header.odfi_id, i + 1) for i, e in enumerate(self.entries)
+        )
+        for e in traced:
+            if self.header.service_class_code == CREDITS_ONLY and e.transaction_code.is_debit():
+                raise NachaFormatError("debit entry in a 220 credits-only batch")
+            if self.header.service_class_code == DEBITS_ONLY and e.transaction_code.is_credit():
+                raise NachaFormatError("credit entry in a 225 debits-only batch")
+        object.__setattr__(self, "entries", traced)
+
+    def entry_hash(self) -> int:
+        return entry_hash([e.receiving_dfi_id() for e in self.entries])
+
+    def entry_addenda_count(self) -> int:
+        return sum(e.record_count() for e in self.entries)
+
+    def total_debit(self) -> Money:
+        total = Money.of_minor(0, USD)
+        for e in self.entries:
+            if e.transaction_code.is_debit():
+                total = total.plus(e.amount)
+        return total
+
+    def control(self) -> BatchControl:
+        return BatchControl(
+            self.header.service_class_code, self.entry_addenda_count(), self.entry_hash(), self.total_debit(), self.total_credit(),
+            self.header.company_id, self.header.odfi_id, self.header.batch_number,
+        )
+```
+
+#### Step 7: Blocking and the file
+
+`block_count` is ceiling division with `//`; `to_lines` appends `FILLER` until the count is a multiple of `BLOCKING_FACTOR`, and `write` joins with newlines.
+
+```python
+    def record_count(self) -> int:
+        return 2 + sum(2 + b.entry_addenda_count() for b in self.batches)
+
+    def block_count(self) -> int:
+        return (self.record_count() + BLOCKING_FACTOR - 1) // BLOCKING_FACTOR
+
+    def to_lines(self) -> list[str]:
+        lines = [self.header.to_line()]
+        for b in self.batches:
+            lines.extend(b.to_lines())
+        lines.append(self.control().to_line())
+        while len(lines) % BLOCKING_FACTOR != 0:
+            lines.append(FILLER)
+        return lines
+
+    def write(self) -> str:
+        return "\n".join(self.to_lines()) + "\n"
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/11-payment-rails/08-ach-and-nacha/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Every 94-character line matches the Java output; Python prints booleans as `True`/`False` in the return-reason lines:
+
+```console
+== A return: R01 Insufficient Funds on a WEB debit ==
+5225ACME STORE                          1234567890WEBRETURN          261015   1011999990000001
+626011999993000123456789     0000004999ORD-7781       ADA LOVELACE            1011999990000001
+799R01021999990000001      02199999                                            011999990000001
+822500000200011999990000000049990000000000001234567890                         011999990000001
+R01 Insufficient funds: window 2 banking days, deadline 2026-10-19, re-presentable True
+
+== Rejections ==
+rejected: invalid routing number (check digit): 021999969
+rejected: batch 1 total credit mismatch: declared 7387.88 USD, computed 7387.87 USD
+```
 
 ### In Go
 
+The Go port keeps the design with four differences. **Errors are values:** every constructor returns `(T, error)`, and `IsFormatError` uses `errors.As` to recognise a `*NachaFormatError` through wrapping. `ToLine` methods panic on a 94-character miscount because the constructors have already validated every field; a panic there is a bug in the writer, not bad input. **`EntryDetail.Addenda` is a pointer**, so an optional addenda is `nil`; that makes `==` on `AchFile` unreliable (pointer identity), so `Equal` compares the written text, which is the canonical form anyway. **`must` in the demo** turns `(T, error)` into `T` or a panic; it is a demo convenience and the tests do not use it. **`time.Time` for dates:** `AddDate(0, 0, 1)` and `Weekday()` implement the banking-day count.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Fixed-width fields with the spec's own numbering
+
+`Alpha` truncates and pads with `strings.Repeat`; `Numeric` returns a `*NachaFormatError` (via `formatErr`) for a negative or oversized value, and `mustNumeric` wraps it for values a constructor has already validated. `Field` is the 1-based inclusive slice and `require94` the length guard.
+
 ```go
-func ParseAchFile(text string) (AchFile, error) {
-    for _, raw := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
-        if err := require94(raw); err != nil {
-            return AchFile{}, err
-        }
-        // ...
-    }
+func Alpha(value string, width int) string {
+	s := strings.ToUpper(value)
+	if len(s) > width {
+		s = s[:width]
+	}
+	return s + strings.Repeat(" ", width-len(s))
+}
+
+// Numeric: right-justify, zero-fill; a value that does not fit is an error, never truncated.
+func Numeric(value int64, width int) (string, error) {
+	if value < 0 {
+		return "", formatErr("numeric field cannot be negative: %d", value)
+	}
+	s := strconv.FormatInt(value, 10)
+	if len(s) > width {
+		return "", formatErr("value %d does not fit in %d digits", value, width)
+	}
+	return strings.Repeat("0", width-len(s)) + s, nil
+}
+
+// Field returns characters start..end inclusive, 1-based, exactly as the Nacha layout tables number them.
+func Field(line string, start, end int) string { return line[start-1 : end] }
+
+func require94(line string) error {
+	if len(line) != 94 {
+		return formatErr("record must be 94 characters, got %d: %q", len(line), line)
+	}
+	return nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The routing number check digit
 
-- **Errors are values.** Every constructor returns `(T, error)`, and `IsFormatError` uses `errors.As` to recognise a `*NachaFormatError` through wrapping. `ToLine` methods panic on a 94-character miscount because the constructors have already validated every field; a panic there is a bug in the writer, not bad input.
-- **`EntryDetail.Addenda` is a pointer**, so an optional addenda is `nil`. That makes `==` on `AchFile` unreliable (pointer identity), so `Equal` compares the written text, which is the canonical form anyway.
-- **`must` in the demo** turns `(T, error)` into `T` or a panic; it is a demo convenience and the tests do not use it.
-- **`time.Time` for dates**; `AddDate(0, 0, 1)` and `Weekday()` implement the banking-day count.
+`RoutingCheckDigit` returns an error for a malformed prefix instead of assuming eight digits; `RoutingIsValid` folds that error into `false`, and `requireRouting` is what the constructors call.
+
+```go
+func RoutingCheckDigit(first8 string) (int, error) {
+	if len(first8) != 8 || !allDigits(first8) {
+		return 0, formatErr("routing prefix must be 8 digits: %q", first8)
+	}
+	sum := 0
+	for i := 0; i < 8; i++ {
+		sum += routingWeights[i] * int(first8[i]-'0')
+	}
+	return (10 - sum%10) % 10, nil
+}
+
+// RoutingIsValid checks shape and the ABA mod-10 check digit.
+func RoutingIsValid(routing string) bool {
+	if len(routing) != 9 || !allDigits(routing) {
+		return false
+	}
+	cd, err := RoutingCheckDigit(routing[:8])
+	return err == nil && cd == int(routing[8]-'0')
+}
+
+func requireRouting(routing string) error {
+	if !RoutingIsValid(routing) {
+		return formatErr("invalid routing number (check digit): %s", routing)
+	}
+	return nil
+}
+```
+
+#### Step 3: Transaction codes that know their own direction
+
+A typed `int` whose constants *are* the two-digit codes, so `int(t)` is the wire value and the predicates read the ones digit the same way; `knownTransactionCodes` backs the parser's lookup.
+
+```go
+type TransactionCode int
+
+const (
+	CheckingReturnCredit  TransactionCode = 21
+	CheckingCredit        TransactionCode = 22
+	CheckingPrenoteCredit TransactionCode = 23
+	CheckingReturnDebit   TransactionCode = 26
+	CheckingDebit         TransactionCode = 27
+	CheckingPrenoteDebit  TransactionCode = 28
+	SavingsReturnCredit   TransactionCode = 31
+	SavingsCredit         TransactionCode = 32
+	SavingsPrenoteCredit  TransactionCode = 33
+	SavingsReturnDebit    TransactionCode = 36
+	SavingsDebit          TransactionCode = 37
+	SavingsPrenoteDebit   TransactionCode = 38
+)
+
+var knownTransactionCodes = []TransactionCode{21, 22, 23, 26, 27, 28, 31, 32, 33, 36, 37, 38}
+
+func (t TransactionCode) IsCredit() bool  { d := int(t) % 10; return d >= 1 && d <= 4 }
+func (t TransactionCode) IsDebit() bool   { d := int(t) % 10; return d >= 6 && d <= 9 }
+func (t TransactionCode) IsPrenote() bool { d := int(t) % 10; return d == 3 || d == 8 }
+func (t TransactionCode) IsReturn() bool  { d := int(t) % 10; return d == 1 || d == 6 }
+```
+
+#### Step 4: The Entry Detail record
+
+`NewEntryDetail` is the validating constructor with the same rules as the Java compact constructor; `Addenda` is a `*Addenda` so "no addenda" is `nil`. `ToLine` uses `mustNumeric` because every value was validated on construction, and panics on a 94-character miscount.
+
+```go
+func NewEntryDetail(code TransactionCode, receivingDfi, account string, amount Money, individualID, name, discretionary string, addenda *Addenda, trace string) (EntryDetail, error) {
+	if err := requireRouting(receivingDfi); err != nil {
+		return EntryDetail{}, err
+	}
+	if strings.TrimSpace(account) == "" || len(account) > 17 {
+		return EntryDetail{}, formatErr("account number must be 1-17 characters")
+	}
+	if amount.Currency != USD {
+		return EntryDetail{}, formatErr("ACH carries USD only")
+	}
+	if amount.IsNegative() {
+		return EntryDetail{}, formatErr("amount must not be negative; direction is the transaction code")
+	}
+	if amount.MinorUnits > maxAmountCents {
+		return EntryDetail{}, formatErr("amount exceeds 10 digits of cents")
+	}
+	if code.IsPrenote() && !amount.IsZero() {
+		return EntryDetail{}, formatErr("prenote entries must carry a zero amount")
+	}
+	if trace != "" && len(trace) != 15 {
+		return EntryDetail{}, formatErr("trace number must be 15 digits")
+	}
+	return EntryDetail{code, receivingDfi, account, amount, individualID, name, discretionary, addenda, trace}, nil
+}
+
+// ReceivingDfiID is the first eight digits: what the entry hash sums. The check digit is excluded on purpose.
+func (e EntryDetail) ReceivingDfiID() string { return e.ReceivingDfi[:8] }
+
+func (e EntryDetail) ToLine() string {
+	indicator := "0"
+	if e.Addenda != nil {
+		indicator = "1"
+	}
+	line := "6" + mustNumeric(int64(e.TransactionCode), 2) + e.ReceivingDfi + Alpha(e.AccountNumber, 17) +
+		mustNumeric(e.Amount.MinorUnits, 10) + Alpha(e.IndividualID, 15) + Alpha(e.IndividualName, 22) +
+		Alpha(e.DiscretionaryData, 2) + indicator + e.TraceNumber
+	if err := require94(line); err != nil {
+		panic(err)
+	}
+	return line
+}
+```
+
+#### Step 5: Return reasons and the return window
+
+`time.Time` with `AddDate` for day steps and `Weekday()` for the weekend test; `IsTimely` is `!After`, the same inclusive boundary as `!isAfter`.
+
+```go
+func (r ReturnReason) WindowDays() int {
+	if r.ExtendedWindow {
+		return 60
+	}
+	return 2
+}
+
+// Deadline is the last date the RDFI may transmit the return. Banking days skip Sat/Sun; Fed holidays are out of scope.
+func (r ReturnReason) Deadline(settlement time.Time) time.Time {
+	if r.ExtendedWindow {
+		return settlement.AddDate(0, 0, 60)
+	}
+	d, remaining := settlement, 2
+	for remaining > 0 {
+		d = d.AddDate(0, 0, 1)
+		if d.Weekday() != time.Saturday && d.Weekday() != time.Sunday {
+			remaining--
+		}
+	}
+	return d
+}
+
+// IsTimely reports whether a return sent on returnDate is on or before the deadline.
+func (r ReturnReason) IsTimely(settlement, returnDate time.Time) bool {
+	return !returnDate.After(r.Deadline(settlement))
+}
+```
+
+#### Step 6: Batch totals and the entry hash
+
+`EntryHash` parses each eight-digit id (already validated) and sums into an `int64`; twelve digits of sum cannot overflow it. `NewBatch` assigns trace numbers and rejects wrong-direction entries; `Control()` is computed on demand.
+
+```go
+func EntryHash(receivingDfiIDs []string) int64 {
+	var sum int64
+	for _, id := range receivingDfiIDs {
+		n, _ := strconv.ParseInt(id, 10, 64)
+		sum += n
+	}
+	return sum % HashModulus
+}
+
+func NewBatch(header BatchHeader, entries []EntryDetail) (Batch, error) {
+	if len(entries) == 0 {
+		return Batch{}, formatErr("a batch needs at least one entry")
+	}
+	traced := make([]EntryDetail, len(entries))
+	for i, e := range entries {
+		if e.TraceNumber == "" {
+			e = e.WithTrace(header.OdfiID, i+1)
+		}
+		if header.ServiceClassCode == CreditsOnly && e.TransactionCode.IsDebit() {
+			return Batch{}, formatErr("debit entry in a 220 credits-only batch")
+		}
+		if header.ServiceClassCode == DebitsOnly && e.TransactionCode.IsCredit() {
+			return Batch{}, formatErr("credit entry in a 225 debits-only batch")
+		}
+		traced[i] = e
+	}
+	return Batch{header, traced}, nil
+}
+
+func (b Batch) TotalDebit() Money {
+	total := OfMinor(0, USD)
+	for _, e := range b.Entries {
+		if e.TransactionCode.IsDebit() {
+			total = total.Plus(e.Amount)
+		}
+	}
+	return total
+}
+
+func (b Batch) Control() BatchControl {
+	return BatchControl{b.Header.ServiceClassCode, b.EntryAddendaCount(), b.EntryHash(), b.TotalDebit(), b.TotalCredit(),
+		b.Header.CompanyID, b.Header.OdfiID, b.Header.BatchNumber}
+}
+```
+
+#### Step 7: Blocking and the file
+
+Integer division gives the ceiling with the `+ BlockingFactor - 1` trick; `ToLines` pads with `Filler`, `Write` joins, and `Equal` compares the written text because the struct holds a pointer.
+
+```go
+func (f AchFile) RecordCount() int {
+	n := 2
+	for _, b := range f.Batches {
+		n += 2 + b.EntryAddendaCount()
+	}
+	return n
+}
+
+func (f AchFile) BlockCount() int { return (f.RecordCount() + BlockingFactor - 1) / BlockingFactor }
+
+func (f AchFile) ToLines() []string {
+	lines := []string{f.Header.ToLine()}
+	for _, b := range f.Batches {
+		lines = append(lines, b.ToLines()...)
+	}
+	lines = append(lines, f.Control().ToLine())
+	for len(lines)%BlockingFactor != 0 {
+		lines = append(lines, Filler)
+	}
+	return lines
+}
+
+func (f AchFile) Write() string { return strings.Join(f.ToLines(), "\n") + "\n" }
+
+// Equal compares two files structurally (EntryDetail holds a pointer, so == on the struct is not enough).
+func (f AchFile) Equal(other AchFile) bool { return f.Write() == other.Write() }
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/11-payment-rails/08-ach-and-nacha/code/go
+go run .
+go test ./...
+```
+
+The file lines and rejection messages are identical to the Java run:
+
+```console
+== Rejections ==
+rejected: invalid routing number (check digit): 021999969
+rejected: batch 1 total credit mismatch: declared 7387.88 USD, computed 7387.87 USD
+```
 
 ## Use It
 

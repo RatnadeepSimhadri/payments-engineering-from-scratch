@@ -358,33 +358,470 @@ The test run ends with `55 passed, 0 failed`.
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **`order=True` is the comparator.** A frozen dataclass with `order=True` compares fields in declaration order, so `(time, node_id)` is the total order without writing `__lt__`. `total_order` is then `sorted(events, key=lambda e: e.lamport)`. **The vector is a tuple.** `VectorClock` wraps a `tuple[int, ...]`, which is immutable and hashable for free, so a `VectorClock` can be a dict key or a set member without an `__eq__`/`__hash__` pair. **The LCG must be masked.** Python integers do not overflow, so `state * A + C` grows without bound and the shift would read the wrong bits. `next_delay` applies `& ((1 << 64) - 1)` after every step to reproduce Java's `long` wraparound exactly. Without the mask the Python schedule diverges from Java and Go on the second message.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The Lamport clock
+
+Three methods on one integer. `tick` is `+= 1` and return; `send` delegates to `tick` so the call site says what it is doing; `receive` is `max(local, remote) + 1`. Python ints never overflow, so there is no `Math.addExact` question here.
+
+```python
+class LamportClock:
+    def __init__(self) -> None:
+        self._time = 0
+
+    def time(self) -> int:
+        return self._time
+
+    def tick(self) -> int:
+        """Rule 1: a local event advances the clock by exactly one."""
+        self._time += 1
+        return self._time
+
+    def send(self) -> int:
+        """Rule 2: sending is a local event; the value returned is what travels in the message."""
+        return self.tick()
+
+    def receive(self, remote_time: int) -> int:
+        """Rule 3: on receive, jump past the sender's clock so the receive event is later than the send."""
+        self._time = max(self._time, remote_time) + 1
+        return self._time
+```
+
+#### Step 2: The total order
+
+`order=True` generates `__lt__` and friends from the field tuple `(time, node_id)`, which is exactly the Java `compareTo`. `__str__` prints `3@payments`, the form the demo table uses.
+
 ```python
 @dataclass(frozen=True, order=True)
 class LamportTimestamp:
     time: int
     node_id: str
+
+    def __str__(self) -> str:
+        return f"{self.time}@{self.node_id}"
 ```
 
-Three differences, all in `code/python/main.py`:
+#### Step 3: The vector clock
 
-- **`order=True` is the comparator.** A frozen dataclass with `order=True` compares fields in declaration order, so `(time, node_id)` is the total order without writing `__lt__`. `total_order` is then `sorted(events, key=lambda e: e.lamport)`.
-- **The vector is a tuple.** `VectorClock` wraps a `tuple[int, ...]`, which is immutable and hashable for free, so a `VectorClock` can be a dict key or a set member without an `__eq__`/`__hash__` pair.
-- **The LCG must be masked.** Python integers do not overflow, so `state * A + C` grows without bound and the shift would read the wrong bits. `next_delay` applies `& ((1 << 64) - 1)` after every step to reproduce Java's `long` wraparound exactly. Without the mask the Python schedule diverges from Java and Go on the second message.
+The counters live in a tuple, so a `VectorClock` is immutable by construction and `increment` has to copy to a list, bump, and re-tuple. `merge` is a `zip` with `max`. `_require_same_size` raises `ValueError` for a vector from a different cluster size.
+
+```python
+class VectorClock:
+    counters: tuple[int, ...]
+
+    @staticmethod
+    def zero(size: int) -> "VectorClock":
+        return VectorClock(tuple([0] * size))
+
+    @staticmethod
+    def of(*counters: int) -> "VectorClock":
+        return VectorClock(tuple(counters))
+
+    def increment(self, node: int) -> "VectorClock":
+        """A local event on `node`: that component advances by one, nothing else changes."""
+        next_counters = list(self.counters)
+        next_counters[node] += 1
+        return VectorClock(tuple(next_counters))
+
+    def merge(self, other: "VectorClock") -> "VectorClock":
+        """Componentwise maximum: everything either side has observed, the result has observed."""
+        self._require_same_size(other)
+        return VectorClock(tuple(max(a, b) for a, b in zip(self.counters, other.counters)))
+
+    def _require_same_size(self, other: "VectorClock") -> None:
+        if len(other.counters) != len(self.counters):
+            raise ValueError(f"vector clocks must cover the same cluster: {len(self.counters)} vs {len(other.counters)}")
+```
+
+#### Step 4: Comparison
+
+Two `any(...)` generator expressions compute the two flags in two passes rather than one; for a three-element vector the difference is nothing, and the four-way decision that follows is the Java one. `happens_before` is strict because `EQUAL` is its own outcome.
+
+```python
+    def compare(self, other: "VectorClock") -> Relation:
+        """The partial order. BEFORE means self happened-before other; CONCURRENT means neither caused the other."""
+        self._require_same_size(other)
+        any_less = any(a < b for a, b in zip(self.counters, other.counters))
+        any_greater = any(a > b for a, b in zip(self.counters, other.counters))
+        if any_less and any_greater:
+            return Relation.CONCURRENT
+        if any_less:
+            return Relation.BEFORE
+        if any_greater:
+            return Relation.AFTER
+        return Relation.EQUAL
+
+    def happens_before(self, other: "VectorClock") -> bool:
+        return self.compare(other) == Relation.BEFORE
+
+    def concurrent_with(self, other: "VectorClock") -> bool:
+        return self.compare(other) == Relation.CONCURRENT
+```
+
+#### Step 5: A node that stamps every event with both clocks
+
+Each node owns a `LamportClock`, a `VectorClock`, and a log. `receive` merges first and increments second, the order that matters; because the vector is immutable, the `Event` appended by `_record` keeps the exact vector it was stamped with even after the node moves on.
+
+```python
+class Node:
+    def __init__(self, node_id: str, index: int, cluster_size: int) -> None:
+        self.id = node_id
+        self.index = index
+        self.lamport = LamportClock()
+        self.vector = VectorClock.zero(cluster_size)
+        self.log: list[Event] = []
+
+    def local_event(self, description: str) -> Event:
+        """A local posting: both clocks tick; nothing leaves the node."""
+        t = self.lamport.tick()
+        self.vector = self.vector.increment(self.index)
+        return self._record(description, t)
+
+    def send(self, to: str, payload: str) -> Message:
+        """Sending is an event too; the message carries the clock values after the tick."""
+        t = self.lamport.send()
+        self.vector = self.vector.increment(self.index)
+        self._record(f"send {payload} -> {to}", t)
+        return Message(self.id, to, payload, t, self.vector)
+
+    def receive(self, m: Message) -> Event:
+        """Receiving merges what the sender knew, then counts the receive as a local event."""
+        t = self.lamport.receive(m.lamport_time)
+        self.vector = self.vector.merge(m.vector).increment(self.index)
+        return self._record(f"recv {m.payload} <- {m.sender}", t)
+```
+
+#### Step 6: A deterministic network
+
+The queue is `heapq` over an ordered dataclass `_Pending` whose `message` field is excluded from comparison, so ordering is `(deliver_at, seq)` only. `next_delay` is the MMIX LCG with the `& _MASK64` that Java gets for free from `long` overflow; the `>> 33` on a non-negative masked value is already a logical shift.
+
+```python
+    def next_delay(self) -> int:
+        """Knuth's MMIX LCG constants, wrapped to 64 bits by hand because Python ints do not overflow."""
+        self._state = (self._state * 6364136223846793005 + 1442695040888963407) & _MASK64
+        return (self._state >> 33) % (self._max_delay + 1)
+
+    def send(self, m: Message) -> None:
+        self.node(m.to)
+        heapq.heappush(self._queue, _Pending(self._tick + 1 + self.next_delay(), self._seq, m))
+        self._seq += 1
+
+    def deliver_one(self) -> Optional[Event]:
+        """Deliver the earliest pending message. Returns the receive event, or None if nothing is in flight."""
+        if not self._queue:
+            return None
+        p = heapq.heappop(self._queue)
+        self._tick = p.deliver_at
+        self._delivered += 1
+        return self.node(p.message.to).receive(p.message)
+
+    def deliver_all(self) -> None:
+        while self.deliver_one() is not None:
+            pass
+```
+
+#### Step 7: The two scenarios
+
+The scenario is the Java one with f-strings. `CAPTURE.plus(REFUND)` is exact `Money` arithmetic in minor units and prints `0.00 USD`.
+
+```python
+def concurrent_refund_scenario(seed: int) -> SimulatedNetwork:
+    """The incident: the refund is issued before the capture notice arrives. Vector clocks reveal the concurrency."""
+    net = _cluster(seed)
+    payments, refunds, ledger = net.node(PAYMENTS), net.node(REFUNDS), net.node(LEDGER)
+
+    payments.local_event(f"post captured {CAPTURE} pay_8f3")  # A
+    net.send(payments.send(LEDGER, f"captured {CAPTURE} pay_8f3"))
+    refunds.local_event(f"post refunded {REFUND} pay_8f3")  # B: concurrent with A
+    net.send(refunds.send(LEDGER, f"refunded {REFUND} pay_8f3"))
+    net.deliver_all()  # arrival order depends on seed
+    ledger.local_event(f"post settle pay_8f3 net {CAPTURE.plus(REFUND)}")  # C: after A and B
+    return net
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/05-distributed-foundations/03-lamport-and-vector-clocks/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output is byte-identical to the Java and Go runs, which is the point of the masked LCG:
+
+```console
+== Scenario 2: refund issued before the capture notice arrived (seed 7) ==
+lamport     vector   node      event
+1@payments  [1,0,0]  payments  post captured 49.99 USD pay_8f3
+2@payments  [2,0,0]  payments  send captured 49.99 USD pay_8f3 -> ledger
+1@refunds   [0,1,0]  refunds   post refunded -49.99 USD pay_8f3
+2@refunds   [0,2,0]  refunds   send refunded -49.99 USD pay_8f3 -> ledger
+3@ledger    [2,0,1]  ledger    recv captured 49.99 USD pay_8f3 <- payments
+4@ledger    [2,2,2]  ledger    recv refunded -49.99 USD pay_8f3 <- refunds
+5@ledger    [2,2,3]  ledger    post settle pay_8f3 net 0.00 USD
+
+== Concurrent postings by vector clock: the conflicts to resolve ==
+1@payments [1,0,0] 'post captured 49.99 USD pay_8f3'  ||  1@refunds [0,1,0] 'post refunded -49.99 USD pay_8f3'
+
+== What Lamport order cannot tell you ==
+lamport total order puts 1@payments before 1@refunds; vector clocks say [1,0,0] vs [0,1,0] is CONCURRENT
+a smaller Lamport time is necessary for happens-before, never sufficient
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with three differences. **`uint64` wraps the way Java's `long` does for this arithmetic**, so no masking is needed, and the unsigned type makes `>>` a logical shift, matching Java's `>>>`. **Errors are values, except where they are bugs.** `NewSimulatedNetwork` and `Send` return `error` for bad input a caller might plausibly pass. `VectorClock.Compare` on mismatched sizes panics: comparing clocks from different clusters is a programming error, and `Compare` returning a `Relation` has no honest error slot. The test uses `recover` to assert the panic. **The priority queue is `container/heap`.** Go has no generic priority queue; `pendingQueue` implements `heap.Interface` with the same `(deliverAt, seq)` ordering. `TotalOrder` uses `sort.SliceStable` so equal keys (which cannot occur, since stamps are distinct) would still be deterministic.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The Lamport clock
+
+A struct with one `int64` and pointer receivers, since the methods mutate. `Receive` writes `max` out as an `if`, because Go's `max` builtin arrived only in 1.21 and the course targets 1.22 with the explicit form for clarity.
+
 ```go
-func (s *SimulatedNetwork) NextDelay() int {
-    s.state = s.state*6364136223846793005 + 1442695040888963407
-    return int((s.state >> 33) % uint64(s.maxDelay+1))
+type LamportClock struct {
+	time int64
+}
+
+func (c *LamportClock) Time() int64 { return c.time }
+
+// Tick is rule 1: a local event advances the clock by exactly one.
+func (c *LamportClock) Tick() int64 {
+	c.time++
+	return c.time
+}
+
+// Send is rule 2: sending is a local event; the value returned is what travels in the message.
+func (c *LamportClock) Send() int64 { return c.Tick() }
+
+// Receive is rule 3: on receive, jump past the sender's clock so the receive event is later than the send.
+func (c *LamportClock) Receive(remoteTime int64) int64 {
+	if remoteTime > c.time {
+		c.time = remoteTime
+	}
+	c.time++
+	return c.time
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The total order
 
-- **`uint64` wraps the way Java's `long` does for this arithmetic**, so no masking is needed, and the unsigned type makes `>>` a logical shift, matching Java's `>>>`.
-- **Errors are values, except where they are bugs.** `NewSimulatedNetwork` and `Send` return `error` for bad input a caller might plausibly pass. `VectorClock.Compare` on mismatched sizes panics: comparing clocks from different clusters is a programming error, and `Compare` returning a `Relation` has no honest error slot. The test uses `recover` to assert the panic.
-- **The priority queue is `container/heap`.** Go has no generic priority queue; `pendingQueue` implements `heap.Interface` with the same `(deliverAt, seq)` ordering. `TotalOrder` uses `sort.SliceStable` so equal keys (which cannot occur, since stamps are distinct) would still be deterministic.
+Go has no `Comparable`, so `Compare` returns the familiar -1/0/1 and `Less` wraps it for `sort.SliceStable`. `strings.Compare` is the tie-break on node id.
+
+```go
+type LamportTimestamp struct {
+	Time   int64
+	NodeID string
+}
+
+// Compare returns -1, 0, or 1. Two distinct events never compare equal.
+func (t LamportTimestamp) Compare(other LamportTimestamp) int {
+	switch {
+	case t.Time < other.Time:
+		return -1
+	case t.Time > other.Time:
+		return 1
+	}
+	return strings.Compare(t.NodeID, other.NodeID)
+}
+
+func (t LamportTimestamp) Less(other LamportTimestamp) bool { return t.Compare(other) < 0 }
+```
+
+#### Step 3: The vector clock
+
+A slice is mutable, so immutability is a discipline here: `Increment` and `Merge` always allocate a new slice (`append([]int64(nil), v.counters...)` is the idiomatic copy) and never write through the receiver. Value receivers reinforce that nothing is modified in place.
+
+```go
+type VectorClock struct {
+	counters []int64
+}
+
+func NewVectorClock(size int) VectorClock { return VectorClock{make([]int64, size)} }
+
+// Increment is a local event on `node`: that component advances by one, nothing else changes.
+func (v VectorClock) Increment(node int) VectorClock {
+	next := append([]int64(nil), v.counters...)
+	next[node]++
+	return VectorClock{next}
+}
+
+// Merge is the componentwise maximum: everything either side has observed, the result has observed.
+func (v VectorClock) Merge(other VectorClock) VectorClock {
+	v.requireSameSize(other)
+	next := make([]int64, len(v.counters))
+	for i := range next {
+		next[i] = v.counters[i]
+		if other.counters[i] > next[i] {
+			next[i] = other.counters[i]
+		}
+	}
+	return VectorClock{next}
+}
+
+// requireSameSize panics because a size mismatch is a programming error, not a runtime condition.
+func (v VectorClock) requireSameSize(other VectorClock) {
+	if len(other.counters) != len(v.counters) {
+		panic(fmt.Sprintf("vector clocks must cover the same cluster: %d vs %d", len(v.counters), len(other.counters)))
+	}
+}
+```
+
+#### Step 4: Comparison
+
+One pass, two flags, and a tagless `switch` for the four-way decision. `Relation` is an `int` with `iota` constants and a `String` method so the demo prints `CONCURRENT`.
+
+```go
+func (v VectorClock) Compare(other VectorClock) Relation {
+	v.requireSameSize(other)
+	anyLess, anyGreater := false, false
+	for i := range v.counters {
+		if v.counters[i] < other.counters[i] {
+			anyLess = true
+		}
+		if v.counters[i] > other.counters[i] {
+			anyGreater = true
+		}
+	}
+	switch {
+	case anyLess && anyGreater:
+		return Concurrent
+	case anyLess:
+		return Before
+	case anyGreater:
+		return After
+	}
+	return Equal
+}
+
+func (v VectorClock) HappensBefore(other VectorClock) bool { return v.Compare(other) == Before }
+
+func (v VectorClock) ConcurrentWith(other VectorClock) bool { return v.Compare(other) == Concurrent }
+```
+
+#### Step 5: A node that stamps every event with both clocks
+
+`Node` embeds a `LamportClock` by value and holds the current `VectorClock`; events are `*Event` so the log and `AllEvents` share the same objects. `Receive` is merge-then-increment, as in Java.
+
+```go
+type Node struct {
+	ID      string
+	Index   int
+	Lamport LamportClock
+	Vector  VectorClock
+	Log     []*Event
+}
+
+// LocalEvent is a local posting: both clocks tick; nothing leaves the node.
+func (n *Node) LocalEvent(description string) *Event {
+	t := n.Lamport.Tick()
+	n.Vector = n.Vector.Increment(n.Index)
+	return n.record(description, t)
+}
+
+// Send is an event too; the message carries the clock values after the tick.
+func (n *Node) Send(to, payload string) Message {
+	t := n.Lamport.Send()
+	n.Vector = n.Vector.Increment(n.Index)
+	n.record("send "+payload+" -> "+to, t)
+	return Message{n.ID, to, payload, t, n.Vector}
+}
+
+// Receive merges what the sender knew, then counts the receive as a local event.
+func (n *Node) Receive(m Message) *Event {
+	t := n.Lamport.Receive(m.LamportTime)
+	n.Vector = n.Vector.Merge(m.Vector).Increment(n.Index)
+	return n.record("recv "+m.Payload+" <- "+m.From, t)
+}
+```
+
+#### Step 6: A deterministic network
+
+`pendingQueue` implements `heap.Interface`; its `Less` is the `(deliverAt, seq)` comparator. `NextDelay` runs the LCG on a `uint64` with no mask, and `Send` returns an error for an unknown destination rather than panicking.
+
+```go
+type pendingQueue []pending
+
+func (q pendingQueue) Len() int { return len(q) }
+func (q pendingQueue) Less(i, j int) bool {
+	if q[i].deliverAt != q[j].deliverAt {
+		return q[i].deliverAt < q[j].deliverAt
+	}
+	return q[i].seq < q[j].seq
+}
+
+func (s *SimulatedNetwork) NextDelay() int {
+	s.state = s.state*6364136223846793005 + 1442695040888963407
+	return int((s.state >> 33) % uint64(s.maxDelay+1))
+}
+
+func (s *SimulatedNetwork) Send(m Message) error {
+	if _, ok := s.nodes[m.To]; !ok {
+		return fmt.Errorf("unknown node %s", m.To)
+	}
+	heap.Push(&s.queue, pending{s.tick + 1 + int64(s.NextDelay()), s.seq, m})
+	s.seq++
+	return nil
+}
+
+// DeliverOne delivers the earliest pending message. Returns the receive event, or nil if nothing is in flight.
+func (s *SimulatedNetwork) DeliverOne() *Event {
+	if s.queue.Len() == 0 {
+		return nil
+	}
+	p := heap.Pop(&s.queue).(pending)
+	s.tick = p.deliverAt
+	s.delivered++
+	return s.Node(p.message.To).Receive(p.message)
+}
+```
+
+#### Step 7: The two scenarios
+
+The scenario discards `Send`'s error with `_ =` because the node names are constants that exist; `mustPlus` panics on the currency mismatch that `Money.Plus` reports as an error, since the demo's amounts are fixed.
+
+```go
+func ConcurrentRefundScenario(seed uint64) *SimulatedNetwork {
+	net := cluster(seed)
+	payments, refunds, ledger := net.Node(Payments), net.Node(Refunds), net.Node(Ledger)
+
+	payments.LocalEvent(fmt.Sprintf("post captured %s pay_8f3", Capture)) // A
+	_ = net.Send(payments.Send(Ledger, fmt.Sprintf("captured %s pay_8f3", Capture)))
+	refunds.LocalEvent(fmt.Sprintf("post refunded %s pay_8f3", Refund)) // B: concurrent with A
+	_ = net.Send(refunds.Send(Ledger, fmt.Sprintf("refunded %s pay_8f3", Refund)))
+	net.DeliverAll()                                                                        // arrival order depends on seed
+	ledger.LocalEvent(fmt.Sprintf("post settle pay_8f3 net %s", mustPlus(Capture, Refund))) // C: after A and B
+	return net
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/05-distributed-foundations/03-lamport-and-vector-clocks/code/go
+go run .
+go test ./...
+```
+
+`diff <(go run .) <(python3 ../python/main.py)` is empty: the three runs are identical.
+
+```console
+== Scenario 2: refund issued before the capture notice arrived (seed 7) ==
+lamport     vector   node      event
+1@payments  [1,0,0]  payments  post captured 49.99 USD pay_8f3
+2@payments  [2,0,0]  payments  send captured 49.99 USD pay_8f3 -> ledger
+1@refunds   [0,1,0]  refunds   post refunded -49.99 USD pay_8f3
+2@refunds   [0,2,0]  refunds   send refunded -49.99 USD pay_8f3 -> ledger
+3@ledger    [2,0,1]  ledger    recv captured 49.99 USD pay_8f3 <- payments
+4@ledger    [2,2,2]  ledger    recv refunded -49.99 USD pay_8f3 <- refunds
+5@ledger    [2,2,3]  ledger    post settle pay_8f3 net 0.00 USD
+
+== What Lamport order cannot tell you ==
+lamport total order puts 1@payments before 1@refunds; vector clocks say [1,0,0] vs [0,1,0] is CONCURRENT
+a smaller Lamport time is necessary for happens-before, never sufficient
+```
 
 ## Use It
 

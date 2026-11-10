@@ -359,25 +359,222 @@ The test suite has 41 assertions: expiry boundaries, each strategy's write path,
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **The workload generator is `java.util.Random`, not `random.Random`:** Python's Mersenne Twister would produce a different 80/20 stream and different hit rates, so `JavaRandom` reproduces the 48-bit LCG (`next`, `next_int(bound)` with its rejection loop, `next_double`) and `java_round` is `floor(x + 0.5)` rather than Python's banker's `round`. The measured table then matches the Java output digit for digit: 6433 store reads and 4686 divergent reads for TTL-only, 399 coalesced writes for write-behind. **No overflow:** `Math.addExact(clock.now(), ttlMs)` becomes plain addition; `NO_EXPIRY` is still `2**63 - 1` so the sentinel comparison reads the same. **`null` becomes `None`, and the interface becomes an `ABC`:** `BalanceCache` is an abstract base class with `read_measured` as the one concrete method; the four strategies share a `_CachedStrategy` helper for the accessors and the miss-then-load path, which the Java code repeats inline. `TtlCache.get` returns `Optional[Money]`, and `read_measured` compares with `!=` on frozen dataclasses where Java uses `Objects.equals`. **Write-behind's `LinkedHashMap` is a plain `dict`:** Python dicts preserve insertion order, so the dirty map alone would do; the port keeps the explicit `_order` list anyway so the flush order is spelled out the same way as in Java and Go.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A clock you move by hand and a store that charges for every call
+
+`ManualClock.advance` raises `ValueError` on a negative step. `BackingStore` keeps a dict of rows and public counters; `read` and `write` add their latency to `simulated_latency_ms` instead of sleeping, and `peek` is the uncounted oracle the meter uses.
+
 ```python
-class JavaRandom:
-    """java.util.Random, bit for bit (48-bit LCG), so the seeded workload matches the Java demo exactly."""
+class ManualClock:
+    def __init__(self, start_ms: int) -> None:
+        self._now_ms = start_ms
 
-    def next(self, bits: int) -> int:
-        self._seed = (self._seed * self._MULTIPLIER + self._ADDEND) & self._MASK
-        r = self._seed >> (48 - bits)
-        return r - (1 << 32) if r >= (1 << 31) else r
+    def now(self) -> int:
+        return self._now_ms
 
-    def next_double(self) -> float:
-        return ((self.next(26) << 27) + self.next(27)) * (1.0 / (1 << 53))
+    def advance(self, ms: int) -> None:
+        if ms < 0:
+            raise ValueError("clock only moves forward")
+        self._now_ms += ms
+
+
+class BackingStore:
+    def __init__(self, read_latency_ms: int, write_latency_ms: int) -> None:
+        self._rows: dict[str, Money] = {}
+        self._read_latency_ms = read_latency_ms
+        self._write_latency_ms = write_latency_ms
+        self.reads = 0
+        self.writes = 0
+        self.simulated_latency_ms = 0
+
+    def read(self, account: str) -> Optional[Money]:
+        self.reads += 1
+        self.simulated_latency_ms += self._read_latency_ms
+        return self._rows.get(account)
+
+    def write(self, account: str, balance: Money) -> None:
+        self.writes += 1
+        self.simulated_latency_ms += self._write_latency_ms
+        self._rows[account] = balance
+
+    def peek(self, account: str) -> Optional[Money]:
+        return self._rows.get(account)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The TTL cache
 
-- **The workload generator is `java.util.Random`, not `random.Random`.** Python's Mersenne Twister would produce a different 80/20 stream and different hit rates, so `JavaRandom` reproduces the 48-bit LCG (`next`, `next_int(bound)` with its rejection loop, `next_double`) and `java_round` is `floor(x + 0.5)` rather than Python's banker's `round`. The measured table then matches the Java output digit for digit: 6433 store reads and 4686 divergent reads for TTL-only, 399 coalesced writes for write-behind.
-- **No overflow.** `Math.addExact(clock.now(), ttlMs)` becomes plain addition; `NO_EXPIRY` is still `2**63 - 1` so the sentinel comparison reads the same.
-- **`null` becomes `None`, and the interface becomes an `ABC`.** `BalanceCache` is an abstract base class with `read_measured` as the one concrete method; the four strategies share a `_CachedStrategy` helper for the accessors and the miss-then-load path, which the Java code repeats inline. `TtlCache.get` returns `Optional[Money]`, and `read_measured` compares with `!=` on frozen dataclasses where Java uses `Objects.equals`.
-- **Write-behind's `LinkedHashMap` is a plain `dict`.** Python dicts preserve insertion order, so the dirty map alone would do; the port keeps the explicit `_order` list anyway so the flush order is spelled out the same way as in Java and Go.
+Lazy expiry with the same `<=` boundary: an entry whose `expires_at_ms` equals `now` is gone. `NO_EXPIRY` is `(1 << 63) - 1` so the sentinel check reads like the Java; the addition in `put` needs no `addExact` because Python ints do not overflow. `pop(key, None) is not None` is the `remove(key) != null` idiom.
+
+```python
+class TtlCache:
+    NO_EXPIRY = (1 << 63) - 1  # Long.MAX_VALUE in the Java version
+
+    def __init__(self, clock: ManualClock) -> None:
+        self._entries: dict[str, Entry] = {}
+        self._clock = clock
+
+    def get(self, key: str) -> Optional[Money]:
+        e = self._entries.get(key)
+        if e is None:
+            return None
+        if e.expires_at_ms <= self._clock.now():
+            del self._entries[key]
+            return None
+        return e.value
+
+    def put(self, key: str, value: Money, ttl_ms: int) -> None:
+        expires = self.NO_EXPIRY if ttl_ms == self.NO_EXPIRY else self._clock.now() + ttl_ms
+        self._entries[key] = Entry(value, expires)
+
+    def invalidate(self, key: str) -> bool:
+        return self._entries.pop(key, None) is not None
+```
+
+#### Step 3: One interface, with the meter built in
+
+An `ABC` with five abstract methods and one concrete one, `read_measured`, which is the Java default method. `_CachedStrategy` sits under the four strategies and holds the common miss-then-load path, `_read_with_ttl`, so each strategy's `read` is one line.
+
+```python
+class BalanceCache(ABC):
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @abstractmethod
+    def read(self, account: str) -> Optional[Money]:
+        """The balance the application sees. May be stale depending on the strategy."""
+
+    @abstractmethod
+    def write(self, account: str, balance: Money) -> None:
+        """Record a new balance. Where it goes first is the strategy."""
+
+    @abstractmethod
+    def stats(self) -> CacheStats: ...
+
+    @abstractmethod
+    def store(self) -> BackingStore: ...
+
+    @abstractmethod
+    def cache(self) -> TtlCache: ...
+
+    def read_measured(self, account: str) -> Optional[Money]:
+        seen = self.read(account)
+        truth = self.store().peek(account)
+        if seen != truth:
+            self.stats().stale_reads += 1
+        return seen
+```
+
+```python
+    def _read_with_ttl(self, account: str, loader: Callable[[str], Optional[Money]], ttl_ms: int) -> Optional[Money]:
+        cached = self._cache.get(account)
+        if cached is not None:
+            self._stats.hit()
+            return cached
+        self._stats.miss()
+        loaded = loader(account)
+        if loaded is not None:
+            self._cache.put(account, loaded, ttl_ms)
+        return loaded
+```
+
+#### Step 4: Cache-aside, with invalidation as a switch
+
+`read` delegates to the shared path with the store's own `read` as the loader; a `None` from the store is not cached. `write` goes to the store and invalidates only when the flag says so, which is the whole difference between the first two rows of the table.
+
+```python
+    def read(self, account: str) -> Optional[Money]:
+        return self._read_with_ttl(account, self._store.read, self._ttl_ms)
+
+    def write(self, account: str, balance: Money) -> None:
+        self._store.write(account, balance)
+        if self._invalidate_on_write:
+            self._cache.invalidate(account)
+```
+
+#### Step 5: Read-through moves the loader behind the interface
+
+The loader is a `Callable[[str], Optional[Money]]` field bound to `store.read` in the constructor, which is Java's `store::read`. The read path is the same shared function; only the ownership of the loader moved.
+
+```python
+class ReadThrough(_CachedStrategy):
+    def __init__(self, store: BackingStore, clock: ManualClock, ttl_ms: int, cache_latency_ms: int) -> None:
+        super().__init__(store, clock, cache_latency_ms)
+        self._loader: Callable[[str], Optional[Money]] = store.read
+        self._ttl_ms = ttl_ms
+
+    def name(self) -> str:
+        return "read-through"
+
+    def read(self, account: str) -> Optional[Money]:
+        return self._read_with_ttl(account, self._loader, self._ttl_ms)
+
+    def write(self, account: str, balance: Money) -> None:
+        self._store.write(account, balance)
+        self._cache.invalidate(account)
+```
+
+#### Step 6: Write-through
+
+Store first, then cache, for the same reason as in Java: if the store write raises, the cache is untouched.
+
+```python
+    def write(self, account: str, balance: Money) -> None:
+        self._store.write(account, balance)  # store first: if this fails, the cache never sees the value
+        self._cache.put(account, balance, self._ttl_ms)
+```
+
+#### Step 7: Write-behind, with a flush and a crash
+
+Dirty values are cached with `NO_EXPIRY`. The `not in self._dirty` check before appending to `_order` is the `put(...) == null` test; `flush` pops each key in first-dirtied order, so three debits to one account become one store write. `crash` counts the dirty entries as lost and clears everything.
+
+```python
+    def write(self, account: str, balance: Money) -> None:
+        self._cache.put(account, balance, TtlCache.NO_EXPIRY)
+        if account not in self._dirty:
+            self._order.append(account)
+        self._dirty[account] = balance
+
+    def dirty_count(self) -> int:
+        return len(self._dirty)
+
+    def flush(self) -> int:
+        flushed = 0
+        for key in self._order:
+            self._store.write(key, self._dirty.pop(key))
+            flushed += 1
+        self._order.clear()
+        return flushed
+
+    def crash(self) -> None:
+        self.lost_writes += len(self._dirty)
+        self._dirty.clear()
+        self._order.clear()
+        self._cache.clear()
+```
+
+#### Step 8: A seeded workload, identical for every strategy
+
+`JavaRandom(seed)` draws in exactly the order the Java generator does (one `next_double` for hot, one `next_int` for the index, one `next_double` for the write flag, one `next_int` for the debit), and `java_round` reproduces `Math.round`. The resulting list is handed to every strategy with a fresh store and clock.
+
+```python
+    def generate(seed: int, ops: int, accounts: int, write_fraction: float, hot_fraction: float,
+                 hot_share: float) -> list[Op]:
+        rng = JavaRandom(seed)
+        hot_count = max(1, java_round(accounts * hot_fraction))
+        out: list[Op] = []
+        for _ in range(ops):
+            hot = rng.next_double() < hot_share
+            idx = rng.next_int(hot_count) if hot else hot_count + rng.next_int(max(1, accounts - hot_count))
+            account = f"acct-{idx % accounts:04d}"
+            is_write = rng.next_double() < write_fraction
+            out.append(Op(is_write, account, 1 + rng.next_int(2000) if is_write else 0))
+        return out
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/03-caching-strategies/code/python
@@ -385,33 +582,276 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The measured table matches the Java output digit for digit:
+
+```console
+== Write-behind: fast until the cache dies ==
+three debits applied; cache says   400.00 USD, store still says 500.00 USD, dirty keys = 1
+flush(): 1 store write for 3 debits (coalesced); store now 400.00 USD; store writes went 1 -> 2
+one more debit, then crash before flush: store = 400.00 USD, lost writes = 1
+
+== Measured: 20,000 ops, 500 accounts, 20% of accounts take 80% of traffic, 15% writes ==
+cache-aside, TTL only      hit rate  67.8%  store reads  6433  store writes  2980  divergent  4686  simulated latency  223160 ms
+cache-aside + invalidate   hit rate  60.8%  store reads  7850  store writes  2980  divergent     0  simulated latency  251500 ms
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`, `money.go`, and `javarandom.go`) keeps the design with five differences. **Absence is a second return value, not `null`:** `TtlCache.Get`, `BackingStore.Read`, and every strategy's `Read` return `(Money, bool)`. A missing account is `false`, never a zero `Money`, so the staleness meter compares presence first and value second; a `Money` struct compares with `==` because both fields are comparable. **The interface has no default method:** Go interfaces declare behaviour only, so `readMeasured` becomes the package function `ReadMeasured(c BalanceCache, account)`. The four strategies embed one small `cached` struct that supplies `Stats()`, `Store()`, `Cache()` and the shared miss-then-load path, which the Java code repeats in each class. **`Money` returns errors instead of throwing:** `Plus` and `Minus` return `(Money, error)` with `ErrCurrencyMismatch` and `ErrOverflow` sentinels (`errors.Is` in the tests), and `addChecked` stands in for `Math.addExact` both in `Money` and in `TtlCache.Put`. `Compare` panics on a currency mismatch, exactly as the Phase 10 reference `Money` does, and the workload driver uses `must(...)` because a debit that fails to subtract is a bug in the demo, not a condition to handle. **The workload generator is `java.util.Random`, not `math/rand`:** `javarandom.go` reproduces the 48-bit LCG (`next`, `NextInt(bound)` with its power-of-two fast path and rejection loop, `NextDouble`), and `javaRound` is `math.Floor(x + 0.5)`. The measured table matches the Java output digit for digit: 6433 store reads and 4686 divergent reads for TTL-only, 399 coalesced writes for write-behind; `TestJavaRandomMatchesJava` pins those numbers. **Write-behind's `LinkedHashMap` is a `map` plus a `[]string`:** Go maps have no iteration order, so the first-dirtied order lives in an explicit slice, exactly the pair the Python port keeps too.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A clock you move by hand and a store that charges for every call
+
+`ManualClock.Advance` panics on a negative step because a clock that runs backwards is a bug in the test, not a runtime condition. `BackingStore` exports its counters; `Read` and `Peek` return the comma-ok pair from the map.
+
 ```go
-// ReadMeasured counts a read as stale when the value handed to the caller differs from the store's truth.
-// It is the Java interface's default method, written as a function because Go interfaces carry no bodies.
-func ReadMeasured(c BalanceCache, account string) (Money, bool) {
-    seen, seenOk := c.Read(account)
-    truth, truthOk := c.Store().Peek(account)
-    if seenOk != truthOk || (seenOk && seen != truth) {
-        c.Stats().StaleReads++
-    }
-    return seen, seenOk
+type ManualClock struct{ nowMs int64 }
+
+func NewManualClock(startMs int64) *ManualClock { return &ManualClock{nowMs: startMs} }
+
+func (c *ManualClock) Now() int64 { return c.nowMs }
+
+func (c *ManualClock) Advance(ms int64) {
+	if ms < 0 {
+		panic("clock only moves forward")
+	}
+	c.nowMs += ms
+}
+
+type BackingStore struct {
+	rows               map[string]Money
+	readLatencyMs      int64
+	writeLatencyMs     int64
+	Reads, Writes      int64
+	SimulatedLatencyMs int64
+}
+
+func (s *BackingStore) Read(account string) (Money, bool) {
+	s.Reads++
+	s.SimulatedLatencyMs += s.readLatencyMs
+	m, ok := s.rows[account]
+	return m, ok
+}
+
+func (s *BackingStore) Write(account string, balance Money) {
+	s.Writes++
+	s.SimulatedLatencyMs += s.writeLatencyMs
+	s.rows[account] = balance
+}
+
+func (s *BackingStore) Peek(account string) (Money, bool) {
+	m, ok := s.rows[account]
+	return m, ok
 }
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `javarandom.go`:
+#### Step 2: The TTL cache
 
-- **Absence is a second return value, not `null`.** `TtlCache.Get`, `BackingStore.Read`, and every strategy's `Read` return `(Money, bool)`. A missing account is `false`, never a zero `Money`, so the staleness meter compares presence first and value second; a `Money` struct compares with `==` because both fields are comparable.
-- **The interface has no default method.** Go interfaces declare behaviour only, so `readMeasured` becomes the package function `ReadMeasured(c BalanceCache, account)`. The four strategies embed one small `cached` struct that supplies `Stats()`, `Store()`, `Cache()` and the shared miss-then-load path, which the Java code repeats in each class.
-- **`Money` returns errors instead of throwing.** `Plus` and `Minus` return `(Money, error)` with `ErrCurrencyMismatch` and `ErrOverflow` sentinels (`errors.Is` in the tests), and `addChecked` stands in for `Math.addExact` both in `Money` and in `TtlCache.Put`. `Compare` panics on a currency mismatch, exactly as the Phase 10 reference `Money` does. The workload driver uses `must(...)` because a debit that fails to subtract is a bug in the demo, not a condition to handle.
-- **The workload generator is `java.util.Random`, not `math/rand`.** `javarandom.go` reproduces the 48-bit LCG (`next`, `NextInt(bound)` with its power-of-two fast path and rejection loop, `NextDouble`), and `javaRound` is `math.Floor(x + 0.5)`. The measured table matches the Java output digit for digit: 6433 store reads and 4686 divergent reads for TTL-only, 399 coalesced writes for write-behind; `TestJavaRandomMatchesJava` pins those numbers.
-- **Write-behind's `LinkedHashMap` is a `map` plus a `[]string`.** Go maps have no iteration order, so the first-dirtied order lives in an explicit slice, exactly the pair the Python port keeps too.
+Same lazy expiry and `<=` boundary, returning `(Money{}, false)` for absent or expired. `Put` goes through `addChecked`, the hand-written `Math.addExact`, and panics on overflow because a TTL that overflows the clock is a programming error.
+
+```go
+func (c *TtlCache) Get(key string) (Money, bool) {
+	e, ok := c.entries[key]
+	if !ok {
+		return Money{}, false
+	}
+	if e.ExpiresAtMs <= c.clock.Now() {
+		delete(c.entries, key)
+		return Money{}, false
+	}
+	return e.Value, true
+}
+
+func (c *TtlCache) Put(key string, value Money, ttlMs int64) {
+	expires := int64(NoExpiry)
+	if ttlMs != NoExpiry {
+		sum, err := addChecked(c.clock.Now(), ttlMs)
+		if err != nil {
+			panic(err)
+		}
+		expires = sum
+	}
+	c.entries[key] = Entry{value, expires}
+}
+
+func (c *TtlCache) Invalidate(key string) bool {
+	_, ok := c.entries[key]
+	delete(c.entries, key)
+	return ok
+}
+```
+
+#### Step 3: One interface, with the meter built in
+
+The interface lists the six methods; `ReadMeasured` is a package function because Go interfaces carry no bodies. It compares presence (`seenOk != truthOk`) before value. The embedded `cached` struct provides the accessors and `loadOnMiss`, the shared read path.
+
+```go
+type BalanceCache interface {
+	Name() string
+	Read(account string) (Money, bool)
+	Write(account string, balance Money)
+	Stats() *CacheStats
+	Store() *BackingStore
+	Cache() *TtlCache
+}
+
+func ReadMeasured(c BalanceCache, account string) (Money, bool) {
+	seen, seenOk := c.Read(account)
+	truth, truthOk := c.Store().Peek(account)
+	if seenOk != truthOk || (seenOk && seen != truth) {
+		c.Stats().StaleReads++
+	}
+	return seen, seenOk
+}
+
+func (c *cached) loadOnMiss(account string, ttlMs int64) (Money, bool) {
+	if v, ok := c.cache.Get(account); ok {
+		c.stats.Hit()
+		return v, true
+	}
+	c.stats.Miss()
+	loaded, ok := c.store.Read(account)
+	if ok {
+		c.cache.Put(account, loaded, ttlMs)
+	}
+	return loaded, ok
+}
+```
+
+#### Step 4: Cache-aside, with invalidation as a switch
+
+`Read` is the embedded `loadOnMiss`; `Write` goes to the store and invalidates on the flag. An absent store value is never cached because `loadOnMiss` only calls `Put` when `ok`.
+
+```go
+func (c *CacheAside) Read(account string) (Money, bool) { return c.loadOnMiss(account, c.ttlMs) }
+
+func (c *CacheAside) Write(account string, balance Money) {
+	c.store.Write(account, balance)
+	if c.invalidateOnWrite {
+		c.cache.Invalidate(account)
+	}
+}
+```
+
+#### Step 5: Read-through moves the loader behind the interface
+
+`Loader` is a function type and the constructor stores the method value `store.Read` in it, which is Go's `store::read`. `Read` spells out the same hit/miss/populate path through the loader instead of the store.
+
+```go
+type Loader func(account string) (Money, bool)
+
+type ReadThrough struct {
+	cached
+	loader Loader
+	ttlMs  int64
+}
+
+func NewReadThrough(store *BackingStore, clock *ManualClock, ttlMs int64, cacheLatencyMs int64) *ReadThrough {
+	return &ReadThrough{cached{store, NewTtlCache(clock), NewCacheStats(cacheLatencyMs)}, store.Read, ttlMs}
+}
+
+func (c *ReadThrough) Read(account string) (Money, bool) {
+	if v, ok := c.cache.Get(account); ok {
+		c.stats.Hit()
+		return v, true
+	}
+	c.stats.Miss()
+	loaded, ok := c.loader(account)
+	if ok {
+		c.cache.Put(account, loaded, c.ttlMs)
+	}
+	return loaded, ok
+}
+```
+
+#### Step 6: Write-through
+
+Store first, then cache.
+
+```go
+func (c *WriteThrough) Write(account string, balance Money) {
+	c.store.Write(account, balance) // store first: if this fails, the cache never sees the value
+	c.cache.Put(account, balance, c.ttlMs)
+}
+```
+
+#### Step 7: Write-behind, with a flush and a crash
+
+The dirty map and the `order` slice together are the `LinkedHashMap`: the comma-ok check decides whether to append to `order`, `Flush` walks `order` and deletes from the map, and `Crash` counts and discards.
+
+```go
+func (c *WriteBehind) Write(account string, balance Money) {
+	c.cache.Put(account, balance, NoExpiry)
+	if _, present := c.dirty[account]; !present {
+		c.order = append(c.order, account)
+	}
+	c.dirty[account] = balance
+}
+
+func (c *WriteBehind) Flush() int {
+	flushed := 0
+	for _, key := range c.order {
+		c.store.Write(key, c.dirty[key])
+		delete(c.dirty, key)
+		flushed++
+	}
+	c.order = c.order[:0]
+	return flushed
+}
+
+func (c *WriteBehind) Crash() {
+	c.LostWrites += int64(len(c.dirty))
+	c.dirty = map[string]Money{}
+	c.order = nil
+	c.cache.Clear()
+}
+```
+
+#### Step 8: A seeded workload, identical for every strategy
+
+`NewJavaRandom(seed)` draws in the same order as the Java generator, `javaRound` reproduces `Math.round`, and the builtin `max` (Go 1.21+) replaces `Math.max`.
+
+```go
+func GenerateWorkload(seed int64, ops, accounts int, writeFraction, hotFraction, hotShare float64) []Op {
+	rng := NewJavaRandom(seed)
+	hotCount := max(1, javaRound(float64(accounts)*hotFraction))
+	out := make([]Op, 0, ops)
+	for i := 0; i < ops; i++ {
+		hot := rng.NextDouble() < hotShare
+		var idx int
+		if hot {
+			idx = rng.NextInt(hotCount)
+		} else {
+			idx = hotCount + rng.NextInt(max(1, accounts-hotCount))
+		}
+		account := fmt.Sprintf("acct-%04d", idx%accounts)
+		isWrite := rng.NextDouble() < writeFraction
+		var debit int64
+		if isWrite {
+			debit = int64(1 + rng.NextInt(2000))
+		}
+		out = append(out, Op{isWrite, account, debit})
+	}
+	return out
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/03-caching-strategies/code/go
 go run .
 go test ./...
+```
+
+The measured table matches the Java and Python output digit for digit:
+
+```console
+read-through               hit rate  60.8%  store reads  7850  store writes  2980  divergent     0  simulated latency  251500 ms
+write-through              hit rate  71.6%  store reads  5685  store writes  2980  divergent     0  simulated latency  208200 ms
+write-behind               hit rate  97.5%  store reads   500  store writes   399  divergent 17092  simulated latency   39975 ms
+no cache                   hit rate   0.0%  store reads 20000  store writes  2980  divergent     0  simulated latency  474500 ms
 ```
 
 ## Use It

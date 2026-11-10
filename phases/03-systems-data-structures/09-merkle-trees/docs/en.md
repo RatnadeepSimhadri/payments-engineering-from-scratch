@@ -350,21 +350,131 @@ The root in section 1 is reproducible: anyone who runs this file on any machine 
 
 ### In Python
 
-`code/python/main.py` has the same records as frozen dataclasses (`Currency`, `Money`, `Posting`, `ProofStep`, `Diff`) and the same `MerkleTree` methods in snake_case (`hash_leaf`, `hash_node`, `proof`, `verify`, `diff`, `of_postings`). The demo prints the same root, `4d637a9b...`, and the tests pin it. Three things differ:
+`code/python/main.py` has the same records as frozen dataclasses (`Currency`, `Money`, `Posting`, `ProofStep`, `Diff`) and the same `MerkleTree` methods in snake_case (`hash_leaf`, `hash_node`, `proof`, `verify`, `diff`, `of_postings`). The demo prints the same root, `4d637a9b...`, and the tests pin it. Three things differ. **`hashlib` and `hmac` replace `MessageDigest`:** `hashlib.sha256()` has the same `update`/`digest` shape, so the domain-separated hashes read line for line like the Java code, and the final root comparison uses `hmac.compare_digest`, the constant-time counterpart of `MessageDigest.isEqual`. **`bytes` is immutable, so no defensive copies:** Java clones every `byte[]` it hands out, and its test checks `root() != root()`. In Python a caller cannot write into the returned root at all, and the test asserts that `root[0] = 0` raises `TypeError`. Use `bytes` everywhere, never `str`, which would re-encode. **Index checks are explicit:** a Python list accepts `-1` and returns the last element, so `proof` checks `0 <= index < leaf_count()` itself and raises `IndexError`, the counterpart of `Objects.checkIndex`. `ValueError` replaces `IllegalArgumentException` for an empty tree or a leaf-count mismatch in `diff`. `Money.__post_init__` rejects a `float` amount, which Java's `long` field rejects at compile time.
 
-- **`hashlib` and `hmac` replace `MessageDigest`.** `hashlib.sha256()` has the same `update`/`digest` shape, so the domain-separated hashes read line for line like the Java code. The final root comparison uses `hmac.compare_digest`, the constant-time counterpart of `MessageDigest.isEqual`:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Canonical bytes for a posting
+
+A frozen dataclass whose `canonical_bytes` builds the `|`-separated form with an f-string and encodes it as UTF-8. The amount is written as `minor_units|code`, an integer and a code, never a formatted string, so the bytes match Java and Go exactly.
 
 ```python
-@staticmethod
-def verify(leaf_data: bytes, proof: list[ProofStep], expected_root: bytes) -> bool:
-    h = MerkleTree.hash_leaf(leaf_data)
-    for step in proof:
-        h = MerkleTree.hash_node(step.sibling, h) if step.sibling_on_left else MerkleTree.hash_node(h, step.sibling)
-    return hmac.compare_digest(h, expected_root)
+@dataclass(frozen=True)
+class Posting:
+    """One ledger posting. The leaf is the hash of canonical_bytes(), not of str()."""
+
+    id: str
+    debit_account: str
+    credit_account: str
+    amount: Money
+
+    def canonical_bytes(self) -> bytes:
+        canonical = (f"{self.id}|{self.debit_account}|{self.credit_account}|"
+                     f"{self.amount.minor_units}|{self.amount.currency.code}")
+        return canonical.encode("utf-8")
 ```
 
-- **`bytes` is immutable, so no defensive copies.** Java clones every `byte[]` it hands out, and its test checks `root() != root()`. In Python a caller cannot write into the returned root at all, and the test asserts that `root[0] = 0` raises `TypeError`. Use `bytes` everywhere, never `str`, which would re-encode.
-- **Index checks are explicit.** A Python list accepts `-1` and returns the last element, so `proof` checks `0 <= index < leaf_count()` itself and raises `IndexError`, the counterpart of `Objects.checkIndex`. `ValueError` replaces `IllegalArgumentException` for an empty tree or a leaf-count mismatch in `diff`. `Money.__post_init__` rejects a `float` amount, which Java's `long` field rejects at compile time.
+#### Step 2: Leaf and node hashes with domain separation
+
+`hashlib.sha256()` accumulates with `update` exactly as `MessageDigest` does, so the prefix, the data, and the second child go in without concatenation. `LEAF_PREFIX` and `NODE_PREFIX` are one-byte `bytes` constants.
+
+```python
+    @staticmethod
+    def hash_leaf(data: bytes) -> bytes:
+        md = hashlib.sha256()
+        md.update(LEAF_PREFIX)
+        md.update(data)
+        return md.digest()
+
+    @staticmethod
+    def hash_node(left: bytes, right: bytes) -> bytes:
+        md = hashlib.sha256()
+        md.update(NODE_PREFIX)
+        md.update(left)
+        md.update(right)
+        return md.digest()
+```
+
+#### Step 3: Building the levels
+
+`_levels` is a list of lists of `bytes`; level 0 is a comprehension over the leaf data, and each higher level is built pairwise with the odd node carried up unchanged. Because `bytes` is immutable, the carried-up entry can be the same object as its child without any aliasing risk.
+
+```python
+    def __init__(self, leaf_data: list[bytes]) -> None:
+        if not leaf_data:
+            raise ValueError("a Merkle tree needs at least one leaf")
+        self._levels: list[list[bytes]] = [[MerkleTree.hash_leaf(d) for d in leaf_data]]
+        current = self._levels[0]
+        while len(current) > 1:
+            nxt = []
+            for i in range(0, len(current), 2):
+                if i + 1 < len(current):
+                    nxt.append(MerkleTree.hash_node(current[i], current[i + 1]))
+                else:
+                    nxt.append(current[i])  # odd node: carried up, not duplicated
+            self._levels.append(nxt)
+            current = nxt
+```
+
+#### Step 4: Proofs and verification
+
+`proof` checks the index by hand because a negative index would silently wrap in Python; the sibling walk is the Java's with `//=` for the integer halving and no `clone()` needed. `verify` folds the path and finishes with `hmac.compare_digest`, which runs in constant time.
+
+```python
+    def proof(self, index: int) -> list[ProofStep]:
+        """Audit path for leaf index: one sibling per level where the node has a sibling."""
+        if not 0 <= index < self.leaf_count():  # Objects.checkIndex; Python would accept negative indexes
+            raise IndexError(f"Index {index} out of bounds for length {self.leaf_count()}")
+        path = []
+        i = index
+        for level in range(len(self._levels) - 1):
+            nodes = self._levels[level]
+            sibling = i + 1 if i % 2 == 0 else i - 1
+            if sibling < len(nodes):
+                path.append(ProofStep(nodes[sibling], sibling < i))
+            i //= 2
+        return path
+
+    @staticmethod
+    def verify(leaf_data: bytes, proof: list[ProofStep], expected_root: bytes) -> bool:
+        """Recompute the root from a leaf's data and its audit path; constant-time compare with the expected root."""
+        h = MerkleTree.hash_leaf(leaf_data)
+        for step in proof:
+            h = MerkleTree.hash_node(step.sibling, h) if step.sibling_on_left else MerkleTree.hash_node(h, step.sibling)
+        return hmac.compare_digest(h, expected_root)
+```
+
+#### Step 5: Diffing by pruned descent
+
+`comparisons` is a one-element list so the recursion can increment it, the Python idiom for Java's `int[]`. `==` on two `bytes` values is `Arrays.equals`. The carried-up case recurses into the single left child.
+
+```python
+    def diff(self, other: "MerkleTree") -> Diff:
+        """Every leaf index where the trees disagree, descending only into subtrees whose hashes differ."""
+        if other.leaf_count() != self.leaf_count():
+            raise ValueError(f"cannot diff trees with {self.leaf_count()} and {other.leaf_count()} leaves")
+        out: list[int] = []
+        comparisons = [0]
+        self._diff_node(other, len(self._levels) - 1, 0, out, comparisons)
+        return Diff(out, comparisons[0])
+
+    def _diff_node(self, other: "MerkleTree", level: int, index: int, out: list[int], comparisons: list[int]) -> None:
+        comparisons[0] += 1
+        if self._levels[level][index] == other._levels[level][index]:
+            return
+        if level == 0:
+            out.append(index)
+            return
+        below = len(self._levels[level - 1])
+        left, right = 2 * index, 2 * index + 1
+        if right >= below:  # this node was carried up: one child only
+            self._diff_node(other, level - 1, left, out, comparisons)
+            return
+        self._diff_node(other, level - 1, left, out, comparisons)
+        self._diff_node(other, level - 1, right, out, comparisons)
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/03-systems-data-structures/09-merkle-trees/code/python
@@ -372,34 +482,190 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+  root = 4d637a9bd4f8ce3eb34cee489fc275f8ff0893e83ae35d42535b2ba5509fae18
+  height = 4 levels for 8 leaves
+  primary root = 4d637a9bd4f8ce3e...
+  replica root = 5c7c47997a474f71...
+  divergent leaves = [5] (txn-0006)
+  hash comparisons = 7 (a row-by-row compare would read all 8 rows on both sides)
+```
+
+The root is the same `4d637a9b...` as the Java run because SHA-256 and the canonical bytes are fully specified.
+
 ### In Go
 
-`code/go/main.go` has the same records as structs (`Currency`, `Money`, `Posting`, `ProofStep`, `Diff`) and the same `MerkleTree` methods in exported CamelCase (`HashLeaf`, `HashNode`, `Proof`, `Verify`, `Diff`, `OfPostings`). The demo prints the same root, `4d637a9b...`, and the Go tests pin it as a constant. Three things differ:
+`code/go/main.go` has the same records as structs (`Currency`, `Money`, `Posting`, `ProofStep`, `Diff`) and the same `MerkleTree` methods in exported CamelCase (`HashLeaf`, `HashNode`, `Proof`, `Verify`, `Diff`, `OfPostings`). The demo prints the same root, `4d637a9b...`, and the Go tests pin it as a constant. Three things differ. **`crypto/sha256` and `crypto/subtle` replace `MessageDigest`:** `sha256.New()` has the same `Write`/`Sum` shape, so the domain-separated hashes read line for line like the Java code, and the final root comparison uses `subtle.ConstantTimeCompare`, the constant-time counterpart of `MessageDigest.isEqual`. **Slices alias, so the copies stay:** a `[]byte` handed out of `Root()` or `LeafHash()` shares memory with the tree unless it is cloned, so `bytes.Clone` does what Java's `clone()` did; the test writes into the returned root and checks the tree is unharmed. `levels` is `[][][]byte`. **Errors are values:** `NewMerkleTree` and `Diff` return `ErrInvalidArgument` for an empty tree or a leaf-count mismatch, and `Proof` returns `ErrIndexOutOfBounds` where Java's `Objects.checkIndex` throws; the tests use `errors.Is`. `Money` is the lesson's own `int64` minor units plus `Currency`; the canonical posting bytes are the same `|`-separated integer form, which is why the root matches.
 
-- **`crypto/sha256` and `crypto/subtle` replace `MessageDigest`.** `sha256.New()` has the same `Write`/`Sum` shape, so the domain-separated hashes read line for line like the Java code. The final root comparison uses `subtle.ConstantTimeCompare`, the constant-time counterpart of `MessageDigest.isEqual`:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Canonical bytes for a posting
+
+String concatenation with `strconv.FormatInt` for the minor units, converted to `[]byte` (Go strings are UTF-8 already). The field order and separator are identical to the other two ports.
 
 ```go
-func Verify(leafData []byte, proof []ProofStep, expectedRoot []byte) bool {
-    h := HashLeaf(leafData)
-    for _, step := range proof {
-        if step.SiblingOnLeft {
-            h = HashNode(step.Sibling, h)
-        } else {
-            h = HashNode(h, step.Sibling)
-        }
-    }
-    return subtle.ConstantTimeCompare(h, expectedRoot) == 1
+type Posting struct {
+	ID            string
+	DebitAccount  string
+	CreditAccount string
+	Amount        Money
+}
+
+func (p Posting) CanonicalBytes() []byte {
+	return []byte(p.ID + "|" + p.DebitAccount + "|" + p.CreditAccount + "|" +
+		strconv.FormatInt(p.Amount.MinorUnits, 10) + "|" + p.Amount.Currency.Code)
 }
 ```
 
-- **Slices alias, so the copies stay.** A `[]byte` handed out of `Root()` or `LeafHash()` shares memory with the tree unless it is cloned, so `bytes.Clone` does what Java's `clone()` did; the test writes into the returned root and checks the tree is unharmed. `levels` is `[][][]byte`.
-- **Errors are values.** `NewMerkleTree` and `Diff` return `ErrInvalidArgument` for an empty tree or a leaf-count mismatch, and `Proof` returns `ErrIndexOutOfBounds` where Java's `Objects.checkIndex` throws; the tests use `errors.Is`. `Money` is the lesson's own `int64` minor units plus `Currency`; the canonical posting bytes are the same `|`-separated integer form, which is why the root matches.
+#### Step 2: Leaf and node hashes with domain separation
+
+`sha256.New()` returns a `hash.Hash` whose `Write` accumulates and `Sum(nil)` returns a fresh 32-byte slice. The prefixes are typed `byte` constants wrapped in a one-element slice for `Write`.
+
+```go
+const (
+	LeafPrefix byte = 0x00
+	NodePrefix byte = 0x01
+)
+
+func HashLeaf(data []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte{LeafPrefix})
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+func HashNode(left, right []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte{NodePrefix})
+	h.Write(left)
+	h.Write(right)
+	return h.Sum(nil)
+}
+```
+
+#### Step 3: Building the levels
+
+`levels` is a `[][][]byte`; each level is `make`d to `(len+1)/2` and filled pairwise. The empty-tree case returns an error wrapping `ErrInvalidArgument` rather than panicking.
+
+```go
+func NewMerkleTree(leafData [][]byte) (*MerkleTree, error) {
+	if len(leafData) == 0 {
+		return nil, fmt.Errorf("%w: a Merkle tree needs at least one leaf", ErrInvalidArgument)
+	}
+	leaves := make([][]byte, len(leafData))
+	for i, d := range leafData {
+		leaves[i] = HashLeaf(d)
+	}
+	t := &MerkleTree{levels: [][][]byte{leaves}}
+	current := leaves
+	for len(current) > 1 {
+		next := make([][]byte, (len(current)+1)/2)
+		for i := 0; i < len(current); i += 2 {
+			if i+1 < len(current) {
+				next[i/2] = HashNode(current[i], current[i+1])
+			} else {
+				next[i/2] = current[i] // odd node: carried up, not duplicated
+			}
+		}
+		t.levels = append(t.levels, next)
+		current = next
+	}
+	return t, nil
+}
+```
+
+#### Step 4: Proofs and verification
+
+`Proof` returns `ErrIndexOutOfBounds` for a bad index and clones each sibling hash so the proof does not alias the tree. `Verify` is a package-level function that holds none of the tree, and `subtle.ConstantTimeCompare` returns 1 for equal inputs.
+
+```go
+func (t *MerkleTree) Proof(index int) ([]ProofStep, error) {
+	if index < 0 || index >= t.LeafCount() {
+		return nil, fmt.Errorf("%w: index %d out of bounds for length %d", ErrIndexOutOfBounds, index, t.LeafCount())
+	}
+	path := []ProofStep{}
+	i := index
+	for level := 0; level < len(t.levels)-1; level++ {
+		nodes := t.levels[level]
+		sibling := i - 1
+		if i%2 == 0 {
+			sibling = i + 1
+		}
+		if sibling < len(nodes) {
+			path = append(path, ProofStep{bytes.Clone(nodes[sibling]), sibling < i})
+		}
+		i /= 2
+	}
+	return path, nil
+}
+
+// Verify recomputes the root from a leaf's data and its audit path; true iff it equals the expected root.
+func Verify(leafData []byte, proof []ProofStep, expectedRoot []byte) bool {
+	h := HashLeaf(leafData)
+	for _, step := range proof {
+		if step.SiblingOnLeft {
+			h = HashNode(step.Sibling, h)
+		} else {
+			h = HashNode(h, step.Sibling)
+		}
+	}
+	return subtle.ConstantTimeCompare(h, expectedRoot) == 1
+}
+```
+
+#### Step 5: Diffing by pruned descent
+
+The `Diff` struct is passed by pointer and accumulates both the divergent indexes and the comparison count, replacing the Java's list plus `int[]`. `bytes.Equal` is `Arrays.equals`.
+
+```go
+func (t *MerkleTree) Diff(other *MerkleTree) (Diff, error) {
+	if other.LeafCount() != t.LeafCount() {
+		return Diff{}, fmt.Errorf("%w: cannot diff trees with %d and %d leaves", ErrInvalidArgument, t.LeafCount(), other.LeafCount())
+	}
+	d := Diff{DivergentLeaves: []int{}}
+	t.diffNode(other, len(t.levels)-1, 0, &d)
+	return d, nil
+}
+
+func (t *MerkleTree) diffNode(other *MerkleTree, level, index int, d *Diff) {
+	d.Comparisons++
+	if bytes.Equal(t.levels[level][index], other.levels[level][index]) {
+		return
+	}
+	if level == 0 {
+		d.DivergentLeaves = append(d.DivergentLeaves, index)
+		return
+	}
+	below := len(t.levels[level-1])
+	left, right := 2*index, 2*index+1
+	if right >= below { // this node was carried up: one child only
+		t.diffNode(other, level-1, left, d)
+		return
+	}
+	t.diffNode(other, level-1, left, d)
+	t.diffNode(other, level-1, right, d)
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/03-systems-data-structures/09-merkle-trees/code/go
 go run .
 go test ./...
 ```
+
+```console
+== 5. Odd leaf counts: carry up, never duplicate ==
+  5 leaves: height 4, proof lengths 3,3,1 (leaf 4 is carried up twice)
+  [p0..p4] vs [p0..p4,p4] roots equal = false  <- duplication would make this true (CVE-2012-2459)
+
+== 6. Scale: 1,000,000 postings disagree on one row ==
+  tree height = 21 levels, internal hashes to build = 999999
+  hashes exchanged to locate one bad row ~ 2 per level = 40, versus 1000000 rows shipped for a full compare
+```
+
+Sections 1 through 4 print the same root, divergent leaf, comparison count, and proof as the Java run.
 
 ## Use It
 

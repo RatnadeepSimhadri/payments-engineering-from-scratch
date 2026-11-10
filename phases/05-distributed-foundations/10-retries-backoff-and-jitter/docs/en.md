@@ -435,9 +435,21 @@ Run the Python and Go versions and diff the output; the three must be identical 
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **Unbounded integers need manual masking.** Python's `int` never overflows, so the left shift and the multiply in xorshift64* must be masked to 64 bits by hand (`& MASK64`) or the state grows without bound and the sequence diverges from Java and Go after the first step. `next_long` then converts to a signed value so its output matches Java's `long` exactly; `next_below` masks back to unsigned before the modulus. **Enum members with equal values alias.** `Outcome` stores `(code, retryable)` tuples because an `Enum` whose members have identical values (`OK = False`, `BAD_REQUEST = False`) silently makes the later ones aliases of the first. The test `assertIsNot(Outcome.CARD_DECLINED, Outcome.OK)` exists because this bug happened while writing the lesson. **`heapq` on tuples.** The event queue is a list of `(time, client)` tuples under `heapq`; tuple comparison gives the `(time, client)` ordering for free, which is what keeps the RNG draw order identical to the Java `Comparator`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A generator the three languages agree on
+
+Two of the three xorshift steps are right shifts on a value that is already masked, so they need nothing; the left shift and the output multiply each get `& MASK64`. The final line folds the unsigned product to a signed 64-bit value so `next_long()` prints the same number as Java's `long`. `next_below` undoes that fold with another mask before the modulus, which is `Long.remainderUnsigned`.
+
 ```python
 class Rng:
+    def __init__(self, seed: int) -> None:
+        self.state = (seed & MASK64) or 0x9E3779B97F4A7C15
+
     def next_long(self) -> int:
+        """Returns the next value as a signed 64-bit integer, matching Java's long."""
         x = self.state
         x ^= x >> 12
         x ^= (x << 25) & MASK64
@@ -445,32 +457,498 @@ class Rng:
         self.state = x
         out = (x * 0x2545F4914F6CDD1D) & MASK64
         return out - (1 << 64) if out >= (1 << 63) else out
+
+    def next_below(self, bound: int) -> int:
+        """Uniform integer in [0, bound), using the unsigned value like Long.remainderUnsigned."""
+        if bound <= 0:
+            raise ValueError(f"bound must be positive: {bound}")
+        return (self.next_long() & MASK64) % bound
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: A clock that does not tick on its own
 
-- **Unbounded integers need manual masking.** Python's `int` never overflows, so the left shift and the multiply must be masked to 64 bits by hand (`& MASK64`) or the state grows without bound and the sequence diverges from Java and Go after the first step. `next_long` then converts to a signed value so its output matches Java's `long` exactly; `next_below` masks back to unsigned before the modulus.
-- **Enum members with equal values alias.** `Outcome` stores `(code, retryable)` tuples because an `Enum` whose members have identical values (`OK = False`, `BAD_REQUEST = False`) silently makes the later ones aliases of the first. The test `assertIsNot(Outcome.CARD_DECLINED, Outcome.OK)` exists because this bug happened while writing the lesson.
-- **`heapq` on tuples.** The event queue is a list of `(time, client)` tuples under `heapq`; tuple comparison gives the `(time, client)` ordering for free, which is what keeps the RNG draw order identical to the Java `Comparator`.
+`Clock` is a `Protocol`; `FakeClock.sleep` adds to a counter and rejects a negative duration with `ValueError`. Nothing calls `time.sleep`.
+
+```python
+class FakeClock:
+    """A clock that only advances when someone sleeps against it. No wall time passes."""
+
+    def __init__(self, start_ms: int = 0) -> None:
+        self._now = start_ms
+
+    def now_ms(self) -> int:
+        return self._now
+
+    def sleep(self, ms: int) -> None:
+        if ms < 0:
+            raise ValueError("cannot sleep a negative duration")
+        self._now += ms
+```
+
+#### Step 3: Jitter and retryability as types
+
+`Jitter` is a plain `Enum`. `Outcome` carries a `(code, retryable)` tuple per member because members with equal values would alias; `retryable()` reads the second element.
+
+```python
+class Jitter(Enum):
+    NONE = "none"                  # delay = exp(attempt): everyone who failed together retries together
+    FULL = "full"                  # delay = uniform[0, exp]: widest spread, lowest peak
+    EQUAL = "equal"                # delay = exp/2 + uniform[0, exp/2]: never sooner than half the backoff
+    DECORRELATED = "decorrelated"  # delay = min(cap, uniform[base, 3 * previous]): spread grows with history
+
+
+class Outcome(Enum):
+    # (code, retryable). Enum members with equal values become aliases, so each needs a distinct code.
+    OK = ("ok", False)
+    TIMEOUT = ("timeout", True)                    # no response: the processor may or may not have done the work
+    CONNECTION_RESET = ("connection_reset", True)  # transport failed before or after the request was read
+    RATE_LIMITED = ("rate_limited", True)          # HTTP 429: slow down, so retry only with backoff
+    SERVER_ERROR = ("server_error", True)          # HTTP 503/502: transient on the processor side
+    BAD_REQUEST = ("bad_request", False)           # HTTP 400: our payload is wrong; the same bytes fail the same way
+    UNAUTHORIZED = ("unauthorized", False)         # HTTP 401: our credentials are wrong; retrying is brute force
+    CARD_DECLINED = ("card_declined", False)       # a valid business answer, not an error
+
+    def retryable(self) -> bool:
+        return self.value[1]
+```
+
+#### Step 4: The policy and its schedule
+
+`RetryPolicy` is a frozen dataclass whose `__post_init__` is the compact constructor. `exponential` uses a `while` loop with the same stop-at-cap condition; `delay` is an `if` chain over the jitter kind with `//` for the halving (all values are non-negative, so floor and truncation agree); `schedule` threads `previous` through `max_attempts - 1` draws.
+
+```python
+    def exponential(self, attempt: int) -> int:
+        """Pure exponential backoff with the cap applied; doubling stops once the cap is reached."""
+        delay = self.base_ms
+        i = 0
+        while i < attempt and delay < self.cap_ms:
+            delay = min(self.cap_ms, delay * 2)
+            i += 1
+        return min(self.cap_ms, delay)
+
+    def delay(self, attempt: int, previous_ms: int, rng: Rng) -> int:
+        """Delay before retry number `attempt` (0 = first retry). Only DECORRELATED reads previous_ms."""
+        exp = self.exponential(attempt)
+        if self.jitter is Jitter.NONE:
+            return exp
+        if self.jitter is Jitter.FULL:
+            return rng.next_below(exp + 1)
+        if self.jitter is Jitter.EQUAL:
+            return exp // 2 + rng.next_below(exp // 2 + 1)
+        upper = min(self.cap_ms, max(self.base_ms, previous_ms) * 3)
+        return self.base_ms + rng.next_below(upper - self.base_ms + 1)
+
+    def schedule(self, rng: Rng) -> list[int]:
+        """Every delay this policy would produce if every attempt failed: max_attempts - 1 entries."""
+        delays: list[int] = []
+        previous = self.base_ms
+        for attempt in range(self.max_attempts - 1):
+            d = self.delay(attempt, previous, rng)
+            delays.append(d)
+            previous = d
+        return delays
+```
+
+#### Step 5: The retry budget
+
+Integer millitokens with `//` for the percentage, so five deposits of 20% make exactly one token.
+
+```python
+class RetryBudget:
+    TOKEN = 1000
+
+    def __init__(self, percent_can_retry: int, max_tokens: int) -> None:
+        if not 0 <= percent_can_retry <= 100:
+            raise ValueError("percent must be 0..100")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+        self._deposit = self.TOKEN * percent_can_retry // 100
+        self._max_balance = self.TOKEN * max_tokens
+        self._balance = 0
+
+    def deposit(self) -> None:
+        self._balance = min(self._max_balance, self._balance + self._deposit)
+
+    def try_withdraw(self) -> bool:
+        if self._balance < self.TOKEN:
+            return False
+        self._balance -= self.TOKEN
+        return True
+
+    def tokens(self) -> int:
+        return self._balance // self.TOKEN
+```
+
+#### Step 6: The retrier
+
+`Operation` is any callable taking the attempt number. The loop body keeps the Java order exactly: success, non-retryable, last-attempt break, budget, then sleep and record.
+
+```python
+    def execute(self, op: Operation) -> RetryResult:
+        if self.budget is not None:
+            self.budget.deposit()
+        delays: list[int] = []
+        total = 0
+        previous = self.policy.base_ms
+        outcome = Outcome.TIMEOUT
+        for attempt in range(self.policy.max_attempts):
+            outcome = op(attempt)
+            if outcome is Outcome.OK:
+                return RetryResult(outcome, attempt + 1, total, StopReason.SUCCEEDED, delays)
+            if not outcome.retryable():
+                return RetryResult(outcome, attempt + 1, total, StopReason.NON_RETRYABLE, delays)
+            if attempt == self.policy.max_attempts - 1:
+                break
+            if self.budget is not None and not self.budget.try_withdraw():
+                return RetryResult(outcome, attempt + 1, total, StopReason.BUDGET_EXHAUSTED, delays)
+            d = self.policy.delay(attempt, previous, self.rng)
+            self.clock.sleep(d)
+            delays.append(d)
+            total += d
+            previous = d
+        return RetryResult(outcome, self.policy.max_attempts, total, StopReason.ATTEMPTS_EXHAUSTED, delays)
+```
+
+#### Step 7: The storm
+
+`heapq` over `(at, client)` tuples gives the `(time, client)` order without a comparator, which is what keeps the RNG consumed in the same sequence as the Java `PriorityQueue`. The loop is the Java loop; `max(d, 1)` keeps a zero jitter delay from landing in the same bucket.
+
+```python
+        rng = Rng(seed)
+        queue: list[tuple[int, int]] = [(0, c) for c in range(clients)]
+        heapq.heapify(queue)
+        load = [0] * horizon_buckets
+        retries = [0] * horizon_buckets
+        served = [0] * horizon_buckets
+        previous_delay = [policy.base_ms] * clients
+        attempts_made = [0] * clients
+        horizon_ms = horizon_buckets * bucket_ms
+        succeeded = gave_up = total_attempts = 0
+
+        while queue and queue[0][0] < horizon_ms:
+            at, c = heapq.heappop(queue)
+            bucket = at // bucket_ms
+            load[bucket] += 1
+            if attempts_made[c] > 0:
+                retries[bucket] += 1
+            attempts_made[c] += 1
+            total_attempts += 1
+            healthy = at >= outage_ms
+            if healthy and served[bucket] < capacity_per_bucket:
+                served[bucket] += 1
+                succeeded += 1
+                continue
+            if attempts_made[c] >= policy.max_attempts:
+                gave_up += 1
+                continue
+            d = policy.delay(attempts_made[c] - 1, previous_delay[c], rng)
+            previous_delay[c] = d
+            heapq.heappush(queue, (at + max(d, 1), c))  # a zero delay still lands strictly later
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/05-distributed-foundations/10-retries-backoff-and-jitter/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Every number matches the Java run; that is the whole reason for the hand-masked generator:
+
+```console
+== The schedule: base 100 ms, cap 10 s, 6 attempts, seed 42 ==
+NONE          [100, 200, 400, 800, 1600]
+FULL          [46, 26, 131, 226, 241]
+EQUAL         [68, 179, 379, 654, 994]
+DECORRELATED  [190, 474, 675, 569, 810]
+
+== One payment, processor flapping: TIMEOUT, TIMEOUT, OK ==
+result=SUCCEEDED attempts=3 waited=300 ms delays=[100, 200] clock=300 ms
+
+== Retry budget: 20% of organic traffic may be retries, max 10 tokens banked ==
+after 50 healthy requests: 10 tokens banked
+outage request 5: attempts=3 stop=ATTEMPTS_EXHAUSTED tokens left=0
+outage request 6: attempts=2 stop=BUDGET_EXHAUSTED   tokens left=0
+
+== Retry storm: 1000 clients, processor down 1 s, then 200 calls per 100 ms bucket, 8 attempts ==
+-- NONE: peak after recovery=1000/bucket busy buckets=6 succeeded=400 gave up=0 waiting=600 attempts=5800
+-- FULL: peak after recovery=146/bucket busy buckets=43 succeeded=998 gave up=2 waiting=0 attempts=5996
+-- EQUAL: peak after recovery=231/bucket busy buckets=27 succeeded=1000 gave up=0 waiting=0 attempts=5298
+-- DECORRELATED: peak after recovery=192/bucket busy buckets=30 succeeded=999 gave up=1 waiting=0 attempts=4708
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with three differences. **`uint64` state, `int64` output.** Go has unsigned integers, so the state is a `uint64` and the shifts are naturally logical; the final conversion to `int64` reinterprets the bits exactly as Java's signed multiply does. No masking is needed because `uint64` arithmetic wraps by definition. **Errors as values.** `NewRetryPolicy` and `NewRetryBudget` return `(T, error)` for the validation failures that Java expresses as exceptions; `mustPolicy` panics for the demo's known-good constants. `Rng.NextBelow` panics on a non-positive bound, because a bad bound is a programming error with no caller who could sensibly handle it. **`container/heap` needs the five methods.** The event heap implements `Len`, `Less`, `Swap`, `Push`, and `Pop` on a slice type; `Less` compares time and then client id, the same tiebreak as the other two languages.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A generator the three languages agree on
+
+With `uint64` state the three shifts and the multiply are the algorithm with no decoration; `int64(...)` at the end reinterprets the bits as Java's signed `long`. `NextBelow` converts back to `uint64` for the modulus.
+
 ```go
+type Rng struct{ state uint64 }
+
+func NewRng(seed int64) *Rng {
+	s := uint64(seed)
+	if s == 0 {
+		s = 0x9E3779B97F4A7C15
+	}
+	return &Rng{state: s}
+}
+
+// NextLong returns the next value as a signed 64-bit integer, matching Java's long.
 func (r *Rng) NextLong() int64 {
-    x := r.state
-    x ^= x >> 12
-    x ^= x << 25
-    x ^= x >> 27
-    r.state = x
-    return int64(x * 0x2545F4914F6CDD1D)
+	x := r.state
+	x ^= x >> 12
+	x ^= x << 25
+	x ^= x >> 27
+	r.state = x
+	return int64(x * 0x2545F4914F6CDD1D)
+}
+
+// NextBelow returns a uniform integer in [0, bound), using the unsigned value like Long.remainderUnsigned.
+func (r *Rng) NextBelow(bound int64) int64 {
+	if bound <= 0 {
+		panic(fmt.Sprintf("bound must be positive: %d", bound))
+	}
+	return int64(uint64(r.NextLong()) % uint64(bound))
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: A clock that does not tick on its own
 
-- **`uint64` state, `int64` output.** Go has unsigned integers, so the state is a `uint64` and the shifts are naturally logical; the final conversion to `int64` reinterprets the bits exactly as Java's signed multiply does. No masking is needed because `uint64` arithmetic wraps by definition.
-- **Errors as values.** `NewRetryPolicy` and `NewRetryBudget` return `(T, error)` for the validation failures that Java expresses as exceptions; `mustPolicy` panics for the demo's known-good constants. `Rng.NextBelow` panics on a non-positive bound, because a bad bound is a programming error with no caller who could sensibly handle it.
-- **`container/heap` needs the five methods.** The event heap implements `Len`, `Less`, `Swap`, `Push`, and `Pop` on a slice type; `Less` compares time and then client id, the same tiebreak as the other two languages.
+`Clock` is a two-method interface; `FakeClock.Sleep` adds and panics on a negative duration, since that is a caller bug.
+
+```go
+type FakeClock struct{ now int64 }
+
+func NewFakeClock(startMs int64) *FakeClock { return &FakeClock{now: startMs} }
+func (c *FakeClock) NowMs() int64          { return c.now }
+func (c *FakeClock) Sleep(ms int64) {
+	if ms < 0 {
+		panic("cannot sleep a negative duration")
+	}
+	c.now += ms
+}
+```
+
+#### Step 3: Jitter and retryability as types
+
+Go has no enum fields, so `Outcome` is an `int` with `iota` constants and `Retryable` is a `switch` listing the four transient outcomes; everything else, including `OK`, is `false`. The decision is still made in one place.
+
+```go
+type Outcome int
+
+const (
+	OK              Outcome = iota
+	Timeout                 // no response: the processor may or may not have done the work
+	ConnectionReset         // transport failed before or after the request was read
+	RateLimited             // HTTP 429: slow down, so retry only with backoff
+	ServerError             // HTTP 503/502: transient on the processor side
+	BadRequest              // HTTP 400: our payload is wrong; the same bytes fail the same way
+	Unauthorized            // HTTP 401: our credentials are wrong; retrying is brute force
+	CardDeclined            // a valid business answer, not an error
+)
+
+func (o Outcome) Retryable() bool {
+	switch o {
+	case Timeout, ConnectionReset, RateLimited, ServerError:
+		return true
+	}
+	return false
+}
+```
+
+#### Step 4: The policy and its schedule
+
+`NewRetryPolicy` validates and returns `ErrInvalidPolicy`; the three methods use the builtin `min`/`max` and Go's truncating `/`, which equals Java's for these non-negative values. The `default` arm of the `switch` is decorrelated jitter.
+
+```go
+func (p RetryPolicy) Exponential(attempt int) int64 {
+	delay := p.BaseMs
+	for i := 0; i < attempt && delay < p.CapMs; i++ {
+		delay = min(p.CapMs, delay*2)
+	}
+	return min(p.CapMs, delay)
+}
+
+// Delay before retry number attempt (0 = first retry). Only Decorrelated reads previousMs.
+func (p RetryPolicy) Delay(attempt int, previousMs int64, rng *Rng) int64 {
+	exp := p.Exponential(attempt)
+	switch p.Jitter {
+	case None:
+		return exp
+	case Full:
+		return rng.NextBelow(exp + 1)
+	case Equal:
+		return exp/2 + rng.NextBelow(exp/2+1)
+	default:
+		upper := min(p.CapMs, max(p.BaseMs, previousMs)*3)
+		return p.BaseMs + rng.NextBelow(upper-p.BaseMs+1)
+	}
+}
+
+// Schedule is every delay this policy would produce if every attempt failed: MaxAttempts - 1 entries.
+func (p RetryPolicy) Schedule(rng *Rng) []int64 {
+	delays := make([]int64, 0, p.MaxAttempts-1)
+	previous := p.BaseMs
+	for attempt := 0; attempt < p.MaxAttempts-1; attempt++ {
+		d := p.Delay(attempt, previous, rng)
+		delays = append(delays, d)
+		previous = d
+	}
+	return delays
+}
+```
+
+#### Step 5: The retry budget
+
+Same integer millitokens; the constructor returns an error for bad percentages and `token` is a package constant.
+
+```go
+type RetryBudget struct {
+	depositMillis int64
+	maxBalance    int64
+	balance       int64
+}
+
+const token = 1000
+
+func NewRetryBudget(percentCanRetry, maxTokens int) (*RetryBudget, error) {
+	if percentCanRetry < 0 || percentCanRetry > 100 {
+		return nil, errors.New("percent must be 0..100")
+	}
+	if maxTokens < 1 {
+		return nil, errors.New("maxTokens must be >= 1")
+	}
+	return &RetryBudget{depositMillis: int64(token * percentCanRetry / 100), maxBalance: int64(token * maxTokens)}, nil
+}
+
+func (b *RetryBudget) Deposit() { b.balance = min(b.maxBalance, b.balance+b.depositMillis) }
+
+func (b *RetryBudget) TryWithdraw() bool {
+	if b.balance < token {
+		return false
+	}
+	b.balance -= token
+	return true
+}
+
+func (b *RetryBudget) Tokens() int64 { return b.balance / token }
+```
+
+#### Step 6: The retrier
+
+`Operation` is a function type; a `nil` budget means unlimited. The check order inside the loop is unchanged from Java.
+
+```go
+func (r *Retrier) Execute(op Operation) RetryResult {
+	if r.Budget != nil {
+		r.Budget.Deposit()
+	}
+	delays := []int64{}
+	var total int64
+	previous := r.Policy.BaseMs
+	outcome := Timeout
+	for attempt := 0; attempt < r.Policy.MaxAttempts; attempt++ {
+		outcome = op(attempt)
+		if outcome == OK {
+			return RetryResult{outcome, attempt + 1, total, Succeeded, delays}
+		}
+		if !outcome.Retryable() {
+			return RetryResult{outcome, attempt + 1, total, NonRetryable, delays}
+		}
+		if attempt == r.Policy.MaxAttempts-1 {
+			break
+		}
+		if r.Budget != nil && !r.Budget.TryWithdraw() {
+			return RetryResult{outcome, attempt + 1, total, BudgetExhausted, delays}
+		}
+		d := r.Policy.Delay(attempt, previous, r.Rng)
+		r.Clock.Sleep(d)
+		delays = append(delays, d)
+		total += d
+		previous = d
+	}
+	return RetryResult{outcome, r.Policy.MaxAttempts, total, AttemptsExhausted, delays}
+}
+```
+
+#### Step 7: The storm
+
+`eventHeap` implements `heap.Interface` with `(at, client)` ordering. The simulation loop pops with `heap.Pop`, pushes with `heap.Push`, and otherwise follows the Java line for line.
+
+```go
+type eventHeap []event
+
+func (h eventHeap) Len() int { return len(h) }
+func (h eventHeap) Less(i, j int) bool {
+	if h[i].at != h[j].at {
+		return h[i].at < h[j].at
+	}
+	return h[i].client < h[j].client
+}
+func (h eventHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *eventHeap) Push(x any)         { *h = append(*h, x.(event)) }
+func (h *eventHeap) Pop() any           { old := *h; e := old[len(old)-1]; *h = old[:len(old)-1]; return e }
+```
+
+```go
+	for queue.Len() > 0 && queue[0].at < horizonMs {
+		e := heap.Pop(&queue).(event)
+		c := e.client
+		bucket := int(e.at / bucketMs)
+		load[bucket]++
+		if attemptsMade[c] > 0 {
+			retries[bucket]++
+		}
+		attemptsMade[c]++
+		totalAttempts++
+		healthy := e.at >= outageMs
+		if healthy && served[bucket] < capacityPerBucket {
+			served[bucket]++
+			succeeded++
+			continue
+		}
+		if attemptsMade[c] >= policy.MaxAttempts {
+			gaveUp++
+			continue
+		}
+		d := policy.Delay(attemptsMade[c]-1, previousDelay[c], rng)
+		previousDelay[c] = d
+		heap.Push(&queue, event{e.at + max(d, 1), c}) // a zero delay still lands strictly later
+	}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/05-distributed-foundations/10-retries-backoff-and-jitter/code/go
+go run .
+go test ./...
+```
+
+The numbers are the same as Java and Python; the only textual difference is that Go's `%v` prints a slice without commas:
+
+```console
+== The schedule: base 100 ms, cap 10 s, 6 attempts, seed 42 ==
+NONE          [100 200 400 800 1600]
+FULL          [46 26 131 226 241]
+EQUAL         [68 179 379 654 994]
+DECORRELATED  [190 474 675 569 810]
+
+== One payment, processor flapping: TIMEOUT, TIMEOUT, OK ==
+result=SUCCEEDED attempts=3 waited=300 ms delays=[100 200] clock=300 ms
+
+== Retry storm: 1000 clients, processor down 1 s, then 200 calls per 100 ms bucket, 8 attempts ==
+-- NONE: peak after recovery=1000/bucket busy buckets=6 succeeded=400 gave up=0 waiting=600 attempts=5800
+-- FULL: peak after recovery=146/bucket busy buckets=43 succeeded=998 gave up=2 waiting=0 attempts=5996
+-- EQUAL: peak after recovery=231/bucket busy buckets=27 succeeded=1000 gave up=0 waiting=0 attempts=5298
+-- DECORRELATED: peak after recovery=192/bucket busy buckets=30 succeeded=999 gave up=1 waiting=0 attempts=4708
+```
 
 ## Use It
 

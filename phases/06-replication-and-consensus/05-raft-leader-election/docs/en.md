@@ -401,42 +401,575 @@ Notice in the first election that two candidates, `n4` and `n1`, started one tic
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **The priority queue is `heapq` on tuples** `(deliver_at, seq, message)`; because `seq` is unique, the comparison never reaches the `Message` dataclass, which is deliberately not orderable. **64-bit arithmetic is emulated:** Python integers do not wrap, so `Rng` masks with `& MASK64` after every addition and multiplication to reproduce SplitMix64 bit-for-bit, and forgetting one mask produces a different stream and the traces stop matching Java and Go. **Nodes tick in `sorted(self.nodes)` order:** dict iteration order is insertion order in modern Python, which happens to be id order here, but sorting makes the determinism contract explicit rather than incidental. **`current_term` and `voted_for` are read-only properties** delegating to `storage`, so the only way to change them is `storage.save`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Terms, roles, and messages
+
+`Role` and `MessageKind` are `Enum`s and `Message` is a frozen dataclass with the three log-related fields defaulted, so the static constructors only fill in what each kind needs. The sender is `from_` because `from` is a keyword. Every constructor, replies included, takes a `term`.
+
 ```python
-class RaftNode:
+class Role(Enum):
+    FOLLOWER = "FOLLOWER"
+    CANDIDATE = "CANDIDATE"
+    LEADER = "LEADER"
+
+
+@dataclass(frozen=True)
+class Message:
+    kind: MessageKind
+    from_: int
+    to: int
+    term: int
+    last_log_index: int = 0
+    last_log_term: int = 0
+    granted: bool = False
+
+    @staticmethod
+    def request_vote(from_: int, to: int, term: int, last_log_index: int, last_log_term: int) -> "Message":
+        return Message(MessageKind.REQUEST_VOTE, from_, to, term, last_log_index, last_log_term, False)
+
+    @staticmethod
+    def vote_reply(from_: int, to: int, term: int, granted: bool) -> "Message":
+        return Message(MessageKind.REQUEST_VOTE_REPLY, from_, to, term, 0, 0, granted)
+
+    @staticmethod
+    def heartbeat(from_: int, to: int, term: int) -> "Message":
+        return Message(MessageKind.APPEND_ENTRIES, from_, to, term, 0, 0, False)
+```
+
+#### Step 2: Stable storage, separated from the node
+
+`Storage` is a plain class with three attributes and one mutator. The node exposes `current_term` and `voted_for` as `@property` accessors over its storage, which is how Python enforces "read through storage, write only through `save`" without a getter convention.
+
+```python
+class Storage:
+    def __init__(self) -> None:
+        self.current_term = 0
+        self.voted_for = -1
+        self.writes = 0
+
+    def save(self, term: int, voted_for: int) -> None:
+        self.current_term = term
+        self.voted_for = voted_for
+        self.writes += 1
+```
+
+```python
+    @property
+    def current_term(self) -> int:
+        return self.storage.current_term
+
+    @property
+    def voted_for(self) -> int:
+        return self.storage.voted_for
+```
+
+#### Step 3: Timing and the election timer
+
+`Config` is a frozen dataclass with the paper's defaults as field defaults, and the compact-constructor validation lives in `__post_init__`, raising `ValueError`. `reset_election_timer` draws a fresh deadline from the node's own `Rng`; `tick` is the two-way branch on role that either sends heartbeats or starts an election when its deadline has passed.
+
+```python
+@dataclass(frozen=True)
+class Config:
+    election_timeout_min: int = 150
+    election_timeout_max: int = 300
+    heartbeat_interval: int = 50
+
+    def __post_init__(self) -> None:
+        if self.election_timeout_min <= 0 or self.election_timeout_max < self.election_timeout_min or self.heartbeat_interval <= 0:
+            raise ValueError("bad timing config")
+        if self.heartbeat_interval >= self.election_timeout_min:
+            raise ValueError("heartbeat interval must be well below the election timeout")
+```
+
+```python
+    def reset_election_timer(self, now: int) -> None:
+        span = self.config.election_timeout_max - self.config.election_timeout_min + 1
+        self.election_deadline = now + self.config.election_timeout_min + self.rng.next_int(span)
+
+    def tick(self, now: int) -> list[Message]:
+        if self.role == Role.LEADER:
+            return self.send_heartbeats(now) if now >= self.next_heartbeat else []
+        return self.start_election(now) if now >= self.election_deadline else []
+```
+
+#### Step 4: Starting an election
+
+Figure 2's conversion list in order. The self-vote is `storage.save(current_term + 1, self.id)`, and `votes_granted` is reset to a set containing only our own id. The `RequestVote` fan-out is a list comprehension over `peers`, returned rather than sent; the `tracer` call is what produces the demo's event lines.
+
+```python
+    def start_election(self, now: int) -> list[Message]:
+        self.role = Role.CANDIDATE
+        self.storage.save(self.storage.current_term + 1, self.id)  # increment currentTerm, vote for self, persist before sending
+        self.leader_id = -1
+        self.votes_granted = {self.id}
+        self.elections_started += 1
+        self.reset_election_timer(now)
+        self.tracer(now, f"{name(self.id)} election timeout -> candidate for term {self.current_term}, votes for itself")
+        return [Message.request_vote(self.id, p, self.current_term, self.last_log_index, self.last_log_term) for p in self.peers]
+```
+
+#### Step 5: Handling a message
+
+The All Servers rule runs first, then an `if` ladder replaces the Java `switch` expression; `APPEND_ENTRIES_REPLY` falls through to an empty list. `become_follower` saves `(term, -1)` only when the term actually advances and gives a demoted leader a fresh election deadline.
+
+```python
     def handle(self, m: Message, now: int) -> list[Message]:
         if m.term > self.current_term:
             self.become_follower(m.term, now)
         if m.kind == MessageKind.REQUEST_VOTE:
             return self.on_request_vote(m, now)
-        ...
+        if m.kind == MessageKind.REQUEST_VOTE_REPLY:
+            return self.on_vote_reply(m, now)
+        if m.kind == MessageKind.APPEND_ENTRIES:
+            return self.on_append_entries(m, now)
+        return []  # APPEND_ENTRIES_REPLY: Lesson 06 uses replies to drive nextIndex/matchIndex
+
+    def become_follower(self, term: int, now: int) -> None:
+        before = self.role
+        self.role = Role.FOLLOWER
+        self.leader_id = -1
+        self.votes_granted = set()
+        if term > self.current_term:
+            self.storage.save(term, -1)  # a new term means votedFor is null again
+        if before == Role.LEADER:
+            self.reset_election_timer(now)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 6: The RequestVote receiver
 
-- **The priority queue is `heapq` on tuples** `(deliver_at, seq, message)`. Because `seq` is unique, the comparison never reaches the `Message` dataclass, which is deliberately not orderable.
-- **64-bit arithmetic is emulated.** Python integers do not wrap, so `Rng` masks with `& MASK64` after every addition and multiplication to reproduce SplitMix64 bit-for-bit. Forgetting one mask produces a different stream and the traces stop matching Java and Go.
-- **Nodes tick in `sorted(self.nodes)` order.** Dict iteration order is insertion order in modern Python, which happens to be id order here, but sorting makes the determinism contract explicit rather than incidental.
-- **`current_term` and `voted_for` are read-only properties** delegating to `storage`, so the only way to change them is `storage.save`.
+Rule 1 and rule 2, with the up-to-date check split across two lines for readability. `save` is called before the granting reply is built, so the vote is durable before it leaves, and the election timer is reset only on a grant.
+
+```python
+    def on_request_vote(self, m: Message, now: int) -> list[Message]:
+        if m.term < self.current_term:  # 1. Reply false if term < currentTerm
+            return [Message.vote_reply(self.id, m.from_, self.current_term, False)]
+        can_vote = self.voted_for == -1 or self.voted_for == m.from_
+        log_up_to_date = m.last_log_term > self.last_log_term or (
+            m.last_log_term == self.last_log_term and m.last_log_index >= self.last_log_index)
+        if can_vote and log_up_to_date:
+            self.storage.save(self.current_term, m.from_)  # persist the vote before the reply leaves
+            self.reset_election_timer(now)  # granting a vote resets the election timer
+            return [Message.vote_reply(self.id, m.from_, self.current_term, True)]
+        return [Message.vote_reply(self.id, m.from_, self.current_term, False)]
+```
+
+#### Step 7: Counting votes and becoming leader
+
+A reply counts only while we are still a candidate in the reply's term. `votes_granted` is a `set`, so a duplicate reply from one peer is counted once, and `majority()` is `cluster_size() // 2 + 1`. `become_leader` immediately sends the first heartbeats.
+
+```python
+    def on_vote_reply(self, m: Message, now: int) -> list[Message]:
+        if self.role != Role.CANDIDATE or m.term != self.current_term:
+            return []
+        if m.granted:
+            self.votes_granted.add(m.from_)
+            if len(self.votes_granted) >= self.majority():
+                return self.become_leader(now)
+        return []
+
+    def become_leader(self, now: int) -> list[Message]:
+        self.role = Role.LEADER
+        self.leader_id = self.id
+        return self.send_heartbeats(now)  # Leaders: upon election send initial empty AppendEntries to each server
+
+    def send_heartbeats(self, now: int) -> list[Message]:
+        self.next_heartbeat = now + self.config.heartbeat_interval
+        return [Message.heartbeat(self.id, p, self.current_term) for p in self.peers]
+```
+
+#### Step 8: Heartbeats and stepping down
+
+A stale heartbeat is rejected with our term; a heartbeat for our term while we are leader raises `RuntimeError` (the port's `IllegalStateException`); a candidate hearing it steps down. Either way the follower records `leader_id` and resets its timer.
+
+```python
+    def on_append_entries(self, m: Message, now: int) -> list[Message]:
+        if m.term < self.current_term:
+            return [Message.heartbeat_reply(self.id, m.from_, self.current_term, False)]
+        if self.role == Role.LEADER:
+            raise RuntimeError(f"two leaders in term {self.current_term}: {self.id} and {m.from_}")
+        if self.role == Role.CANDIDATE:
+            self.role = Role.FOLLOWER
+            self.votes_granted = set()
+        self.leader_id = m.from_
+        self.reset_election_timer(now)
+        return [Message.heartbeat_reply(self.id, m.from_, self.current_term, True)]
+```
+
+#### Step 9: The network
+
+`send` checks crash and partition state first, then draws the roll and the delay in that fixed order before deciding whether to drop, and pushes a `(deliver_at, seq, message)` tuple onto the heap. `tick` iterates `sorted(self.nodes)`, skips crashed nodes, then pops everything due; `deliver` re-checks partition and crash state at delivery time, so a message in flight when the cut happens is lost.
+
+```python
+    def send(self, m: Message) -> None:
+        self.sent += 1
+        if m.from_ in self.down or m.to in self.down or self.crosses_partition(m.from_, m.to):
+            self.dropped += 1
+            return
+        roll = self.rng.next_double()  # always draw both numbers so the rng stream is identical across languages
+        delay = 1 + self.rng.next_int(self.max_delay)
+        if roll < self.drop_rate:
+            self.dropped += 1
+            return
+        heapq.heappush(self.in_flight, (self.now + delay, self.seq, m))
+        self.seq += 1
+
+    def tick(self) -> None:
+        self.now += 1
+        for node_id in sorted(self.nodes):
+            if node_id not in self.down:
+                self.send_all(self.nodes[node_id].tick(self.now))
+        while self.in_flight and self.in_flight[0][0] <= self.now:
+            self.deliver(heapq.heappop(self.in_flight))
+
+    def deliver(self, envelope: tuple[int, int, Message]) -> None:
+        m = envelope[2]
+        if m.to in self.down or self.crosses_partition(m.from_, m.to):
+            self.dropped += 1
+            return
+        self.delivered += 1
+        self.send_all(self.nodes[m.to].handle(m, self.now))
+        self.observer()
+```
+
+#### Step 10: The cluster and the safety check
+
+`leaders_by_term` is a dict and `setdefault` plays the role of `putIfAbsent`: it returns the existing leader for the term or records this one. A different id for an already-recorded term raises `RuntimeError`. The cluster registers this method as the network observer so it runs after every delivery.
+
+```python
+    def check_election_safety(self) -> None:
+        for n in self.nodes:
+            if n.role != Role.LEADER:
+                continue
+            existing = self.leaders_by_term.setdefault(n.current_term, n.id)
+            if existing != n.id:
+                raise RuntimeError(f"ELECTION SAFETY VIOLATED: term {n.current_term} has leaders {existing} and {n.id}")
+```
+
+#### Step 11: Run it
+
+```bash
+cd phases/06-replication-and-consensus/05-raft-leader-election/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The trace is the Java trace, tick for tick:
+
+```console
+== Election on a 5-node cluster (seed 7, no drops, delay 1-5 ticks) ==
+t=0    all nodes are followers in term 0; election timeouts drawn from [150, 300] ticks, heartbeat every 50
+t=178  n4 election timeout -> candidate for term 1, votes for itself
+t=179  n1 election timeout -> candidate for term 1, votes for itself
+t=179  n2 sees term 1 > its own -> follower
+t=179  n2 grants vote to n4 for term 1
+t=183  n4 wins 3/5 votes -> LEADER of term 1
+t=186  n1 hears leader n4 for term 1 -> candidate steps down
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **`container/heap` needs a type with five methods:** `envelopeHeap` implements `Len`, `Less`, `Swap`, `Push`, and `Pop`, and `Less` orders by `(deliverAt, seq)`. **Invariant violations panic; bad inputs return errors:** `NewConfig` returns `(Config, error)` because a bad timing configuration is a caller mistake, while two leaders in one term is a broken invariant and the code panics because there is no correct value to return; the test recovers the panic to assert it happened. **Maps are unordered,** so `Network.Tick` collects node ids and sorts them before ticking; iterating the map directly would make the trace differ run to run and break the determinism test. **No goroutines:** the whole simulation is single-threaded by design, `go test -race` passes trivially, and the lesson on Go concurrency primitives was Phase 4.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Terms, roles, and messages
+
+`Role` and `MessageKind` are `iota` enums, and `Message` is one struct with keyed-field constructors so unused fields stay at their zero values. The constructors are unexported because only the node builds messages. `Term` is `int64` to match Java's `long`.
+
 ```go
-func (n *RaftNode) onAppendEntries(m Message, now int) []Message {
-    if m.Term < n.CurrentTerm() {
-        return []Message{heartbeatReply(n.ID, m.From, n.CurrentTerm(), false)}
-    }
-    if n.Role == Leader {
-        panic(fmt.Sprintf("two leaders in term %d: %d and %d", n.CurrentTerm(), n.ID, m.From))
-    }
-    ...
+type Role int
+
+const (
+	Follower Role = iota
+	Candidate
+	Leader
+)
+
+type Message struct {
+	Kind         MessageKind
+	From, To     int
+	Term         int64
+	LastLogIndex int
+	LastLogTerm  int
+	Granted      bool
+}
+
+func requestVote(from, to int, term int64, lastLogIndex, lastLogTerm int) Message {
+	return Message{Kind: RequestVote, From: from, To: to, Term: term, LastLogIndex: lastLogIndex, LastLogTerm: lastLogTerm}
+}
+func voteReply(from, to int, term int64, granted bool) Message {
+	return Message{Kind: RequestVoteReply, From: from, To: to, Term: term, Granted: granted}
+}
+
+func heartbeat(from, to int, term int64) Message {
+	return Message{Kind: AppendEntries, From: from, To: to, Term: term}
+}
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: Stable storage, separated from the node
 
-- **`container/heap` needs a type with five methods.** `envelopeHeap` implements `Len`, `Less`, `Swap`, `Push`, and `Pop`; `Less` orders by `(deliverAt, seq)`.
-- **Invariant violations panic; bad inputs return errors.** `NewConfig` returns `(Config, error)` because a bad timing configuration is a caller mistake. Two leaders in one term is a broken invariant, and the code panics, because there is no correct value to return. The test recovers the panic to assert it happened.
-- **Maps are unordered**, so `Network.Tick` collects node ids and sorts them before ticking. Iterating the map directly would make the trace differ run to run and break the determinism test.
-- **No goroutines.** The whole simulation is single-threaded by design; `go test -race` passes trivially, and the lesson on Go concurrency primitives was Phase 4.
+`Storage` is a pointer type shared between a node and its successor after a restart. `NewStorage` sets `VotedFor` to -1 because the zero value 0 would be a real node id. The node reads the two persistent fields through `CurrentTerm()` and `VotedFor()` and writes them only through `Save`.
+
+```go
+type Storage struct {
+	CurrentTerm int64
+	VotedFor    int
+	Writes      int
+}
+
+func NewStorage() *Storage { return &Storage{VotedFor: -1} }
+
+func (s *Storage) Save(term int64, votedFor int) {
+	s.CurrentTerm = term
+	s.VotedFor = votedFor
+	s.Writes++
+}
+```
+
+```go
+func (n *RaftNode) CurrentTerm() int64 { return n.Storage.CurrentTerm }
+func (n *RaftNode) VotedFor() int      { return n.Storage.VotedFor }
+```
+
+#### Step 3: Timing and the election timer
+
+A struct literal cannot validate itself, so `DefaultConfig` is a known-good value and `NewConfig` is the validating constructor that returns an error. `ResetElectionTimer` and `Tick` mirror the Java; the `nil` slice returned when nothing happens is what `SendAll` iterates harmlessly.
+
+```go
+type Config struct {
+	ElectionTimeoutMin, ElectionTimeoutMax, HeartbeatInterval int
+}
+
+var DefaultConfig = Config{150, 300, 50}
+
+func NewConfig(min, max, heartbeat int) (Config, error) {
+	if min <= 0 || max < min || heartbeat <= 0 {
+		return Config{}, fmt.Errorf("bad timing config")
+	}
+	if heartbeat >= min {
+		return Config{}, fmt.Errorf("heartbeat interval must be well below the election timeout")
+	}
+	return Config{min, max, heartbeat}, nil
+}
+
+func (n *RaftNode) ResetElectionTimer(now int) {
+	span := n.config.ElectionTimeoutMax - n.config.ElectionTimeoutMin + 1
+	n.ElectionDeadline = now + n.config.ElectionTimeoutMin + n.rng.NextInt(span)
+}
+```
+
+#### Step 4: Starting an election
+
+The same ordered list. `votesGranted` is a `map[int]bool` reset to hold only our own id; `len` of the map is the vote count. The `RequestVote` slice is preallocated with `make(..., 0, len(n.Peers))` and returned to the caller.
+
+```go
+func (n *RaftNode) StartElection(now int) []Message {
+	n.Role = Candidate
+	n.Storage.Save(n.Storage.CurrentTerm+1, n.ID) // increment currentTerm, vote for self, persist before sending
+	n.LeaderID = -1
+	n.votesGranted = map[int]bool{n.ID: true}
+	n.ElectionsStarted++
+	n.ResetElectionTimer(now)
+	n.tracer(now, fmt.Sprintf("%s election timeout -> candidate for term %d, votes for itself", name(n.ID), n.CurrentTerm()))
+	out := make([]Message, 0, len(n.Peers))
+	for _, p := range n.Peers {
+		out = append(out, requestVote(n.ID, p, n.CurrentTerm(), n.LastLogIndex, n.LastLogTerm))
+	}
+	return out
+}
+```
+
+#### Step 5: Handling a message
+
+Term rule first, then a `switch` on `Kind` with no `AppendEntriesReply` arm, so it returns `nil`. `becomeFollower` replaces `votesGranted` with a fresh map, saves `(term, -1)` only on a term advance, and restarts the timer for a demoted leader.
+
+```go
+func (n *RaftNode) Handle(m Message, now int) []Message {
+	if m.Term > n.CurrentTerm() {
+		n.becomeFollower(m.Term, now)
+	}
+	switch m.Kind {
+	case RequestVote:
+		return n.onRequestVote(m, now)
+	case RequestVoteReply:
+		return n.onVoteReply(m, now)
+	case AppendEntries:
+		return n.onAppendEntries(m, now)
+	}
+	return nil // AppendEntriesReply: Lesson 06 uses replies to drive nextIndex/matchIndex
+}
+
+func (n *RaftNode) becomeFollower(term int64, now int) {
+	before := n.Role
+	n.Role = Follower
+	n.LeaderID = -1
+	n.votesGranted = map[int]bool{}
+	if term > n.CurrentTerm() {
+		n.Storage.Save(term, -1) // a new term means votedFor is null again
+	}
+	// A leader keeps no election timer running, so give it a fresh one when it steps down.
+	if before == Leader {
+		n.ResetElectionTimer(now)
+	}
+}
+```
+
+#### Step 6: The RequestVote receiver
+
+Rule 1, then rule 2 as two booleans. `Save` runs before the granting reply is constructed, and every reply carries `n.CurrentTerm()`, which after the All Servers rule is at least the request's term.
+
+```go
+func (n *RaftNode) onRequestVote(m Message, now int) []Message {
+	if m.Term < n.CurrentTerm() { // 1. Reply false if term < currentTerm
+		return []Message{voteReply(n.ID, m.From, n.CurrentTerm(), false)}
+	}
+	canVote := n.VotedFor() == -1 || n.VotedFor() == m.From
+	logUpToDate := m.LastLogTerm > n.LastLogTerm || (m.LastLogTerm == n.LastLogTerm && m.LastLogIndex >= n.LastLogIndex)
+	if canVote && logUpToDate {
+		n.Storage.Save(n.CurrentTerm(), m.From) // persist the vote before the reply leaves
+		n.ResetElectionTimer(now)               // granting a vote resets the election timer
+		return []Message{voteReply(n.ID, m.From, n.CurrentTerm(), true)}
+	}
+	return []Message{voteReply(n.ID, m.From, n.CurrentTerm(), false)}
+}
+```
+
+#### Step 7: Counting votes and becoming leader
+
+The stale-reply guard, then a set insert via `map[int]bool`, then the majority check against the full cluster size. `becomeLeader` sends the first heartbeats, and `sendHeartbeats` also schedules the next one.
+
+```go
+func (n *RaftNode) onVoteReply(m Message, now int) []Message {
+	if n.Role != Candidate || m.Term != n.CurrentTerm() {
+		return nil
+	}
+	if m.Granted {
+		n.votesGranted[m.From] = true
+		if len(n.votesGranted) >= n.Majority() {
+			return n.becomeLeader(now)
+		}
+	}
+	return nil
+}
+
+func (n *RaftNode) becomeLeader(now int) []Message {
+	n.Role = Leader
+	n.LeaderID = n.ID
+	return n.sendHeartbeats(now) // Leaders: upon election send initial empty AppendEntries to each server
+}
+
+func (n *RaftNode) sendHeartbeats(now int) []Message {
+	n.NextHeartbeat = now + n.config.HeartbeatInterval
+	out := make([]Message, 0, len(n.Peers))
+	for _, p := range n.Peers {
+		out = append(out, heartbeat(n.ID, p, n.CurrentTerm()))
+	}
+	return out
+}
+```
+
+#### Step 8: Heartbeats and stepping down
+
+Identical logic; the two-leaders case panics because there is no sensible return value. A candidate that hears a current-term leader becomes a follower and clears its votes, and every non-stale heartbeat resets the election timer.
+
+```go
+func (n *RaftNode) onAppendEntries(m Message, now int) []Message {
+	if m.Term < n.CurrentTerm() {
+		return []Message{heartbeatReply(n.ID, m.From, n.CurrentTerm(), false)}
+	}
+	if n.Role == Leader {
+		panic(fmt.Sprintf("two leaders in term %d: %d and %d", n.CurrentTerm(), n.ID, m.From))
+	}
+	if n.Role == Candidate {
+		n.Role = Follower
+		n.votesGranted = map[int]bool{}
+	}
+	n.LeaderID = m.From
+	n.ResetElectionTimer(now)
+	return []Message{heartbeatReply(n.ID, m.From, n.CurrentTerm(), true)}
+}
+```
+
+#### Step 9: The network
+
+`Send` draws both random numbers before the drop decision and pushes an `envelope` onto the `container/heap`. `Tick` copies the node ids out of the map, sorts them, ticks the live ones in that order, and pops due envelopes with a type assertion; `deliver` re-checks crash and partition state at delivery time.
+
+```go
+func (w *Network) Send(m Message) {
+	w.Sent++
+	if w.down[m.From] || w.down[m.To] || w.crosses(m.From, m.To) {
+		w.Dropped++
+		return
+	}
+	roll := w.rng.NextDouble() // always draw both numbers so the rng stream is identical across languages
+	delay := 1 + w.rng.NextInt(w.maxDelay)
+	if roll < w.dropRate {
+		w.Dropped++
+		return
+	}
+	heap.Push(&w.inFlight, envelope{w.now + delay, w.seq, m})
+	w.seq++
+}
+
+func (w *Network) Tick() {
+	w.now++
+	ids := make([]int, 0, len(w.nodes))
+	for id := range w.nodes {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	for _, id := range ids {
+		if !w.down[id] {
+			w.SendAll(w.nodes[id].Tick(w.now))
+		}
+	}
+	for len(w.inFlight) > 0 && w.inFlight[0].deliverAt <= w.now {
+		w.deliver(heap.Pop(&w.inFlight).(envelope))
+	}
+}
+```
+
+#### Step 10: The cluster and the safety check
+
+`LeadersByTerm` is a `map[int64]int`; the two-value lookup distinguishes "no leader recorded" from "leader 0", which a plain read could not. A second id for a recorded term panics, and the cluster installs this method as the network observer.
+
+```go
+func (c *Cluster) CheckElectionSafety() {
+	for _, n := range c.Nodes {
+		if n.Role != Leader {
+			continue
+		}
+		existing, ok := c.LeadersByTerm[n.CurrentTerm()]
+		if !ok {
+			c.LeadersByTerm[n.CurrentTerm()] = n.ID
+		} else if existing != n.ID {
+			panic(fmt.Sprintf("ELECTION SAFETY VIOLATED: term %d has leaders %d and %d", n.CurrentTerm(), existing, n.ID))
+		}
+	}
+}
+```
+
+#### Step 11: Run it
+
+```bash
+cd phases/06-replication-and-consensus/05-raft-leader-election/code/go
+go run .
+go test ./...
+```
+
+Same trace, same summary:
+
+```console
+== Election on a 5-node cluster (seed 7, no drops, delay 1-5 ticks) ==
+t=0    all nodes are followers in term 0; election timeouts drawn from [150, 300] ticks, heartbeat every 50
+t=178  n4 election timeout -> candidate for term 1, votes for itself
+
+== 30 seeds, 5 nodes, 20% drops, delay 1-10, 3000 ticks each: Election Safety holds ==
+seeds with a stable leader: 30/30, slowest election at tick 422, 48 (term, leader) pairs recorded, never two leaders in one term
+```
 
 ## Use It
 

@@ -359,25 +359,214 @@ The counts are deterministic because the payment stream is a seeded `Random` wit
 
 ### In Python
 
-The full port is `code/python/main.py` (same `Ledger`, `Snapshot`, `Reading`, `LongList`, `PaymentStream`; tests in `code/python/test_main.py`). Three things differ:
+The Python port has the same `Ledger`, `Snapshot`, `Reading`, `LongList`, and `PaymentStream`, with three differences. **The seeded stream reproduces `java.util.Random`:** the demo's numbers (`-116054.22 USD`, `125347982.56 USD`, `14246` postings scanned) come from the seed, so the port ships a `JavaRandom` with the JDK's 48-bit LCG (`MULTIPLIER = 0x5DEECE66D`, `ADDEND = 0xB`, 48-bit mask, and the `(int)` cast in `next(bits)`) and its `nextInt(bound)` rejection loop; the same seed therefore yields the same ledger in both languages, and the tests assert the JDK's own values for `Random(42)`. **Memory and speed:** `LongList` wraps `array('q')` (8 bytes per value, not a 28-byte `int` object each), and the record types are `@dataclass(frozen=True, slots=True)` so a million postings do not each carry a `__dict__`; `Math.addExact` disappears because `int` never overflows. Pure Python is still 5-10x slower than the JVM on this demo: posting 500,000 entries takes about six seconds, and the cyclic garbage collector accounts for a third of that. The three read paths have the same complexity and the same scan counts; only the wall-clock numbers behind `--timing` differ. **The column search is written out, not `bisect`ed:** `bisect.bisect_right(seqs, seq) - 1` returns the same index, but the hand-written loop is kept so `Reading.postings_scanned` reports the same probe count as Java (9 for the demo's lookup). `LedgerError` extends `ValueError`.
 
-- **The seeded stream reproduces `java.util.Random`.** The demo's numbers (`-116054.22 USD`, `125347982.56 USD`, `14246` postings scanned) come from the seed, so the port ships a `JavaRandom` with the JDK's 48-bit LCG and its `nextInt(bound)` rejection loop. The same seed therefore yields the same ledger in both languages, and the tests assert the JDK's own values for `Random(42)`:
+Run it from `code/python/` with `python3 main.py` (add `--timing` for wall-clock numbers); test with `python3 -m unittest -v`.
+
+#### Step 1: Postings carry a signed contribution
+
+`Posting` is a slotted frozen dataclass; the positivity check is in `__post_init__` and `signed_minor()` is the one place a side becomes a sign. `JournalEntry` has an explicit `__init__` because it must validate per-currency balance before the fields are set, and it stores the postings as a tuple. `effective_at` is an `int` of epoch seconds that the caller passes in.
 
 ```python
-class JavaRandom:
-    MULTIPLIER, ADDEND, MASK = 0x5DEECE66D, 0xB, (1 << 48) - 1
+@dataclass(frozen=True, slots=True)
+class Posting:
+    account_id: str
+    side: Side
+    amount: Money
 
-    def __init__(self, seed: int) -> None:
-        self._seed = (seed ^ self.MULTIPLIER) & self.MASK
+    def __post_init__(self) -> None:
+        if not self.amount.is_positive():
+            raise LedgerError(f"posting amount must be positive, got {self.amount}")
 
-    def next(self, bits: int) -> int:
-        self._seed = (self._seed * self.MULTIPLIER + self.ADDEND) & self.MASK
-        r = self._seed >> (48 - bits)
-        return r - (1 << 32) if r >= (1 << 31) else r  # Java's (int) cast
+    def signed_minor(self) -> int:
+        """Debits count positive, credits negative: the "net debit" convention used by every fold below."""
+        return self.amount.minor_units if self.side is Side.DEBIT else -self.amount.minor_units
+
+
+@dataclass(frozen=True, slots=True)
+class JournalEntry:
+    id: str
+    effective_at: int
+    postings: tuple
+
+    def __init__(self, id: str, effective_at: int, postings) -> None:
+        postings = tuple(postings)
+        if len(postings) < 2:
+            raise LedgerError(f"entry {id} needs at least two postings")
+        net: Dict[Currency, int] = {}
+        for p in postings:
+            net[p.amount.currency] = net.get(p.amount.currency, 0) + p.signed_minor()
+        for currency, value in net.items():
+            if value != 0:
+                raise LedgerError(f"entry {id} unbalanced in {currency.code}")
 ```
 
-- **Memory and speed.** `LongList` wraps `array('q')` (8 bytes per value, not a 28-byte `int` object each), and the record types are `@dataclass(frozen=True, slots=True)` so a million postings do not each carry a `__dict__`. `Math.addExact` disappears because `int` never overflows. Pure Python is still 5-10x slower than the JVM on this demo: posting 500,000 entries takes about six seconds, and the cyclic garbage collector accounts for a third of that. The three read paths have the same complexity and the same scan counts; only the wall-clock numbers behind `--timing` differ.
-- **The column search is written out, not `bisect`ed.** `bisect.bisect_right(seqs, seq) - 1` returns the same index, but the hand-written loop is kept so `Reading.postings_scanned` reports the same probe count as Java (9 for the demo's lookup). `LedgerError` extends `ValueError`, and `Snapshot.__post_init__` copies the dict for the same reason Java's canonical constructor calls `Map.copyOf`: the copy is the snapshot.
+#### Step 2: Snapshots and readings are values
+
+`Snapshot.__post_init__` replaces the mapping it was given with `dict(...)`, for the same reason Java calls `Map.copyOf`: the copy is the snapshot, and `take_snapshot` can safely pass the live running dict. `dict.get(id, 0)` is `getOrDefault`. `LongList` is the `array('q')` wrapper that keeps the column compact.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    seq: int
+    effective_at: int
+    net_debits: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "net_debits", dict(self.net_debits))  # the copy IS the snapshot
+
+    def net_debit(self, account_id: str) -> int:
+        return self.net_debits.get(account_id, 0)
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    balance: Money
+    postings_scanned: int
+
+
+class LongList:
+    def __init__(self) -> None:
+        self._data = array("q")
+
+    def add(self, value: int) -> None:
+        self._data.append(value)
+
+    def get(self, index: int) -> int:
+        return self._data[index]
+
+    def size(self) -> int:
+        return len(self._data)
+```
+
+#### Step 3: Post updates every derived structure, after validating
+
+Both checks run before `self._journal.append`; the backdating test is `<`, so equal timestamps are accepted. The running total is a plain `int` add (no `addExact`), and the local alias `running = self._running` avoids an attribute lookup per posting in the hot loop. Every `snapshot_interval` entries `take_snapshot` runs automatically.
+
+```python
+    def post(self, entry: JournalEntry) -> int:
+        """Validate everything, then mutate everything. Returns the entry's journal position (seq)."""
+        for p in entry.postings:
+            if self.account(p.account_id).currency != p.amount.currency:
+                raise LedgerError(f"entry {entry.id}: currency does not match account {p.account_id}")
+        if self._journal and entry.effective_at < self._journal[-1].effective_at:
+            raise LedgerError(f"entry {entry.id} is backdated; post a correction at the current time instead")
+        self._journal.append(entry)
+        seq = len(self._journal)
+        running = self._running
+        for p in entry.postings:
+            after = running[p.account_id] + p.signed_minor()
+            running[p.account_id] = after
+            self._column_seq[p.account_id].add(seq)
+            self._column_after[p.account_id].add(after)
+        if seq % self._snapshot_interval == 0:
+            self.take_snapshot()
+        return seq
+```
+
+#### Step 4: Taking a snapshot
+
+Identical logic: the early return keeps the snapshot list strictly increasing in `seq`, and the constructor passes `self._running` straight in, relying on the copy in `Snapshot.__post_init__`.
+
+```python
+    def take_snapshot(self) -> Snapshot:
+        """Copy every running total. O(accounts). Called automatically every snapshot_interval entries."""
+        seq = self.head()
+        last = self._snapshots[-1]
+        if last.seq == seq:
+            return last
+        s = Snapshot(seq, self._journal[seq - 1].effective_at, self._running)
+        self._snapshots.append(s)
+        return s
+```
+
+#### Step 5: Three reads, one answer
+
+The snapshot read replays `range(base.seq, seq)`, the same index range as Java because Python lists are also zero-indexed and seq is one-based. `nearest_snapshot` uses `(lo + hi + 1) >> 1` for the round-up midpoint; Python ints never overflow, so no unsigned shift is needed.
+
+```python
+    def snapshot_net_debit(self, account_id: str, seq: int) -> Reading:
+        a = self.account(account_id)
+        self._require_seq(seq)
+        base = self.nearest_snapshot(seq)
+        acc = base.net_debit(account_id)
+        scanned = 0
+        for s in range(base.seq, seq):
+            for p in self._journal[s].postings:
+                scanned += 1
+                if p.account_id == account_id:
+                    acc += p.signed_minor()
+        return Reading(Money.of_minor(acc, a.currency), scanned)
+
+    def nearest_snapshot(self, seq: int) -> Snapshot:
+        """Binary search: the last snapshot whose seq <= target. Snapshot 0 (all zero) always qualifies."""
+        lo, hi = 0, len(self._snapshots) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) >> 1
+            if self._snapshots[mid].seq <= seq:
+                lo = mid
+            else:
+                hi = mid - 1
+        return self._snapshots[lo]
+```
+
+The column read is the hand-written "last element with `seq <= target`" search over the two `LongList`s, kept explicit instead of `bisect_right` so the probe count is reported.
+
+```python
+    def column_net_debit(self, account_id: str, seq: int) -> Reading:
+        a = self.account(account_id)
+        self._require_seq(seq)
+        seqs, after = self._column_seq[account_id], self._column_after[account_id]
+        lo, hi, found, probes = 0, seqs.size() - 1, -1, 0
+        while lo <= hi:  # last posting of this account with seq <= target (what bisect_right - 1 would return)
+            mid = (lo + hi) >> 1
+            probes += 1
+            if seqs.get(mid) <= seq:
+                found = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return Reading(Money.of_minor(0 if found < 0 else after.get(found), a.currency), probes)
+```
+
+#### Step 6: Time becomes a position
+
+`seq_as_of` searches the count range `[0, len(journal)]`, probing `journal[mid - 1]` because seq `mid` is index `mid - 1`. `balance_as_of` composes it with the snapshot read and flips the sign into the account's normal direction with `_to_normal`.
+
+```python
+    def seq_as_of(self, timestamp: int) -> int:
+        """The journal position of the last entry with effective_at <= t; 0 if none. Binary search: timestamps never decrease."""
+        lo, hi = 0, len(self._journal)  # answer in [0, size]
+        while lo < hi:
+            mid = (lo + hi + 1) >> 1
+            if self._journal[mid - 1].effective_at <= timestamp:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def balance_as_of(self, account_id: str, timestamp: int) -> Money:
+        a = self.account(account_id)
+        return self._to_normal(a, self.snapshot_net_debit(account_id, self.seq_as_of(timestamp)).balance.minor_units)
+```
+
+#### Step 7: Verify against the definition
+
+The two checks are the same: every known account must match the full fold at the snapshot's seq, and the snapshot may not name an account the ledger has never opened. Iterating `self._accounts` walks ids in opening order.
+
+```python
+    def verify(self, s: Snapshot) -> bool:
+        """Check a snapshot against the definition: every account's value must equal the full fold at its seq."""
+        for id in self._accounts:
+            if s.net_debit(id) != self.fold_net_debit(id, s.seq).balance.minor_units:
+                return False
+        for id in s.net_debits:
+            if id not in self._accounts:
+                return False
+        return True
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/05-balances-and-snapshots/code/python
@@ -385,31 +574,310 @@ python3 main.py            # add --timing for wall-clock numbers
 python3 -m unittest -v
 ```
 
-### In Go
+Because `JavaRandom` reproduces the JDK sequence, the large-ledger section prints the same numbers as the Java run; expect it to take several seconds in CPython:
 
-The full port is `code/go/main.go` (same `Ledger`, `Snapshot`, `Reading`, `LongList`, `PaymentStream`), with `money.go` (the Lesson 01 `Money`) and `javarandom.go` (the JDK's 48-bit LCG, so seed 7 produces the same 500,000 payments and the same `-116054.22 USD`). Tests are in `code/go/main_test.go`. Three things differ:
-
-- **Validation happens in constructors that return errors.** Java's compact record constructors throw; Go has no constructors, so `NewPosting`, `NewJournalEntry`, and `NewLedger` return `(T, error)`, and every ledger rule wraps the sentinel `ErrLedger` so tests check `errors.Is(err, ErrLedger)`. `Post` also pre-computes every new running total with `addChecked` *before* mutating anything, which is what makes "rejected entry left no trace" hold even for an overflow:
-
-```go
-after := make([]int64, len(entry.Postings))
-for i, p := range entry.Postings {
-    sum, err := addChecked(base, p.SignedMinor())
-    if err != nil {
-        return 0, err             // nothing has been appended yet
-    }
-    after[i] = sum
-}
-l.journal = append(l.journal, entry)
+```console
+== One million postings, 1,000 merchants, snapshot every 10,000 entries ==
+entries=500000 snapshots=51
+merchant m0042 as of seq 437123:
+  full fold      -116054.22 USD  postings scanned 874246
+  snapshot+delta -116054.22 USD  postings scanned 14246  (from snapshot at seq 430000)
+  running column -116054.22 USD  binary-search probes 9
+  all three agree: true
+receivable 125347982.56 USD == sum of merchant payables 125347982.56 USD: true
 ```
 
-- **Map order is not insertion order.** `Ledger` keeps `accountOrder []string` beside the `accounts` map so `Verify` walks accounts in the order they were opened, and `Snapshot.AccountIDs()` sorts its keys. The snapshot's own map is private and copied in `NewSnapshot`: the copy is the snapshot, exactly as `Map.copyOf` is in Java.
-- **The binary searches are written out, not `sort.Search`ed.** `sort.Search` would find the same indices, but the hand-written loops keep `Reading.PostingsScanned` reporting the same probe count as Java (9 for the demo's lookup). `LongList` is a thin named wrapper over `[]int64`; Go slices are already unboxed, so the type exists only so the three ports read alike. `--timing` works the same way, with `time.Now()` instead of `System.nanoTime()`.
+### In Go
+
+The Go port is `code/go/main.go` (same `Ledger`, `Snapshot`, `Reading`, `LongList`, `PaymentStream`), with `money.go` (the Lesson 01 `Money`) and `javarandom.go` (the JDK's 48-bit LCG, so seed 7 produces the same 500,000 payments and the same `-116054.22 USD`). Three things differ. **Validation happens in constructors that return errors:** Java's compact record constructors throw; Go has no constructors, so `NewPosting`, `NewJournalEntry`, and `NewLedger` return `(T, error)`, and every ledger rule wraps the sentinel `ErrLedger` (via `ledgerErr`) so tests check `errors.Is(err, ErrLedger)`. `Post` also pre-computes every new running total with `addChecked` *before* mutating anything, which is what makes "rejected entry left no trace" hold even for an overflow. **Map order is not insertion order:** `Ledger` keeps `accountOrder []string` beside the `accounts` map so `Verify` walks accounts in the order they were opened, and `Snapshot.AccountIDs()` sorts its keys; the snapshot's own map is private and copied in `NewSnapshot`, exactly as `Map.copyOf` is in Java. **The binary searches are written out, not `sort.Search`ed:** `sort.Search` would find the same indices, but the hand-written loops keep `Reading.PostingsScanned` reporting the same probe count as Java (9 for the demo's lookup). `LongList` is a thin named wrapper over `[]int64`; Go slices are already unboxed, so the type exists only so the three ports read alike. `--timing` works the same way, with `time.Now()` instead of `System.nanoTime()`.
+
+Run it from `code/go/` with `go run .` (add `--timing` for wall-clock numbers); test with `go test ./...`.
+
+#### Step 1: Postings carry a signed contribution
+
+`Posting` is a plain struct; `NewPosting` is the validating constructor and `DebitPosting`/`CreditPosting` the two shorthands, all returning `(Posting, error)`. `SignedMinor` is the single side-to-sign conversion. `JournalEntry` exposes `Postings` as a public slice that `NewJournalEntry` copies on construction.
+
+```go
+type Posting struct {
+	AccountID string
+	Side      Side
+	Amount    Money
+}
+
+// NewPosting rejects non-positive amounts, as the Java compact constructor does.
+func NewPosting(accountID string, side Side, amount Money) (Posting, error) {
+	if !amount.IsPositive() {
+		return Posting{}, ledgerErr("posting amount must be positive, got %v", amount)
+	}
+	return Posting{accountID, side, amount}, nil
+}
+
+func DebitPosting(accountID string, amount Money) (Posting, error) {
+	return NewPosting(accountID, Debit, amount)
+}
+func CreditPosting(accountID string, amount Money) (Posting, error) {
+	return NewPosting(accountID, Credit, amount)
+}
+
+// SignedMinor: debits count positive, credits negative: the "net debit" convention used by every fold below.
+func (p Posting) SignedMinor() int64 {
+	if p.Side == Debit {
+		return p.Amount.MinorUnits
+	}
+	return -p.Amount.MinorUnits
+}
+
+type JournalEntry struct {
+	ID          string
+	EffectiveAt int64
+	Postings    []Posting
+}
+```
+
+#### Step 2: Snapshots and readings are values
+
+`netDebits` is unexported and `NewSnapshot` copies it key by key: that copy is the snapshot. Reading a missing key from a Go map returns `0`, which gives `getOrDefault` for free. `AccountIDs` sorts because map iteration order is random. `LongList` wraps a `[]int64` purely to keep the three ports structurally identical.
+
+```go
+type Snapshot struct {
+	Seq         int64
+	EffectiveAt int64
+	netDebits   map[string]int64
+}
+
+// NewSnapshot copies the map: the copy is the snapshot.
+func NewSnapshot(seq, effectiveAt int64, netDebits map[string]int64) Snapshot {
+	copied := make(map[string]int64, len(netDebits))
+	for k, v := range netDebits {
+		copied[k] = v
+	}
+	return Snapshot{seq, effectiveAt, copied}
+}
+
+func (s Snapshot) NetDebit(accountID string) int64 { return s.netDebits[accountID] }
+
+type Reading struct {
+	Balance         Money
+	PostingsScanned int64
+}
+
+type LongList struct {
+	data []int64
+}
+
+func (l *LongList) Add(value int64)     { l.data = append(l.data, value) }
+func (l *LongList) Get(index int) int64 { return l.data[index] }
+func (l *LongList) Size() int           { return len(l.data) }
+```
+
+#### Step 3: Post updates every derived structure, after validating
+
+The Go version adds a third pre-mutation pass: it computes every posting's new running total with `addChecked` into a scratch `after` slice (tracking `pending` so two postings to the same account chain correctly), and only then appends to the journal. Java gets this ordering for free because `addExact` throws mid-loop is considered a bug, not a validation failure; Go makes overflow a clean rejection with no partial writes.
+
+```go
+func (l *Ledger) Post(entry JournalEntry) (int64, error) {
+	for _, p := range entry.Postings {
+		a, err := l.Account(p.AccountID)
+		if err != nil {
+			return 0, err
+		}
+		if a.Currency != p.Amount.Currency {
+			return 0, ledgerErr("entry %s: currency does not match account %s", entry.ID, p.AccountID)
+		}
+	}
+	if len(l.journal) > 0 && entry.EffectiveAt < l.journal[len(l.journal)-1].EffectiveAt {
+		return 0, ledgerErr("entry %s is backdated; post a correction at the current time instead", entry.ID)
+	}
+	// Overflow is checked before any mutation so a rejected entry leaves no trace.
+	after := make([]int64, len(entry.Postings))
+	pending := map[string]int64{}
+	for i, p := range entry.Postings {
+		base, ok := pending[p.AccountID]
+		if !ok {
+			base = l.running[p.AccountID]
+		}
+		sum, err := addChecked(base, p.SignedMinor())
+		if err != nil {
+			return 0, err
+		}
+		after[i] = sum
+		pending[p.AccountID] = sum
+	}
+	l.journal = append(l.journal, entry)
+	seq := int64(len(l.journal))
+	for i, p := range entry.Postings {
+		l.running[p.AccountID] = after[i]
+		l.columnSeq[p.AccountID].Add(seq)
+		l.columnAfter[p.AccountID].Add(after[i])
+	}
+	if seq%int64(l.snapshotInterval) == 0 {
+		l.TakeSnapshot()
+	}
+	return seq, nil
+}
+```
+
+#### Step 4: Taking a snapshot
+
+Same idempotent shape; `NewSnapshot` does the copy, and `l.journal[seq-1]` is the entry at the head.
+
+```go
+func (l *Ledger) TakeSnapshot() Snapshot {
+	seq := l.Head()
+	last := l.snapshots[len(l.snapshots)-1]
+	if last.Seq == seq {
+		return last
+	}
+	s := NewSnapshot(seq, l.journal[seq-1].EffectiveAt, l.running)
+	l.snapshots = append(l.snapshots, s)
+	return s
+}
+```
+
+#### Step 5: Three reads, one answer
+
+The snapshot read is the Java loop with `addChecked` in the accumulator and error returns for an unknown account or out-of-range seq. The midpoint `int(uint(lo+hi+1) >> 1)` is Go's spelling of Java's `>>> 1`.
+
+```go
+func (l *Ledger) SnapshotNetDebit(accountID string, seq int64) (Reading, error) {
+	a, err := l.Account(accountID)
+	if err != nil {
+		return Reading{}, err
+	}
+	if err := l.requireSeq(seq); err != nil {
+		return Reading{}, err
+	}
+	base := l.NearestSnapshot(seq)
+	acc, scanned := base.NetDebit(accountID), int64(0)
+	for s := base.Seq; s < seq; s++ {
+		for _, p := range l.journal[s].Postings {
+			scanned++
+			if p.AccountID == accountID {
+				if acc, err = addChecked(acc, p.SignedMinor()); err != nil {
+					return Reading{}, err
+				}
+			}
+		}
+	}
+	return Reading{OfMinor(acc, a.Currency), scanned}, nil
+}
+
+func (l *Ledger) NearestSnapshot(seq int64) Snapshot {
+	lo, hi := 0, len(l.snapshots)-1
+	for lo < hi {
+		mid := int(uint(lo+hi+1) >> 1)
+		if l.snapshots[mid].Seq <= seq {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return l.snapshots[lo]
+}
+```
+
+The column read probes the two `LongList`s; `found = -1` still means "no postings yet, balance zero".
+
+```go
+func (l *Ledger) ColumnNetDebit(accountID string, seq int64) (Reading, error) {
+	a, err := l.Account(accountID)
+	if err != nil {
+		return Reading{}, err
+	}
+	if err := l.requireSeq(seq); err != nil {
+		return Reading{}, err
+	}
+	seqs, after := l.columnSeq[accountID], l.columnAfter[accountID]
+	lo, hi, found, probes := 0, seqs.Size()-1, -1, int64(0)
+	for lo <= hi { // last posting of this account with seq <= target
+		mid := int(uint(lo+hi) >> 1)
+		probes++
+		if seqs.Get(mid) <= seq {
+			found = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	var value int64
+	if found >= 0 {
+		value = after.Get(found)
+	}
+	return Reading{OfMinor(value, a.Currency), probes}, nil
+}
+```
+
+#### Step 6: Time becomes a position
+
+`SeqAsOf` cannot fail, so it returns a bare `int64`; `BalanceAsOf` threads the two possible errors from the account lookup and the snapshot read, then `toNormal` applies the account's normal side.
+
+```go
+func (l *Ledger) SeqAsOf(timestamp int64) int64 {
+	lo, hi := 0, len(l.journal) // answer in [0, size]
+	for lo < hi {
+		mid := int(uint(lo+hi+1) >> 1)
+		if l.journal[mid-1].EffectiveAt <= timestamp {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return int64(lo)
+}
+
+func (l *Ledger) BalanceAsOf(accountID string, timestamp int64) (Money, error) {
+	a, err := l.Account(accountID)
+	if err != nil {
+		return Money{}, err
+	}
+	r, err := l.SnapshotNetDebit(accountID, l.SeqAsOf(timestamp))
+	if err != nil {
+		return Money{}, err
+	}
+	return toNormal(a, r.Balance.MinorUnits)
+}
+```
+
+#### Step 7: Verify against the definition
+
+`Verify` walks `l.accountOrder` for a deterministic order and treats a fold error the same as a mismatch. The second loop uses the sorted `AccountIDs()` to catch a snapshot that names an account this ledger never opened.
+
+```go
+func (l *Ledger) Verify(s Snapshot) bool {
+	for _, id := range l.accountOrder {
+		fold, err := l.FoldNetDebit(id, s.Seq)
+		if err != nil || s.NetDebit(id) != fold.Balance.MinorUnits {
+			return false
+		}
+	}
+	for _, id := range s.AccountIDs() {
+		if _, known := l.accounts[id]; !known {
+			return false
+		}
+	}
+	return true
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/05-balances-and-snapshots/code/go
 go run .                   # add --timing for wall-clock numbers
 go test ./...
+```
+
+With `javarandom.go` driving the stream, the output is identical to the Java and Python runs:
+
+```console
+== One million postings, 1,000 merchants, snapshot every 10,000 entries ==
+entries=500000 snapshots=51
+merchant m0042 as of seq 437123:
+  full fold      -116054.22 USD  postings scanned 874246
+  snapshot+delta -116054.22 USD  postings scanned 14246  (from snapshot at seq 430000)
+  running column -116054.22 USD  binary-search probes 9
+  all three agree: true
+receivable 125347982.56 USD == sum of merchant payables 125347982.56 USD: true
 ```
 
 ## Use It

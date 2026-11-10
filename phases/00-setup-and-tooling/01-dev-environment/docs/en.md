@@ -340,58 +340,457 @@ The process exit code is 0 in both cases. Check it: `echo $?`.
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **`order=True` writes `compareTo` for you:** a frozen, ordered dataclass compares field by field in declaration order, which for three `int` fields is exactly the numeric tuple comparison; declare the fields as `str` and you get lexical comparison and the `3.9 > 3.11` bug back, silently. **`None` is the "not installed" signal:** `subprocess.run` raises `FileNotFoundError` when the executable does not exist, which maps to `None`; a non-zero exit does not raise (no `check=True`), so the output still reaches the parser. **`CommandRunner` is a `Callable` type alias**, and the fake in the tests is a `lambda`; no interface declaration is needed because the runner is just a function.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A version that compares numerically
+
+The same anchored regex lives at module level as `_LEADING`. `parse` is a `@staticmethod` that returns `None` where the Java returns `Optional.empty()`, and a generator over `m.groups()` turns each missing group into `0`. There is no hand-written `compareTo`: `at_least` is `self >= minimum`, which the `order=True` dataclass resolves as a tuple comparison of three ints.
+
 ```python
+_LEADING = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+
+
 @dataclass(frozen=True, order=True)
 class Version:
+    """A three-part version. Pre-release suffixes ("-ea", "rc1", "_292") are dropped."""
+
     major: int
     minor: int
     patch: int
 
+    @staticmethod
+    def parse(text: Optional[str]) -> Optional["Version"]:
+        if text is None:
+            return None
+        m = _LEADING.match(text.strip())
+        if not m:
+            return None
+        major, minor, patch = (int(g) if g is not None else 0 for g in m.groups())
+        return Version(major, minor, patch)
+
     def at_least(self, minimum: "Version") -> bool:
-        return self >= minimum   # order=True compares (major, minor, patch) as a tuple of ints
+        return self >= minimum  # dataclass(order=True) compares field by field, numerically
+```
+
+#### Step 2: What a toolchain is
+
+`Toolchain` is a frozen dataclass whose `argv` is a tuple (hashable, so the dataclass stays frozen) and whose `version_pattern` is a compiled `re.Pattern`. `parse_version` uses `search`, the equivalent of Java's `find`, so the `Picked up JAVA_TOOL_OPTIONS` noise line is skipped. The table is a module-level tuple with the same four rows and the same `(?:1\.)?` trick for legacy Java version strings.
+
+```python
+@dataclass(frozen=True)
+class Toolchain:
+    name: str
+    argv: tuple[str, ...]
+    minimum: Version
+    version_pattern: re.Pattern[str]
+    fix: str
+
+    def parse_version(self, output: str) -> Optional[Version]:
+        """Extract the version text from combined stdout+stderr, ignoring noise lines."""
+        m = self.version_pattern.search(output)
+        return Version.parse(m.group(1)) if m else None
+
+
+TOOLCHAINS: tuple[Toolchain, ...] = (
+    Toolchain("java", ("java", "-version"), JAVA_MIN,
+              re.compile(r'version "(?:1\.)?([^"]+)"'),  # legacy "1.8.0_292" means Java 8
+              "install a JDK 21+ (https://adoptium.net or `sudo apt install openjdk-21-jdk`) and put its bin/ on PATH"),
+    Toolchain("javac", ("javac", "-version"), JAVA_MIN,
+              re.compile(r"javac\s+(\S+)"),
+              "a JRE alone is not enough: install the full JDK 21+ so `javac` exists"),
+    Toolchain("python3", ("python3", "--version"), PYTHON_MIN,
+              re.compile(r"Python\s+(\S+)"),
+              "install Python 3.11+ (https://www.python.org/downloads/ or `sudo apt install python3.12`)"),
+    Toolchain("go", ("go", "version"), GO_MIN,
+              re.compile(r"go version go(\S+)"),
+              "install Go 1.22+ from https://go.dev/dl/ and add /usr/local/go/bin to PATH"),
+)
+```
+
+#### Step 3: The boundary with the operating system
+
+The runner is a plain function, and `CommandRunner` is just the `Callable` alias that names its shape. `capture_output=True` collects both streams and the function concatenates them, which is the `redirectErrorStream(true)` equivalent that makes `java -version` (written to stderr) readable. `FileNotFoundError` is the only path that returns `None`; a timeout returns the empty string so the parser produces `UNPARSEABLE`, and a non-zero exit is not an exception at all.
+
+```python
+# A runner takes argv and returns the combined output, or None when the executable does not exist.
+CommandRunner = Callable[[tuple[str, ...]], Optional[str]]
 
 
 def real_runner(argv: tuple[str, ...]) -> Optional[str]:
+    """Spawn the process and merge stderr into stdout (java -version writes to stderr)."""
     try:
         proc = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
-        return None             # executable not on PATH
+        return None  # executable not on PATH
     except subprocess.TimeoutExpired:
         return ""
     return proc.stdout + proc.stderr
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 4: Classify one toolchain
 
-- **`order=True` writes `compareTo` for you.** A frozen, ordered dataclass compares field by field in declaration order, which for three `int` fields is exactly the numeric tuple comparison. Declare the fields as `str` and you get lexical comparison and the `3.9 > 3.11` bug back, silently.
-- **`None` is the "not installed" signal.** `subprocess.run` raises `FileNotFoundError` when the executable does not exist, which maps to `None`; a non-zero exit does not raise (no `check=True`), so the output still reaches the parser.
-- **`CommandRunner` is a `Callable` type alias**, and the fake in the tests is a `lambda`. No interface declaration is needed because the runner is just a function.
+The four outcomes in discovery order, with `None` checks where the Java checks `Optional.isEmpty()`. `Status` is an `Enum` whose values are the display strings, and `CheckResult` is a frozen dataclass with the same `formatted()` method, so tests assert on fields and the layout lives in one f-string.
+
+```python
+def check_toolchain(tool: Toolchain, runner: CommandRunner) -> CheckResult:
+    output = runner(tool.argv)
+    if output is None:
+        return CheckResult(tool.name, Status.MISSING, None, f"not on PATH (minimum {tool.minimum}) -> {tool.fix}")
+    found = tool.parse_version(output)
+    if found is None:
+        return CheckResult(tool.name, Status.UNPARSEABLE, None,
+                           f"ran but printed no recognisable version; run `{' '.join(tool.argv)}` by hand")
+    if not found.at_least(tool.minimum):
+        return CheckResult(tool.name, Status.TOO_OLD, found, f"below minimum {tool.minimum} -> {tool.fix}")
+    return CheckResult(tool.name, Status.OK, found, f"(minimum {tool.minimum})")
+
+
+def check_toolchains(runner: CommandRunner) -> list[CheckResult]:
+    return [check_toolchain(t, runner) for t in TOOLCHAINS]
+```
+
+#### Step 5: The repository layout
+
+`pathlib` makes the upward walk a single loop: `start.parents` already yields every ancestor up to the filesystem root, so there is no explicit `getParent()` null check. The fallback to `start` is the same deliberate choice as in Java: outside the repository, every layout row reports `MISSING`.
+
+```python
+def find_repo_root(start: Path) -> Path:
+    """Walk upward from start until a directory holding languages.json appears; fall back to start."""
+    start = start.resolve()
+    for d in (start, *start.parents):
+        if (d / "languages.json").is_file():
+            return d
+    return start
+
+
+def check_layout(root: Path) -> list[CheckResult]:
+    results = []
+    for d in REQUIRED_DIRS:
+        present = (root / d).is_dir()
+        results.append(CheckResult(d + "/", Status.OK if present else Status.MISSING, None,
+                                   "directory present" if present
+                                   else "missing -> re-clone the repository; you may be running outside it"))
+    for f in REQUIRED_FILES:
+        present = (root / f).is_file()
+        results.append(CheckResult(f, Status.OK if present else Status.MISSING, None,
+                                   "file present" if present
+                                   else "missing -> re-clone the repository; this file is the course's registry"))
+    return results
+```
+
+#### Step 6: The report, and the exit code that is not there
+
+`main` prints the deterministic block first (the five canned strings, looked up in a `by_name` dict), then the live toolchain and layout rows, then the summary. There is no `sys.exit` anywhere, so the script's exit status is 0 whatever it finds. `summary` iterates over the `Status` enum in declaration order, which is why the counts always print as `OK TOO_OLD UNPARSEABLE MISSING`.
+
+```python
+def summary(results: list[CheckResult]) -> str:
+    counts = {s: 0 for s in Status}
+    for r in results:
+        counts[r.status] += 1
+    return "Summary:" + "".join(f" {counts[s]} {s.value}" for s in Status)
+```
+
+```python
+    print("\n== Preflight: toolchains on this machine ==")
+    tools = check_toolchains(real_runner)
+    for r in tools:
+        print(r.formatted())
+
+    print("\n== Preflight: repository layout ==")
+    root = find_repo_root(Path.cwd())
+    print(f"repository root: {root}")
+    layout = check_layout(root)
+    for r in layout:
+        print(r.formatted())
+
+    everything = tools + layout
+    print()
+    print(summary(everything))
+    if all(r.ok() for r in everything):
+        print("Every toolchain and directory is in place. Run any lesson with scripts/run_lesson.py.")
+    else:
+        print("Something is missing. You need only the language recorded in LEARNING.md to follow the course;"
+              " CI needs all three.")
+    # A preflight reports; it never fails. Exit 0 regardless of findings.
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/00-setup-and-tooling/01-dev-environment/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The deterministic block is identical to the Java run; the live block shows whatever your machine has. On the author's machine:
+
+```console
+== Parsing version strings (deterministic) ==
+java     "openjdk version "21.0.2" 2024-01-16"         -> 21.0.2 (meets 21.0.0)
+java     "java version "1.8.0_292""                    -> 8.0.0 (below 21.0.0)
+python3  "Python 3.12.1"                               -> 3.12.1 (meets 3.11.0)
+go       "go version go1.22.3 linux/amd64"             -> 1.22.3 (meets 1.22.0)
+go       "go version go1.21.13 linux/amd64"            -> 1.21.13 (below 1.22.0)
+
+== Preflight: toolchains on this machine ==
+OK          java                        21.0.12   (minimum 21.0.0)
+OK          javac                       21.0.12   (minimum 21.0.0)
+OK          python3                     3.13.16   (minimum 3.11.0)
+OK          go                          1.24.7    (minimum 1.22.0)
+
+Summary: 8 OK 0 TOO_OLD 0 UNPARSEABLE 0 MISSING
+```
+
+`echo $?` prints 0 even when a row says `MISSING`.
 
 ### In Go
 
-```go
-type CommandRunner func(argv []string) (output string, found bool)
+The Go port (`code/go/main.go`) keeps the design and changes how "nothing" is expressed. **Two return values instead of `Optional`:** `(Version, bool)` for parsing and `(string, bool)` for the runner are the Go idiom for "a value or nothing"; `*Version` in `CheckResult` is `nil` when no version was read. **`exec.Error` versus `exec.ExitError`:** Go reports "could not start" as `*exec.Error` (wrapping `exec.ErrNotFound`) and "started, exited non-zero" as `*exec.ExitError`. Only the first means `MISSING`; the second still carries output, and `errors.As` is how you tell them apart. **`CombinedOutput` merges the streams** the same way `redirectErrorStream(true)` does, and `context.WithTimeout` bounds the run so a hung child is killed and reports as `UNPARSEABLE`. **`Status` is an `int` with a names table**, because Go has no enums; `statusNames` doubles as the iteration order for the summary line.
 
-func RealRunner(argv []string) (string, bool) {
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-    out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
-    if err != nil {
-        var execErr *exec.Error
-        if errors.As(err, &execErr) || errors.Is(err, exec.ErrNotFound) {
-            return "", false // executable not on PATH
-        }
-    }
-    return string(out), true // ran (perhaps with a non-zero exit); let the parser decide
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A version that compares numerically
+
+`Version` is a struct of three ints and `ParseVersion` is a package function returning `(Version, bool)`. `regexp.FindStringSubmatch` returns `nil` when nothing matches and an empty string for an optional group that did not participate, so the loop only calls `strconv.Atoi` on groups that captured digits. `Compare` is written out field by field through a small `cmp` helper, and `AtLeast` is the same `>= 0` test as the Java.
+
+```go
+type Version struct {
+	Major, Minor, Patch int
+}
+
+var leading = regexp.MustCompile(`^(\d+)(?:\.(\d+))?(?:\.(\d+))?`)
+
+func ParseVersion(text string) (v Version, ok bool) {
+	m := leading.FindStringSubmatch(strings.TrimSpace(text))
+	if m == nil {
+		return Version{}, false
+	}
+	parts := [3]int{}
+	for i := 0; i < 3; i++ {
+		if m[i+1] != "" {
+			parts[i], _ = strconv.Atoi(m[i+1]) // the regexp guarantees digits
+		}
+	}
+	return Version{parts[0], parts[1], parts[2]}, true
+}
+
+// Compare returns -1, 0, or +1, comparing major, then minor, then patch numerically.
+func (v Version) Compare(o Version) int {
+	switch {
+	case v.Major != o.Major:
+		return cmp(v.Major, o.Major)
+	case v.Minor != o.Minor:
+		return cmp(v.Minor, o.Minor)
+	default:
+		return cmp(v.Patch, o.Patch)
+	}
+}
+
+func (v Version) AtLeast(minimum Version) bool { return v.Compare(minimum) >= 0 }
+```
+
+#### Step 2: What a toolchain is
+
+A struct with exported fields and a package-level slice of four rows. `regexp.MustCompile` panics at start-up on a bad pattern, which is the right time to find out. The method `ParseVersion` on `Toolchain` uses `FindStringSubmatch`, which scans like Java's `find` rather than anchoring like `matches`, so the noise line before the real `java -version` output is skipped.
+
+```go
+type Toolchain struct {
+	Name           string
+	Argv           []string
+	Minimum        Version
+	VersionPattern *regexp.Regexp
+	Fix            string
+}
+
+// ParseVersion extracts the version text from combined stdout+stderr, ignoring noise lines.
+func (t Toolchain) ParseVersion(output string) (Version, bool) {
+	m := t.VersionPattern.FindStringSubmatch(output)
+	if m == nil {
+		return Version{}, false
+	}
+	return ParseVersion(m[1])
+}
+
+var Toolchains = []Toolchain{
+	{"java", []string{"java", "-version"}, JavaMin,
+		regexp.MustCompile(`version "(?:1\.)?([^"]+)"`), // legacy "1.8.0_292" means Java 8
+		"install a JDK 21+ (https://adoptium.net or `sudo apt install openjdk-21-jdk`) and put its bin/ on PATH"},
+	{"javac", []string{"javac", "-version"}, JavaMin,
+		regexp.MustCompile(`javac\s+(\S+)`),
+		"a JRE alone is not enough: install the full JDK 21+ so `javac` exists"},
+	{"python3", []string{"python3", "--version"}, PythonMin,
+		regexp.MustCompile(`Python\s+(\S+)`),
+		"install Python 3.11+ (https://www.python.org/downloads/ or `sudo apt install python3.12`)"},
+	{"go", []string{"go", "version"}, GoMin,
+		regexp.MustCompile(`go version go(\S+)`),
+		"install Go 1.22+ from https://go.dev/dl/ and add /usr/local/go/bin to PATH"},
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: The boundary with the operating system
 
-- **Two return values instead of `Optional`.** `(Version, bool)` for parsing and `(string, bool)` for the runner are the Go idiom for "a value or nothing"; `*Version` in `CheckResult` is `nil` when no version was read.
-- **`exec.Error` versus `exec.ExitError`.** Go reports "could not start" as `*exec.Error` (wrapping `exec.ErrNotFound`) and "started, exited non-zero" as `*exec.ExitError`. Only the first means `MISSING`; the second still carries output. `errors.As` is how you tell them apart.
-- **`CombinedOutput` merges the streams** the same way `redirectErrorStream(true)` does. `context.WithTimeout` bounds the run; a hung child is killed and reports as `UNPARSEABLE`.
-- **The `Status` type is an `int` with a names table**, because Go has no enums; `statusNames` doubles as the iteration order for the summary line.
+`CommandRunner` is a named function type, so the test fake is a function literal. `exec.CommandContext` with a ten-second context kills a hung child; `CombinedOutput` returns stdout and stderr interleaved. The error inspection is the whole point of the step: a `*exec.Error` means the binary never started (`MISSING`), while a `*exec.ExitError` from a non-zero exit falls through and returns the output with `found == true`.
+
+```go
+// CommandRunner runs argv and returns combined output; found is false when the executable does not exist.
+type CommandRunner func(argv []string) (output string, found bool)
+
+// RealRunner spawns the process and merges stderr into stdout (java -version writes to stderr).
+func RealRunner(argv []string) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
+	if err != nil {
+		var execErr *exec.Error
+		if errors.As(err, &execErr) || errors.Is(err, exec.ErrNotFound) {
+			return "", false // executable not on PATH
+		}
+	}
+	return string(out), true // ran (perhaps with a non-zero exit); let the parser decide
+}
+```
+
+#### Step 4: Classify one toolchain
+
+The same four outcomes. `Found` is a `*Version`, so the two non-OK branches that read no version pass `nil` and the two that did pass `&v`. `Status` constants come from an `iota` block in severity order, and `CheckResult.Formatted` prints the status through its `String()` method, which indexes `statusNames`.
+
+```go
+func CheckToolchain(tool Toolchain, runner CommandRunner) CheckResult {
+	output, found := runner(tool.Argv)
+	if !found {
+		return CheckResult{tool.Name, Missing, nil,
+			fmt.Sprintf("not on PATH (minimum %s) -> %s", tool.Minimum, tool.Fix)}
+	}
+	v, ok := tool.ParseVersion(output)
+	if !ok {
+		return CheckResult{tool.Name, Unparseable, nil,
+			fmt.Sprintf("ran but printed no recognisable version; run `%s` by hand", strings.Join(tool.Argv, " "))}
+	}
+	if !v.AtLeast(tool.Minimum) {
+		return CheckResult{tool.Name, TooOld, &v, fmt.Sprintf("below minimum %s -> %s", tool.Minimum, tool.Fix)}
+	}
+	return CheckResult{tool.Name, OK, &v, fmt.Sprintf("(minimum %s)", tool.Minimum)}
+}
+
+func CheckToolchains(runner CommandRunner) []CheckResult {
+	results := make([]CheckResult, 0, len(Toolchains))
+	for _, t := range Toolchains {
+		results = append(results, CheckToolchain(t, runner))
+	}
+	return results
+}
+```
+
+#### Step 5: The repository layout
+
+`filepath.Dir` of the filesystem root is the root itself, so `FindRepoRoot` detects the top by checking `filepath.Dir(dir) == dir` instead of a `nil` parent. `os.Stat` plus `IsDir()` distinguishes files from directories; the error from `Stat` is folded into the `present` boolean because "does not exist" is exactly the outcome being reported.
+
+```go
+func FindRepoRoot(start string) string {
+	abs, err := filepath.Abs(start)
+	if err != nil {
+		return start
+	}
+	for dir := abs; ; dir = filepath.Dir(dir) {
+		if info, err := os.Stat(filepath.Join(dir, "languages.json")); err == nil && !info.IsDir() {
+			return dir
+		}
+		if filepath.Dir(dir) == dir {
+			return abs
+		}
+	}
+}
+
+func CheckLayout(root string) []CheckResult {
+	var results []CheckResult
+	for _, d := range RequiredDirs {
+		info, err := os.Stat(filepath.Join(root, d))
+		present := err == nil && info.IsDir()
+		r := CheckResult{d + "/", OK, nil, "directory present"}
+		if !present {
+			r = CheckResult{d + "/", Missing, nil, "missing -> re-clone the repository; you may be running outside it"}
+		}
+		results = append(results, r)
+	}
+	for _, f := range RequiredFiles {
+		info, err := os.Stat(filepath.Join(root, f))
+		present := err == nil && !info.IsDir()
+		r := CheckResult{f, OK, nil, "file present"}
+		if !present {
+			r = CheckResult{f, Missing, nil, "missing -> re-clone the repository; this file is the course's registry"}
+		}
+		results = append(results, r)
+	}
+	return results
+}
+```
+
+#### Step 6: The report, and the exit code that is not there
+
+`Summary` counts into a slice indexed by `Status` and walks `statusNames` in order, so the line reads the same as the Java and Python ones. `main` prints the deterministic block, the live blocks, and the summary; there is no `os.Exit` call, and the `allOK` loop only chooses the closing sentence.
+
+```go
+func Summary(results []CheckResult) string {
+	counts := make([]int, len(statusNames))
+	for _, r := range results {
+		counts[r.Status]++
+	}
+	var sb strings.Builder
+	sb.WriteString("Summary:")
+	for s, name := range statusNames {
+		fmt.Fprintf(&sb, " %d %s", counts[s], name)
+	}
+	return sb.String()
+}
+```
+
+```go
+	all := append(append([]CheckResult{}, tools...), layout...)
+	fmt.Println()
+	fmt.Println(Summary(all))
+	allOK := true
+	for _, r := range all {
+		allOK = allOK && r.OK()
+	}
+	if allOK {
+		fmt.Println("Every toolchain and directory is in place. Run any lesson with scripts/run_lesson.py.")
+	} else {
+		fmt.Println("Something is missing. You need only the language recorded in LEARNING.md to follow the course;" +
+			" CI needs all three.")
+	}
+	// A preflight reports; it never fails. Exit 0 regardless of findings.
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/00-setup-and-tooling/01-dev-environment/code/go
+go run .
+go test ./...
+```
+
+The output is line for line the same as the Java and Python runs; only the live rows depend on your machine:
+
+```console
+== Preflight: toolchains on this machine ==
+OK          java                        21.0.12   (minimum 21.0.0)
+OK          javac                       21.0.12   (minimum 21.0.0)
+OK          python3                     3.13.16   (minimum 3.11.0)
+OK          go                          1.24.7    (minimum 1.22.0)
+
+== Preflight: repository layout ==
+repository root: /home/claude/payments-engineering-from-scratch
+OK          phases/                     -         directory present
+OK          scripts/                    -         directory present
+OK          languages.json              -         file present
+OK          curriculum/curriculum.json  -         file present
+
+Summary: 8 OK 0 TOO_OLD 0 UNPARSEABLE 0 MISSING
+```
+
+`go run .` exits 0 in every case; a `MISSING` row is a report, not a failure.
 
 ## Use It
 

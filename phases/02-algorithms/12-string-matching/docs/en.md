@@ -360,19 +360,198 @@ The 38 tests cover: three hand-computed failure tables; overlapping matches in a
 
 ### In Python
 
+The five classes and the `Match` record keep their names and algorithms in `code/python/main.py`; three things differ. **Strings are code points, not UTF-16 units:** indexing a Python `str` yields code points, so `len("𝔘")` is 1 where Java's `length()` is 2, and `ord(c)` replaces the implicit `char`-to-`long` widening in the rolling hash. For every input in the lesson and the tests (ASCII, plus `ü`, which is one unit in both) the hashes, indices, and matches are identical; a name containing characters outside the Basic Multilingual Plane would give different offsets in the two languages. `normalize` uses `str.upper()` and `str.isalnum()` for `toUpperCase(Locale.ROOT)` and `Character.isLetterOrDigit`; they agree on Latin, Cyrillic, and Arabic letters, and a production screener would pin a Unicode normalization form (NFKC) in both. **Hash arithmetic cannot overflow:** Python integers are unbounded and `%` with a positive modulus is never negative, so the `+ MOD` in `roll` is kept only so the line reads like the Java; the hash values are the same numbers. `text.startswith(pattern, i)` is `regionMatches`. **Trie nodes are a small class with `__slots__`:** children live in a `dict`, which also iterates in insertion order (the Java `HashMap` does not), but the BFS needs only depth order, so the automaton and the matches are the same. `Match` is a frozen dataclass whose `__str__` prints `Match[pattern=..., start=...]` like the Java record. The test file carries a port of `java.util.Random` so the 300 random strings are the same inputs as the Java run.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo output is identical to the Java run, and the suite runs the same 38 checks.
+
+#### Step 1: The naive baseline, kept as the oracle
+
+A `while` loop rather than a `for`, because the bound `i + len(pattern) <= len(text)` depends on both lengths; `text[i + j]` indexes code points. `require_non_empty` is a static method the other matchers call too, raising `ValueError` where Java throws `IllegalArgumentException`.
+
 ```python
-def roll(self, window_hash: int, out: str, in_: str) -> int:
-    h = (window_hash - (ord(out) * self._high_power) % self.MOD + self.MOD) % self.MOD
-    return (h * self.BASE + ord(in_)) % self.MOD
+class NaiveMatcher:
+    @staticmethod
+    def search(text: str, pattern: str) -> list[int]:
+        NaiveMatcher.require_non_empty(pattern)
+        hits: list[int] = []
+        i = 0
+        while i + len(pattern) <= len(text):
+            j = 0
+            while j < len(pattern) and text[i + j] == pattern[j]:
+                j += 1
+            if j == len(pattern):
+                hits.append(i)
+            i += 1
+        return hits
+
+    @staticmethod
+    def require_non_empty(pattern: str) -> None:
+        if not pattern:
+            raise ValueError("pattern must be non-empty")
 ```
 
-The five classes and the `Match` record keep their names and algorithms; three things differ, all in `code/python/main.py`:
+#### Step 2: The failure function
 
-- **Strings are code points, not UTF-16 units.** Indexing a Python `str` yields code points, so `len("𝔘")` is 1 where Java's `length()` is 2, and `ord(c)` replaces the implicit `char`-to-`long` widening in the rolling hash. For every input in the lesson and the tests (ASCII, plus `ü`, which is one unit in both) the hashes, indices, and matches are identical; a name containing characters outside the Basic Multilingual Plane would give different offsets in the two languages. `normalize` uses `str.upper()` and `str.isalnum()` for `toUpperCase(Locale.ROOT)` and `Character.isLetterOrDigit`; they agree on Latin, Cyrillic, and Arabic letters, and a production screener would pin a Unicode normalization form (NFKC) in both.
-- **Hash arithmetic cannot overflow.** Python integers are unbounded and `%` with a positive modulus is never negative, so the `+ MOD` in `roll` is kept only so the line reads like the Java; the hash values are the same numbers. `text.startswith(pattern, i)` is `regionMatches`.
-- **Trie nodes are a small class with `__slots__`.** Children live in a `dict`, which also iterates in insertion order (the Java `HashMap` does not), but the BFS needs only depth order, so the automaton and the matches are the same. `Match` is a frozen dataclass whose `__str__` prints `Match[pattern=..., start=...]` like the Java record, so the demo output is identical.
+`[0] * len(p)` is the zeroed `int[]`. The fallback `while` and the extension `if` are the same two lines; `p[i]` and `p[k]` compare one-character strings, which is what `charAt` equality means here.
 
-The test file carries a port of `java.util.Random` so the 300 random strings are the same inputs as the Java run.
+```python
+    @staticmethod
+    def failure_function(p: str) -> list[int]:
+        fail = [0] * len(p)
+        k = 0  # length of the current longest prefix-suffix
+        for i in range(1, len(p)):
+            while k > 0 and p[i] != p[k]:
+                k = fail[k - 1]
+            if p[i] == p[k]:
+                k += 1
+            fail[i] = k
+        return fail
+```
+
+#### Step 3: KMP search
+
+`enumerate(text)` yields the index and the character together, so there is no `charAt(i)`. After a full match `j` falls back to `fail[j - 1]` rather than 0, which is what makes overlapping matches (`aa` in `aaaa` at 0, 1, 2) appear.
+
+```python
+    def search(self, text: str) -> list[int]:
+        pattern, fail = self._pattern, self._fail
+        hits: list[int] = []
+        j = 0  # characters of pattern matched so far
+        for i, c in enumerate(text):
+            while j > 0 and c != pattern[j]:
+                j = fail[j - 1]
+            if c == pattern[j]:
+                j += 1
+            if j == len(pattern):
+                hits.append(i - j + 1)
+                j = fail[j - 1]  # keep going: matches may overlap
+        return hits
+```
+
+#### Step 4: Rolling hash
+
+`BASE` and `MOD` are class attributes, `ord(c)` supplies the code point that Java gets by widening a `char`, and the `+ self.MOD` is cosmetic because Python's `%` with a positive divisor is already non-negative. The constructor computes `_high_power` as `BASE^(m-1) mod MOD` by repeated multiplication.
+
+```python
+    BASE = 256
+    MOD = 1_000_000_007  # a large prime so collisions are ~ 1 / MOD per window
+
+    @staticmethod
+    def hash(s: str) -> int:
+        h = 0
+        for c in s:
+            h = (h * RabinKarpMatcher.BASE + ord(c)) % RabinKarpMatcher.MOD
+        return h
+
+    def roll(self, window_hash: int, out: str, in_: str) -> int:
+        """Slide the window one character: drop `out`, shift, add `in_`. O(1)."""
+        h = (window_hash - (ord(out) * self._high_power) % self.MOD + self.MOD) % self.MOD
+        return (h * self.BASE + ord(in_)) % self.MOD
+```
+
+#### Step 5: Rabin-Karp search with verification
+
+The Java `for (int i = 0; ; i++)` becomes `while True` with an explicit `i += 1` after the roll, so the break test sits in the same place. `text.startswith(self._pattern, i)` is the `O(m)` verification that `regionMatches` performs; the two counters are instance state so the demo and tests can read them after a search.
+
+```python
+        window = RabinKarpMatcher.hash(text[:m])
+        i = 0
+        while True:
+            if window == self._pattern_hash:
+                self._hash_matches += 1
+                if text.startswith(self._pattern, i):  # String.regionMatches
+                    hits.append(i)
+                else:
+                    self._false_positives += 1
+            if i + m >= n:
+                break
+            window = self.roll(window, text[i], text[i + m])
+            i += 1
+        return hits
+```
+
+#### Step 6: The automaton's links
+
+A `deque` drives the BFS. The `assert node.fail is not None` lines exist for the type checker: every node in the queue has had its failure link set by the time it is dequeued, which is the invariant BFS order gives you. The output-link rule and the `target is child` guard for depth-1 nodes are the Java lines with `is` for reference identity.
+
+```python
+    def _build_links(self) -> None:
+        root = self._root
+        queue: deque[_Node] = deque()
+        root.fail = root
+        for child in root.next.values():
+            child.fail = root
+            queue.append(child)
+        while queue:
+            node = queue.popleft()
+            assert node.fail is not None
+            node.output = node.fail if node.fail is not root and node.fail.patterns else node.fail.output
+            for c, child in node.next.items():
+                f = node.fail
+                while f is not root and c not in f.next:
+                    assert f.fail is not None
+                    f = f.fail
+                target = f.next.get(c)
+                child.fail = root if (target is None or target is child) else target
+                queue.append(child)
+        root.output = None
+```
+
+#### Step 7: Searching with the automaton
+
+The same KMP shape with `cur.fail` for `fail[j-1]` and `c not in cur.next` for the mismatch test. The output chain starts at `cur` itself when it ends a pattern (so the longer match is reported before the shorter one ending at the same position), and `Match(p, i - len(p) + 1)` converts the end index to a start.
+
+```python
+    def search(self, text: str) -> list[Match]:
+        root = self._root
+        hits: list[Match] = []
+        cur = root
+        for i, c in enumerate(text):
+            while cur is not root and c not in cur.next:
+                assert cur.fail is not None
+                cur = cur.fail
+            step = cur.next.get(c)
+            cur = root if step is None else step
+            out = cur.output if not cur.patterns else cur
+            while out is not None:
+                for p in out.patterns:
+                    hits.append(Match(p, i - len(p) + 1))
+                out = out.output
+        return hits
+```
+
+#### Step 8: Whole-token screening
+
+`normalize` builds the cleaned string through a list and `"".join`, using `isalnum()` as `Character.isLetterOrDigit`. `screen` pads with spaces, keeps only matches bounded by spaces on both sides, and shifts the start back by one so it is relative to the normalized name rather than the padded one.
+
+```python
+    @staticmethod
+    def normalize(name: str) -> str:
+        if name is None:
+            raise TypeError("name")
+        out: list[str] = []
+        last_space = True
+        for c in name.upper():
+            if c.isalnum():  # Character.isLetterOrDigit
+                out.append(c)
+                last_space = False
+            elif not last_space:
+                out.append(" ")
+                last_space = True
+        return "".join(out).strip()
+
+    def screen(self, counterparty_name: str) -> list[Match]:
+        padded = " " + SanctionsScreener.normalize(counterparty_name) + " "
+        whole: list[Match] = []
+        for m in self._automaton.search(padded):
+            start, end = m.start, m.end()
+            # whole-token: bounded by spaces on both sides (the padding guarantees indices are in range)
+            if padded[start - 1] == " " and padded[end] == " ":
+                whole.append(Match(m.pattern, start - 1))
+        return whole
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/02-algorithms/12-string-matching/code/python
@@ -380,38 +559,256 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo output is identical to the Java run, and the suite runs the same 38 checks.
+```console
+== Naive vs KMP on a pathological input ==
+text = a*30 + b, pattern = aaaab
+naive hits:  [26]
+kmp hits:    [26]  failure function [0, 1, 2, 3, 0]
+failure(ABABAC) = [0, 0, 1, 2, 3, 0]
+
+patterns he, she, his, hers -> 10 trie nodes
+search("ushers") = [Match[pattern=she, start=1], Match[pattern=he, start=2], Match[pattern=hers, start=2]]
+```
+
+The Rabin-Karp and screening sections print the same lines as the Java run.
 
 ### In Go
 
+The five types and the `Match` record keep their names and algorithms in `code/go/main.go`; three things differ. **Strings are bytes, so the matchers work on runes:** `text[i]` in Go is a byte, and `"ü"` is two of them; indexing bytes would report `müller` matches at offsets 1 and 9 instead of the lesson's 1 and 8. Every matcher converts with `[]rune(s)` or ranges over the string (which yields code points) and keeps its own rune counter, so indices, hashes, and matches equal the Java's for the Basic Multilingual Plane. The trie's children live in a `map[rune]*acNode`, `Hash` widens each rune to `int64` the way Java widens a `char`, and `Normalize` uses `strings.ToUpper` with `unicode.IsLetter`/`IsDigit`. **Map iteration order is random, and the automaton must not care:** the Aho-Corasick BFS visits siblings in whatever order the map yields, which is fine because the construction only needs every node at depth *d* linked before depth *d+1*; a test builds the automaton twenty times and checks the matches never change. **Errors are values:** `NaiveSearch`, `NewKmpMatcher`, `NewRabinKarpMatcher`, `NewAhoCorasick`, and `NewSanctionsScreener` return `(T, error)`, and an empty pattern is the sentinel `ErrEmptyPattern`, checked with `errors.Is`. `Failure()` returns `slices.Clone` of the table, and the test mutates the copy to prove it. Go's `%` on a negative `int64` is negative, exactly like Java's, so the `+ Mod` in `Roll` is load-bearing here. The test file replays `java.util.Random(7)` through `javarandom.go`, so the 300 random strings are the same inputs as the Java run.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo output is identical to the Java run; the suite runs the Java's 38 checks plus 5 for the empty-pattern sentinel, the hash value, build determinism, and the automaton size.
+
+#### Step 1: The naive baseline, kept as the oracle
+
+Both strings are converted to `[]rune` up front so `t[i+j]` is a code point, not a byte. The empty-pattern check returns `ErrEmptyPattern` instead of throwing, and the function is a package-level `NaiveSearch` rather than a static method.
+
 ```go
-func (m *KmpMatcher) Search(text string) []int {
-    hits := []int{}
-    j, i := 0, 0
-    for _, c := range text { // ranging a string yields code points, not bytes
-        for j > 0 && c != m.pattern[j] {
-            j = m.fail[j-1]
-        }
-        if c == m.pattern[j] {
-            j++
-        }
-        if j == len(m.pattern) {
-            hits = append(hits, i-j+1)
-            j = m.fail[j-1]
-        }
-        i++
-    }
-    return hits
+func requireNonEmpty(pattern string) error {
+	if pattern == "" {
+		return ErrEmptyPattern
+	}
+	return nil
+}
+
+func NaiveSearch(text, pattern string) ([]int, error) {
+	if err := requireNonEmpty(pattern); err != nil {
+		return nil, err
+	}
+	t, p := []rune(text), []rune(pattern)
+	hits := []int{}
+	for i := 0; i+len(p) <= len(t); i++ {
+		j := 0
+		for j < len(p) && t[i+j] == p[j] {
+			j++
+		}
+		if j == len(p) {
+			hits = append(hits, i)
+		}
+	}
+	return hits, nil
 }
 ```
 
-The five types and the `Match` record keep their names and algorithms; three things differ, all in `code/go/main.go`:
+#### Step 2: The failure function
 
-- **Strings are bytes, so the matchers work on runes.** `text[i]` in Go is a byte, and `"ü"` is two of them; indexing bytes would report `müller` matches at offsets 1 and 9 instead of the lesson's 1 and 8. Every matcher converts with `[]rune(s)` or ranges over the string (which yields code points) and keeps its own rune counter, so indices, hashes, and matches equal the Java's for the Basic Multilingual Plane. The trie's children live in a `map[rune]*acNode`, `Hash` widens each rune to `int64` the way Java widens a `char`, and `Normalize` uses `strings.ToUpper` with `unicode.IsLetter`/`IsDigit`.
-- **Map iteration order is random, and the automaton must not care.** Java's `HashMap` has an unspecified but stable order; Go deliberately randomizes it between runs. The Aho-Corasick BFS visits siblings in whatever order the map yields, which is fine because the construction only needs every node at depth *d* linked before depth *d+1*; a test builds the automaton twenty times and checks the matches never change. The failure-link and output-link rules are the same lines as the Java.
-- **Errors are values.** `NaiveSearch`, `NewKmpMatcher`, `NewRabinKarpMatcher`, `NewAhoCorasick`, and `NewSanctionsScreener` return `(T, error)`, and an empty pattern is the sentinel `ErrEmptyPattern`, checked with `errors.Is`. `Failure()` returns `slices.Clone` of the table, and the test mutates the copy to prove it. Go's `%` on a negative `int64` is negative, exactly like Java's, so the `+ Mod` in `Roll` is load-bearing here.
+`FailureFunction` is a package-level function over the rune slice; Go's `for` with a condition is the `while`. `make([]int, len(p))` is zero-filled like a Java `int[]`.
 
-The test file replays `java.util.Random(7)` through `javarandom.go`, so the 300 random strings are the same inputs as the Java run.
+```go
+func FailureFunction(pattern string) []int {
+	p := []rune(pattern)
+	fail := make([]int, len(p))
+	k := 0 // length of the current longest prefix-suffix
+	for i := 1; i < len(p); i++ {
+		for k > 0 && p[i] != p[k] {
+			k = fail[k-1]
+		}
+		if p[i] == p[k] {
+			k++
+		}
+		fail[i] = k
+	}
+	return fail
+}
+```
+
+#### Step 3: KMP search
+
+`for _, c := range text` yields code points, but its index is a byte offset, so the matcher keeps its own rune counter `i` and increments it at the bottom of the loop. The match start `i-j+1` is therefore a rune index, which is what the tests and the Java agree on.
+
+```go
+func (m *KmpMatcher) Search(text string) []int {
+	hits := []int{}
+	j := 0 // characters of pattern matched so far
+	i := 0
+	for _, c := range text {
+		for j > 0 && c != m.pattern[j] {
+			j = m.fail[j-1]
+		}
+		if c == m.pattern[j] {
+			j++
+		}
+		if j == len(m.pattern) {
+			hits = append(hits, i-j+1)
+			j = m.fail[j-1] // keep going: matches may overlap
+		}
+		i++
+	}
+	return hits
+}
+```
+
+#### Step 4: Rolling hash
+
+`Base` and `Mod` are untyped constants, so they combine with `int64` without casts. `int64(c)` widens the rune exactly as Java widens a `char`; the `+ Mod` is required because Go's `%` on a negative dividend is negative, the same rule as Java's.
+
+```go
+const (
+	Base = 256
+	Mod  = 1_000_000_007
+)
+
+func Hash(s string) int64 {
+	var h int64
+	for _, c := range s {
+		h = (h*Base + int64(c)) % Mod
+	}
+	return h
+}
+
+func (m *RabinKarpMatcher) Roll(windowHash int64, out, in rune) int64 {
+	h := (windowHash - (int64(out)*m.highPower)%Mod + Mod) % Mod
+	return (h*Base + int64(in)) % Mod
+}
+```
+
+#### Step 5: Rabin-Karp search with verification
+
+The text is a rune slice, so the first window is `string(t[:k])` and verification is `slices.Equal` on the rune sub-slice, the role `regionMatches` plays in Java. The loop shape, the break, and the two counters are unchanged.
+
+```go
+	window := Hash(string(t[:k]))
+	for i := 0; ; i++ {
+		if window == m.patternHash {
+			m.hashMatches++
+			if slices.Equal(t[i:i+k], m.pattern) {
+				hits = append(hits, i)
+			} else {
+				m.falsePositives++
+			}
+		}
+		if i+k >= n {
+			break
+		}
+		window = m.Roll(window, t[i], t[i+k])
+	}
+	return hits
+```
+
+#### Step 6: The automaton's links
+
+The BFS queue is a slice with a moving `head` index. Ranging over `root.next` and `node.next` happens in random map order, which the construction tolerates because only depth order matters. Reading a missing key from `map[rune]*acNode` yields `nil`, so `f.next[c] == nil` is the `containsKey` test; the output link and the depth-1 guard are the Java rules written as `if`/`else`.
+
+```go
+func (ac *AhoCorasick) buildLinks() {
+	root := ac.root
+	root.fail = root
+	var queue []*acNode
+	for _, child := range root.next {
+		child.fail = root
+		queue = append(queue, child)
+	}
+	for head := 0; head < len(queue); head++ {
+		node := queue[head]
+		if node.fail != root && len(node.fail.patterns) > 0 {
+			node.output = node.fail
+		} else {
+			node.output = node.fail.output
+		}
+		for c, child := range node.next {
+			f := node.fail
+			for f != root && f.next[c] == nil {
+				f = f.fail
+			}
+			target := f.next[c]
+			if target == nil || target == child {
+				child.fail = root
+			} else {
+				child.fail = target
+			}
+			queue = append(queue, child)
+		}
+	}
+	root.output = nil
+}
+```
+
+#### Step 7: Searching with the automaton
+
+Again a hand-kept rune counter `i`, and `len([]rune(p))` rather than `len(p)` when converting an end index to a start, because `len` on a Go string counts bytes. The output chain is a `for` with an empty init clause.
+
+```go
+func (ac *AhoCorasick) Search(text string) []Match {
+	hits := []Match{}
+	cur := ac.root
+	i := 0
+	for _, c := range text {
+		for cur != ac.root && cur.next[c] == nil {
+			cur = cur.fail
+		}
+		if step := cur.next[c]; step != nil {
+			cur = step
+		} else {
+			cur = ac.root
+		}
+		out := cur
+		if len(cur.patterns) == 0 {
+			out = cur.output
+		}
+		for ; out != nil; out = out.output {
+			for _, p := range out.patterns {
+				hits = append(hits, Match{p, i - len([]rune(p)) + 1})
+			}
+		}
+		i++
+	}
+	return hits
+}
+```
+
+#### Step 8: Whole-token screening
+
+`Normalize` writes runes into a `strings.Builder` and uses `unicode.IsLetter || unicode.IsDigit` for `Character.isLetterOrDigit`. `Screen` converts the padded name to runes once so `padded[m.Start-1]` and `padded[m.End()]` index code points, then shifts the start back by one.
+
+```go
+func Normalize(name string) string {
+	var sb strings.Builder
+	lastSpace := true
+	for _, c := range strings.ToUpper(name) {
+		if unicode.IsLetter(c) || unicode.IsDigit(c) {
+			sb.WriteRune(c)
+			lastSpace = false
+		} else if !lastSpace {
+			sb.WriteRune(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func (s *SanctionsScreener) Screen(counterpartyName string) []Match {
+	padded := []rune(" " + Normalize(counterpartyName) + " ")
+	raw := s.automaton.Search(string(padded))
+	whole := []Match{}
+	for _, m := range raw {
+		if padded[m.Start-1] == ' ' && padded[m.End()] == ' ' {
+			whole = append(whole, Match{m.Pattern, m.Start - 1})
+		}
+	}
+	return whole
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/02-algorithms/12-string-matching/code/go
@@ -419,7 +816,19 @@ go run .
 go test ./...
 ```
 
-The demo output is identical to the Java run; the suite runs the Java's 38 checks plus 5 for the empty-pattern sentinel, the hash value, build determinism, and the automaton size.
+```console
+== Sanctions screening: 6 listed names, one pass per payment ==
+automaton nodes: 78
+IVANOV TRADING, LLC            -> HIT [IVANOV, IVANOV TRADING LLC]
+Northern Star Shipping Co.     -> HIT [NORTHERN STAR SHIPPING, STAR SHIPPING]
+Dmitri Ivanova                 -> clear
+Star Shipping Partners         -> HIT [STAR SHIPPING]
+al rashid exchange house       -> HIT [RASHID, AL RASHID EXCHANGE]
+Rashida Patel                  -> clear
+Acme Widgets Inc               -> clear
+```
+
+The earlier sections match the Java run line for line; `Match.String()` reproduces the record's `toString` so the `ushers` line is identical.
 
 ## Use It
 

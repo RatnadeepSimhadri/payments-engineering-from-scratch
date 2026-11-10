@@ -351,19 +351,152 @@ The test run prints `50 passed, 0 failed`.
 
 ### In Python
 
+The classes, method names (in `snake_case`), and every test case are the same; three things differ in `code/python/main.py`. **The deque is `collections.deque`:** it has `O(1)` `append`/`popleft`/`pop` at both ends, so `max_of_each_window` and `VelocityChecker` use it exactly as the Java uses `ArrayDeque`: `dq[0]` is `peekFirst`, `dq[-1]` is `peekLast`. Its `maxlen` option is tempting for fixed windows but wrong for time windows, where eviction is by timestamp, not count. **Integers do not overflow, so `Money` checks by hand:** `plus` and `minus` call `_check_long`, which raises `ArithmeticError` outside the signed 64-bit range where `Math.addExact` would throw; the currency check is unchanged and raises `ValueError` (the `IllegalArgumentException` mapping used throughout). A test pins the overflow. **Strings are code points:** `longest_without_repeat` keeps `last_seen` in a `dict` instead of a 65,536-entry `int[]`, and iterates code points rather than UTF-16 units; for any string in the Basic Multilingual Plane the answers are identical. The `>= left` guard is the same line.
+
+`Decision` is an `Enum`, also reachable as `VelocityChecker.Decision` so the Java spelling works. The test file carries a small port of `java.util.Random` so the 600 brute-force oracle trials are the same random arrays as the Java run. Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v` (the Java's 50 checks plus one for the overflow guard).
+
+#### Step 1: Converging pointers
+
+`sorted_` carries an underscore because `sorted` is a builtin. The loop returns a two-element list or `None`; `i < j` keeps an element from pairing with itself.
+
 ```python
-def _evict_older_than(self, cutoff_exclusive: int) -> None:
-    while self._window and self._window[0].timestamp_ms <= cutoff_exclusive:
-        self._total = self._total.minus(self._window.popleft().amount)
+    @staticmethod
+    def pair_with_sum(sorted_: list[int], target: int) -> list[int] | None:
+        """Indices [i, j], i < j, with a[i] + a[j] == target in a sorted list, or None. O(n)."""
+        i, j = 0, len(sorted_) - 1
+        while i < j:
+            s = sorted_[i] + sorted_[j]
+            if s == target:
+                return [i, j]
+            if s < target:
+                i += 1  # the smallest element can never pair with anything: drop it
+            else:
+                j -= 1  # the largest element can never pair with anything: drop it
+        return None
 ```
 
-The classes, method names (in `snake_case`), and every test case are the same; three things differ, all in `code/python/main.py`:
+#### Step 2: Reader and writer
 
-- **The deque is `collections.deque`.** It has `O(1)` `append`/`popleft`/`pop` at both ends, so `max_of_each_window` and `VelocityChecker` use it exactly as the Java uses `ArrayDeque`: `dq[0]` is `peekFirst`, `dq[-1]` is `peekLast`. Its `maxlen` option is tempting for fixed windows but wrong for time windows, where eviction is by timestamp, not count.
-- **Integers do not overflow, so `Money` checks by hand.** `plus` and `minus` call `_check_long`, which raises `ArithmeticError` outside the signed 64-bit range where `Math.addExact` would throw; the currency check is unchanged and raises `ValueError` (the `IllegalArgumentException` mapping used throughout). A test pins the overflow.
-- **Strings are code points.** `longest_without_repeat` keeps `last_seen` in a `dict` instead of a 65,536-entry `int[]`, and iterates code points rather than UTF-16 units; for any string in the Basic Multilingual Plane the answers are identical. The `>= left` guard is the same line.
+The compaction writes into the same list it reads; `write <= read` always holds, and the caller slices `copy[:n]` to see the live prefix.
 
-`Decision` is an `Enum`, also reachable as `VelocityChecker.Decision` so the Java spelling works. The test file carries a small port of `java.util.Random` so the 600 brute-force oracle trials are the same random arrays as the Java run.
+```python
+    @staticmethod
+    def dedupe_sorted(sorted_: list[int]) -> int:
+        """Remove duplicates from a sorted list in place; returns the new length. Reader and writer pointers."""
+        if not sorted_:
+            return 0
+        write = 1
+        for read in range(1, len(sorted_)):
+            if sorted_[read] != sorted_[write - 1]:
+                sorted_[write] = sorted_[read]
+                write += 1
+        return write
+```
+
+#### Step 3: Fixed window
+
+`sum(a[:k])` seeds the window; the slide adds the entering element and subtracts the leaving one. An out-of-range `k` raises `ValueError`.
+
+```python
+    @staticmethod
+    def max_sum_fixed(a: list[int], k: int) -> int:
+        """Fixed width k: the maximum sum of any k consecutive elements. Raises if k is out of range."""
+        if k <= 0 or k > len(a):
+            raise ValueError(f"k must be in 1..{len(a)}: {k}")
+        s = sum(a[:k])
+        best = s
+        for right in range(k, len(a)):
+            s += a[right] - a[right - k]  # slide: add the new element, drop the one that fell off the left
+            best = max(best, s)
+        return best
+```
+
+#### Step 4: Variable window
+
+The negative-value guard and the shrink-while-qualifying loop are the Java ones; `best == 0` still means "nothing found yet". `longest_without_repeat` swaps the 65,536-slot array for a `dict` with `get(c, -1)`, which also makes it correct for code points above the BMP.
+
+```python
+    @staticmethod
+    def shortest_run_with_sum_at_least(a: list[int], target: int) -> int:
+        """Variable width: length of the shortest contiguous run with sum >= target; 0 if none. Non-negative only."""
+        for v in a:
+            if v < 0:
+                raise ValueError("values must be non-negative for the window to be monotone")
+        best = left = 0
+        s = 0
+        for right in range(len(a)):
+            s += a[right]
+            while s >= target and left <= right:  # shrink from the left while the window still qualifies
+                length = right - left + 1
+                if best == 0 or length < best:
+                    best = length
+                s -= a[left]
+                left += 1
+        return best
+```
+
+```python
+    @staticmethod
+    def longest_without_repeat(s: str) -> int:
+        """Longest substring with no repeated character; the "at most one of each" window."""
+        last_seen: dict[str, int] = {}
+        best = left = 0
+        for right, c in enumerate(s):
+            if last_seen.get(c, -1) >= left:
+                left = last_seen[c] + 1  # jump left past the previous copy of c
+            last_seen[c] = right
+            best = max(best, right - left + 1)
+        return best
+```
+
+#### Step 5: The monotonic deque
+
+`collections.deque` gives `pop` (back), `append` (back), and `popleft` (front); `dq[-1]` and `dq[0]` peek. The order push, evict, read is preserved for the same `k = 1` reason as in Java.
+
+```python
+    @staticmethod
+    def max_of_each_window(a: list[int], k: int) -> list[int]:
+        """Sliding-window maximum with a monotonic deque of indices whose values strictly decrease front to back."""
+        if k <= 0 or k > len(a):
+            raise ValueError(f"k must be in 1..{len(a)}: {k}")
+        out = [0] * (len(a) - k + 1)
+        dq: deque[int] = deque()
+        for i in range(len(a)):
+            while dq and a[dq[-1]] <= a[i]:
+                dq.pop()  # a[i] dominates everything smaller before it
+            dq.append(i)
+            if dq[0] <= i - k:
+                dq.popleft()  # the front fell out of the window
+            if i >= k - 1:
+                out[i - k + 1] = a[dq[0]]
+        return out
+```
+
+#### Step 6: The velocity checker
+
+The window is a `deque[Event]` and `_total` is a `Money` kept exact by `plus`/`minus`. Count is checked before amount, as the rule specifies; an out-of-order event raises `ValueError`.
+
+```python
+    def record(self, e: Event) -> Decision:
+        """Record the event and decide. Denied events still count: an attacker's failed attempts are the signal."""
+        if e.timestamp_ms < self._last_timestamp:
+            raise ValueError("events must arrive in time order")
+        self._last_timestamp = e.timestamp_ms
+        self._evict_older_than(e.timestamp_ms - self._window_ms)
+        self._window.append(e)
+        self._total = self._total.plus(e.amount)
+        if len(self._window) > self._max_count:
+            return Decision.DENY_COUNT
+        if self._total.compare_to(self._max_total) > 0:
+            return Decision.DENY_AMOUNT
+        return Decision.ALLOW
+
+    def _evict_older_than(self, cutoff_exclusive: int) -> None:
+        while self._window and self._window[0].timestamp_ms <= cutoff_exclusive:
+            self._total = self._total.minus(self._window.popleft().amount)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/03-two-pointers-and-sliding-windows/code/python
@@ -371,30 +504,220 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 50 checks plus one for the overflow guard.
+```console
+== Two pointers on a sorted array ==
+pairWithSum(4574) -> indices [3, 5] = 1999 + 2575
+dedupeSorted      -> [75, 500, 1999, 2575, 4500, 12000]
+
+== Fixed window: best 3-day settlement total (cents per day) ==
+maxSumFixed(k=3) = 112575 (days 2..4: 80000 + 2575 + 30000)
+
+== Variable window: shortest run of days totalling at least 100,000 cents ==
+shortestRunWithSumAtLeast(100000) = 3 days
+
+== Sliding-window maximum with a monotonic deque, k = 3 ==
+input  [1, 3, -1, -3, 5, 3, 6, 7]
+maxima [3, 3, 5, 5, 6, 7]
+
+== Velocity check: max 4 authorizations and 500.00 USD per trailing 60 s ==
+  t=+  0s  120.00 USD -> ALLOW        window: 1 events, 120.00 USD
+  t=+ 10s  45.00 USD  -> ALLOW        window: 2 events, 165.00 USD
+  t=+ 20s  250.00 USD -> ALLOW        window: 3 events, 415.00 USD
+  t=+ 25s  19.99 USD  -> ALLOW        window: 4 events, 434.99 USD
+  t=+ 30s  1.00 USD   -> DENY_COUNT   window: 5 events, 435.99 USD
+  t=+ 70s  300.00 USD -> DENY_AMOUNT  window: 4 events, 570.99 USD
+  t=+125s  0.75 USD   -> ALLOW        window: 2 events, 300.75 USD
+```
+
+The output is identical to the Java run.
 
 ### In Go
 
+The types, method names, and every test case are the same; three things differ in `code/go/`. **The deque is hand-built:** Go's standard library has no deque, and a slice used as a queue with `q = q[1:]` keeps the whole backing array alive until it is reallocated. `deque.go` is a small generic ring buffer, `Deque[T]`, with `AddLast`, `PeekFirst`, `PeekLast`, `PollFirst`, and `PollLast`, the five `ArrayDeque` calls the lesson uses; `MaxOfEachWindow` and `VelocityChecker` call it exactly as the Java calls `ArrayDeque`. A test pushes past its initial capacity so `grow()` runs with a wrapped head. **Errors are values:** `MaxSumFixed`, `ShortestRunWithSumAtLeast`, `MaxOfEachWindow`, `NewVelocityChecker`, and `Record` return `(T, error)` where the Java throws `IllegalArgumentException`; the sentinels `ErrBadWindow`, `ErrNegative`, `ErrOutOfOrder`, and `ErrBadVelocity` support `errors.Is`. `PairWithSum` returns `([2]int, bool)` instead of `null`. **`int64` wraps, so `Money` checks by hand:** `Plus` and `Minus` call `addChecked` and `subChecked` in `money.go`, which return `ErrOverflow` where `Math.addExact` would throw; a currency mismatch is `ErrCurrencyMismatch`. `LongestWithoutRepeat` ranges over runes with a `map[rune]int`, so it counts code points rather than UTF-16 units; for the Basic Multilingual Plane the answers are identical, and a test with `"ééa"` shows it is not counting bytes.
+
+The test file replays `java.util.Random(11)` through `javarandom.go`, so the 600 brute-force oracle trials are the same random arrays as the Java run. Run it from `code/go/` with `go run .`; test with `go test ./...` (the Java's 50 checks plus 8 for the deque's growth, the code-point count, the `k=0` sentinel, and the two overflow guards).
+
+#### Step 1: Converging pointers
+
+A fixed-size `[2]int` array and an `ok` flag replace the nullable `int[]`. The loop is otherwise the Java one.
+
 ```go
-func (vc *VelocityChecker) evictOlderThan(cutoffExclusive int64) error {
-    for !vc.window.IsEmpty() && vc.window.PeekFirst().TimestampMs <= cutoffExclusive {
-        total, err := vc.total.Minus(vc.window.PollFirst().Amount)
-        if err != nil {
-            return err
-        }
-        vc.total = total
-    }
-    return nil
+// PairWithSum finds indices (i, j), i < j, with a[i] + a[j] == target in a sorted slice. O(n). ok is false when none exists.
+func PairWithSum(sorted []int64, target int64) (pair [2]int, ok bool) {
+	i, j := 0, len(sorted)-1
+	for i < j {
+		sum := sorted[i] + sorted[j]
+		if sum == target {
+			return [2]int{i, j}, true
+		}
+		if sum < target {
+			i++ // the smallest element can never pair with anything: drop it
+		} else {
+			j-- // the largest element can never pair with anything: drop it
+		}
+	}
+	return [2]int{}, false
 }
 ```
 
-The types, method names, and every test case are the same; three things differ, all in `code/go/`:
+#### Step 2: Reader and writer
 
-- **The deque is hand-built.** Go's standard library has no deque, and a slice used as a queue with `q = q[1:]` keeps the whole backing array alive until it is reallocated. `deque.go` is a small generic ring buffer, `Deque[T]`, with `AddLast`, `PeekFirst`, `PeekLast`, `PollFirst`, and `PollLast`, the five `ArrayDeque` calls the lesson uses; `MaxOfEachWindow` and `VelocityChecker` call it exactly as the Java calls `ArrayDeque`. A test pushes past its initial capacity so `grow()` runs with a wrapped head.
-- **Errors are values.** `MaxSumFixed`, `ShortestRunWithSumAtLeast`, `MaxOfEachWindow`, `NewVelocityChecker`, and `Record` return `(T, error)` where the Java throws `IllegalArgumentException`; the sentinels `ErrBadWindow`, `ErrNegative`, `ErrOutOfOrder`, and `ErrBadVelocity` support `errors.Is`. `PairWithSum` returns `([2]int, bool)` instead of `null`.
-- **`int64` wraps, so `Money` checks by hand.** `Plus` and `Minus` call `addChecked` and `subChecked` in `money.go`, which return `ErrOverflow` where `Math.addExact` would throw; a currency mismatch is `ErrCurrencyMismatch`. `LongestWithoutRepeat` ranges over runes with a `map[rune]int`, so it counts code points rather than UTF-16 units; for the Basic Multilingual Plane the answers are identical, and a test with `"ééa"` shows it is not counting bytes.
+Identical to the Java apart from the separate `write++`.
 
-The test file replays `java.util.Random(11)` through `javarandom.go`, so the 600 brute-force oracle trials are the same random arrays as the Java run.
+```go
+// DedupeSorted removes duplicates from a sorted slice in place; returns the new length. Reader and writer pointers.
+func DedupeSorted(sorted []int64) int {
+	if len(sorted) == 0 {
+		return 0
+	}
+	write := 1
+	for read := 1; read < len(sorted); read++ {
+		if sorted[read] != sorted[write-1] {
+			sorted[write] = sorted[read]
+			write++
+		}
+	}
+	return write
+}
+```
+
+#### Step 3: Fixed window
+
+A bad `k` returns a wrapped `ErrBadWindow`. The built-in `max` (Go 1.21+) replaces `Math.max`.
+
+```go
+// MaxSumFixed: fixed width k, the maximum sum of any k consecutive elements. Errors if k is out of range.
+func MaxSumFixed(a []int64, k int) (int64, error) {
+	if k <= 0 || k > len(a) {
+		return 0, fmt.Errorf("%w: got %d for len %d", ErrBadWindow, k, len(a))
+	}
+	var sum int64
+	for i := 0; i < k; i++ {
+		sum += a[i]
+	}
+	best := sum
+	for right := k; right < len(a); right++ {
+		sum += a[right] - a[right-k] // slide: add the new element, drop the one that fell off the left
+		best = max(best, sum)
+	}
+	return best, nil
+}
+```
+
+#### Step 4: Variable window
+
+The negative guard returns `ErrNegative`. `LongestWithoutRepeat` ranges over the string's runes and keeps its own code-point counter `i`, because the index `range` yields is a byte offset; `lastSeen` is a `map[rune]int` and the two-value lookup supplies the "seen before" test.
+
+```go
+func ShortestRunWithSumAtLeast(a []int64, target int64) (int, error) {
+	for _, v := range a {
+		if v < 0 {
+			return 0, ErrNegative
+		}
+	}
+	best, left := 0, 0
+	var sum int64
+	for right := 0; right < len(a); right++ {
+		sum += a[right]
+		for sum >= target && left <= right { // shrink from the left while the window still qualifies
+			length := right - left + 1
+			if best == 0 || length < best {
+				best = length
+			}
+			sum -= a[left]
+			left++
+		}
+	}
+	return best, nil
+}
+```
+
+```go
+// LongestWithoutRepeat: longest substring with no repeated character; the "at most one of each" window.
+func LongestWithoutRepeat(s string) int {
+	lastSeen := map[rune]int{}
+	best, left, i := 0, 0, 0
+	for _, c := range s { // Go strings are UTF-8: index code points, not bytes
+		if prev, seen := lastSeen[c]; seen && prev >= left {
+			left = prev + 1 // jump left past the previous copy of c
+		}
+		lastSeen[c] = i
+		best = max(best, i-left+1)
+		i++
+	}
+	return best
+}
+```
+
+#### Step 5: The monotonic deque
+
+`Deque[int]` from `deque.go` supplies the five `ArrayDeque` operations with the same names, so the loop body reads like the Java. Push, evict, read, in that order.
+
+```go
+func MaxOfEachWindow(a []int64, k int) ([]int64, error) {
+	if k <= 0 || k > len(a) {
+		return nil, fmt.Errorf("%w: got %d for len %d", ErrBadWindow, k, len(a))
+	}
+	out := make([]int64, len(a)-k+1)
+	dq := NewDeque[int]()
+	for i := range a {
+		for !dq.IsEmpty() && a[dq.PeekLast()] <= a[i] { // a[i] dominates everything smaller before it
+			dq.PollLast()
+		}
+		dq.AddLast(i)
+		if dq.PeekFirst() <= i-k { // the front fell out of the window
+			dq.PollFirst()
+		}
+		if i >= k-1 {
+			out[i-k+1] = a[dq.PeekFirst()]
+		}
+	}
+	return out, nil
+}
+```
+
+#### Step 6: The velocity checker
+
+`Record` returns `(Decision, error)`: `ErrOutOfOrder` for a backwards timestamp, and the `Money` errors from `Plus` and `Minus` are threaded through `evictOlderThan`. The decision order (count before amount) is unchanged.
+
+```go
+// Record stores the event and decides. Denied events still count: an attacker's failed attempts are the signal.
+func (vc *VelocityChecker) Record(e Event) (Decision, error) {
+	if e.TimestampMs < vc.lastTimestamp {
+		return 0, ErrOutOfOrder
+	}
+	vc.lastTimestamp = e.TimestampMs
+	if err := vc.evictOlderThan(e.TimestampMs - vc.windowMs); err != nil {
+		return 0, err
+	}
+	vc.window.AddLast(e)
+	total, err := vc.total.Plus(e.Amount)
+	if err != nil {
+		return 0, err
+	}
+	vc.total = total
+	if vc.window.Len() > vc.maxCount {
+		return DenyCount, nil
+	}
+	if vc.total.Compare(vc.maxTotal) > 0 {
+		return DenyAmount, nil
+	}
+	return Allow, nil
+}
+
+func (vc *VelocityChecker) evictOlderThan(cutoffExclusive int64) error {
+	for !vc.window.IsEmpty() && vc.window.PeekFirst().TimestampMs <= cutoffExclusive {
+		total, err := vc.total.Minus(vc.window.PollFirst().Amount)
+		if err != nil {
+			return err
+		}
+		vc.total = total
+	}
+	return nil
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/03-two-pointers-and-sliding-windows/code/go
@@ -402,7 +725,30 @@ go run .
 go test ./...
 ```
 
-The demo prints the same numbers as the Java run (Go formats slices as `[3 5]` rather than `[3, 5]`); the suite covers the Java's 50 checks plus 8 for the deque's growth, the code-point count, the `k=0` sentinel, and the two overflow guards.
+```console
+== Two pointers on a sorted array ==
+pairWithSum(4574) -> indices [3 5] = 1999 + 2575
+pairWithSum(1)    -> found=false
+dedupeSorted      -> [75 500 1999 2575 4500 12000]
+
+== Fixed window: best 3-day settlement total (cents per day) ==
+maxSumFixed(k=3) = 112575 (days 2..4: 80000 + 2575 + 30000)
+
+== Variable window: shortest run of days totalling at least 100,000 cents ==
+shortestRunWithSumAtLeast(100000) = 3 days
+
+== Sliding-window maximum with a monotonic deque, k = 3 ==
+input  [1 3 -1 -3 5 3 6 7]
+maxima [3 3 5 5 6 7]
+
+== Velocity check: max 4 authorizations and 500.00 USD per trailing 60 s ==
+  t=+  0s  120.00 USD -> ALLOW        window: 1 events, 120.00 USD
+  t=+ 30s  1.00 USD   -> DENY_COUNT   window: 5 events, 435.99 USD
+  t=+ 70s  300.00 USD -> DENY_AMOUNT  window: 4 events, 570.99 USD
+  t=+125s  0.75 USD   -> ALLOW        window: 2 events, 300.75 USD
+```
+
+The numbers are the same as the Java run; Go's `fmt` prints slices as `[3 5]` rather than `[3, 5]`, and the missing pair prints as `found=false` rather than `null`.
 
 ## Use It
 

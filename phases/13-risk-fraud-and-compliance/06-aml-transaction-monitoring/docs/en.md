@@ -355,59 +355,520 @@ The laundromat is the lesson. Its deposits are 8,400 to 9,300, every day, from o
 
 ### In Python
 
-```python
-def jdiv(a: int, b: int) -> int:
-    q = abs(a) // abs(b)
-    return q if (a < 0) == (b < 0) else -q
+The Python port (`code/python/main.py`, tests in `test_main.py`) has the same scenarios, detectors, merge step, and generator, and its demo prints the same population (1,792 transactions), the same four alerts with the same scores and evidence, and the same first alert in full. What differs: **Integer division is Java's.** Python's `//` floors and `%` takes the sign of the divisor; `jdiv` and `jmod` truncate toward zero like Java's `/` and `%`. Every score, the `basis_points` half-even rounding, the 96% pass-through split, and `Hours.format` go through them; the inputs here are non-negative, so `//` would usually agree, but the helpers make the port correct for every input rather than for this data, and a test pins `jdiv(-7, 2) == -3`. **The generator is `java.util.Random`:** `JavaRandom` ports the 48-bit LCG and `nextInt(bound)`, and `normal_account` draws its random numbers into local variables in the order Java evaluates the call's arguments (counterparty, amount, hour, minute); change that order and every account changes. **Ordering is explicit:** accounts are evaluated in `sorted()` order (Java's `TreeMap`), transactions sort on `(timestamp, id)`, and alerts on `(-severity, -score, account, scenario)`, the same comparator chain as the Java. **One harmless difference:** Java prints each scenario's `Map.of(...)` parameters in an order that changes from one JVM run to the next; Python prints them in declaration order. Every other line of the demo is identical.
 
-score = min(100, 50 + 10 * count + jdiv((total.minor_units - threshold.minor_units) * 10, threshold.minor_units))
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The transaction
+
+`Direction` and `Channel` are `Enum`s; `Transaction` is a frozen dataclass whose `__post_init__` rejects a non-positive amount with `ValueError`. Amounts are the Phase 10 `Money`.
+
+```python
+class Direction(Enum):
+    IN = "IN"
+    OUT = "OUT"
+
+
+class Channel(Enum):
+    CASH = "CASH"
+    WIRE = "WIRE"
+    ACH = "ACH"
+    CARD = "CARD"
+
+class Transaction:
+    id: str
+    account_id: str
+    counterparty_id: str
+    direction: Direction
+    channel: Channel
+    amount: Money
+    timestamp: int
+
+    def __post_init__(self) -> None:
+        if self.amount.minor_units <= 0:
+            raise ValueError(f"transaction amount must be positive: {self.amount}")
 ```
 
-`code/python/main.py` has the same scenarios, detectors, merge step, and generator, and its demo prints the same population (1,792 transactions), the same four alerts with the same scores and evidence, and the same first alert in full. What differs:
+#### Step 2: Scenarios
 
-- **Integer division is Java's.** Python's `//` floors and `%` takes the sign of the divisor; `jdiv` and `jmod` truncate toward zero like Java's `/` and `%`. Every score, the `basis_points` half-even rounding, the 96% pass-through split, and `Hours.format` go through them. The inputs here are non-negative, so `//` would usually agree, but the helpers make the port correct for every input rather than for this data; a test pins `jdiv(-7, 2) == -3`.
-- **The generator is `java.util.Random`.** `JavaRandom` ports the 48-bit LCG and `nextInt(bound)`, and `normal_account` draws its random numbers into local variables in the order Java evaluates the call's arguments (counterparty, amount, hour, minute). Change that order and every account changes.
-- **Ordering is explicit.** Accounts are evaluated in `sorted()` order (Java's `TreeMap`), transactions sort on `(timestamp, id)`, and alerts on `(-severity, -score, account, scenario)`, the same comparator chain as the Java.
-- **One harmless difference.** Java prints each scenario's `Map.of(...)` parameters in an order that changes from one JVM run to the next; Python prints them in declaration order. Every other line of the demo is identical.
+`Scenario` is a frozen dataclass over a plain `dict` of parameters; `param` raises `ValueError` on a missing name rather than defaulting. The `structuring` factory builds the dict and the description, with `//` for the day count.
 
-Run it from `code/python/`:
+```python
+class Scenario:
+    id: str
+    kind: ScenarioKind
+    severity: Severity
+    params: dict
+    description: str
+
+    def param(self, name: str) -> int:
+        v = self.params.get(name)
+        if v is None:
+            raise ValueError(f"scenario {self.id} missing parameter {name}")
+        return v
+
+    @staticmethod
+    def structuring(id: str, threshold_minor: int, floor_bps: int, window_seconds: int, min_count: int) -> "Scenario":
+        """Cash deposits each under the reporting threshold but at least floor_bps of it, summing to >= threshold."""
+        return Scenario(id, ScenarioKind.STRUCTURING, Severity.HIGH,
+                        {"thresholdMinor": threshold_minor, "floorBps": floor_bps, "windowSeconds": window_seconds, "minCount": min_count},
+                        f"cash deposits just under the CTR threshold that aggregate above it within {window_seconds // Hours.DAY} days")
+```
+
+#### Step 3: The structuring detector
+
+The qualifying filter is a list comprehension; the two-pointer scan keeps a running `Money` sum and slides `left` forward with a `while`. The score uses `jdiv` so the integer division truncates toward zero as Java's does.
+
+```python
+    def structuring(s: Scenario, account: str, srt: list[Transaction]) -> list[Alert]:
+        """Rolling window over qualifying cash deposits: each in [floor, threshold), window sum >= threshold, count >= min_count."""
+        threshold = Money.of_minor(s.param("thresholdMinor"), USD)
+        floor = threshold.basis_points(s.param("floorBps"))
+        window = s.param("windowSeconds")
+        min_count = s.param("minCount")
+        qualifying = [tx for tx in srt if tx.direction == Direction.IN and tx.channel == Channel.CASH
+                      and tx.amount.compare_to(threshold) < 0 and tx.amount.compare_to(floor) >= 0]
+        out: list[Alert] = []
+        left = 0
+        total = Money.zero(USD)
+        for right in range(len(qualifying)):
+            total = total.plus(qualifying[right].amount)
+            while qualifying[right].timestamp - qualifying[left].timestamp > window:
+                total = total.minus(qualifying[left].amount)
+                left += 1
+            count = right - left + 1
+            if count >= min_count and total.compare_to(threshold) >= 0:
+                evidence = tuple(qualifying[left:right + 1])
+                score = min(100, 50 + 10 * count + jdiv((total.minor_units - threshold.minor_units) * 10, threshold.minor_units))
+                out.append(Alert(s.id, s.kind, s.severity, account, score, evidence,
+                                 f"{count} cash deposits of {floor} to {threshold} totalling {total} within {window // Hours.DAY} days"))
+        return out
+```
+
+#### Step 4: Pass-through
+
+For each qualifying inbound, the inner `while` walks forward inside the window, skips card spend, and breaks as soon as the outbound total reaches `required`, so the evidence is minimal. Elapsed hours and the speed-weighted score go through `jdiv`.
+
+```python
+    def rapid_pass_through(s: Scenario, account: str, srt: list[Transaction]) -> list[Alert]:
+        """For each inbound of at least min_in, outbound transfers inside the window totalling >= out_bps of it."""
+        min_in = Money.of_minor(s.param("minInMinor"), USD)
+        out_bps, window = s.param("outBps"), s.param("windowSeconds")
+        out: list[Alert] = []
+        for i, inbound in enumerate(srt):
+            if inbound.direction != Direction.IN or inbound.amount.compare_to(min_in) < 0:
+                continue
+            required = inbound.amount.basis_points(out_bps)
+            sent_on = Money.zero(USD)
+            evidence = [inbound]
+            j = i + 1
+            while j < len(srt) and srt[j].timestamp - inbound.timestamp <= window:
+                tx = srt[j]
+                j += 1
+                if tx.direction != Direction.OUT or tx.channel == Channel.CARD:
+                    continue
+                sent_on = sent_on.plus(tx.amount)
+                evidence.append(tx)
+                if sent_on.compare_to(required) >= 0:
+                    break
+            if sent_on.compare_to(required) >= 0:
+                elapsed_hours = jdiv(evidence[-1].timestamp - inbound.timestamp, Hours.HOUR)
+                window_hours = jdiv(window, Hours.HOUR)
+                score = min(100, 60 + jdiv((window_hours - elapsed_hours) * 40, max(1, window_hours)))
+                out.append(Alert(s.id, s.kind, s.severity, account, score, tuple(evidence),
+                                 f"{inbound.amount} in, {sent_on} out to {len(evidence) - 1} counterparties within {elapsed_hours}h"))
+        return out
+```
+
+#### Step 5: Velocity
+
+The window slides with `left`; the distinct counterparties are a set comprehension recomputed per step (the incremental version is Exercise 2), and the score is the two `jdiv` ratios.
+
+```python
+    def velocity(s: Scenario, account: str, srt: list[Transaction]) -> list[Alert]:
+        """Score = 50 * count/baseline_count + 50 * counterparties/baseline_counterparties over the window."""
+        window, base_count, base_cp = s.param("windowSeconds"), s.param("baselineCount"), s.param("baselineCounterparties")
+        score_threshold = s.param("scoreThreshold")
+        out: list[Alert] = []
+        left = 0
+        for right in range(len(srt)):
+            while srt[right].timestamp - srt[left].timestamp > window:
+                left += 1
+            win = srt[left:right + 1]
+            cps = {tx.counterparty_id for tx in win}
+            score = jdiv(50 * len(win), base_count) + jdiv(50 * len(cps), base_cp)
+            if score >= score_threshold:
+                out.append(Alert(s.id, s.kind, s.severity, account, min(100, score), tuple(win),
+                                 f"{len(win)} transactions with {len(cps)} counterparties in {window // Hours.HOUR}h "
+                                 f"(baseline {base_count}/{base_cp})"))
+        return out
+```
+
+#### Step 6: Merging
+
+`merge_overlapping` compares each raw alert's evidence ids against the previous merged alert only, unions the evidence through a dict keyed by id, sorts it with `by_time`, keeps the better score and its narrative, and appends the merged total.
+
+```python
+    def merge_overlapping(raw: list[Alert]) -> list[Alert]:
+        """Alerts from the same scenario whose evidence overlaps are one pattern, not several. Keep the highest score."""
+        merged: list[Alert] = []
+        for a in raw:
+            if merged:
+                last = merged[-1]
+                last_ids = {tx.id for tx in last.evidence}
+                if any(tx.id in last_ids for tx in a.evidence):
+                    union: dict[str, Transaction] = {}
+                    for tx in last.evidence:
+                        union[tx.id] = tx
+                    for tx in a.evidence:
+                        union[tx.id] = tx
+                    ev = tuple(sorted(union.values(), key=by_time))
+                    better = a if a.score > last.score else last
+                    cut = better.narrative.find("; merged")
+                    peak = better.narrative[:cut] if cut >= 0 else better.narrative
+                    merged_alert = Alert(a.scenario_id, a.kind, a.severity, a.account_id, better.score, ev, peak)
+                    merged[-1] = Alert(a.scenario_id, a.kind, a.severity, a.account_id, better.score, ev,
+                                       f"{peak}; merged window holds {len(ev)} transactions totalling {merged_alert.total()}")
+                    continue
+            merged.append(a)
+        return merged
+```
+
+#### Step 7: The synthetic population
+
+`structurer` records the ground truth in `planted`, builds a normal account, and adds `deposits` cash deposits drawn from `JavaRandom` in the same order as the Java (amount, then branch), seven hours apart.
+
+```python
+    def structurer(self, account: str, t0: int, deposits: int, threshold_minor: int) -> list[Transaction]:
+        """The classic: N cash deposits each a little under the threshold, spread over a few days."""
+        self.planted[account] = "STRUCTURING"
+        out = list(self.normal_account(account, t0, 10))
+        for i in range(deposits):
+            amount = threshold_minor - 5_000 - self._rng.next_int(60_000)   # 9,400.00 to 9,950.00 on a 10,000.00 threshold
+            cp = f"branch-{self._rng.next_int(3)}"
+            out.append(self._tx(account, cp, Direction.IN, Channel.CASH, amount, t0 + 2 * Hours.DAY + i * 7 * Hours.HOUR))
+        return out
+```
+
+#### Step 8: Run it
 
 ```bash
+cd phases/13-risk-fraud-and-compliance/06-aml-transaction-monitoring/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+The population and the alerts match the Java run:
+
+```console
+== Synthetic population: 60 ordinary accounts, two cash businesses, three planted patterns (seed 7) ==
+  transactions: 1792, alerts: 4
+  HIGH  STR-01  acct-laundromat  score=100 planted=none               4 cash deposits of 8000.00 USD to 10000.00 USD totalling 35694.21 USD within 3 days; merged window holds 5 transactions totalling 44359.83 USD
+  HIGH  STR-01  acct-structurer  score=100 planted=STRUCTURING        4 cash deposits of 8000.00 USD to 10000.00 USD totalling 38315.53 USD within 3 days; merged window holds 10 transactions totalling 96665.85 USD
+  HIGH  RPT-01  acct-mule        score= 86 planted=RAPID_PASS_THROUGH 48500.00 USD in, 46560.00 USD out to 3 counterparties within 8h
+  MEDIUM VEL-01  acct-burst       score=100 planted=VELOCITY           8 transactions with 8 counterparties in 6h (baseline 6/4); merged window holds 40 transactions totalling 4680.73 USD
+  planted patterns found: 3 of 3; true-positive alerts 3, false-positive alerts 1
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`, tests in `main_test.go`) has the same scenarios, detectors, merge step, and generator, and its demo prints the same population (1,792 transactions), the same four alerts with the same scores and evidence, and the same first alert in full. What differs: **Errors are values.** `Scenario.Param` returns `ErrMissingParam`, and each detector reads its parameters through a small `paramReader` that remembers the first miss, so `Evaluate` returns `([]Alert, error)` instead of throwing mid-sweep; `NewTransaction` returns `ErrNonPositiveAmount`, `NewMonitoringEngine` returns `ErrDuplicateScenario`, and `Money.Plus`/`Minus`/`BasisPoints` return `(Money, error)`, which the detectors unwrap with `must` because every operand there is USD and the sums cannot overflow. **Integer division is already Java's:** Go's `/` and `%` truncate toward zero exactly like Java, so the scores, the half-even `BasisPoints`, and the 96% pass-through split need no helper; the Python port had to write `jdiv` for the same lines. **The generator is `java.util.Random`:** `JavaRandom` ports the 48-bit LCG and `NextInt(bound)`, and `NormalAccount` draws its random numbers into local variables in the order Java evaluates the call's arguments. **Ordering is explicit:** Go maps are unordered, so accounts are evaluated in sorted order (Java's `TreeMap`), transactions sort on `(timestamp, id)` with `sort.SliceStable`, alerts on `(-severity, -score, account, scenario)`, and the generator keeps its planted accounts in a slice beside the map. The one harmless difference is the scenario parameter line: Java prints `Map.of(...)` in an order that changes between JVM runs; Go prints the parameters in declaration order.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The transaction
+
+`Direction` and `Channel` are `iota` enums; `NewTransaction` is the validating constructor and wraps `ErrNonPositiveAmount`.
+
 ```go
+type Direction int
+
+const (
+	In Direction = iota
+	Out
+)
+
+type Channel int
+
+const (
+	Cash Channel = iota
+	Wire
+	ACH
+	Card
+)
+
+type Transaction struct {
+	ID             string
+	AccountID      string
+	CounterpartyID string
+	Direction      Direction
+	Channel        Channel
+	Amount         Money
+	Timestamp      int64
+}
+
+func NewTransaction(id, accountID, counterpartyID string, direction Direction, channel Channel, amount Money, timestamp int64) (Transaction, error) {
+	if amount.MinorUnits <= 0 {
+		return Transaction{}, fmt.Errorf("%w: %s", ErrNonPositiveAmount, amount)
+	}
+	return Transaction{id, accountID, counterpartyID, direction, channel, amount, timestamp}, nil
+}
+```
+
+#### Step 2: Scenarios
+
+`Scenario` keeps a `paramOrder` slice beside the map so the demo can print parameters in declaration order; `Param` returns `(int64, error)`. The `paramReader` lets a detector read several parameters and check for a miss once.
+
+```go
+type Scenario struct {
+	ID          string
+	Kind        ScenarioKind
+	Severity    Severity
+	Params      map[string]int64
+	paramOrder  []string // declaration order, for printing (Java's Map.of prints in an unspecified order)
+	Description string
+}
+
+func NewScenario(id string, kind ScenarioKind, severity Severity, params map[string]int64, description string) Scenario {
+	order := make([]string, 0, len(params))
+	for k := range params {
+		order = append(order, k)
+	}
+	sort.Strings(order)
+	return Scenario{id, kind, severity, params, order, description}
+}
+
+func (s Scenario) Param(name string) (int64, error) {
+	v, ok := s.Params[name]
+	if !ok {
+		return 0, fmt.Errorf("%w: scenario %s missing parameter %s", ErrMissingParam, s.ID, name)
+	}
+	return v, nil
+}
+
+func StructuringScenario(id string, thresholdMinor, floorBps, windowSeconds, minCount int64) Scenario {
+	return withOrder(NewScenario(id, Structuring, High,
+		map[string]int64{"thresholdMinor": thresholdMinor, "floorBps": floorBps, "windowSeconds": windowSeconds, "minCount": minCount},
+		fmt.Sprintf("cash deposits just under the CTR threshold that aggregate above it within %d days", windowSeconds/Day)),
+		"thresholdMinor", "floorBps", "windowSeconds", "minCount")
+}
+
 type paramReader struct {
-    s   Scenario
-    err error
+	s   Scenario
+	err error
 }
 
 func (p *paramReader) get(name string) int64 {
-    v, err := p.s.Param(name)
-    if err != nil && p.err == nil {
-        p.err = err
-    }
-    return v
+	v, err := p.s.Param(name)
+	if err != nil && p.err == nil {
+		p.err = err
+	}
+	return v
 }
-
-func (e *MonitoringEngine) Evaluate(transactions []Transaction) ([]Alert, error) { ... }
 ```
 
-`code/go/main.go` has the same scenarios, detectors, merge step, and generator, and its demo prints the same population (1,792 transactions), the same four alerts with the same scores and evidence, and the same first alert in full. What differs:
+#### Step 3: The structuring detector
 
-- **Errors are values.** `Scenario.Param` returns `ErrMissingParam`, and each detector reads its parameters through a small `paramReader` that remembers the first miss, so `Evaluate` returns `([]Alert, error)` instead of throwing mid-sweep. `NewTransaction` returns `ErrNonPositiveAmount`, `NewMonitoringEngine` returns `ErrDuplicateScenario`, and `Money.Plus`/`Minus`/`BasisPoints` return `(Money, error)`; the detectors unwrap them with `must` because every operand there is USD and the sums cannot overflow.
-- **Integer division is already Java's.** Go's `/` and `%` truncate toward zero exactly like Java, so the scores, the half-even `BasisPoints`, and the 96% pass-through split need no helper; the Python port had to write `jdiv` for the same lines.
-- **The generator is `java.util.Random`.** `JavaRandom` ports the 48-bit LCG and `NextInt(bound)`, and `NormalAccount` draws its random numbers into local variables in the order Java evaluates the call's arguments (counterparty, amount, hour, minute). Change that order and every account changes.
-- **Ordering is explicit.** Go maps are unordered, so accounts are evaluated in sorted order (Java's `TreeMap`), transactions sort on `(timestamp, id)` with `sort.SliceStable`, alerts on `(-severity, -score, account, scenario)`, and the generator keeps its planted accounts in a slice beside the map. The one harmless difference is the scenario parameter line: Java prints `Map.of(...)` in an order that changes between JVM runs; Go prints the parameters in declaration order.
+Parameters are read through the `paramReader` and the first miss is returned before any work. The qualifying filter, two-pointer scan, and score are the Java's; `must` unwraps the USD-only `Plus`/`Minus`/`BasisPoints`, and `/` already truncates toward zero.
 
-Run it from `code/go/`:
+```go
+func StructuringDetector(s Scenario, account string, sorted []Transaction) ([]Alert, error) {
+	p := &paramReader{s: s}
+	threshold := OfMinor(p.get("thresholdMinor"), USD)
+	floorBps := p.get("floorBps")
+	window := p.get("windowSeconds")
+	minCount := int(p.get("minCount"))
+	if p.err != nil {
+		return nil, p.err
+	}
+	floor := must(threshold.BasisPoints(floorBps))
+	qualifying := []Transaction{}
+	for _, tx := range sorted {
+		if tx.Direction == In && tx.Channel == Cash && tx.Amount.Compare(threshold) < 0 && tx.Amount.Compare(floor) >= 0 {
+			qualifying = append(qualifying, tx)
+		}
+	}
+	out := []Alert{}
+	left := 0
+	sum := Zero(USD)
+	for right := 0; right < len(qualifying); right++ {
+		sum = must(sum.Plus(qualifying[right].Amount))
+		for qualifying[right].Timestamp-qualifying[left].Timestamp > window {
+			sum = must(sum.Minus(qualifying[left].Amount))
+			left++
+		}
+		count := right - left + 1
+		if count >= minCount && sum.Compare(threshold) >= 0 {
+			evidence := append([]Transaction(nil), qualifying[left:right+1]...)
+			score := minInt64(100, 50+10*int64(count)+(sum.MinorUnits-threshold.MinorUnits)*10/threshold.MinorUnits)
+			out = append(out, Alert{s.ID, s.Kind, s.Severity, account, score, evidence,
+				fmt.Sprintf("%d cash deposits of %s to %s totalling %s within %d days", count, floor, threshold, sum, window/Day)})
+		}
+	}
+	return out, nil
+}
+```
+
+#### Step 4: Pass-through
+
+The inner `for` breaks as soon as the onward total reaches the required share; elapsed hours and the speed-weighted score are plain integer arithmetic with `minInt64`/`maxInt64` helpers.
+
+```go
+func RapidPassThroughDetector(s Scenario, account string, sorted []Transaction) ([]Alert, error) {
+	p := &paramReader{s: s}
+	minIn := OfMinor(p.get("minInMinor"), USD)
+	outBps, window := p.get("outBps"), p.get("windowSeconds")
+	if p.err != nil {
+		return nil, p.err
+	}
+	out := []Alert{}
+	for i := 0; i < len(sorted); i++ {
+		in := sorted[i]
+		if in.Direction != In || in.Amount.Compare(minIn) < 0 {
+			continue
+		}
+		required := must(in.Amount.BasisPoints(outBps))
+		sentOn := Zero(USD)
+		evidence := []Transaction{in}
+		for j := i + 1; j < len(sorted) && sorted[j].Timestamp-in.Timestamp <= window; j++ {
+			tx := sorted[j]
+			if tx.Direction != Out || tx.Channel == Card {
+				continue
+			}
+			sentOn = must(sentOn.Plus(tx.Amount))
+			evidence = append(evidence, tx)
+			if sentOn.Compare(required) >= 0 {
+				break
+			}
+		}
+		if sentOn.Compare(required) >= 0 {
+			elapsedHours := (evidence[len(evidence)-1].Timestamp - in.Timestamp) / Hour
+			score := minInt64(100, 60+(window/Hour-elapsedHours)*40/maxInt64(1, window/Hour))
+			out = append(out, Alert{s.ID, s.Kind, s.Severity, account, score, evidence,
+				fmt.Sprintf("%s in, %s out to %d counterparties within %dh", in.Amount, sentOn, len(evidence)-1, elapsedHours)})
+		}
+	}
+	return out, nil
+}
+```
+
+#### Step 5: Velocity
+
+The window slides with `left`; distinct counterparties are collected in a `map[string]bool` per step, and the score is the two integer ratios.
+
+```go
+func VelocityDetector(s Scenario, account string, sorted []Transaction) ([]Alert, error) {
+	p := &paramReader{s: s}
+	window, baseCount, baseCp := p.get("windowSeconds"), p.get("baselineCount"), p.get("baselineCounterparties")
+	scoreThreshold := p.get("scoreThreshold")
+	if p.err != nil {
+		return nil, p.err
+	}
+	out := []Alert{}
+	left := 0
+	for right := 0; right < len(sorted); right++ {
+		for sorted[right].Timestamp-sorted[left].Timestamp > window {
+			left++
+		}
+		win := sorted[left : right+1]
+		cps := map[string]bool{}
+		for _, tx := range win {
+			cps[tx.CounterpartyID] = true
+		}
+		score := 50*int64(len(win))/baseCount + 50*int64(len(cps))/baseCp
+		if score >= scoreThreshold {
+			out = append(out, Alert{s.ID, s.Kind, s.Severity, account, minInt64(100, score), append([]Transaction(nil), win...),
+				fmt.Sprintf("%d transactions with %d counterparties in %dh (baseline %d/%d)", len(win), len(cps), window/Hour, baseCount, baseCp)})
+		}
+	}
+	return out, nil
+}
+```
+
+#### Step 6: Merging
+
+`MergeOverlapping` checks overlap against the last merged alert only, unions the evidence through a `seen` map while preserving first occurrence, re-sorts with `sortByTime`, and rewrites the narrative with the merged total.
+
+```go
+func MergeOverlapping(raw []Alert) []Alert {
+	merged := []Alert{}
+	for _, a := range raw {
+		if len(merged) > 0 {
+			last := merged[len(merged)-1]
+			lastIDs := map[string]bool{}
+			for _, tx := range last.Evidence {
+				lastIDs[tx.ID] = true
+			}
+			overlaps := false
+			for _, tx := range a.Evidence {
+				if lastIDs[tx.ID] {
+					overlaps = true
+					break
+				}
+			}
+			if overlaps {
+				seen := map[string]bool{}
+				ev := []Transaction{}
+				for _, tx := range append(append([]Transaction(nil), last.Evidence...), a.Evidence...) {
+					if !seen[tx.ID] {
+						seen[tx.ID] = true
+						ev = append(ev, tx)
+					}
+				}
+				sortByTime(ev)
+				better := last
+				if a.Score > last.Score {
+					better = a
+				}
+				peak := better.Narrative
+				if idx := strings.Index(peak, "; merged"); idx >= 0 {
+					peak = peak[:idx]
+				}
+				mergedAlert := Alert{a.ScenarioID, a.Kind, a.Severity, a.AccountID, better.Score, ev, peak}
+				merged[len(merged)-1] = Alert{a.ScenarioID, a.Kind, a.Severity, a.AccountID, better.Score, ev,
+					fmt.Sprintf("%s; merged window holds %d transactions totalling %s", peak, len(ev), mergedAlert.Total())}
+				continue
+			}
+		}
+		merged = append(merged, a)
+	}
+	return merged
+}
+```
+
+#### Step 7: The synthetic population
+
+`Structurer` plants the ground truth, builds a normal account, and appends the near-threshold deposits with the random draws in the Java order (amount, then branch).
+
+```go
+func (g *SyntheticGenerator) Structurer(account string, t0 int64, deposits int, thresholdMinor int64) []Transaction {
+	g.plant(account, "STRUCTURING")
+	out := g.NormalAccount(account, t0, 10)
+	for i := 0; i < deposits; i++ {
+		amount := thresholdMinor - 5_000 - int64(g.rng.NextInt(60_000)) // 9,400.00 to 9,950.00 on a 10,000.00 threshold
+		branch := g.rng.NextInt(3)
+		out = append(out, g.tx(account, fmt.Sprintf("branch-%d", branch), In, Cash, amount, t0+2*Day+int64(i)*7*Hour))
+	}
+	return out
+}
+```
+
+#### Step 8: Run it
 
 ```bash
+cd phases/13-risk-fraud-and-compliance/06-aml-transaction-monitoring/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run apart from the parameter order on the scenario lines:
+
+```console
+== Scenarios (data, not code) ==
+  STR-01  STRUCTURING        HIGH   cash deposits just under the CTR threshold that aggregate above it within 3 days
+    params {thresholdMinor=1000000, floorBps=8000, windowSeconds=259200, minCount=3}
+  RPT-01  RAPID_PASS_THROUGH HIGH   funds received and at least 90% sent onward within 24 hours
+    params {minInMinor=1000000, outBps=9000, windowSeconds=86400}
 ```
 
 ## Use It

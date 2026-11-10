@@ -375,9 +375,22 @@ The test file runs the same ABA interleaving and asserts the duplicate pop, then
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps `TreiberStack`, `PooledStack`, `StampedPooledStack`, `MichaelScottQueue`, and `Progress`, with every CAS loop written line for line. Four things differ. **There is no CAS instruction to call.** CPython exposes no atomic compare-and-swap to Python code, so the port supplies `AtomicReference`, `AtomicLong`, and `AtomicStampedReference` whose `compare_and_set` holds a private `threading.Lock` for the compare and the write. The CAS is therefore blocking, and the structures are lock-free in shape only; what carries over is the algorithm: read, compute, CAS, retry. `compare_and_set` compares with `is`, not `==`, because Java's CAS compares references, and the ABA bug depends on that. **The GIL hides races, so the seam matters more.** Python threads switch only between bytecodes (every 5 ms by default), so the window between `head.get()` and the CAS is rarely hit by chance and the stress tests mostly check conservation; `before_cas` runs thread B's pop, pop, push inside thread A's gap, and the tests assert the duplicate pop of `pay_002` and, with the stamp, exactly one rejected stale CAS and a final stamp of 8. **`Optional` becomes `None`.** `pop`, `peek`, and `dequeue` return the value or `None`; `push` and `enqueue` reject `None` with `TypeError` (Java's `NullPointerException`), so `None` can only mean empty. `Thread.onSpinWait()` becomes `on_spin_wait()`, which calls `time.sleep(0)` to release the GIL so a spinning consumer does not starve the producers. **Real threads still run.** The stress test pushes 80,000 values from four `threading.Thread`s and the queue test runs four producers against four consumers; both pass reliably because every shared counter is an `AtomicLong` rather than a bare `+=`, which the GIL does not make atomic.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The lock-free stack
+
+The emulated `AtomicReference` comes first, because everything below is written against it. `get` is a bare attribute read (atomic in CPython); `compare_and_set` takes the lock, compares by identity, and writes. `TreiberStack.push` then reads exactly like the Java: a fresh `Node`, link `next`, CAS on `_head`, count a retry on failure. `None` is refused up front so that `pop` returning `None` always means empty.
+
 ```python
 class AtomicReference(Generic[T]):
-    """java.util.concurrent.atomic.AtomicReference: compare_and_set compares by identity (`is`), like Java's ==."""
+    def __init__(self, value: Optional[T] = None) -> None:
+        self._value = value
+        self._lock = threading.Lock()
+
+    def get(self) -> Optional[T]:
+        return self._value  # a single attribute read is atomic in CPython
 
     def compare_and_set(self, expected: Optional[T], new: Optional[T]) -> bool:
         with self._lock:
@@ -385,14 +398,202 @@ class AtomicReference(Generic[T]):
                 self._value = new
                 return True
             return False
+
+
+class TreiberStack(Generic[T]):
+    def push(self, value: T) -> None:
+        if value is None:
+            raise TypeError("value")  # Java: NullPointerException from Objects.requireNonNull
+        node = TreiberStack.Node(value)
+        while True:
+            current = self._head.get()
+            node.next = current  # link before publishing: next is set, then CAS publishes the node
+            if self._head.compare_and_set(current, node):
+                return
+            self._cas_retries.increment_and_get()
 ```
 
-`code/python/main.py` keeps `TreiberStack`, `PooledStack`, `StampedPooledStack`, `MichaelScottQueue`, and `Progress`, with every CAS loop written line for line. What differs:
+`pop` reads `current` and `current.next`, then CASes. Python's reference counting plus the cycle collector play the role of Java's GC here: `current` cannot be reused while this frame holds a reference to it, so if `_head` is still `current`, nothing was popped and pushed in between.
 
-- **There is no CAS instruction to call.** CPython exposes no atomic compare-and-swap to Python code, so the port supplies `AtomicReference`, `AtomicLong`, and `AtomicStampedReference` whose `compare_and_set` holds a private `threading.Lock` for the compare and the write. The CAS is therefore blocking, and the structures are lock-free in shape only; what carries over is the algorithm: read, compute, CAS, retry. `compare_and_set` compares with `is`, not `==`, because Java's CAS compares references, and the ABA bug depends on that.
-- **The GIL hides races, so the seam matters more.** Python threads switch only between bytecodes (every 5 ms by default), so the window between `head.get()` and the CAS is rarely hit by chance and the stress tests mostly check conservation. The ABA bug is not left to chance in either language: `before_cas` runs thread B's pop, pop, push inside thread A's gap, and the tests assert the duplicate pop of `pay_002` and, with the stamp, exactly one rejected stale CAS and a final stamp of 8.
-- **`Optional` becomes `None`.** `pop`, `peek`, and `dequeue` return the value or `None`; `push` and `enqueue` reject `None` with `TypeError` (Java's `NullPointerException`), so `None` can only mean empty. `Thread.onSpinWait()` becomes `on_spin_wait()`, which calls `time.sleep(0)` to release the GIL so a spinning consumer does not starve the producers.
-- **Real threads still run.** The stress test pushes 80,000 values from four `threading.Thread`s and the queue test runs four producers against four consumers; both pass reliably because every shared counter is an `AtomicLong` rather than a bare `+=`, which the GIL does not make atomic.
+```python
+    def pop(self) -> Optional[T]:
+        """The top value, or None when empty (Java returns Optional.empty())."""
+        while True:
+            current = self._head.get()
+            if current is None:
+                return None
+            nxt = current.next
+            if self._head.compare_and_set(current, nxt):
+                return current.value
+            self._cas_retries.increment_and_get()
+```
+
+#### Step 2: Reintroduce the bug with a node pool
+
+`PooledNode` uses `__slots__` and a stable `id` so the demo can print `N3`. The free list is a `collections.deque` used FIFO (`popleft`), guarded by `_pool_lock` in place of Java's `synchronized`, so the pool itself stays correct and the only bug in the class is ABA. `before_cas` is the seam, defaulting to a no-op lambda.
+
+```python
+class PooledStack:
+    Node = PooledNode
+
+    def __init__(self, before_cas: Callable[[], None] = lambda: None) -> None:
+        self._head: AtomicReference[PooledNode] = AtomicReference()
+        self._free_list: deque[PooledNode] = deque()  # FIFO: the oldest freed node is reused first
+        self._before_cas = before_cas
+        self._next_id = 1
+        self._pool_lock = threading.Lock()  # Java: synchronized allocate/free
+
+    def _allocate(self, value: CaptureJob) -> PooledNode:
+        with self._pool_lock:
+            if self._free_list:
+                node = self._free_list.popleft()
+            else:
+                node = PooledNode(self._next_id)
+                self._next_id += 1
+            node.value = value
+            return node
+
+    def pop(self) -> Optional[CaptureJob]:
+        while True:
+            current = self._head.get()
+            if current is None:
+                return None
+            nxt = current.next
+            self._before_cas()  # the gap where ABA happens
+            if self._head.compare_and_set(current, nxt):
+                value = current.value
+                self._free(current)
+                return value
+```
+
+`demo_aba` arms the seam once through a one-element list (the hook must reach the stack that owns it, which does not exist yet when the hook is defined). The pops inside the hook see `armed[0]` already `False`, so they run uninterrupted.
+
+```python
+    def thread_b() -> None:
+        if not armed[0]:
+            return
+        armed[0] = False  # only the first pop is interrupted
+        s = holder[0]
+        print("  thread A paused between reading head=N3 and its CAS")
+        job = s.pop()
+        print(f"  thread B: pop -> {job.payment_id if job else 'empty'}  (N3 goes to the free list)")
+        job = s.pop()
+        print(f"  thread B: pop -> {job.payment_id if job else 'empty'}  (N2 goes to the free list)")
+        s.push(CaptureJob("pay_004", 4_000))
+        print(f"  thread B: push pay_004 reuses N3; stack is now [{', '.join(s.snapshot())}]")
+
+    stack = PooledStack(thread_b)
+    holder.append(stack)
+```
+
+#### Step 3: The stamped fix
+
+`AtomicStampedReference` stores the pair as one tuple, so `get()` returns both halves at once and Python's tuple unpacking replaces Java's `int[] stamp` out-parameter. `compare_and_set` succeeds only when the node *and* the stamp match; the stack's `push` and `pop` pass `stamp + 1` as the new stamp on every attempt, so thread A's `(N3, 3)` is rejected against `(N3, 6)` and `_stale_cas_rejected` goes to 1.
+
+```python
+class AtomicStampedReference(Generic[T]):
+    def __init__(self, reference: Optional[T], stamp: int) -> None:
+        self._pair = (reference, stamp)
+        self._lock = threading.Lock()
+
+    def get(self) -> tuple[Optional[T], int]:
+        """Java's get(int[] stampHolder): returns the reference and the stamp read together."""
+        return self._pair
+
+    def compare_and_set(self, expected_ref: Optional[T], new_ref: Optional[T], expected_stamp: int,
+                        new_stamp: int) -> bool:
+        with self._lock:
+            ref, stamp = self._pair
+            if ref is expected_ref and stamp == expected_stamp:
+                self._pair = (new_ref, new_stamp)
+                return True
+            return False
+```
+
+```python
+    def pop(self) -> Optional[CaptureJob]:
+        while True:
+            current, stamp = self._head.get()
+            if current is None:
+                return None
+            nxt = current.next
+            self._before_cas()
+            if self._head.compare_and_set(current, nxt, stamp, stamp + 1):
+                value = current.value
+                self._free(current)
+                return value
+            self._stale_cas_rejected.increment_and_get()
+```
+
+#### Step 4: The Michael-Scott queue
+
+Each `Node.next` is itself an `AtomicReference`, because `enqueue` CASes it. The identity re-check uses `is not`, and the two CAS steps keep their Java comments: linking is the linearization point, swinging the tail may fail because a helper already did it. The `else` branch is the helping step.
+
+```python
+    def enqueue(self, value: T) -> None:
+        if value is None:
+            raise TypeError("value")
+        node = MichaelScottQueue.Node(value)
+        while True:
+            last = self._tail.get()
+            nxt = last.next.get()
+            if last is not self._tail.get():  # tail moved under us; re-read
+                self._cas_retries.increment_and_get()
+                continue
+            if nxt is None:
+                if last.next.compare_and_set(None, node):  # step 1: link the node (linearization point)
+                    self._tail.compare_and_set(last, node)  # step 2: swing tail; failure is fine, someone helped
+                    return
+                self._cas_retries.increment_and_get()
+            else:
+                self._helped_tail.increment_and_get()
+                self._tail.compare_and_set(last, nxt)  # tail is lagging: help, then retry
+```
+
+`dequeue` reads `nxt.value` before the CAS on `_head`, for the same reason as in Java: after the CAS, `nxt` is the sentinel and may be dequeued past by another thread. The `first is last` case helps the lagging tail before taking anything out.
+
+```python
+    def dequeue(self) -> Optional[T]:
+        while True:
+            first = self._head.get()
+            last = self._tail.get()
+            nxt = first.next.get()
+            if first is not self._head.get():
+                self._cas_retries.increment_and_get()
+                continue
+            if nxt is None:
+                return None  # sentinel has no successor: empty
+            if first is last:  # tail lagging behind a real node: help
+                self._helped_tail.increment_and_get()
+                self._tail.compare_and_set(last, nxt)
+                continue
+            value = nxt.value  # read before the CAS: after it, nxt is the new sentinel
+            if self._head.compare_and_set(first, nxt):
+                return value
+            self._cas_retries.increment_and_get()
+```
+
+#### Step 5: Progress as a type
+
+A standard `Enum` whose value is the one-line meaning. Python enums have no built-in ordinal, so `ordinal` is the index into `list(Progress)`, which iterates in definition order; the test pins that order.
+
+```python
+class Progress(Enum):
+    BLOCKING = "a thread holding a lock that is descheduled blocks every other thread"
+    OBSTRUCTION_FREE = "a thread running alone for long enough completes; contention may livelock"
+    LOCK_FREE = "some thread completes in a bounded number of steps; an individual thread may starve"
+    WAIT_FREE = "every thread completes in a bounded number of its own steps"
+
+    @property
+    def meaning(self) -> str:
+        return self.value
+
+    @property
+    def ordinal(self) -> int:
+        return list(Progress).index(self)
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/04-concurrency/03-compare-and-swap-and-lock-free-structures/code/python
@@ -400,45 +601,288 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The ABA and stamped sections print exactly the Java text; the empty-pop line shows `None` where Java shows `Optional.empty`:
+
+```console
+== ABA: the same node, a different stack ==
+before: [N3=pay_003, N2=pay_002, N1=pay_001]
+  thread A paused between reading head=N3 and its CAS
+  thread B: pop -> pay_003  (N3 goes to the free list)
+  thread B: pop -> pay_002  (N2 goes to the free list)
+  thread B: push pay_004 reuses N3; stack is now [N3=pay_004, N1=pay_001]
+thread A resumes: CAS(head, N3 -> N2) succeeds, returns pay_004
+after:  [N2=pay_002, N1=pay_001]   <- pay_002 is back on the stack and will be captured twice
+
+== The fix: a stamp that changes on every CAS ==
+before: [N3=pay_003, N2=pay_002, N1=pay_001] stamp = 3
+  thread B: pop, pop, push pay_004 -> stamp is now 6, stack [N3=pay_004, N1=pay_001]
+thread A: CAS expecting (N3, stamp 3) rejected (1 stale CAS), retried, returned pay_004
+after:  [N1=pay_001]   <- every job captured exactly once
+
+== Michael-Scott queue: two CAS pointers and a helping step ==
+4 producers x 20000 enqueues -> dequeued 80000, every value exactly once: true
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps `TreiberStack`, `PooledStack`, `StampedPooledStack`, `MichaelScottQueue`, and `Progress`, with every CAS loop written line for line. Four things differ. **The CAS is real.** `sync/atomic.Pointer[T]` has `Load`, `Store`, and `CompareAndSwap`, which compile to the processor's compare-exchange instruction and compare pointer identity exactly as `AtomicReference` does, so the Treiber stack and the Michael-Scott queue are genuinely lock-free. `atomic.Int64` replaces `AtomicLong` for the retry counters. Only the free lists in the pooled stacks take a `sync.Mutex`, where Java used `synchronized`. **The stamp is a pair behind a pointer.** Go has no `AtomicStampedReference` and no double-word CAS, so `StampedPooledStack.head` is an `atomic.Pointer[stamped]`; `compareAndSet` checks that the pair read earlier still holds the expected node and stamp, then CASes the pointer to a freshly allocated pair, which is how `AtomicStampedReference` works internally too. The ABA test shows exactly one rejected stale CAS and a final stamp of 8, the same numbers as Java. **`(T, bool)` instead of `Optional`.** `Pop`, `Peek`, and `Dequeue` return a second result that says whether a value existed; a zero value is a legal element. Java's `requireNonNull` checks have no counterpart for a generic `T`, so the test instead pushes the empty string and reads it back with `ok == true`. **Goroutines, channels, and `sync.WaitGroup`.** `CountDownLatch` becomes a closed channel for the start signal and a `WaitGroup` for completion; `Thread.onSpinWait()` becomes `runtime.Gosched()`. The stress tests run four goroutines against the stack and four producers against four consumers on the queue, and the whole suite passes under `go test -race ./...`, which is the proof that the publish-before-CAS ordering is right: the race detector treats `atomic` operations as synchronization and would flag a node field read without one.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The lock-free stack
+
+`treiberNode` is an unexported generic struct; `head` is an `atomic.Pointer` to it. `Push` writes `node.next` with a plain store before the CAS, which is safe because the node is unpublished until `CompareAndSwap` succeeds and the race detector understands atomics as synchronization.
+
 ```go
+type treiberNode[T any] struct {
+	value T
+	next  *treiberNode[T]
+}
+
 type TreiberStack[T any] struct {
-    head       atomic.Pointer[treiberNode[T]]
-    casRetries atomic.Int64
+	head       atomic.Pointer[treiberNode[T]]
+	casRetries atomic.Int64
 }
 
 func (s *TreiberStack[T]) Push(value T) {
-    node := &treiberNode[T]{value: value}
-    for {
-        current := s.head.Load()
-        node.next = current // link before publishing
-        if s.head.CompareAndSwap(current, node) {
-            return
-        }
-        s.casRetries.Add(1)
-    }
-}
-
-// stamped is a (pointer, stamp) pair behind one atomic.Pointer: Go has no double-word CAS,
-// so every successful CAS installs a freshly allocated pair, as AtomicStampedReference does internally.
-type stamped struct {
-    node  *PooledNode
-    stamp int
+	node := &treiberNode[T]{value: value}
+	for {
+		current := s.head.Load()
+		node.next = current // link before publishing: next is set, then CAS publishes the node
+		if s.head.CompareAndSwap(current, node) {
+			return
+		}
+		s.casRetries.Add(1)
+	}
 }
 ```
 
-`code/go/main.go` keeps `TreiberStack`, `PooledStack`, `StampedPooledStack`, `MichaelScottQueue`, and `Progress`, with every CAS loop written line for line. What differs:
+`Pop` returns `(zero, false)` on empty rather than an `Optional`; `var zero T` is the idiom for a generic zero value. Go's garbage collector gives the same ABA immunity as Java's: `current` cannot be freed and reallocated while this goroutine holds it.
 
-- **The CAS is real.** `sync/atomic.Pointer[T]` has `Load`, `Store`, and `CompareAndSwap`, which compile to the processor's compare-exchange instruction and compare pointer identity exactly as `AtomicReference` does, so the Treiber stack and the Michael-Scott queue are genuinely lock-free. `atomic.Int64` replaces `AtomicLong` for the retry counters. Only the free lists in the pooled stacks take a `sync.Mutex`, where Java used `synchronized`.
-- **The stamp is a pair behind a pointer.** Go has no `AtomicStampedReference`, so `StampedPooledStack.head` is an `atomic.Pointer[stamped]`; `compareAndSet` checks that the pair read earlier still holds the expected node and stamp, then CASes the pointer to a new pair. The ABA test shows exactly one rejected stale CAS and a final stamp of 8, the same numbers as Java.
-- **`(T, bool)` instead of `Optional`.** `Pop`, `Peek`, and `Dequeue` return a second result that says whether a value existed; a zero value is a legal element. Java's `requireNonNull` checks have no counterpart for a generic `T`, so the test instead pushes the empty string and reads it back with `ok == true`.
-- **Goroutines, channels, and `sync.WaitGroup`.** `CountDownLatch` becomes a closed channel for the start signal and a `WaitGroup` for completion; `Thread.onSpinWait()` becomes `runtime.Gosched()`. The stress tests run four goroutines against the stack and four producers against four consumers on the queue, and the whole suite passes under `go test -race ./...`, which is the proof that the publish-before-CAS ordering is right: the race detector treats `atomic` operations as synchronization and would flag a node field read without one.
+```go
+func (s *TreiberStack[T]) Pop() (T, bool) {
+	for {
+		current := s.head.Load()
+		if current == nil {
+			var zero T
+			return zero, false
+		}
+		next := current.next
+		if s.head.CompareAndSwap(current, next) {
+			return current.value, true
+		}
+		s.casRetries.Add(1)
+	}
+}
+```
+
+#### Step 2: Reintroduce the bug with a node pool
+
+The free list is a slice used FIFO (`freeList[0]`, then reslice) under a `sync.Mutex`, where Java had `synchronized` methods. `NewPooledStack(nil)` installs a no-op seam; `Pop` calls `beforeCas` in the gap and returns the node to the pool after a successful CAS, which is the recycling that makes ABA possible.
+
+```go
+type PooledStack struct {
+	head      atomic.Pointer[PooledNode]
+	mu        sync.Mutex
+	freeList  []*PooledNode // FIFO: the oldest freed node is reused first
+	beforeCas func()
+	nextID    int
+}
+
+func (s *PooledStack) allocate(value CaptureJob) *PooledNode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var node *PooledNode
+	if len(s.freeList) == 0 {
+		node = &PooledNode{ID: s.nextID}
+		s.nextID++
+	} else {
+		node = s.freeList[0]
+		s.freeList = s.freeList[1:]
+	}
+	node.value = value
+	return node
+}
+
+func (s *PooledStack) Pop() (CaptureJob, bool) {
+	for {
+		current := s.head.Load()
+		if current == nil {
+			return CaptureJob{}, false
+		}
+		next := current.next
+		s.beforeCas() // the gap where ABA happens
+		if s.head.CompareAndSwap(current, next) {
+			value := current.value
+			s.free(current)
+			return value, true
+		}
+	}
+}
+```
+
+`demoAba` declares `stack` before building the closure so the seam can call back into the stack it belongs to; `armed` is a captured `bool`, flipped on the first entry so the inner pops run clean.
+
+```go
+	var stack *PooledStack
+	armed := true
+	stack = NewPooledStack(func() {
+		if !armed {
+			return
+		}
+		armed = false // only the first pop is interrupted
+		fmt.Println("  thread A paused between reading head=N3 and its CAS")
+		v1, ok1 := stack.Pop()
+		fmt.Printf("  thread B: pop -> %s  (N3 goes to the free list)\n", orEmpty(v1.PaymentID, ok1))
+		v2, ok2 := stack.Pop()
+		fmt.Printf("  thread B: pop -> %s  (N2 goes to the free list)\n", orEmpty(v2.PaymentID, ok2))
+		stack.Push(CaptureJob{"pay_004", 4_000})
+		fmt.Printf("  thread B: push pay_004 reuses N3; stack is now %s\n", list(stack.Snapshot()))
+	})
+```
+
+#### Step 3: The stamped fix
+
+`stamped` bundles the node pointer and the stamp; `head` is an `atomic.Pointer[stamped]`. Because every successful CAS installs a *new* `stamped` value, pointer identity on the pair is enough: `compareAndSet` first checks that the pair it read still carries the expected node and stamp, then CASes the pair pointer. `Pop` loads the pair once, so `seen.stamp` is the stamp that went with `current`, which is what the Java `int[] stamp` out-parameter guarantees.
+
+```go
+type stamped struct {
+	node  *PooledNode
+	stamp int
+}
+
+func (s *StampedPooledStack) compareAndSet(seen *stamped, expectedNode, newNode *PooledNode, expectedStamp, newStamp int) bool {
+	if seen.node != expectedNode || seen.stamp != expectedStamp {
+		return false
+	}
+	return s.head.CompareAndSwap(seen, &stamped{newNode, newStamp})
+}
+
+func (s *StampedPooledStack) Pop() (CaptureJob, bool) {
+	for {
+		seen := s.head.Load()
+		current := seen.node
+		if current == nil {
+			return CaptureJob{}, false
+		}
+		next := current.next
+		s.beforeCas()
+		if s.compareAndSet(seen, current, next, seen.stamp, seen.stamp+1) {
+			value := current.value
+			s.free(current)
+			return value, true
+		}
+		s.staleCasRejected.Add(1)
+	}
+}
+```
+
+#### Step 4: The Michael-Scott queue
+
+`msNode.next` is an `atomic.Pointer` because `Enqueue` CASes it; the sentinel is installed by `NewMichaelScottQueue`. The loop is the Java loop with `Load` for `get()` and `CompareAndSwap` for `compareAndSet`; the `else` branch helps a lagging enqueuer by swinging `tail` on its behalf.
+
+```go
+func (q *MichaelScottQueue[T]) Enqueue(value T) {
+	node := &msNode[T]{value: value}
+	for {
+		last := q.tail.Load()
+		next := last.next.Load()
+		if last != q.tail.Load() { // tail moved under us; re-read
+			q.casRetries.Add(1)
+			continue
+		}
+		if next == nil {
+			if last.next.CompareAndSwap(nil, node) { // step 1: link the node (linearization point)
+				q.tail.CompareAndSwap(last, node) // step 2: swing tail; failure is fine, someone helped
+				return
+			}
+			q.casRetries.Add(1)
+		} else {
+			q.helpedTail.Add(1)
+			q.tail.CompareAndSwap(last, next) // tail is lagging: help, then retry
+		}
+	}
+}
+```
+
+`Dequeue` copies `next.value` before the head CAS. In Go this matters as much as in Java: once `next` is the sentinel, another dequeuer may move past it and a later read of its value would be stale.
+
+```go
+func (q *MichaelScottQueue[T]) Dequeue() (T, bool) {
+	for {
+		first := q.head.Load()
+		last := q.tail.Load()
+		next := first.next.Load()
+		if first != q.head.Load() {
+			q.casRetries.Add(1)
+			continue
+		}
+		if next == nil { // sentinel has no successor: empty
+			var zero T
+			return zero, false
+		}
+		if first == last { // tail lagging behind a real node: help
+			q.helpedTail.Add(1)
+			q.tail.CompareAndSwap(last, next)
+			continue
+		}
+		value := next.value // read before the CAS: after it, next is the new sentinel
+		if q.head.CompareAndSwap(first, next) {
+			return value, true
+		}
+		q.casRetries.Add(1)
+	}
+}
+```
+
+#### Step 5: Progress as a type
+
+Go has no enum, so `Progress` is an `int` with `iota` constants, a `Progresses` slice standing in for `values()`, and `String`/`Meaning` methods indexing fixed arrays. The ordinal is the integer itself.
+
+```go
+type Progress int
+
+const (
+	Blocking Progress = iota
+	ObstructionFree
+	LockFree
+	WaitFree
+)
+
+// Progresses lists every guarantee in order, like Progress.values().
+var Progresses = []Progress{Blocking, ObstructionFree, LockFree, WaitFree}
+
+func (p Progress) String() string {
+	return [...]string{"BLOCKING", "OBSTRUCTION_FREE", "LOCK_FREE", "WAIT_FREE"}[p]
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/04-concurrency/03-compare-and-swap-and-lock-free-structures/code/go
 go run .
 go test -race ./...
+```
+
+Same output as Java except that empty results print as `ok=false`:
+
+```console
+== A lock-free stack: one CAS per push, one per pop ==
+pushed pay_001, pay_002, pay_003; size = 3
+pop -> pay_003, pop -> pay_002
+peek -> pay_001, size = 1
+pop on empty -> ok=false
+
+== The fix: a stamp that changes on every CAS ==
+before: [N3=pay_003, N2=pay_002, N1=pay_001] stamp = 3
+  thread B: pop, pop, push pay_004 -> stamp is now 6, stack [N3=pay_004, N1=pay_001]
+thread A: CAS expecting (N3, stamp 3) rejected (1 stale CAS), retried, returned pay_004
+after:  [N1=pay_001]   <- every job captured exactly once
+
+== Michael-Scott queue: two CAS pointers and a helping step ==
+enqueue 1,2,3; dequeue -> 1, 2, 3, then ok=false
+4 producers x 20000 enqueues -> dequeued 80000, every value exactly once: true
 ```
 
 ## Use It

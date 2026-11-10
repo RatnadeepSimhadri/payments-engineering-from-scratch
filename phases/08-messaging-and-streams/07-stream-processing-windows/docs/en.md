@@ -338,68 +338,378 @@ a record with an earlier processing time is rejected: processing time went backw
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **No `TreeMap`; a `dict` scanned in sorted order:** state is `dict[str, dict[Window, Aggregate]]`. Per-key window counts are small (six for the sliding demo), so the trigger sorts each key's windows and pops the closed ones; `Window` gets its ordering from `order=True`, which compares `(start, end)` exactly as the Java `compareTo` does, and the results are sorted by `(window, key)` before returning so the demo lines come out in the same order. **`Math.floorMod` is `%`:** Python's `%` already floors toward negative infinity, so `time - time % size` is the window start without a helper; the Go port has to write `floorMod` by hand. **`merge(w, fresh, Aggregate::merge)`** becomes an explicit `fresh if w not in per_key else per_key[w].merge(fresh)`; the session merge loop iterates `sorted(sessions)` and `pop`s overlapping windows, which is the `Iterator.remove()` idiom without an iterator. **`Money` is `int` minor units** (a `float` is a `TypeError`), `Aggregate` and `Txn` are frozen dataclasses, and `ValueError` stands in for `IllegalArgumentException` everywhere, including the "processing time went backwards" check.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Records, windows, aggregates
+
+`Window` is a frozen dataclass with `order=True`, so `sorted(windows)` orders by `(start, end)` and the half-open `contains` is a chained comparison. `Aggregate` is also frozen and has both `add` (one record) and `merge` (two aggregates), because sliding windows need the first and session merges need the second.
+
 ```python
 @dataclass(frozen=True, order=True)
 class Window:
     start: int
     end: int
 
-def on_timer(self, now: int) -> List[WindowResult]:
-    out: List[WindowResult] = []
-    for key in list(self._state.keys()):
-        windows = self._state[key]
-        for w in sorted(windows):
-            if w.end > now:
-                break
-            out.append(WindowResult(key, w, windows.pop(w), now))
-        if not windows:
-            del self._state[key]
-    return _sort_results(out)
+    def __post_init__(self) -> None:
+        if self.end <= self.start:
+            raise ValueError(f"window must have positive length: [{self.start}, {self.end})")
+
+    def contains(self, t: int) -> bool:
+        return self.start <= t < self.end
+
+
+@dataclass(frozen=True)
+class Aggregate:
+    count: int
+    sum: Money
+    max: Money
+
+    @staticmethod
+    def empty(currency: Currency) -> "Aggregate":
+        return Aggregate(0, Money.zero(currency), Money.zero(currency))
+
+    def add(self, amount: Money) -> "Aggregate":
+        return Aggregate(self.count + 1, self.sum.plus(amount), self.max.max(amount))
+
+    def merge(self, other: "Aggregate") -> "Aggregate":
+        return Aggregate(self.count + other.count, self.sum.plus(other.sum), self.max.max(other.max))
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: Tumbling and sliding assigners
 
-- **No `TreeMap`; a `dict` scanned in sorted order.** State is `dict[str, dict[Window, Aggregate]]`. Per-key window counts are small (six for the sliding demo), so the trigger sorts each key's windows and pops the closed ones; `Window` gets its ordering from `order=True`, which compares `(start, end)` exactly as the Java `compareTo` does. The results are sorted by `(window, key)` before returning, as in Java, so the demo lines come out in the same order.
-- **`Math.floorMod` is `%`.** Python's `%` already floors toward negative infinity, so `time - time % size` is the window start without a helper; the Go port has to write `floorMod` by hand.
-- **`merge(w, fresh, Aggregate::merge)`** becomes an explicit `fresh if w not in per_key else per_key[w].merge(fresh)`; the session merge loop iterates `sorted(sessions)` and `pop`s overlapping windows, which is the `Iterator.remove()` idiom without an iterator.
-- **`Money` is `int` minor units** (a `float` is a `TypeError`), `Aggregate` and `Txn` are frozen dataclasses, and `ValueError` stands in for `IllegalArgumentException` everywhere, including the "processing time went backwards" check.
+Because Python's `%` floors, `time - time % size` aligns negative timestamps correctly with no helper. The sliding loop is the Java one written as a `while`: start at the latest window start at or before `time`, walk back by `slide` while the window still contains `time`, then reverse so the windows come out oldest first.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The 43 sliding results, 5 breaches, and peak state sizes (2/10/2) match the Java run.
+```python
+    def assign(self, time: int) -> List[Window]:
+        start = time - time % self.size  # Python's % already floors, like Math.floorMod
+        return [Window(start, start + self.size)]
+```
+
+```python
+    def assign(self, time: int) -> List[Window]:
+        out: List[Window] = []
+        last_start = time - time % self.slide
+        start = last_start
+        while start > time - self.size:
+            out.append(Window(start, start + self.size))
+            start -= self.slide
+        out.reverse()
+        return out
+```
+
+#### Step 3: The windowed aggregator
+
+`setdefault` creates the per-key dict on first sight. The one-line `merge` becomes a conditional expression: a fresh single-record aggregate if the window is new, otherwise the existing aggregate merged with it. Processing time going backwards is a `ValueError`.
+
+```python
+    def process(self, txn: Txn) -> None:
+        if txn.time < self._max_time_seen:
+            raise ValueError(f"processing time went backwards: {txn.time} < {self._max_time_seen}")
+        self._max_time_seen = txn.time
+        per_key = self._state.setdefault(txn.card_id, {})
+        for w in self._assigner.assign(txn.time):
+            fresh = Aggregate.empty(self._currency).add(txn.amount)
+            per_key[w] = fresh if w not in per_key else per_key[w].merge(fresh)
+```
+
+#### Step 4: The processing-time trigger
+
+For each key, walk its windows in sorted order and pop while `end <= now`; the `break` on the first open window is what makes "front of the sorted map" and "earliest end" coincide. `list(self._state.keys())` snapshots the keys so a key with no windows left can be deleted during the walk, and `_sort_results` orders the output by `(window, key)` as Java's iteration does.
+
+```python
+    def on_timer(self, now: int) -> List[WindowResult]:
+        out: List[WindowResult] = []
+        for key in list(self._state.keys()):
+            windows = self._state[key]
+            for w in sorted(windows):
+                if w.end > now:
+                    break
+                out.append(WindowResult(key, w, windows.pop(w), now))
+            if not windows:
+                del self._state[key]
+        return _sort_results(out)
+```
+
+#### Step 5: Session windows
+
+The record proposes `[t, t + gap)` and absorbs every session it overlaps; `sessions.pop(w)` both removes the merged session and hands its aggregate to `merge`, which is the `Iterator.remove()` idiom. The overlap test is the standard half-open intersection, and a session's `end` is "last record plus gap", so the Step 4 trigger works unchanged.
+
+```python
+    def process(self, txn: Txn) -> None:
+        if txn.time < self._max_time_seen:
+            raise ValueError(f"processing time went backwards: {txn.time} < {self._max_time_seen}")
+        self._max_time_seen = txn.time
+        sessions = self._state.setdefault(txn.card_id, {})
+        # A record's own session is [t, t + gap). Merge with every existing session it overlaps.
+        mine = Window(txn.time, txn.time + self.gap)
+        agg = Aggregate.empty(self._currency).add(txn.amount)
+        for w in sorted(sessions):
+            overlaps = w.start < mine.end and mine.start < w.end
+            if overlaps:
+                mine = Window(min(w.start, mine.start), max(w.end, mine.end))
+                agg = agg.merge(sessions.pop(w))
+        sessions[mine] = agg
+```
+
+#### Step 6: Driving the stream and applying the rule
+
+`StreamRunner.run` fires every timer tick at or before a record's time before processing the record, then drains the ticks up to `end_of_stream`; that interleaving is what makes the simulation equal a real operator with a wall-clock timer. `VelocityRule.breaches` is a list comprehension.
+
+```python
+    def run(self, txns: List[Txn], end_of_stream: int) -> List[WindowResult]:
+        for t in txns:
+            while self._next_timer <= t.time:
+                self._results.extend(self._operator.on_timer(self._next_timer))
+                self._next_timer += self._timer_interval
+            self._operator.process(t)
+            self._max_state_size = max(self._max_state_size, self._operator.state_size())
+        while self._next_timer <= end_of_stream:
+            self._results.extend(self._operator.on_timer(self._next_timer))
+            self._next_timer += self._timer_interval
+        return list(self._results)
+```
+
+```python
+    def breaches(self, results: List[WindowResult]) -> List[WindowResult]:
+        return [r for r in results if r.aggregate.count > self.max_per_window]
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/08-messaging-and-streams/07-stream-processing-windows/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The 43 sliding results, 5 breaches, and peak state sizes (2/10/2) match the Java run:
+
+```console
+== 5. Trigger timing: a window closes only when the timer passes its end ==
+state for card-A [0, 60000) before the timer: Aggregate[count=2, sum=37.49 USD, max=24.50 USD]
+onTimer(0:59) emits 0 windows; onTimer(1:00) emits 1
+a record with an earlier processing time is rejected: processing time went backwards: 30000 < 56000
+```
 
 ### In Go
 
+The Go port (`code/go/main.go` and `code/go/money.go`) keeps the design with four differences. **`Window` is a comparable struct and a map key:** state is `map[string]map[Window]Aggregate`; there is no `TreeMap`, so `sortedWindows` sorts a key's windows by `(Start, End)` with `Window.Less` before the trigger walks them, and `sortedKeys` sorts the card ids so emission order is deterministic. Per-key window counts are small, so the sort costs nothing noticeable. **`floorMod` is written by hand:** Go's `%` truncates toward zero like Java's, so `time - time % size` would misalign a negative timestamp; the helper is `Math.floorMod` and both assigners use it. **Errors are values:** the constructors (`NewWindow`, `NewTumblingWindows`, `NewSlidingWindows`, `NewSessionAggregator`, `NewStreamRunner`, `NewTxn`) return `error` for the arguments Java rejects with `IllegalArgumentException`; `Process` returns `ErrTimeWentBackwards` and `StreamRunner.Run` propagates it; `Peek` returns `(Aggregate, bool)` where Java returns `null`; `Aggregate.Add` panics on a `Money` error because every record in a stream shares the operator's currency, so a mismatch is a bug, not a condition. **The session merge loop deletes from the map while iterating a sorted snapshot**, which is the `Iterator.remove()` idiom; Go permits deletion during a range over the map itself, but the snapshot keeps the overlap test in the same order as Java's `TreeMap`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Records, windows, aggregates
+
+`Window` is a two-field struct, which makes it comparable and therefore usable as a map key; `Less` is Java's `compareTo` for the sorts. `NewWindow` validates where a struct literal cannot. `Aggregate.Add` and `Merge` panic on the `Money` error because it cannot happen within one stream.
+
 ```go
-// floorMod is Java's Math.floorMod: the remainder takes the divisor's sign, so negative timestamps still align.
-func floorMod(x, m int64) int64 {
-    r := x % m
-    if r != 0 && (r < 0) != (m < 0) {
-        r += m
-    }
-    return r
+type Window struct {
+	Start int64
+	End   int64
 }
 
-func (a *WindowedAggregator) OnTimer(now int64) []WindowResult {
-    out := []WindowResult{}
-    for _, key := range sortedKeys(a.state) {
-        windows := a.state[key]
-        for _, w := range sortedWindows(windows) {
-            if w.End > now {
-                break
-            }
-            out = append(out, WindowResult{key, w, windows[w], now})
-            delete(windows, w)
-        }
-        ...
+func NewWindow(start, end int64) (Window, error) {
+	if end <= start {
+		return Window{}, fmt.Errorf("window must have positive length: [%d, %d)", start, end)
+	}
+	return Window{start, end}, nil
+}
+
+func (w Window) Contains(t int64) bool { return t >= w.Start && t < w.End }
+
+func (w Window) Less(o Window) bool {
+	if w.Start != o.Start {
+		return w.Start < o.Start
+	}
+	return w.End < o.End
+}
+
+type Aggregate struct {
+	Count int
+	Sum   Money
+	Max   Money
+}
+
+func (a Aggregate) Add(amount Money) Aggregate {
+	sum, err := a.Sum.Plus(amount)
+	if err != nil {
+		panic(err)
+	}
+	return Aggregate{a.Count + 1, sum, a.Max.Max(amount)}
+}
+
+func (a Aggregate) Merge(other Aggregate) Aggregate {
+	sum, err := a.Sum.Plus(other.Sum)
+	if err != nil {
+		panic(err)
+	}
+	return Aggregate{a.Count + other.Count, sum, a.Max.Max(other.Max)}
+}
 ```
 
-Differences, all in `code/go/main.go` and `code/go/money.go`:
+#### Step 2: Tumbling and sliding assigners
 
-- **`Window` is a comparable struct and a map key.** State is `map[string]map[Window]Aggregate`; there is no `TreeMap`, so `sortedWindows` sorts a key's windows by `(Start, End)` with `Window.Less` before the trigger walks them, and `sortedKeys` sorts the card ids so emission order is deterministic. Per-key window counts are small (six for the sliding demo), so the sort costs nothing noticeable.
-- **`floorMod` is written by hand.** Go's `%` truncates toward zero like Java's, so `time - time % size` would misalign a negative timestamp; the helper above is `Math.floorMod` and both assigners use it.
-- **Errors are values.** The constructors (`NewWindow`, `NewTumblingWindows`, `NewSlidingWindows`, `NewSessionAggregator`, `NewStreamRunner`, `NewTxn`) return `error` for the arguments Java rejects with `IllegalArgumentException`; `Process` returns `ErrTimeWentBackwards` and `StreamRunner.Run` propagates it. `Peek` returns `(Aggregate, bool)` where Java returns `null`. `Aggregate.Add` panics on a `Money` error because every record in a stream shares the operator's currency, so a mismatch is a bug, not a condition.
-- **The session merge loop deletes from the map while iterating a sorted snapshot**, which is the `Iterator.remove()` idiom; Go permits deletion during a range over the map itself, but the snapshot keeps the overlap test in the same order as Java's `TreeMap`.
+`floorMod` fixes the sign of the remainder so a negative timestamp still lands in the right window. The sliding assigner walks back by `Slide` while the window still contains `time` and then reverses the slice in place, since Go has no `Collections.reverse`.
 
-Run it from `code/go/` with `go run .`; test with `go test ./...`. The 43 sliding results, 5 breaches, and peak state sizes (2/10/2) match the Java run.
+```go
+func floorMod(x, m int64) int64 {
+	r := x % m
+	if r != 0 && (r < 0) != (m < 0) {
+		r += m
+	}
+	return r
+}
+
+func (t *TumblingWindows) Assign(time int64) []Window {
+	start := time - floorMod(time, t.Size)
+	return []Window{{start, start + t.Size}}
+}
+```
+
+```go
+func (s *SlidingWindows) Assign(time int64) []Window {
+	out := []Window{}
+	lastStart := time - floorMod(time, s.Slide)
+	for start := lastStart; start > time-s.Size; start -= s.Slide {
+		out = append(out, Window{start, start + s.Size})
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+```
+
+#### Step 3: The windowed aggregator
+
+The comma-ok lookup creates the per-key map on first sight. `fresh` is computed once per record and either stored or merged into the existing aggregate, which is the `TreeMap.merge` call spelled out. Processing time going backwards returns the wrapped `ErrTimeWentBackwards` sentinel.
+
+```go
+func (a *WindowedAggregator) Process(txn Txn) error {
+	if txn.Time < a.maxTimeSeen {
+		return fmt.Errorf("%w: %d < %d", ErrTimeWentBackwards, txn.Time, a.maxTimeSeen)
+	}
+	a.maxTimeSeen = txn.Time
+	perKey, ok := a.state[txn.CardID]
+	if !ok {
+		perKey = map[Window]Aggregate{}
+		a.state[txn.CardID] = perKey
+	}
+	fresh := EmptyAggregate(a.currency).Add(txn.Amount)
+	for _, w := range a.assigner.Assign(txn.Time) {
+		if existing, found := perKey[w]; found {
+			perKey[w] = existing.Merge(fresh)
+		} else {
+			perKey[w] = fresh
+		}
+	}
+	return nil
+}
+```
+
+#### Step 4: The processing-time trigger
+
+`sortedKeys` and `sortedWindows` supply the order the Java `TreeMap` gave for free; the inner `break` on the first still-open window keeps the walk proportional to the closed windows. Deleting from `windows` while ranging over the sorted snapshot is safe, and a key left with no windows is removed from `state`.
+
+```go
+func (a *WindowedAggregator) OnTimer(now int64) []WindowResult {
+	out := []WindowResult{}
+	for _, key := range sortedKeys(a.state) {
+		windows := a.state[key]
+		for _, w := range sortedWindows(windows) {
+			if w.End > now {
+				break
+			}
+			out = append(out, WindowResult{key, w, windows[w], now})
+			delete(windows, w)
+		}
+		if len(windows) == 0 {
+			delete(a.state, key)
+		}
+	}
+	sortResults(out)
+	return out
+}
+```
+
+#### Step 5: Session windows
+
+Same proposal-and-absorb loop over a sorted snapshot of the key's sessions. The builtin `min` and `max` (Go 1.21+) grow the merged window; `delete(sessions, w)` after reading `sessions[w]` is the iterator-remove idiom.
+
+```go
+	// A record's own session is [t, t + gap). Merge with every existing session it overlaps.
+	mine := Window{txn.Time, txn.Time + s.Gap}
+	agg := EmptyAggregate(s.currency).Add(txn.Amount)
+	for _, w := range sortedWindows(sessions) {
+		overlaps := w.Start < mine.End && mine.Start < w.End
+		if overlaps {
+			mine = Window{min(w.Start, mine.Start), max(w.End, mine.End)}
+			agg = agg.Merge(sessions[w])
+			delete(sessions, w)
+		}
+	}
+	sessions[mine] = agg
+	return nil
+}
+```
+
+#### Step 6: Driving the stream and applying the rule
+
+`Run` returns `([]WindowResult, error)`: a record with an earlier processing time stops the run and the error comes back with the results so far. The returned slice is a copy so a caller cannot alias the runner's buffer. `Breaches` is the same three-line filter.
+
+```go
+func (r *StreamRunner) Run(txns []Txn, endOfStream int64) ([]WindowResult, error) {
+	for _, t := range txns {
+		for r.nextTimer <= t.Time {
+			r.results = append(r.results, r.operator.OnTimer(r.nextTimer)...)
+			r.nextTimer += r.timerInterval
+		}
+		if err := r.operator.Process(t); err != nil {
+			return r.results, err
+		}
+		r.maxStateSize = max(r.maxStateSize, r.operator.StateSize())
+	}
+	for r.nextTimer <= endOfStream {
+		r.results = append(r.results, r.operator.OnTimer(r.nextTimer)...)
+		r.nextTimer += r.timerInterval
+	}
+	return append([]WindowResult(nil), r.results...), nil
+}
+```
+
+```go
+func (v VelocityRule) Breaches(results []WindowResult) []WindowResult {
+	out := []WindowResult{}
+	for _, r := range results {
+		if r.Aggregate.Count > v.MaxPerWindow {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/08-messaging-and-streams/07-stream-processing-windows/code/go
+go run .
+go test ./...
+```
+
+The 43 sliding results, 5 breaches, and peak state sizes (2/10/2) match the Java run; the session section shows the sorted emission order:
+
+```console
+== 4. Session windows with a 30-second gap: activity bursts, not clock minutes ==
+  card-B  0:30-1:00  count=1 sum=40.00 USD max=40.00 USD  (emitted at 1:00)
+  card-A  0:50-1:39  count=4 sum=196.48 USD max=150.00 USD  (emitted at 1:40)
+  card-B  1:30-2:00  count=1 sum=40.01 USD max=40.01 USD  (emitted at 2:00)
+  card-C  2:00-2:40  count=3 sum=15.00 USD max=5.00 USD  (emitted at 2:40)
+  card-B  2:30-3:00  count=1 sum=40.02 USD max=40.02 USD  (emitted at 3:00)
+  card-C  3:00-3:35  count=2 sum=198.00 USD max=99.00 USD  (emitted at 3:40)
+  card-B  3:30-4:00  count=1 sum=40.03 USD max=40.03 USD  (emitted at 4:00)
+```
 
 ## Use It
 

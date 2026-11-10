@@ -422,6 +422,59 @@ The `SCORE` block is the argument for a scored layer: four independent `REVIEW` 
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **`//` is already floor division**, so `now_millis // bucket_millis` replaces `Math.floorDiv`; the comment in `record` says timestamps are non-negative here, and if you ever feed negative ones `//` still floors correctly, which is what the ring needs. **No overflow**, so there is no `addExact` and the test suite does not assert an overflow error; `_compare` excludes `bool` explicitly because `True` is an `int` in Python and `Operator.GT.apply(True, 0)` would otherwise be a legal comparison. **`shadow` is a dataclass field with a default** (`shadow: bool = False`), so the eight-argument call site stays the same and `as_shadow()` builds the copy explicitly rather than through `dataclasses.replace`, to keep the same name as the Java and Go methods. **Sets become `frozenset`** in `Rule.__post_init__` via `object.__setattr__` (the dataclass is frozen), and `_fmt` sorts them for printing; Python's `set` iteration order depends on hash seeds, so without the sort two runs of the same demo would print different explanations.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Inject the clock
+
+There is no interface to declare: anything with `now_millis()` is a clock. `ManualClock.advance` raises `ValueError` on a negative step, so a test can never move time backwards by accident.
+
+```python
+class ManualClock:
+    """A clock the test or demo moves by hand. Monotone: advance() never goes backwards."""
+
+    def __init__(self, start_millis: int) -> None:
+        self._now = start_millis
+
+    def now_millis(self) -> int:
+        return self._now
+
+    def advance(self, millis: int) -> None:
+        if millis < 0:
+            raise ValueError("clock never goes backwards")
+        self._now += millis
+```
+
+#### Step 2: The transaction and its facts
+
+`Transaction` is a frozen dataclass; `facts()` returns a plain dict, which in Python is insertion-ordered, so the explanation prints the same way every run. Values keep their types: the amount is a `Money`, the card age an `int`.
+
+```python
+class Transaction:
+    id: str
+    account_id: str
+    card_token: str
+    bin: str
+    country: str
+    card_age_days: int
+    amount: Money
+
+    def facts(self) -> dict[str, Any]:
+        """The facts a rule can see before velocity enrichment. Keys are the rule `field` names."""
+        return {
+            "amount": self.amount,
+            "bin": self.bin,
+            "country": self.country,
+            "card_age_days": self.card_age_days,
+            "account_id": self.account_id,
+        }
+```
+
+#### Step 3: The ring of buckets
+
+`_Ring` uses `__slots__` and marks a never-used slot with `None` where Java used `Long.MIN_VALUE`. `record` computes `lap`, `bucket_start`, and `idx` with `//` and `%`, resets a slot that holds an older lap, and adds without an overflow check. `_live` is a generator over the slots whose start is strictly newer than `now - W`, shared by `count` and `sum`.
+
 ```python
 class _Ring:
     __slots__ = ("starts", "counts", "sums")
@@ -430,41 +483,612 @@ class _Ring:
         self.starts = [None] * n  # None marks a never-used slot
         self.counts = [0] * n
         self.sums = [0] * n
+
+
+class SlidingWindowCounter:
+    """Counts and sums events per key over a sliding window of W ms split into n buckets of
+    width b = W / n. Recording lands in bucket floor(now / b); a slot holding an older lap is
+    reset first. Queries add every slot whose start is newer than now - W. Memory per key is
+    O(n); the effective window is between W - b and W."""
+
+    def __init__(self, window_millis: int, buckets: int, currency: Currency) -> None:
+        if buckets <= 0:
+            raise ValueError("buckets must be positive")
+        if window_millis <= 0 or window_millis % buckets != 0:
+            raise ValueError("window must be a positive multiple of the bucket count")
+        self.window_millis = window_millis
+        self.bucket_millis = window_millis // buckets
+        self.buckets = buckets
+        self.currency = currency
+        self._rings: dict[str, _Ring] = {}
+
+    def record(self, key: str, amount: Money, now_millis: int) -> None:
+        if amount.currency != self.currency:
+            raise CurrencyMismatchError(self.currency, amount.currency)
+        ring = self._rings.setdefault(key, _Ring(self.buckets))
+        lap = now_millis // self.bucket_millis          # Python // floors; timestamps are non-negative here
+        bucket_start = lap * self.bucket_millis
+        idx = lap % self.buckets
+        if ring.starts[idx] != bucket_start:            # slot holds a previous lap: reset it
+            ring.starts[idx] = bucket_start
+            ring.counts[idx] = 0
+            ring.sums[idx] = 0
+        ring.counts[idx] += 1
+        ring.sums[idx] += amount.minor_units
+
+    def _live(self, ring: _Ring, now_millis: int):
+        cutoff = now_millis - self.window_millis
+        return (i for i, start in enumerate(ring.starts) if start is not None and start > cutoff)
+
+    def count(self, key: str, now_millis: int) -> int:
+        ring = self._rings.get(key)
+        if ring is None:
+            return 0
+        return sum(ring.counts[i] for i in self._live(ring, now_millis))
+
+    def sum(self, key: str, now_millis: int) -> Money:
+        ring = self._rings.get(key)
+        total = 0 if ring is None else sum(ring.sums[i] for i in self._live(ring, now_millis))
+        return Money.of_minor(total, self.currency)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 4: Velocity as facts
 
-- **`//` is already floor division**, so `now_millis // bucket_millis` replaces `Math.floorDiv`. The comment in `record` says timestamps are non-negative here; if you ever feed negative ones, `//` still floors correctly, which is what the ring needs.
-- **No overflow**, so there is no `addExact`; the test suite does not assert an overflow error. `_compare` excludes `bool` explicitly because `True` is an `int` in Python and `Operator.GT.apply(True, 0)` would otherwise be a legal comparison.
-- **`shadow` is a dataclass field with a default** (`shadow: bool = False`), so the eight-argument call site stays the same and `as_shadow()` builds the copy explicitly rather than through `dataclasses.replace`, to keep the same name as the Java and Go methods.
-- **Sets become `frozenset`** in `Rule.__post_init__` via `object.__setattr__` (the dataclass is frozen), and `_fmt` sorts them for printing. Python's `set` iteration order depends on hash seeds, so without the sort two runs of the same demo would print different explanations.
+`Dimension.key_for` picks the card or account key; `enrich` records first and then reads, so the current attempt counts itself, and writes one fact per definition into the dict returned by `tx.facts()`.
+
+```python
+class Dimension(Enum):
+    CARD = "card"
+    ACCOUNT = "account"
+
+    def key_for(self, tx: Transaction) -> str:
+        return f"card:{tx.card_token}" if self is Dimension.CARD else f"account:{tx.account_id}"
+
+    def enrich(self, tx: Transaction, now_millis: int) -> dict[str, Any]:
+        """Record the attempt, then return the transaction facts plus one velocity fact per counter.
+        The attempt counts itself; declined attempts are recorded too (a burst of declines is the
+        card-testing signal)."""
+        facts = tx.facts()
+        for d in self._definitions:
+            key = d.dimension.key_for(tx)
+            d.counter.record(key, tx.amount, now_millis)
+            facts[d.fact_name] = d.counter.count(key, now_millis) if d.metric is Metric.COUNT else d.counter.sum(key, now_millis)
+        return facts
+```
+
+#### Step 5: Operators that fail loudly
+
+`_compare` orders only `int` against `int` (excluding `bool`) and `Money` against `Money`; anything else raises `ValueError`. `apply` dispatches on the enum member and looks the four ordering results up in a small dict keyed by operator.
+
+```python
+def _compare(a: Any, b: Any) -> int:
+    """Order two facts of the same kind. int vs int, Money vs Money; anything else is a config bug.
+    bool is excluded because True is an int in Python."""
+    ints = (isinstance(a, int) and not isinstance(a, bool)) and (isinstance(b, int) and not isinstance(b, bool))
+    if ints or (isinstance(a, Money) and isinstance(b, Money)):
+        return (a > b) - (a < b)  # Money.__lt__ raises on currency mismatch
+    raise ValueError(f"cannot order {_type_name(a)} against {_type_name(b)}")
+
+
+def _as_set(expected: Any) -> frozenset:
+    if isinstance(expected, (set, frozenset)):
+        return frozenset(expected)
+    raise ValueError(f"IN / NOT_IN need a set, got {_type_name(expected)}")
+
+
+class Operator(Enum):
+    EQ = "EQ"
+    NE = "NE"
+    GT = "GT"
+    GTE = "GTE"
+    LT = "LT"
+    LTE = "LTE"
+    IN = "IN"
+    NOT_IN = "NOT_IN"
+
+    def apply(self, observed: Any, expected: Any) -> bool:
+        if self is Operator.EQ:
+            return observed == expected
+        if self is Operator.NE:
+            return observed != expected
+        if self is Operator.IN:
+            return observed in _as_set(expected)
+        if self is Operator.NOT_IN:
+            return observed not in _as_set(expected)
+        cmp = _compare(observed, expected)
+        return {Operator.GT: cmp > 0, Operator.GTE: cmp >= 0, Operator.LT: cmp < 0, Operator.LTE: cmp <= 0}[self]
+```
+
+#### Step 6: The rule and its trace
+
+`Rule` is a frozen dataclass with `shadow: bool = False`; `__post_init__` performs the Java compact constructor's checks and freezes a `set` value into a `frozenset` with `object.__setattr__`. `as_shadow` returns a copy with the flag set.
+
+```python
+class Rule:
+    """One rule. Lower priority number is evaluated and, under FIRST_MATCH, decided first.
+    `score` is only used under SCORE. `explanation` is what an analyst or customer reads."""
+
+    name: str
+    field: str
+    operator: Operator
+    value: Any
+    action: Action
+    priority: int
+    score: int
+    explanation: str
+    shadow: bool = False  # evaluated and traced, but never decides and never scores
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("rule needs a name")
+        if not self.field.strip():
+            raise ValueError("rule needs a field")
+        if self.value is None:
+            raise ValueError("rule needs a value")
+        if self.score < 0:
+            raise ValueError("score must be non-negative")
+        if not self.explanation.strip():
+            raise ValueError("rule needs an explanation")
+        if isinstance(self.value, set):
+            object.__setattr__(self, "value", frozenset(self.value))
+
+    def as_shadow(self) -> "Rule":
+        """Same rule, evaluated and traced but never acting: it cannot decide and its score is not counted."""
+        return Rule(self.name, self.field, self.operator, self.value, self.action, self.priority, self.score,
+                    self.explanation, True)
+```
+
+#### Step 7: The engine
+
+`decide` walks the pre-sorted rules, builds one `RuleTrace` per rule, and acts only on rules that fired and are not shadow; `first = first or rule` keeps the first live firing. The strategy branch at the end is the same as Java's.
+
+```python
+    def decide(self, transaction_id: str, facts: dict[str, Any], now_millis: int) -> Decision:
+        """Evaluate every rule (the full trace is the audit record), then decide. An absent fact
+        never fires a rule. A type mismatch between fact and value raises: a rule that can never
+        evaluate is a configuration error, not a risk signal."""
+        traces: list[RuleTrace] = []
+        total = 0
+        first: Rule | None = None
+        for rule in self.rules:
+            observed = facts.get(rule.field)
+            fired = observed is not None and rule.operator.apply(observed, rule.value)
+            traces.append(RuleTrace(rule.name, rule.priority, rule.field, observed, rule.operator, rule.value,
+                                    rule.action, rule.score, fired, rule.shadow, rule.explanation))
+            if fired and not rule.shadow:  # a shadow rule is observed, never obeyed
+                total += rule.score
+                first = first or rule
+        if self.strategy is Strategy.FIRST_MATCH:
+            action = first.action if first else Action.ALLOW
+            return Decision(transaction_id, action, self.strategy, total, first.name if first else None, traces, now_millis)
+        action = Action.DECLINE if total >= self.decline_at else Action.REVIEW if total >= self.review_at else Action.ALLOW
+        return Decision(transaction_id, action, self.strategy, total, None, traces, now_millis)
+```
+
+#### Step 8: The explanation
+
+`explain` derives every line from the trace: `_fmt` renders `None` as `<absent>` and sorts sets, and the mark is `pass`, `shadow`, or `fire`.
+
+```python
+    def explain(self) -> str:
+        head = f"decision for {self.transaction_id}: {self.action.name} [{self.strategy.value}, score={self.score}]"
+        if self.strategy is Strategy.SCORE:
+            head += " by accumulated score"
+        elif self.deciding_rule is None:
+            head += " default: no rule matched"
+        else:
+            head += f' by "{self.deciding_rule}"'
+        lines = [head + f" at t={self.decided_at_millis}"]
+        for t in self.traces:
+            mark = "pass" if not t.fired else "shadow" if t.shadow else "fire"
+            line = (f"  [{mark}] p{t.priority} {t.rule}: "
+                    f"{t.field}={_fmt(t.observed)} {t.operator.value} {_fmt(t.expected)}")
+            if t.fired:
+                line += f" -> {t.action.name} (+{t.score}): {t.explanation}"
+            lines.append(line)
+        return "\n".join(lines) + "\n"
+```
+
+#### Step 9: Run it
+
+```bash
+cd phases/13-risk-fraud-and-compliance/02-rules-engine-and-velocity-checks/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output is identical to the Java run:
+
+```console
+== A normal purchase ==
+decision for tx-001: ALLOW [FIRST_MATCH, score=0] default: no rule matched at t=1700000040000
+  [pass] p5 bin-blocklist: bin=411111 IN [888888, 999999]
+  [pass] p10 card-testing-burst: attempts_per_card_10m=1 GT 5
+  [pass] p20 fresh-card-micro-auth: card_age_days=400 LT 1
+  [pass] p30 high-risk-country: country=US IN [NG, RU, VE]
+  [pass] p40 daily-spend: amount_per_account_1d=42.50 USD GT 2000.00 USD
+  [pass] p50 large-ticket: amount=42.50 USD GTE 5000.00 USD
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`, tests in `main_test.go`) keeps the design with five differences. **Errors are values:** `Apply`, `Record`, `Enrich`, `Decide`, and `Screen` return `error`; `ErrConfiguration`, `ErrCurrencyMismatch`, and `ErrOverflow` are sentinels for `errors.Is`, and a type mismatch in a rule surfaces as `rule bad: configuration error: cannot order string against int64`, wrapped so the rule name is in the message. **Facts are a small ordered map type**, because Go's `map` iterates in random order and the explanation must print deterministically; `Facts.Put` records insertion order and `Facts.Get` returns `(value, present)` so absence is distinguishable from a nil value. **Integer facts are `int64`**, and rule values must be `int64` too: `GT, 5` (an untyped `int`) will not compare against an `int64` fact and fails loudly, which is the Go version of the "no coercion" rule; the demo writes `int64(5)`. **Set printing** is `StringSet.String()`, which sorts keys, the same reason as the Java `TreeSet`. **`AsShadow` is a value-receiver method** that sets the field on its copy and returns it; because `Rule` is a struct passed by value, the original in the slice is untouched, which is the same immutability the Java record gives you for free.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Inject the clock
+
+`Clock` is a one-method interface and `ManualClock` its hand-driven implementation; a negative `Advance` panics, because it can only be a test bug.
+
 ```go
-func (o Operator) Apply(observed, expected any) (bool, error) {
-    switch o {
-    case EQ:
-        return observed == expected, nil
-    case IN, NotIn:
-        set, ok := expected.(StringSet)
-        if !ok {
-            return false, fmt.Errorf("%w: IN / NOT_IN need a set, got %s", ErrConfiguration, typeName(expected))
-        }
-        // ...
-    }
-    cmp, err := compareFacts(observed, expected)
-    // ...
+type Clock interface {
+	NowMillis() int64
+}
+
+// ManualClock is moved by hand. Monotone: Advance never goes backwards.
+type ManualClock struct{ now int64 }
+
+func NewManualClock(start int64) *ManualClock { return &ManualClock{now: start} }
+
+func (c *ManualClock) NowMillis() int64 { return c.now }
+
+func (c *ManualClock) Advance(millis int64) {
+	if millis < 0 {
+		panic("clock never goes backwards")
+	}
+	c.now += millis
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The transaction and its facts
 
-- **Errors are values.** `Apply`, `Record`, `Enrich`, `Decide`, and `Screen` return `error`; `ErrConfiguration`, `ErrCurrencyMismatch`, and `ErrOverflow` are sentinels for `errors.Is`. A type mismatch in a rule surfaces as `rule bad: configuration error: cannot order string against int64`, wrapped so the rule name is in the message.
-- **Facts are a small ordered map type**, because Go's `map` iterates in random order and the explanation must print deterministically. `Facts.Put` records insertion order; `Facts.Get` returns `(value, present)` so absence is distinguishable from a nil value.
-- **Integer facts are `int64`**, and rule values must be `int64` too: `GT, 5` (an untyped `int`) will not compare against an `int64` fact and fails loudly, which is the Go version of the "no coercion" rule. The demo writes `int64(5)`.
-- **Set printing** is `StringSet.String()`, which sorts keys, the same reason as the Java `TreeSet`.
-- **`AsShadow` is a value-receiver method** that sets the field on its copy and returns it; because `Rule` is a struct passed by value, the original in the slice is untouched, which is the same immutability the Java record gives you for free.
+`Facts` is the ordered map: a `map[string]any` plus an `order` slice so iteration is deterministic. `Transaction.Facts()` puts the five base facts in the same order as the Java `LinkedHashMap`.
+
+```go
+type Facts struct {
+	values map[string]any
+	order  []string
+}
+
+func NewFacts() *Facts { return &Facts{values: map[string]any{}} }
+
+func (f *Facts) Put(name string, v any) {
+	if _, ok := f.values[name]; !ok {
+		f.order = append(f.order, name)
+	}
+	f.values[name] = v
+}
+
+func (f *Facts) Get(name string) (any, bool) {
+	v, ok := f.values[name]
+	return v, ok
+}
+
+func (f *Facts) Remove(name string) { delete(f.values, name) }
+
+func (tx Transaction) Facts() *Facts {
+	f := NewFacts()
+	f.Put("amount", tx.Amount)
+	f.Put("bin", tx.BIN)
+	f.Put("country", tx.Country)
+	f.Put("card_age_days", tx.CardAgeDays)
+	f.Put("account_id", tx.AccountID)
+	return f
+}
+```
+
+#### Step 3: The ring of buckets
+
+`newRing` fills `starts` with `math.MinInt64`. `Record` uses `floorDiv` (Go's `/` truncates) and a double-modulo for a non-negative index, resets a stale slot, and adds through `addChecked`, returning `ErrOverflow` where Java's `addExact` would throw. `live` is the strict `start > now - W` predicate shared by `Count` and `Sum`.
+
+```go
+type ring struct {
+	starts []int64 // math.MinInt64 marks a never-used slot
+	counts []int64
+	sums   []int64
+}
+
+func newRing(n int) *ring {
+	r := &ring{make([]int64, n), make([]int64, n), make([]int64, n)}
+	for i := range r.starts {
+		r.starts[i] = math.MinInt64
+	}
+	return r
+}
+
+func (c *SlidingWindowCounter) Record(key string, amount Money, now int64) error {
+	if amount.Currency != c.Currency {
+		return fmt.Errorf("%w: counter is %s, amount is %s", ErrCurrencyMismatch, c.Currency.Code, amount.Currency.Code)
+	}
+	r, ok := c.rings[key]
+	if !ok {
+		r = newRing(c.Buckets)
+		c.rings[key] = r
+	}
+	lap := floorDiv(now, c.BucketMillis)
+	bucketStart := lap * c.BucketMillis
+	idx := int(((lap % int64(c.Buckets)) + int64(c.Buckets)) % int64(c.Buckets))
+	if r.starts[idx] != bucketStart { // slot holds a previous lap: reset it
+		r.starts[idx], r.counts[idx], r.sums[idx] = bucketStart, 0, 0
+	}
+	r.counts[idx]++
+	sum, err := addChecked(r.sums[idx], amount.MinorUnits)
+	if err != nil {
+		return err
+	}
+	r.sums[idx] = sum
+	return nil
+}
+
+func (c *SlidingWindowCounter) live(r *ring, now int64, i int) bool {
+	return r.starts[i] > now-c.WindowMillis
+}
+
+// Count returns the events for the key inside the window ending at now.
+func (c *SlidingWindowCounter) Count(key string, now int64) int64 {
+	r, ok := c.rings[key]
+	if !ok {
+		return 0
+	}
+	var n int64
+	for i := 0; i < c.Buckets; i++ {
+		if c.live(r, now, i) {
+			n += r.counts[i]
+		}
+	}
+	return n
+}
+
+// Sum returns the amounts for the key inside the window ending at now.
+func (c *SlidingWindowCounter) Sum(key string, now int64) Money {
+	var total int64
+	if r, ok := c.rings[key]; ok {
+		for i := 0; i < c.Buckets; i++ {
+			if c.live(r, now, i) {
+				total += r.sums[i]
+			}
+		}
+	}
+	return OfMinor(total, c.Currency)
+}
+```
+
+#### Step 4: Velocity as facts
+
+`Dimension.KeyFor` builds the key; `Enrich` records before reading so the attempt counts itself and returns the first `Record` error it meets.
+
+```go
+type Dimension int
+
+const (
+	DimensionCard Dimension = iota
+	DimensionAccount
+)
+
+func (d Dimension) KeyFor(tx Transaction) string {
+	if d == DimensionCard {
+		return "card:" + tx.CardToken
+	}
+	return "account:" + tx.AccountID
+}
+
+func (v *VelocityService) Enrich(tx Transaction, now int64) (*Facts, error) {
+	facts := tx.Facts()
+	for _, d := range v.definitions {
+		key := d.Dimension.KeyFor(tx)
+		if err := d.Counter.Record(key, tx.Amount, now); err != nil {
+			return nil, err
+		}
+		if d.Metric == MetricCount {
+			facts.Put(d.FactName, d.Counter.Count(key, now))
+		} else {
+			facts.Put(d.FactName, d.Counter.Sum(key, now))
+		}
+	}
+	return facts, nil
+}
+```
+
+#### Step 5: Operators that fail loudly
+
+`compareFacts` orders `int64` against `int64` and `Money` against `Money` (whose `Compare` reports a currency mismatch); everything else is `ErrConfiguration`. `Apply` handles `EQ`/`NE` with `==`, the set operators with a `StringSet` and a string fact, and the four orderings through `compareFacts`.
+
+```go
+func compareFacts(a, b any) (int, error) {
+	switch x := a.(type) {
+	case int64:
+		if y, ok := b.(int64); ok {
+			switch {
+			case x < y:
+				return -1, nil
+			case x > y:
+				return 1, nil
+			}
+			return 0, nil
+		}
+	case Money:
+		if y, ok := b.(Money); ok {
+			return x.Compare(y) // currency mismatch surfaces as an error
+		}
+	}
+	return 0, fmt.Errorf("%w: cannot order %s against %s", ErrConfiguration, typeName(a), typeName(b))
+}
+
+// Apply evaluates observed <op> expected. Types must agree; a mismatch is a configuration bug.
+func (o Operator) Apply(observed, expected any) (bool, error) {
+	switch o {
+	case EQ:
+		return observed == expected, nil
+	case NE:
+		return observed != expected, nil
+	case IN, NotIn:
+		set, ok := expected.(StringSet)
+		if !ok {
+			return false, fmt.Errorf("%w: IN / NOT_IN need a set, got %s", ErrConfiguration, typeName(expected))
+		}
+		s, ok := observed.(string)
+		if !ok {
+			return false, fmt.Errorf("%w: IN / NOT_IN need a string fact, got %s", ErrConfiguration, typeName(observed))
+		}
+		_, member := set[s]
+		if o == IN {
+			return member, nil
+		}
+		return !member, nil
+	}
+	cmp, err := compareFacts(observed, expected)
+	if err != nil {
+		return false, err
+	}
+	switch o {
+	case GT:
+		return cmp > 0, nil
+	case GTE:
+		return cmp >= 0, nil
+	case LT:
+		return cmp < 0, nil
+	default:
+		return cmp <= 0, nil
+	}
+}
+```
+
+#### Step 6: The rule and its trace
+
+`NewRule` performs the construction checks and returns `ErrConfiguration`; `AsShadow` flips the flag on a copy because `Rule` is a value type.
+
+```go
+type Rule struct {
+	Name        string
+	Field       string
+	Operator    Operator
+	Value       any
+	Action      Action
+	Priority    int
+	Score       int
+	Explanation string
+	Shadow      bool // evaluated and traced, but never decides and never scores
+}
+
+func NewRule(name, field string, op Operator, value any, action Action, priority, score int, explanation string) (Rule, error) {
+	switch {
+	case strings.TrimSpace(name) == "":
+		return Rule{}, fmt.Errorf("%w: rule needs a name", ErrConfiguration)
+	case strings.TrimSpace(field) == "":
+		return Rule{}, fmt.Errorf("%w: rule needs a field", ErrConfiguration)
+	case value == nil:
+		return Rule{}, fmt.Errorf("%w: rule needs a value", ErrConfiguration)
+	case score < 0:
+		return Rule{}, fmt.Errorf("%w: score must be non-negative", ErrConfiguration)
+	case strings.TrimSpace(explanation) == "":
+		return Rule{}, fmt.Errorf("%w: rule needs an explanation", ErrConfiguration)
+	}
+	return Rule{name, field, op, value, action, priority, score, explanation, false}, nil
+}
+
+// AsShadow returns the same rule, evaluated and traced but never acting: it cannot decide and
+// its score is not counted.
+func (r Rule) AsShadow() Rule {
+	r.Shadow = true
+	return r
+}
+```
+
+#### Step 7: The engine
+
+`Decide` returns `(Decision, error)`: a fact that is absent (`present == false`) never fires, an `Apply` error is wrapped with the rule name, and only fired non-shadow rules score or decide.
+
+```go
+func (e *RulesEngine) Decide(transactionID string, facts *Facts, now int64) (Decision, error) {
+	traces := make([]RuleTrace, 0, len(e.Rules))
+	total := 0
+	var first *Rule
+	for i := range e.Rules {
+		rule := &e.Rules[i]
+		observed, present := facts.Get(rule.Field)
+		fired := false
+		if present {
+			var err error
+			fired, err = rule.Operator.Apply(observed, rule.Value)
+			if err != nil {
+				return Decision{}, fmt.Errorf("rule %s: %w", rule.Name, err)
+			}
+		}
+		traces = append(traces, RuleTrace{rule.Name, rule.Priority, rule.Field, observed, rule.Operator, rule.Value, rule.Action, rule.Score, fired, rule.Shadow, rule.Explanation})
+		if fired && !rule.Shadow { // a shadow rule is observed, never obeyed
+			total += rule.Score
+			if first == nil {
+				first = rule
+			}
+		}
+	}
+	if e.Strategy == FirstMatch {
+		action, name := Allow, ""
+		if first != nil {
+			action, name = first.Action, first.Name
+		}
+		return Decision{transactionID, action, e.Strategy, total, name, traces, now}, nil
+	}
+	action := Allow
+	switch {
+	case total >= e.DeclineAt:
+		action = Decline
+	case total >= e.ReviewAt:
+		action = Review
+	}
+	return Decision{transactionID, action, e.Strategy, total, "", traces, now}, nil
+}
+```
+
+#### Step 8: The explanation
+
+`Explain` writes into a `strings.Builder` with the same header and per-rule lines; `fmtValue` prints `<absent>` for a nil observed value, and the mark is chosen by `Fired` and `Shadow`.
+
+```go
+func (d Decision) Explain() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "decision for %s: %s [%s, score=%d]", d.TransactionID, d.Action, d.Strategy, d.Score)
+	switch {
+	case d.Strategy == ScoreStrategy:
+		sb.WriteString(" by accumulated score")
+	case d.DecidingRule == "":
+		sb.WriteString(" default: no rule matched")
+	default:
+		fmt.Fprintf(&sb, " by %q", d.DecidingRule)
+	}
+	fmt.Fprintf(&sb, " at t=%d\n", d.DecidedAtMillis)
+	for _, t := range d.Traces {
+		mark := "pass"
+		if t.Fired && t.Shadow {
+			mark = "shadow"
+		} else if t.Fired {
+			mark = "fire"
+		}
+		fmt.Fprintf(&sb, "  [%s] p%d %s: %s=%s %s %s", mark, t.Priority, t.Rule, t.Field, fmtValue(t.Observed), t.Operator, fmtValue(t.Expected))
+		if t.Fired {
+			fmt.Fprintf(&sb, " -> %s (+%d): %s", t.Action, t.Score, t.Explanation)
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+```
+
+#### Step 9: Run it
+
+```bash
+cd phases/13-risk-fraud-and-compliance/02-rules-engine-and-velocity-checks/code/go
+go run .
+go test ./...
+```
+
+The output is identical to the Java run; the shadow-mode section ends:
+
+```console
+  [shadow] p45 mid-ticket-candidate: amount=750.00 USD GTE 500.00 USD -> REVIEW (+20): candidate: single authorization at or above 500.00 USD
+  [pass] p50 large-ticket: amount=750.00 USD GTE 5000.00 USD
+acted on: []  would have fired: [mid-ticket-candidate]
+```
 
 ## Use It
 

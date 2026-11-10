@@ -427,46 +427,561 @@ The output of `main.py` and `main.go` is byte-identical to this, which you can v
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences, plus everything inherited from Lesson 05 (the `heapq` network, the masked SplitMix64, the `sorted(self.nodes)` tick order). **`Message.entries` is a tuple:** the dataclass is frozen and the constructor calls `tuple(entries)`, which is Python's version of `List.copyOf`; the leader's later appends cannot reach a message already in the queue, and although a `list` slice `self.log[nxt:]` would already be a copy, the tuple makes the intent visible. **`truncate` is `del self.log[from_index:]`,** one statement where Java loops; slicing from index to end is exactly rule 3. **`KVStore.__str__` sorts the keys** because a plain `dict` prints in insertion order, which differs between nodes that applied `DEL` and re-`SET`; the Java `TreeMap` and Go's sorted-keys `String()` make the same choice so the demo output matches.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Log entries and the AppendEntries message
+
+`LogEntry` is a frozen dataclass with no index field. `Message` gains the four replication fields, all defaulted, and `append_entries` freezes the entries into a tuple at construction time, so what sits in the network queue is a snapshot. `append_reply` carries the follower's `match_index` as in the Java.
+
 ```python
-def advance_commit_index(self, now: int) -> None:
-    for n in range(self.last_log_index, self.commit_index, -1):
-        if self.storage.term_at(n) != self.current_term:
-            continue
-        count = 1 + sum(1 for p in self.peers if self.match_index[p] >= n)
-        if count >= self.majority:
-            self.commit_index = n
+@dataclass(frozen=True)
+class LogEntry:
+    term: int
+    command: str
+
+    def __str__(self) -> str:
+        return f"t{self.term}:{self.command}"
+
+
+@dataclass(frozen=True)
+class Message:
+    kind: MessageKind
+    from_: int
+    to: int
+    term: int
+    prev_log_index: int = 0
+    prev_log_term: int = 0
+    entries: tuple[LogEntry, ...] = ()
+    leader_commit: int = 0
+    success: bool = False
+    match_index: int = 0
+
+    @staticmethod
+    def append_entries(from_: int, to: int, term: int, prev_log_index: int, prev_log_term: int,
+                       entries: list[LogEntry], leader_commit: int) -> "Message":
+        return Message(MessageKind.APPEND_ENTRIES, from_, to, term, prev_log_index, prev_log_term, tuple(entries), leader_commit)
+
+    @staticmethod
+    def append_reply(from_: int, to: int, term: int, success: bool, match_index: int) -> "Message":
+        return Message(MessageKind.APPEND_ENTRIES_REPLY, from_, to, term, success=success, match_index=match_index)
+```
+
+#### Step 2: Persistent storage, now with a log
+
+The log starts as a one-element list holding the term-0 sentinel, so index arithmetic is the paper's. `truncate` is a slice deletion, and every mutator bumps `writes` so tests can count persistence events.
+
+```python
+class Storage:
+    def __init__(self) -> None:
+        self.current_term = 0
+        self.voted_for = -1
+        self.log: list[LogEntry] = [LogEntry(0, "<sentinel>")]
+        self.writes = 0
+
+    def save(self, term: int, voted_for: int) -> None:
+        self.current_term = term
+        self.voted_for = voted_for
+        self.writes += 1
+
+    def append(self, e: LogEntry) -> None:
+        self.log.append(e)
+        self.writes += 1
+
+    def truncate(self, from_index: int) -> None:
+        del self.log[from_index:]
+        self.writes += 1
+
+    def last_index(self) -> int:
+        return len(self.log) - 1
+
+    def term_at(self, index: int) -> int:
+        return self.log[index].term
+```
+
+#### Step 3: The state machine
+
+An `if`/`elif` chain on the first token replaces the Java `switch`; malformed commands raise `ValueError`. `dict.pop(key, None)` is a `DEL` of a missing key that does nothing, and `__str__` sorts the items so two nodes with the same contents print the same text.
+
+```python
+class KVStore:
+    def __init__(self) -> None:
+        self.data: dict[str, str] = {}
+        self.applied_commands: list[str] = []
+
+    def apply(self, command: str) -> None:
+        parts = command.split(" ")
+        if parts[0] == "SET":
+            if len(parts) != 3:
+                raise ValueError(f"SET needs key and value: {command}")
+            self.data[parts[1]] = parts[2]
+        elif parts[0] == "DEL":
+            if len(parts) != 2:
+                raise ValueError(f"DEL needs key: {command}")
+            self.data.pop(parts[1], None)
+        elif parts[0] == "NOOP":
+            pass
+        else:
+            raise ValueError(f"unknown command: {command}")
+        self.applied_commands.append(command)
+
+    def __str__(self) -> str:
+        return "{" + ", ".join(f"{k}={v}" for k, v in sorted(self.data.items())) + "}"
+```
+
+#### Step 4: Leader state and the election's one change
+
+The volatile fields live in `__init__` as plain attributes and two dicts. `become_leader` initialises `next_index` optimistically and `match_index` to zero for each peer, appends the current-term `NOOP`, and immediately replicates.
+
+```python
+        # Volatile state on all servers (Figure 2). Rebuilt after a restart by re-applying the persisted log.
+        self.commit_index = 0
+        self.last_applied = 0
+        self.state_machine = KVStore()
+        # Volatile state on leaders, reinitialised after election.
+        self.next_index: dict[int, int] = {}
+        self.match_index: dict[int, int] = {}
+```
+
+```python
+    def become_leader(self, now: int) -> list[Message]:
+        self.role = Role.LEADER
+        self.leader_id = self.id
+        for p in self.peers:
+            self.next_index[p] = self.last_log_index() + 1
+            self.match_index[p] = 0
+        self.storage.append(LogEntry(self.current_term, "NOOP"))
+        return self.replicate_all(now)
+```
+
+#### Step 5: Proposing and replicating
+
+`propose` returns -1 on a non-leader and the new index otherwise. `append_entries_for` slices `self.log[nxt:]` (empty for a caught-up peer, which is the heartbeat) and `Message.append_entries` turns it into a tuple. `replicate_all` resets the heartbeat timer and builds one message per peer with a comprehension.
+
+```python
+    def propose(self, command: str) -> int:
+        if self.role != Role.LEADER:
+            return -1
+        self.storage.append(LogEntry(self.current_term, command))
+        return self.last_log_index()
+
+    def replicate_all(self, now: int) -> list[Message]:
+        self.next_heartbeat = now + self.config.heartbeat_interval
+        return [self.append_entries_for(p) for p in self.peers]
+
+    def append_entries_for(self, peer: int) -> Message:
+        nxt = self.next_index[peer]
+        prev = nxt - 1
+        return Message.append_entries(self.id, peer, self.current_term, prev, self.storage.term_at(prev), self.log[nxt:], self.commit_index)
+```
+
+#### Step 6: The receiver, rules 1 to 5
+
+The five rules in the paper's order with the same numbered comments. The timer reset sits between rule 1 and rule 2; the per-entry loop skips an entry already present with the same term, truncates at the first conflict, and appends. `min(m.leader_commit, last_new)` is rule 5. The tracer lines that describe rejections and truncations are omitted here.
+
+```python
+    def on_append_entries(self, m: Message, now: int) -> list[Message]:
+        if m.term < self.current_term:  # 1
+            return [Message.append_reply(self.id, m.from_, self.current_term, False, 0)]
+        if self.role == Role.LEADER:
+            raise RuntimeError(f"two leaders in term {self.current_term}")
+        if self.role == Role.CANDIDATE:
+            self.role = Role.FOLLOWER
+            self.votes_granted = set()
+        self.leader_id = m.from_
+        self.reset_election_timer(now)
+        if m.prev_log_index > self.last_log_index() or self.storage.term_at(m.prev_log_index) != m.prev_log_term:  # 2
+            self.consistency_rejections += 1
+            return [Message.append_reply(self.id, m.from_, self.current_term, False, 0)]
+        index = m.prev_log_index
+        for e in m.entries:
+            index += 1
+            if index <= self.last_log_index():
+                if self.storage.term_at(index) == e.term:
+                    continue  # 4: already have it
+                self.storage.truncate(index)  # 3
+            self.storage.append(e)  # 4
+        last_new = m.prev_log_index + len(m.entries)
+        if m.leader_commit > self.commit_index:  # 5
+            self.commit_index = min(m.leader_commit, last_new)
             self.apply_committed(now)
+        return [Message.append_reply(self.id, m.from_, self.current_term, True, last_new)]
+```
+
+#### Step 7: The leader's reaction to replies
+
+Stale replies are dropped; a success moves `match_index` forward only, and a failure steps `next_index` back with a floor of 1 and resends at once.
+
+```python
+    def on_append_reply(self, m: Message, now: int) -> list[Message]:
+        if self.role != Role.LEADER or m.term != self.current_term:
+            return []
+        if m.success:
+            if m.match_index > self.match_index[m.from_]:
+                self.match_index[m.from_] = m.match_index
+                self.next_index[m.from_] = m.match_index + 1
+                self.advance_commit_index(now)
+            return []
+        self.next_index[m.from_] = max(1, self.next_index[m.from_] - 1)
+        return [self.append_entries_for(m.from_)]
+```
+
+#### Step 8: Advancing the commit index
+
+`range(last, commit_index, -1)` scans from the newest entry down to (not including) the current commit index. The `continue` on the term check is the section 5.4.2 rule; the replica count is a generator expression plus one for the leader. `apply_committed` is the only code that touches the state machine.
+
+```python
+    def advance_commit_index(self, now: int) -> None:
+        for n in range(self.last_log_index(), self.commit_index, -1):
+            if self.storage.term_at(n) != self.current_term:
+                continue
+            count = 1 + sum(1 for p in self.peers if self.match_index[p] >= n)  # the leader itself counts
+            if count >= self.majority():
+                self.commit_index = n
+                self.apply_committed(now)
+                return
+
+    def apply_committed(self, now: int) -> None:
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            self.state_machine.apply(self.log[self.last_applied].command)
+```
+
+#### Step 9: The invariant checker
+
+A module-level function rather than a static method. It walks from the last shared index downward, and on the first index where the terms agree it checks every earlier entry with dataclass equality, raising `RuntimeError` on a mismatch. `Cluster.check_invariants` calls it for every pair after every delivery.
+
+```python
+def check_log_matching(a: list[LogEntry], b: list[LogEntry], ia: int, ib: int) -> None:
+    for k in range(min(len(a), len(b)) - 1, 0, -1):
+        if a[k].term == b[k].term:
+            for i in range(1, k + 1):
+                if a[i] != b[i]:
+                    raise RuntimeError(f"LOG MATCHING: nodes {ia} and {ib} agree at index {k} (term {a[k].term}) "
+                                       f"but differ at index {i}: {a[i]} vs {b[i]}")
             return
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 10: Run it
 
-- **`Message.entries` is a tuple.** The dataclass is frozen and the constructor calls `tuple(entries)`, which is Python's version of `List.copyOf`: the leader's later appends cannot reach a message already in the queue, and a `list` slice `self.log[nxt:]` would already be a copy but the tuple makes the intent visible.
-- **`truncate` is `del self.log[from_index:]`**, one statement where Java loops. Python slicing from index to end is exactly rule 3.
-- **`KVStore.__str__` sorts the keys** because a plain `dict` prints in insertion order, which differs between nodes that applied `DEL` and re-`SET`. The Java `TreeMap` and Go's sorted-keys `String()` make the same choice so the demo output matches.
-- **Everything else is Lesson 05's**: the `heapq` network, the masked SplitMix64, the `sorted(self.nodes)` tick order.
+```bash
+cd phases/06-replication-and-consensus/06-raft-log-replication/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output is byte-identical to the Java run:
+
+```console
+== Replicate three commands on a 5-node cluster (seed 7, no drops, delay 1-5) ==
+t=186  n4 appends index 2 t1:SET alice 100 and replicates
+t=186  n4 appends index 3 t1:SET bob 50 and replicates
+t=186  n4 appends index 4 t1:SET alice 75 and replicates
+t=188  n4 commits through index 1 (3/5 replicas)
+t=190  n4 commits through index 3 (3/5 replicas)
+t=191  n4 commits through index 4 (3/5 replicas)
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Slices alias:** `s.Log[:fromIndex]` reslices in place, which is what a truncation should do, but it also means `s.Log[next:]` handed to a message would share the leader's backing array, and a later truncate-then-append would rewrite entries inside a message still in flight; the `appendEntries` constructor copies for that reason, the Go-specific version of the same rule as `List.copyOf` and `tuple()`. **`KVStore.Apply` returns an error** for malformed commands rather than panicking; `applyCommitted` panics on that error because a committed entry that cannot be applied is a broken invariant, not a recoverable condition. **`Get` returns `(string, bool)`,** the idiomatic missing-key signal, where Java returns `null` and Python `None`. **No goroutines:** single-threaded simulation, so `go test -race ./...` passes without synchronisation and the determinism test holds.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Log entries and the AppendEntries message
+
+`Message` is one struct with keyed-field constructors. `appendEntries` copies the incoming slice with `append([]LogEntry(nil), entries...)`, which allocates a fresh backing array; without it the message would alias the leader's log. `appendReply` carries `MatchIndex`.
+
 ```go
-func (s *Storage) Truncate(fromIndex int) {
-    s.Log = s.Log[:fromIndex]
-    s.Writes++
+type LogEntry struct {
+	Term    int64
+	Command string
+}
+
+type Message struct {
+	Kind         MessageKind
+	From, To     int
+	Term         int64
+	PrevLogIndex int
+	PrevLogTerm  int64
+	Entries      []LogEntry
+	LeaderCommit int
+	Success      bool
+	MatchIndex   int
 }
 
 func appendEntries(from, to int, term int64, prevLogIndex int, prevLogTerm int64, entries []LogEntry, leaderCommit int) Message {
-    copied := append([]LogEntry(nil), entries...)
-    return Message{Kind: AppendEntries, From: from, To: to, Term: term, PrevLogIndex: prevLogIndex,
-        PrevLogTerm: prevLogTerm, Entries: copied, LeaderCommit: leaderCommit}
+	copied := append([]LogEntry(nil), entries...)
+	return Message{Kind: AppendEntries, From: from, To: to, Term: term, PrevLogIndex: prevLogIndex, PrevLogTerm: prevLogTerm,
+		Entries: copied, LeaderCommit: leaderCommit}
+}
+
+func appendReply(from, to int, term int64, success bool, matchIndex int) Message {
+	return Message{Kind: AppendEntriesReply, From: from, To: to, Term: term, Success: success, MatchIndex: matchIndex}
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: Persistent storage, now with a log
 
-- **Slices alias.** `s.Log[:fromIndex]` reslices in place, which is what a truncation should do, but it also means `s.Log[next:]` handed to a message would share the leader's backing array, and a later truncate-then-append would rewrite entries inside a message still in flight. The `appendEntries` constructor copies for that reason. This is the Go-specific version of the same rule as `List.copyOf` and `tuple()`.
-- **`KVStore.Apply` returns an error** for malformed commands rather than panicking; `applyCommitted` panics on that error because a committed entry that cannot be applied is a broken invariant, not a recoverable condition.
-- **`Get` returns `(string, bool)`**, the idiomatic missing-key signal, where Java returns `null` and Python `None`.
-- **No goroutines.** Single-threaded simulation, so `go test -race ./...` passes without synchronisation and the determinism test holds.
+`NewStorage` seeds the log with the sentinel and `VotedFor` with -1. `Truncate` is a reslice, which keeps the backing array and drops the tail in O(1); that is exactly why messages must copy.
+
+```go
+type Storage struct {
+	CurrentTerm int64
+	VotedFor    int
+	Log         []LogEntry
+	Writes      int
+}
+
+func NewStorage() *Storage { return &Storage{VotedFor: -1, Log: []LogEntry{{0, "<sentinel>"}}} }
+
+func (s *Storage) Append(e LogEntry) {
+	s.Log = append(s.Log, e)
+	s.Writes++
+}
+
+func (s *Storage) Truncate(fromIndex int) {
+	s.Log = s.Log[:fromIndex]
+	s.Writes++
+}
+
+func (s *Storage) LastIndex() int         { return len(s.Log) - 1 }
+func (s *Storage) TermAt(index int) int64 { return s.Log[index].Term }
+```
+
+#### Step 3: The state machine
+
+`Apply` returns an `error` instead of throwing; the `NOOP` case is an empty arm and `default` catches unknown commands. `String()` sorts the map keys before joining so output is deterministic across nodes.
+
+```go
+func (kv *KVStore) Apply(command string) error {
+	parts := strings.Split(command, " ")
+	switch parts[0] {
+	case "SET":
+		if len(parts) != 3 {
+			return fmt.Errorf("SET needs key and value: %s", command)
+		}
+		kv.Data[parts[1]] = parts[2]
+	case "DEL":
+		if len(parts) != 2 {
+			return fmt.Errorf("DEL needs key: %s", command)
+		}
+		delete(kv.Data, parts[1])
+	case "NOOP":
+	default:
+		return fmt.Errorf("unknown command: %s", command)
+	}
+	kv.AppliedCommands = append(kv.AppliedCommands, command)
+	return nil
+}
+
+func (kv *KVStore) Get(key string) (string, bool) {
+	v, ok := kv.Data[key]
+	return v, ok
+}
+```
+
+#### Step 4: Leader state and the election's one change
+
+The volatile state is a block of exported struct fields plus two `map[int]int`s for the leader. `becomeLeader` fills both maps per peer, appends the `NOOP`, and replicates.
+
+```go
+	// Volatile state on all servers (Figure 2). Rebuilt after a restart by re-applying the persisted log.
+	CommitIndex  int
+	LastApplied  int
+	StateMachine *KVStore
+	// Volatile state on leaders, reinitialised after election.
+	NextIndex  map[int]int
+	MatchIndex map[int]int
+```
+
+```go
+func (n *RaftNode) becomeLeader(now int) []Message {
+	n.Role = Leader
+	n.LeaderID = n.ID
+	for _, p := range n.Peers {
+		n.NextIndex[p] = n.LastLogIndex() + 1
+		n.MatchIndex[p] = 0
+	}
+	n.Storage.Append(LogEntry{n.CurrentTerm(), "NOOP"})
+	return n.ReplicateAll(now)
+}
+```
+
+#### Step 5: Proposing and replicating
+
+`AppendEntriesFor` passes `n.Storage.Log[next:]`, a view into the leader's log, to `appendEntries`, which copies it. `ReplicateAll` preallocates the slice of messages and resets the heartbeat timer.
+
+```go
+func (n *RaftNode) Propose(command string) int {
+	if n.Role != Leader {
+		return -1
+	}
+	n.Storage.Append(LogEntry{n.CurrentTerm(), command})
+	return n.LastLogIndex()
+}
+
+func (n *RaftNode) ReplicateAll(now int) []Message {
+	n.NextHeartbeat = now + n.config.HeartbeatInterval
+	out := make([]Message, 0, len(n.Peers))
+	for _, p := range n.Peers {
+		out = append(out, n.AppendEntriesFor(p))
+	}
+	return out
+}
+
+func (n *RaftNode) AppendEntriesFor(peer int) Message {
+	next := n.NextIndex[peer]
+	prev := next - 1
+	return appendEntries(n.ID, peer, n.CurrentTerm(), prev, n.Storage.TermAt(prev), n.Storage.Log[next:], n.CommitIndex)
+}
+```
+
+#### Step 6: The receiver, rules 1 to 5
+
+Same five rules; the two-leaders case panics. Rule 5's `min` is written as an assignment followed by a conditional lowering. The tracer calls for rejections and conflicts are left out of the chunk.
+
+```go
+func (n *RaftNode) onAppendEntries(m Message, now int) []Message {
+	if m.Term < n.CurrentTerm() { // 1
+		return []Message{appendReply(n.ID, m.From, n.CurrentTerm(), false, 0)}
+	}
+	if n.Role == Leader {
+		panic(fmt.Sprintf("two leaders in term %d", n.CurrentTerm()))
+	}
+	if n.Role == Candidate {
+		n.Role = Follower
+		n.votesGranted = map[int]bool{}
+	}
+	n.LeaderID = m.From
+	n.ResetElectionTimer(now)
+	if m.PrevLogIndex > n.LastLogIndex() || n.Storage.TermAt(m.PrevLogIndex) != m.PrevLogTerm { // 2
+		n.ConsistencyRejections++
+		return []Message{appendReply(n.ID, m.From, n.CurrentTerm(), false, 0)}
+	}
+	index := m.PrevLogIndex
+	for _, e := range m.Entries {
+		index++
+		if index <= n.LastLogIndex() {
+			if n.Storage.TermAt(index) == e.Term {
+				continue // 4: already have it
+			}
+			n.Storage.Truncate(index) // 3
+		}
+		n.Storage.Append(e) // 4
+	}
+	lastNew := m.PrevLogIndex + len(m.Entries)
+	if m.LeaderCommit > n.CommitIndex { // 5
+		n.CommitIndex = lastNew
+		if m.LeaderCommit < lastNew {
+			n.CommitIndex = m.LeaderCommit
+		}
+		n.applyCommitted(now)
+	}
+	return []Message{appendReply(n.ID, m.From, n.CurrentTerm(), true, lastNew)}
+}
+```
+
+#### Step 7: The leader's reaction to replies
+
+The decrement-with-floor is spelled out as an `if`/`else` because there is no `Math.max` on ints; everything else is the Java logic with `nil` for "no messages".
+
+```go
+func (n *RaftNode) onAppendReply(m Message, now int) []Message {
+	if n.Role != Leader || m.Term != n.CurrentTerm() {
+		return nil
+	}
+	if m.Success {
+		if m.MatchIndex > n.MatchIndex[m.From] {
+			n.MatchIndex[m.From] = m.MatchIndex
+			n.NextIndex[m.From] = m.MatchIndex + 1
+			n.advanceCommitIndex(now)
+		}
+		return nil
+	}
+	if n.NextIndex[m.From]-1 < 1 {
+		n.NextIndex[m.From] = 1
+	} else {
+		n.NextIndex[m.From]--
+	}
+	return []Message{n.AppendEntriesFor(m.From)}
+}
+```
+
+#### Step 8: Advancing the commit index
+
+The loop variable is `idx` rather than `n` because `n` is the receiver. The term check and the majority count are the Java's. `applyCommitted` turns an `Apply` error into a panic, since a committed entry that cannot be applied means the log itself is corrupt.
+
+```go
+func (n *RaftNode) advanceCommitIndex(now int) {
+	for idx := n.LastLogIndex(); idx > n.CommitIndex; idx-- {
+		if n.Storage.TermAt(idx) != n.CurrentTerm() {
+			continue
+		}
+		count := 1 // the leader itself
+		for _, p := range n.Peers {
+			if n.MatchIndex[p] >= idx {
+				count++
+			}
+		}
+		if count >= n.Majority() {
+			n.CommitIndex = idx
+			n.applyCommitted(now)
+			return
+		}
+	}
+}
+
+func (n *RaftNode) applyCommitted(now int) {
+	for n.LastApplied < n.CommitIndex {
+		n.LastApplied++
+		if err := n.StateMachine.Apply(n.Storage.Log[n.LastApplied].Command); err != nil {
+			panic(err)
+		}
+	}
+}
+```
+
+#### Step 9: The invariant checker
+
+`CheckLogMatching` returns an error instead of throwing, and `Cluster.CheckInvariants` panics on it. `LogEntry` is a comparable struct, so `a[i] != b[i]` compares term and command at once.
+
+```go
+func CheckLogMatching(a, b []LogEntry, ia, ib int) error {
+	limit := len(a)
+	if len(b) < limit {
+		limit = len(b)
+	}
+	for k := limit - 1; k >= 1; k-- {
+		if a[k].Term == b[k].Term {
+			for i := 1; i <= k; i++ {
+				if a[i] != b[i] {
+					return fmt.Errorf("LOG MATCHING: nodes %d and %d agree at index %d (term %d) but differ at index %d: %s vs %s",
+						ia, ib, k, a[k].Term, i, a[i], b[i])
+				}
+			}
+			return nil
+		}
+	}
+	return nil
+}
+```
+
+#### Step 10: Run it
+
+```bash
+cd phases/06-replication-and-consensus/06-raft-log-replication/code/go
+go run .
+go test ./...
+```
+
+Byte-identical to the Java and Python runs, through to the final sweep:
+
+```console
+== 20 seeds, 5 nodes, 20% drops, delay 1-10, a crash and restart, 12 commands: all four Figure 3 properties hold ==
+seeds whose five state machines converged on all 12 writes: 20/20; no invariant check fired
+```
 
 ## Use It
 

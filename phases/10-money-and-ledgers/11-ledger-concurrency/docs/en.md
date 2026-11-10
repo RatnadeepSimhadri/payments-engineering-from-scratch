@@ -352,31 +352,182 @@ With `--stats`, expect the sharded ledger to report far fewer lock waits than th
 
 ### In Python
 
-The full port is `code/python/main.py` (same `InterleavingChecker`, `PessimisticLedger`, `OptimisticLedger`, `ShardedLedger`, `Workload`; tests in `code/python/test_main.py`). Three things differ, and the first one is the lesson:
+The Python port has the same `InterleavingChecker`, `PessimisticLedger`, `OptimisticLedger`, `ShardedLedger`, and `Workload`, with three differences, and the first one is the lesson. **The GIL hides the race; the checker reproduces it:** CPython runs one thread's bytecode at a time and only switches every few milliseconds, so a naive read-modify-write on a Python `int` attribute almost never loses an update under the stress workload; the race is real but not observable on demand. That is why Part 1 is the teaching tool here: `InterleavingChecker` is an explicit scheduler that enumerates every interleaving of the step machines, so the 76 violating schedules out of 90 for `NAIVE` are reproduced deterministically on every run, in every language. The real-thread ledgers in Part 2 are still exercised by 8 threads and an auditor taking consistent cuts, because lock ordering, atomic rejection, and conservation hold or fail regardless of the GIL. **Primitives map one to one:** `ReentrantLock` becomes `threading.Lock` (no reentrancy is needed: the two locks taken in a transfer are different cells), `tryLock()` is `acquire(blocking=False)`, `CountDownLatch` is a `threading.Event`, and `AtomicLong` is a tiny class with its own lock because `+=` on a shared attribute is not atomic across threads. `AtomicReference<AccountState>` is a plain attribute that is only ever replaced, never mutated, so the optimistic validate step compares identity with `is`, exactly as Java compares references with `==`. Round-robin routing uses `itertools.count()`, whose `next()` is atomic under the GIL. **Same scripts, same balances:** `Workload.script` seeds a `JavaRandom` (the JDK's 48-bit LCG) with `seed * 31 + thread`, so the per-thread scripts, the expected balances, and the demo's `merchant 27204989.39 USD` are identical to Java's; contention counters and elapsed times behind `--stats` are the only numbers that differ. `InsufficientFundsError` extends `RuntimeError`; argument errors are `ValueError`.
 
-- **The GIL hides the race; the checker reproduces it.** CPython runs one thread's bytecode at a time and only switches every few milliseconds, so a naive read-modify-write on a Python `int` attribute almost never loses an update under the stress workload: the race is real but not observable on demand. That is why Part 1 is the teaching tool here. `InterleavingChecker` is an explicit scheduler that enumerates every interleaving of the step machines, so the 76 violating schedules out of 90 for `NAIVE` are reproduced deterministically on every run, in every language. The real-thread ledgers in Part 2 are still exercised by 8 threads and an auditor taking consistent cuts, because lock ordering, atomic rejection, and conservation hold or fail regardless of the GIL.
-- **Primitives map one to one.** `ReentrantLock` becomes `threading.Lock` (no reentrancy is needed: the two locks taken in a transfer are different cells), `tryLock()` is `acquire(blocking=False)`, `CountDownLatch` is a `threading.Event`, and `AtomicLong` is a tiny class with its own lock because `+=` on a shared attribute is not atomic across threads. `AtomicReference<AccountState>` is a plain attribute that is only ever replaced, never mutated, so the optimistic validate step compares identity with `is`, exactly as Java compares references with `==`. Round-robin routing uses `itertools.count()`, whose `next()` is atomic under the GIL.
+Run it from `code/python/` with `python3 main.py` (add `--stats` for contention counters and timings); test with `python3 -m unittest -v`.
+
+#### Step 1: Steps as state machines
+
+`_step` is a static method on `InterleavingChecker` with one branch per strategy; this is the `VERSIONED` branch. The `World` holds `pc`, `local_balance`, and `local_version` as lists indexed by thread, and the trace is a list of tokens joined later. A stale version resets `pc[t]` to 0 (retry), and the rejection happens only after the version check passes.
 
 ```python
-while True:
-    sa, sb = a.state, b.state                                   # read phase: no locks
-    insufficient = not a.overdraft_allowed and sa.balance < m
-    first.commit.acquire()
-    second.commit.acquire()
-    try:
-        if a.state is sa and b.state is sb:                      # validate: nothing changed since the read
-            if insufficient:
-                raise InsufficientFundsError(a.id, sa.balance, m)
-            a.state = AccountState(sa.version + 1, sa.balance - m)
-            b.state = AccountState(sb.version + 1, sb.balance + m)
-            return
-    finally:
-        second.commit.release()
-        first.commit.release()
-    self._retries.increment_and_get()                           # stale read: go again
+        elif s is Strategy.VERSIONED:
+            if w.pc[t] == 0:
+                w.local_balance[t] = w.balance
+                w.local_version[t] = w.version
+                w.pc[t] = 1
+                w.trace.append(f"{who}:read")
+            elif w.version != w.local_version[t]:
+                w.pc[t] = 0  # stale read: retry from the top
+                w.trace.append(f"{who}:conflict")
+            else:  # validate + write, one atomic step
+                nxt = w.local_balance[t] + op.amount
+                if nxt >= 0:
+                    w.balance = nxt
+                    w.version += 1
+                    w.applied[t] = True
+                    w.trace.append(f"{who}:commit")
+                else:
+                    w.trace.append(f"{who}:reject")
+                w.pc[t] = DONE
 ```
 
-- **Same scripts, same balances.** `Workload.script` seeds a `JavaRandom` (the JDK's 48-bit LCG) with `seed * 31 + thread`, so the per-thread scripts, the expected balances, and the demo's `merchant 27204989.39 USD` are identical to Java's. Contention counters and elapsed times behind `--stats` are the only numbers that differ. `InsufficientFundsError` extends `RuntimeError`; argument errors are `ValueError`.
+#### Step 2: Explore every schedule
+
+The depth-first search copies the world before each step and counts terminal states. `counts` and `first` are one-element lists so the recursive static method can mutate them, standing in for Java's `int[]` and `String[]`. The depth guard turns a non-terminating model into a `RuntimeError` rather than a stack overflow.
+
+```python
+    def _dfs(s: Strategy, initial: int, ops: Sequence[Op], w: "InterleavingChecker.World", counts: List[int],
+             first: List[Optional[str]], depth: int) -> None:
+        if depth > 200:
+            raise RuntimeError("exploration did not terminate")
+        any_enabled = False
+        for t in range(len(ops)):
+            if w.pc[t] == InterleavingChecker.DONE or not InterleavingChecker._enabled(s, w, t):
+                continue
+            any_enabled = True
+            nxt = w.copy()
+            InterleavingChecker._step(s, nxt, t, ops[t])
+            InterleavingChecker._dfs(s, initial, ops, nxt, counts, first, depth + 1)
+        if not any_enabled:
+            counts[0] += 1
+            violation = InterleavingChecker._check(initial, ops, w)
+            if violation is not None:
+                counts[1] += 1
+                if first[0] is None:
+                    first[0] = violation + " via " + " ".join(w.trace)
+```
+
+#### Step 3: Pessimistic transfer with a global lock order
+
+Cells are ordered by `id` with a tuple assignment, the nested `try/finally` releases both `threading.Lock`s on every path, and `_lock` counts a contention wait when the non-blocking `acquire` fails before blocking for real. Plain `-=` and `+=` replace `subtractExact`/`addExact` because `int` cannot overflow.
+
+```python
+    def transfer(self, from_: str, to: str, amount: Money) -> None:
+        a, b = self._cell(from_), self._cell(to)
+        self._validate(a, b, amount)
+        first, second = (a, b) if a.id < b.id else (b, a)  # global order: no deadlock
+        self._lock(first)
+        try:
+            self._lock(second)
+            try:
+                m = amount.minor_units
+                if not a.overdraft_allowed and a.balance < m:
+                    raise InsufficientFundsError(a.id, a.balance, m)
+                a.balance -= m
+                b.balance += m
+            finally:
+                second.lock.release()
+        finally:
+            first.lock.release()
+
+    def _lock(self, c: Cell) -> None:
+        if not c.lock.acquire(blocking=False):
+            self._waits.increment_and_get()
+            c.lock.acquire()
+```
+
+#### Step 4: Optimistic transfer: read, check, validate, commit, retry
+
+`a.state` is read without a lock; `AccountState` is a frozen dataclass that is replaced wholesale on commit, so `a.state is sa` is an exact "nothing changed" test. The business decision is made on the read and acted on only after validation. A failed validation falls through the `finally`, bumps the retry counter, and loops.
+
+```python
+        while True:
+            sa, sb = a.state, b.state                                   # read phase: no locks
+            insufficient = not a.overdraft_allowed and sa.balance < m   # business check on the read
+            first.commit.acquire()
+            second.commit.acquire()
+            try:
+                if a.state is sa and b.state is sb:                      # validate: nothing changed since the read
+                    if insufficient:
+                        raise InsufficientFundsError(a.id, sa.balance, m)
+                    a.state = AccountState(sa.version + 1, sa.balance - m)
+                    b.state = AccountState(sb.version + 1, sb.balance + m)
+                    return
+            finally:
+                second.commit.release()
+                first.commit.release()
+            self._retries.increment_and_get()                           # stale read: go again
+```
+
+#### Step 5: Sharded credits and greedy debits
+
+`ShardedLedger` subclasses `PessimisticLedger`, so `super().transfer` reaches the ordered two-lock transfer and `_move_up_to` reuses it for every shard move. `next(self._routing)` on an `itertools.count` is the `getAndIncrement`. On a shortfall every unit drained into the in-flight cell is pushed back before the error is raised.
+
+```python
+    def transfer(self, from_: str, to: str, amount: Money) -> None:
+        if self.is_hot(from_) and self.is_hot(to):
+            raise ValueError("hot-to-hot transfers are not supported")
+        if self.is_hot(to):
+            k = next(self._routing) % self.shards(to)  # spread credits across shards
+            super().transfer(from_, self.shard_id(to, k), amount)
+        elif self.is_hot(from_):
+            self._debit_hot(from_, to, amount)
+        else:
+            super().transfer(from_, to, amount)
+
+    def _debit_hot(self, hot: str, to: str, amount: Money) -> None:
+        inflight, dest = self._cell(f"{hot}#inflight"), self._cell(to)
+        self._validate(inflight, dest, amount)
+        remaining = amount.minor_units
+        n = self.shards(hot)
+        taken = [0] * n
+        start = next(self._routing) % n
+        for i in range(n):
+            if remaining <= 0:
+                break
+            k = (start + i) % n
+            got = self._move_up_to(self._cell(self.shard_id(hot, k)), inflight, remaining)
+            taken[k] += got
+            remaining -= got
+        if remaining > 0:
+            for k in range(n):
+                if taken[k] > 0:
+                    self._move_up_to(inflight, self._cell(self.shard_id(hot, k)), taken[k])
+            raise InsufficientFundsError(hot, amount.minor_units - remaining, amount.minor_units)
+        self._move_up_to(inflight, dest, amount.minor_units)
+```
+
+#### Step 6: The stress test with an auditor
+
+From `test_main.py`: a `threading.Event` plays the role of the `AtomicBoolean running` flag, the auditor thread calls `total_minor()` (a consistent cut under all locks) in a loop, and the counters are `AtomicLong` instances. The sharded ledger is rolled up before the per-account comparison.
+
+```python
+                running = threading.Event()
+                running.set()
+                bad_cuts, cuts = AtomicLong(), AtomicLong()
+
+                def audit(ledger: ConcurrentLedger = l) -> None:
+                    while running.is_set():
+                        cuts.increment_and_get()
+                        if ledger.total_minor() != initial_total:
+                            bad_cuts.increment_and_get()
+
+                auditor = threading.Thread(target=audit)
+                auditor.start()
+                failed = w.run(l)
+                running.clear()
+                auditor.join()
+                if isinstance(l, ShardedLedger):
+                    l.roll_up("merchant")
+                match = all(l.balance(k).minor_units == v for k, v in expected.items())
+                self.assertEqual(failed, 0)
+                self.assertEqual(l.total_minor(), initial_total)
+                self.assertTrue(match)
+                self.assertEqual(bad_cuts.get(), 0)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/11-ledger-concurrency/code/python
@@ -384,37 +535,269 @@ python3 main.py            # add --stats for contention counters and timings
 python3 -m unittest -v
 ```
 
+Because the scripts replay `java.util.Random`, every number matches the Java run; the 160,000 threaded operations take noticeably longer under CPython:
+
+```console
+== Exhaustive interleavings: balance 100.00, payouts of 60.00 and 60.00, deposit of 30.00 ==
+NAIVE     schedules   90  violations   76
+          e.g. lost update: balance 7000 but applied ops imply 1000 via P1:read P2:read P1:write P2:write D:read D:write
+VERSIONED schedules  498  violations    0
+LOCKED    schedules    6  violations    0
+
+== 8 threads x 20,000 ops: customers pay one hot merchant account; every 20th op pays out ==
+payouts requested 395807.83 USD against a merchant float of 20000000.00 USD (every op can succeed in any order)
+pessimistic  failures 0  total conserved true   every balance as expected true   merchant 27204989.39 USD
+optimistic   failures 0  total conserved true   every balance as expected true   merchant 27204989.39 USD
+sharded      failures 0  total conserved true   every balance as expected true   merchant 27204989.39 USD
+```
+
 ### In Go
 
-The full port is `code/go/main.go` (same `InterleavingChecker` as `Explore`, `PessimisticLedger`, `OptimisticLedger`, `ShardedLedger`, `Workload`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go`, so seed 42 produces the same 160,000 scripted transfers and the same `395807.83 USD` of payouts. Tests are in `code/go/main_test.go` and must pass under `go test -race ./...`. Three things differ:
+The Go port is `code/go/main.go` (same `InterleavingChecker` as `Explore`, `PessimisticLedger`, `OptimisticLedger`, `ShardedLedger`, `Workload`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go`, so seed 42 produces the same 160,000 scripted transfers and the same `395807.83 USD` of payouts. Tests must pass under `go test -race ./...`. Three things differ. **Goroutines and `sync` replace threads and `ReentrantLock`:** `Cell.lock` is a `sync.Mutex`; `TryLock` (Go 1.18+) counts the lock waits exactly as `tryLock()` did. `Workload.Run` releases every goroutine at once by closing a channel instead of a `CountDownLatch`, and a `sync.WaitGroup` stands in for `join()`; the deadlock-freedom test waits on a done channel with a ten-second `select` timeout rather than `join(10_000)`. **The optimistic row is an `atomic.Pointer[AccountState]`:** validation compares pointers, not values; a stale read is detected because a commit stores a *new* `AccountState`, so `a.state.Load() != sa` is the Go spelling of Java's `a.state().get() == sa` reference check. The validate-and-write section is a closure with deferred unlocks so every exit path releases both commit locks in order. **No inheritance, so `ShardedLedger` embeds `*PessimisticLedger`:** calls through the `ConcurrentLedger` interface reach the sharded `Transfer` and `Balance`; `RollUp` calls `l.PessimisticLedger.Transfer` explicitly where Java wrote `super.transfer`. `Math.floorMod` on the routing counter becomes a two-line `floorMod` helper, `ErrInsufficientFunds` is a sentinel checked with `errors.Is`, and the `ConcurrentHashMap`s become plain maps behind a `sync.RWMutex`, which the race detector would flag if any path forgot.
 
-- **Goroutines and `sync` replace threads and `ReentrantLock`.** `Cell.lock` is a `sync.Mutex`; `TryLock` (Go 1.18+) counts the lock waits exactly as `tryLock()` did. `Workload.Run` releases every goroutine at once by closing a channel instead of a `CountDownLatch`, and a `sync.WaitGroup` stands in for `join()`. The deadlock-freedom test waits on a done channel with a ten-second `select` timeout rather than `join(10_000)`.
-- **The optimistic row is an `atomic.Pointer[AccountState]`.** Validation compares pointers, not values: a stale read is detected because a commit stores a *new* `AccountState`, so `a.state.Load() != sa` is the Go spelling of Java's `a.state().get() == sa` reference check. The validate-and-write section is a closure with deferred unlocks so every exit path releases both commit locks in order:
+Run it from `code/go/` with `go run .` (add `--stats` for contention counters and timings); test with `go test -race ./...`.
+
+#### Step 1: Steps as state machines
+
+`step` is a package-level function with a `switch` per strategy; the `Versioned` case is a tagless `switch` over the three conditions. `w.trace` is a `strings.Builder` so the tokens are appended with a trailing space and trimmed once at the end.
 
 ```go
-for {
-    sa, sb := a.state.Load(), b.state.Load()                 // read phase: no locks
-    committed, err := func() (bool, error) {
-        first.commit.Lock(); defer first.commit.Unlock()
-        second.commit.Lock(); defer second.commit.Unlock()
-        if a.state.Load() != sa || b.state.Load() != sb {    // validate: nothing changed since the read
-            return false, nil
-        }
-        ...
-    }()
-    if err != nil || committed {
-        return err
-    }
-    l.retries.Add(1)                                          // stale read: go again
+	case Versioned:
+		switch {
+		case w.pc[t] == 0:
+			w.localBalance[t] = w.balance
+			w.localVersion[t] = w.version
+			w.pc[t] = 1
+			w.trace.WriteString(who + ":read ")
+		case w.version != w.localVersion[t]:
+			w.pc[t] = 0 // stale read: retry from the top
+			w.trace.WriteString(who + ":conflict ")
+		default: // validate + write, one atomic step
+			next := w.localBalance[t] + op.Amount
+			if next >= 0 {
+				w.balance = next
+				w.version++
+				w.applied[t] = true
+				w.trace.WriteString(who + ":commit ")
+			} else {
+				w.trace.WriteString(who + ":reject ")
+			}
+			w.pc[t] = done
+		}
+```
+
+#### Step 2: Explore every schedule
+
+The search accumulates into an `exploration` struct passed by pointer instead of two arrays. `check` returns an empty string for a clean terminal state, so `violation != ""` is the test; a runaway model panics at depth 200.
+
+```go
+func dfs(s Strategy, initial int64, ops []Op, w *world, e *exploration, depth int) {
+	if depth > 200 {
+		panic("exploration did not terminate")
+	}
+	anyEnabled := false
+	for t := range ops {
+		if w.pc[t] == done || !enabled(s, w, t) {
+			continue
+		}
+		anyEnabled = true
+		next := w.copy()
+		step(s, next, t, ops[t])
+		dfs(s, initial, ops, next, e, depth+1)
+	}
+	if !anyEnabled {
+		e.schedules++
+		if violation := check(initial, ops, w); violation != "" {
+			e.violations++
+			if e.first == "" {
+				e.first = violation + " via " + strings.TrimSpace(w.trace.String())
+			}
+		}
+	}
 }
 ```
 
-- **No inheritance, so `ShardedLedger` embeds `*PessimisticLedger`.** Calls through the `ConcurrentLedger` interface reach the sharded `Transfer` and `Balance`; `RollUp` calls `l.PessimisticLedger.Transfer` explicitly where Java wrote `super.transfer`. `Math.floorMod` on the routing counter becomes a two-line `floorMod` helper, `ErrInsufficientFunds` is a sentinel checked with `errors.Is`, and the `ConcurrentHashMap`s become plain maps behind a `sync.RWMutex`, which the race detector would flag if any path forgot.
+#### Step 3: Pessimistic transfer with a global lock order
+
+`ordered` picks the lock order by id, and two `defer` statements replace the nested `try/finally`: deferred calls run last-in-first-out, so `second` is unlocked before `first`, matching the Java. Overflow is checked with `addChecked` before either balance is written, so a rejected transfer changes nothing.
+
+```go
+func (l *PessimisticLedger) Transfer(from, to string, amount Money) error {
+	a, err := l.cell(from)
+	if err != nil {
+		return err
+	}
+	b, err := l.cell(to)
+	if err != nil {
+		return err
+	}
+	if err := validate(a, b, amount); err != nil {
+		return err
+	}
+	first, second := ordered(a, b) // global order: no deadlock
+	l.lock(first)
+	defer first.lock.Unlock()
+	l.lock(second)
+	defer second.lock.Unlock()
+	m := amount.MinorUnits
+	if !a.OverdraftAllowed && a.balance < m {
+		return insufficient(a.ID, a.balance, m)
+	}
+	newA, err := addChecked(a.balance, -m)
+	if err != nil {
+		return err
+	}
+	newB, err := addChecked(b.balance, m)
+	if err != nil {
+		return err
+	}
+	a.balance, b.balance = newA, newB
+	return nil
+}
+```
+
+#### Step 4: Optimistic transfer: read, check, validate, commit, retry
+
+The read phase loads two pointers; the validate-and-write phase is an immediately invoked closure whose deferred unlocks guarantee release on every return. `committed == false` with a nil error means a stale read: bump `retries` and loop. A new `*AccountState` is stored on every commit, which is what makes the pointer comparison sound.
+
+```go
+	for {
+		sa, sb := a.state.Load(), b.state.Load()                   // read phase: no locks
+		insufficientFunds := !a.overdraftAllowed && sa.Balance < m // business check on the read
+		committed, err := func() (bool, error) {
+			first.commit.Lock()
+			defer first.commit.Unlock()
+			second.commit.Lock()
+			defer second.commit.Unlock()
+			if a.state.Load() != sa || b.state.Load() != sb { // validate: nothing changed since the read
+				return false, nil
+			}
+			if insufficientFunds {
+				return false, insufficient(a.id, sa.Balance, m)
+			}
+			newA, err := addChecked(sa.Balance, -m)
+			if err != nil {
+				return false, err
+			}
+			newB, err := addChecked(sb.Balance, m)
+			if err != nil {
+				return false, err
+			}
+			a.state.Store(&AccountState{sa.Version + 1, newA})
+			b.state.Store(&AccountState{sb.Version + 1, newB})
+			return true, nil
+		}()
+		if err != nil || committed {
+			return err
+		}
+		l.retries.Add(1) // stale read: go again
+	}
+```
+
+#### Step 5: Sharded credits and greedy debits
+
+`Transfer` is a `switch` that routes credits to a shard (`routing.Add(1)-1` is `getAndIncrement`) and payouts to `debitHot`; the embedded `l.PessimisticLedger.Transfer` is the explicit `super` call. `debitHot` resolves every shard cell up front, drains greedily from a rotating start, and on a shortfall returns every unit before reporting `ErrInsufficientFunds`.
+
+```go
+func (l *ShardedLedger) Transfer(from, to string, amount Money) error {
+	switch {
+	case l.IsHot(from) && l.IsHot(to):
+		return errors.New("hot-to-hot transfers are not supported")
+	case l.IsHot(to):
+		k := int(floorMod(l.routing.Add(1)-1, int64(l.Shards(to)))) // spread credits across shards
+		return l.PessimisticLedger.Transfer(from, ShardID(to, k), amount)
+	case l.IsHot(from):
+		return l.debitHot(from, to, amount)
+	default:
+		return l.PessimisticLedger.Transfer(from, to, amount)
+	}
+}
+```
+
+```go
+	remaining := amount.MinorUnits
+	n := l.Shards(hot)
+	taken := make([]int64, n)
+	start := int(floorMod(l.routing.Add(1)-1, int64(n)))
+	shards := make([]*Cell, n)
+	for k := range n {
+		if shards[k], err = l.cell(ShardID(hot, k)); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < n && remaining > 0; i++ {
+		k := (start + i) % n
+		got, err := l.moveUpTo(shards[k], inflight, remaining)
+		if err != nil {
+			return err
+		}
+		taken[k] += got
+		remaining -= got
+	}
+	if remaining > 0 {
+		for k := range n {
+			if taken[k] > 0 {
+				if _, err := l.moveUpTo(inflight, shards[k], taken[k]); err != nil {
+					return err
+				}
+			}
+		}
+		return insufficient(hot, amount.MinorUnits-remaining, amount.MinorUnits)
+	}
+	_, err = l.moveUpTo(inflight, dest, amount.MinorUnits)
+	return err
+```
+
+#### Step 6: The stress test with an auditor
+
+From `main_test.go`: an `atomic.Bool` is the running flag, two `atomic.Int64`s are the counters, and the auditor goroutine is joined through a `WaitGroup`. `TotalMinor()` locks every cell in id order, so each cut is consistent; the sharded ledger is rolled up before per-account balances are compared.
+
+```go
+			var running atomic.Bool
+			running.Store(true)
+			var badCuts, cuts atomic.Int64
+			var auditor sync.WaitGroup
+			auditor.Add(1)
+			go func() {
+				defer auditor.Done()
+				for running.Load() {
+					cuts.Add(1)
+					if l.TotalMinor() != initialTotal {
+						badCuts.Add(1)
+					}
+				}
+			}()
+			failed := w.Run(l)
+			running.Store(false)
+			auditor.Wait()
+			if s, ok := l.(*ShardedLedger); ok {
+				if _, err := s.RollUp("merchant"); err != nil {
+					t.Fatal(err)
+				}
+			}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/11-ledger-concurrency/code/go
 go run .                   # add --stats for contention counters and timings
 go test -race ./...
+```
+
+The output is identical to the Java and Python runs:
+
+```console
+== 8 threads x 20,000 ops: customers pay one hot merchant account; every 20th op pays out ==
+payouts requested 395807.83 USD against a merchant float of 20000000.00 USD (every op can succeed in any order)
+pessimistic  failures 0  total conserved true   every balance as expected true   merchant 27204989.39 USD
+optimistic   failures 0  total conserved true   every balance as expected true   merchant 27204989.39 USD
+sharded      failures 0  total conserved true   every balance as expected true   merchant 27204989.39 USD
+
+== A payout that would overdraw is rejected atomically, in every strategy ==
+pessimistic: rejected; merchant still 100.00 USD, bank 0.00 USD
+optimistic: rejected; merchant still 100.00 USD, bank 0.00 USD
+sharded: rejected; merchant still 100.00 USD, bank 0.00 USD
 ```
 
 ## Use It

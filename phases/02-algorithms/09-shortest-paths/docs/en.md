@@ -323,37 +323,444 @@ The test suites also compare Dijkstra against Bellman-Ford on a seeded random gr
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with the same names in `snake_case`, and four differences. **`round` is banker's rounding** (ties to even) where Java rounds ties up and Go rounds ties away from zero; no weight in this lesson lands on an exact tie, so all three agree, but a production implementation that must agree across languages should implement one rounding rule by hand on the scaled integer, as Phase 10, Lesson 01 does for money. **No `BigInteger` is needed:** Python ints are unbounded, so `cycle_product` multiplies plain ints and `Money.convert` cannot overflow, where Java and Go must check. **`gain_basis_points` truncates toward zero explicitly**, because `//` floors; for a positive gain they coincide, but the code handles the negative case the way the other languages do. **`Optional` is `None`:** `BellmanFordResult.negative_cycle` is `Optional[list[str]]` and `arbitrage` returns `None` when there is nothing to report.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The weighted graph
+
+`Edge` is a frozen dataclass (the field is `frm` because `from` is a keyword). A plain `dict` keeps insertion order in Python 3.7+, so `_adjacency` plays the role of the `LinkedHashMap` without any extra bookkeeping, and `_edges` is the flat list Bellman-Ford walks. `out_edges` and `edges` hand back tuples so callers cannot mutate the graph through them.
+
 ```python
+@dataclass(frozen=True)
+class Edge:
+    frm: str
+    to: str
+    weight: int
+
+
+class WeightedGraph:
+    def __init__(self) -> None:
+        self._adjacency: dict[str, list[Edge]] = {}
+        self._edges: list[Edge] = []
+
+    def add_node(self, node_id: str) -> None:
+        self._adjacency.setdefault(node_id, [])
+
+    def add_edge(self, frm: str, to: str, weight: int) -> None:
+        self.add_node(frm)
+        self.add_node(to)
+        e = Edge(frm, to, weight)
+        self._adjacency[frm].append(e)
+        self._edges.append(e)
+```
+
+#### Step 2: Dijkstra on the indexed heap
+
+The structure is identical: `distance` holds settled nodes, `tentative` mirrors the heap, and the `continue` on an already-settled neighbour is the invariant. There is no `Math.addExact` because `top.priority + e.weight` cannot overflow a Python int. A negative weight raises `ValueError` before the first pop, and an unknown source raises `KeyError`.
+
+```python
+def dijkstra(g: WeightedGraph, source: str) -> PathResult:
+    if not g.has_node(source):
+        raise KeyError(f"unknown node: {source}")
+    for e in g.edges():
+        if e.weight < 0:
+            raise ValueError(f"Dijkstra requires non-negative weights; {e.frm}->{e.to} is {e.weight}")
+    distance: dict[str, int] = {}
+    parent: dict[str, str] = {}
+    tentative: dict[str, int] = {source: 0}
+    heap: IndexedMinHeap[str] = IndexedMinHeap()
+    heap.push(source, 0)
+    while not heap.is_empty():
+        top = heap.pop()
+        u = top.key
+        distance[u] = top.priority  # settled: never changes again
+        for e in g.out_edges(u):
+            if e.to in distance:  # already settled; a shorter route cannot exist
+                continue
+            candidate = top.priority + e.weight
+            known = tentative.get(e.to)
+            if known is None:
+                tentative[e.to] = candidate
+                parent[e.to] = u
+                heap.push(e.to, candidate)
+            elif candidate < known:
+                tentative[e.to] = candidate
+                parent[e.to] = u
+                heap.decrease_key(e.to, candidate)
+    return PathResult(distance, parent)
+```
+
+#### Step 3: Bellman-Ford with early exit
+
+`distance.get(e.frm)` returning `None` is the "unreached" state, so there is no `INF` arithmetic. The loop runs `n` rounds and `relaxed_in_last_round` is the detector: `None` after the loop means early exit and no cycle.
+
+```python
+    distance: dict[str, int] = {source: 0}
+    parent: dict[str, str] = {}
+    n = g.node_count()
+    relaxed_in_last_round: Optional[str] = None
+    for _ in range(n):
+        relaxed_in_last_round = None
+        for e in g.edges():
+            du = distance.get(e.frm)
+            if du is None:  # unreachable so far
+                continue
+            candidate = du + e.weight
+            dv = distance.get(e.to)
+            if dv is None or candidate < dv:
+                distance[e.to] = candidate
+                parent[e.to] = e.frm
+                relaxed_in_last_round = e.to
+        if relaxed_in_last_round is None:  # early exit: a full round changed nothing
+            break
+```
+
+The cycle extraction walks `parent` `n` times first so `x` is guaranteed to sit on the cycle, then collects backwards and reverses with a slice instead of prepending.
+
+```python
+    if relaxed_in_last_round is None:
+        return BellmanFordResult(PathResult(distance, parent), None)
+    # Round n still relaxed: walk parents n times to be sure we are inside the cycle, then collect it.
+    x = relaxed_in_last_round
+    for _ in range(n):
+        x = parent[x]
+    cycle: list[str] = [x]
+    at = parent[x]
+    while at != x:
+        cycle.append(at)
+        at = parent[at]
+    cycle.append(x)
+    return BellmanFordResult(PathResult(distance, parent), cycle[::-1])  # parents point backwards; reverse for forward order
+```
+
+#### Step 4: Rates to weights
+
+The one float in the file. `scaled_rate / RATE_SCALE` is true division, so the result is a `float` even though both operands are ints, and `round` with no second argument returns an `int`, rounding ties to even (Java: ties up; Go: ties away from zero). The docstring in the shipped file records that no rate in the lesson hits a tie.
+
+```python
+RATE_SCALE = 100_000_000      # rates carry 8 decimals: 0.92 is 92_000_000
+WEIGHT_SCALE = 1_000_000      # weights are -ln(rate) in micro-nats, rounded once
+SOURCE = "__source__"
+
+
 def weight_of(scaled_rate: int) -> int:
     rate = scaled_rate / RATE_SCALE
     return round(-math.log(rate) * WEIGHT_SCALE)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 5: Arbitrage with a virtual source and an exact check
 
-- **`round` is banker's rounding** (ties to even) where Java rounds ties up and Go rounds ties away from zero. For the weights in this lesson no value lands on an exact tie, so all three agree; a production implementation that must agree across languages should implement one rounding rule by hand on the scaled integer, as Phase 10, Lesson 01 does for money.
-- **No `BigInteger` needed.** Python ints are unbounded, so `cycle_product` multiplies plain ints, and `Money.convert` cannot overflow; the Java and Go versions must check.
-- **`gain_basis_points` truncates toward zero** explicitly, because `//` floors; for a positive gain they coincide, but the code handles the negative case the same way the other languages do.
-- **`Optional` is `None`**, and the Bellman-Ford result's `negative_cycle` is `Optional[list[str]]`.
+`g.nodes()` returns a fresh list, so adding the `SOURCE` edges while iterating is safe. `cycle_product` multiplies unbounded ints, so the `BigInteger` dance disappears; `zip(closed_walk, closed_walk[1:])` pairs each hop. The rounding-artefact guard is the same: a candidate whose exact product does not exceed one is reported as `None`.
+
+```python
+def cycle_product(rates: Sequence[Rate], closed_walk: Sequence[str]) -> CycleProduct:
+    num, den = 1, 1
+    for a, b in zip(closed_walk, closed_walk[1:]):
+        num *= rate_between(rates, a, b)
+        den *= RATE_SCALE
+    return CycleProduct(num, den)
+
+
+def arbitrage(rates: Sequence[Rate]) -> Optional[list[str]]:
+    """Any negative cycle in the whole graph: add a virtual source with zero-weight edges to every currency."""
+    g = from_rates(rates)
+    for node in g.nodes():
+        g.add_edge(SOURCE, node, 0)
+    cycle = bellman_ford(g, SOURCE).negative_cycle
+    if cycle is not None and not cycle_product(rates, cycle).exceeds_one():
+        return None  # rounding artefact, not arbitrage: the exact product is <= 1
+    return cycle
+```
+
+#### Step 6: Converting money along the path
+
+`convert` builds the numerator and denominator as exact ints (no `multiplyExact`, nothing can wrap) and rounds once through `divide_rounded`, the Phase 10 helper that works on magnitudes so negatives truncate like Java and Go. `convert_along` applies it hop by hop with `HALF_EVEN` and refuses an amount whose currency is not the path's first node.
+
+```python
+    def convert(self, scaled_rate: int, to: Currency, rounding: Rounding) -> "Money":
+        numerator = self.minor_units * scaled_rate * to.minor_units_per_major()
+        denominator = RATE_SCALE * self.currency.minor_units_per_major()
+        return Money(divide_rounded(numerator, denominator, rounding), to)
+```
+
+```python
+def convert_along(amount: Money, path: Sequence[str], rates: Sequence[Rate], currencies: dict[str, Currency]) -> Money:
+    """Convert an amount along a path, rounding HALF_EVEN at each hop as a real multi-leg conversion would."""
+    if not path or amount.currency.code != path[0]:
+        raise ValueError(f"amount is {amount.currency.code} but path starts at {list(path)}")
+    current = amount
+    for a, b in zip(path, path[1:]):
+        current = current.convert(rate_between(rates, a, b), currencies[b], Rounding.HALF_EVEN)
+    return current
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/02-algorithms/09-shortest-paths/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The numbers are identical to the Java run; only the list formatting is Python's:
+
+```console
+== Dijkstra on non-negative spread costs (basis points) ==
+USD->JPY cheapest spread: 40 bps via ['USD', 'EUR', 'JPY']
+all distances: {'USD': 0, 'EUR': 20, 'JPY': 40, 'GBP': 40}
+
+== A stale GBP->USD quote creates a negative cycle ==
+arbitrage cycle: ['EUR', 'GBP', 'USD', 'EUR']
+exact product of rates along the cycle = 1008689106944000000000000 / 1000000000000000000000000
+gain = 86 basis points per loop
+10,000.00 USD around ['USD', 'EUR', 'GBP', 'USD'] = 10086.89 USD
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes three things. **Errors are values:** `Dijkstra`, `BellmanFord`, `Arbitrage`, and `ConvertAlong` return `(result, error)`; `ErrNegativeWeight`, `ErrUnknownNode`, and `ErrArbitrage` are sentinels for `errors.Is`, and `Arbitrage` returns `nil, nil` when there is no cycle. **`math/big` for the exact product and for overflow-safe conversion:** Go has no `multiplyExact`, so `Convert` computes the numerator in `big.Int` and checks `IsInt64`, which is the equivalent of Java's exception. **Maps iterate randomly**, so `WeightedGraph` keeps `order []string` and per-node edge slices, as Lesson 08 did; otherwise the reported cycle would rotate between runs. `math.Round` rounds ties away from zero; no weight in this lesson is a tie. `go test -race` passes trivially because nothing here is concurrent.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The weighted graph
+
+Because a Go map has no insertion order, the graph keeps `order` (node ids in first-seen order), `index` (id to position), and a slice of out-edge slices aligned with `order`. `AddNode` is idempotent; `AddEdge` appends to both the per-node slice and the flat `edges` list that Bellman-Ford scans.
+
 ```go
-func (m Money) Convert(scaledRate int64, to Currency, rounding Rounding) (Money, error) {
-    num := new(big.Int).Mul(big.NewInt(m.MinorUnits), big.NewInt(scaledRate))
-    num.Mul(num, big.NewInt(to.MinorUnitsPerMajor()))
-    ...
-    if !num.IsInt64() {
-        return Money{}, errors.New("int64 overflow in conversion")
-    }
+type Edge struct {
+	From   string
+	To     string
+	Weight int64
+}
+
+// WeightedGraph keeps nodes and out-edges in insertion order (Go maps iterate randomly).
+type WeightedGraph struct {
+	order     []string
+	index     map[string]int
+	adjacency [][]Edge
+	edges     []Edge
+}
+
+func (g *WeightedGraph) AddNode(id string) {
+	if _, ok := g.index[id]; ok {
+		return
+	}
+	g.index[id] = len(g.order)
+	g.order = append(g.order, id)
+	g.adjacency = append(g.adjacency, nil)
+}
+
+func (g *WeightedGraph) AddEdge(from, to string, weight int64) {
+	g.AddNode(from)
+	g.AddNode(to)
+	e := Edge{from, to, weight}
+	g.adjacency[g.index[from]] = append(g.adjacency[g.index[from]], e)
+	g.edges = append(g.edges, e)
+}
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: Dijkstra on the indexed heap
 
-- **`math/big` for the exact product and for overflow-safe conversion.** Go has no `multiplyExact`; computing the numerator in `big.Int` and checking `IsInt64` is the equivalent of Java's exception.
-- **Errors are values**: `ErrNegativeWeight`, `ErrUnknownNode`, `ErrArbitrage` are sentinels for `errors.Is`; `Arbitrage` returns `nil, nil` when there is none.
-- **Maps iterate randomly**, so `WeightedGraph` keeps `order []string` and per-node edge slices, as Lesson 08 did; otherwise the reported cycle would rotate between runs.
-- **`math.Round` rounds ties away from zero**; see the Python note. The `go test -race` flag passes trivially because nothing here is concurrent.
+The up-front checks return wrapped sentinels instead of throwing. The heap methods return errors too, but inside `Dijkstra` they cannot fail (a key is pushed only when unseen and decreased only when present), so the results are discarded with `_ =`. The two-value map read `_, settled := distance[e.To]` is the settled test; `candidate := top.Priority + e.Weight` is unchecked `int64` addition, so unlike Java an overflow would wrap, which is one reason the weights are kept in micro-nats rather than nano-nats.
+
+```go
+	distance := map[string]int64{}
+	parent := map[string]string{}
+	tentative := map[string]int64{source: 0}
+	heap := NewIndexedMinHeap[string]()
+	_ = heap.Push(source, 0)
+	for !heap.IsEmpty() {
+		top, _ := heap.Pop()
+		u := top.Key
+		distance[u] = top.Priority // settled: never changes again
+		out, _ := g.OutEdges(u)
+		for _, e := range out {
+			if _, settled := distance[e.To]; settled { // a shorter route cannot exist
+				continue
+			}
+			candidate := top.Priority + e.Weight
+			known, seen := tentative[e.To]
+			if !seen {
+				tentative[e.To] = candidate
+				parent[e.To] = u
+				_ = heap.Push(e.To, candidate)
+			} else if candidate < known {
+				tentative[e.To] = candidate
+				parent[e.To] = u
+				_ = heap.DecreaseKey(e.To, candidate)
+			}
+		}
+	}
+	return PathResult{distance, parent}, nil
+```
+
+#### Step 3: Bellman-Ford with early exit
+
+The relaxed-node marker is the empty string rather than `null`, which is safe because node ids are never empty. Everything else is a line-for-line port of the Java loop, including running to round `n` so the last round is the detector.
+
+```go
+	distance := map[string]int64{source: 0}
+	parent := map[string]string{}
+	n := g.NodeCount()
+	relaxed := ""
+	for round := 1; round <= n; round++ {
+		relaxed = ""
+		for _, e := range g.edges {
+			du, ok := distance[e.From]
+			if !ok { // unreachable so far
+				continue
+			}
+			candidate := du + e.Weight
+			if dv, seen := distance[e.To]; !seen || candidate < dv {
+				distance[e.To] = candidate
+				parent[e.To] = e.From
+				relaxed = e.To
+			}
+		}
+		if relaxed == "" { // early exit: a full round changed nothing
+			break
+		}
+	}
+```
+
+A `nil` `NegativeCycle` slice is the `Optional.empty()`. The cycle is collected backwards into a temporary slice and reversed by index, because prepending to a Go slice would reallocate on every step.
+
+```go
+	if relaxed == "" {
+		return BellmanFordResult{PathResult{distance, parent}, nil}, nil
+	}
+	// Round n still relaxed: walk parents n times to be sure we are inside the cycle, then collect it.
+	x := relaxed
+	for i := 0; i < n; i++ {
+		x = parent[x]
+	}
+	backwards := []string{x}
+	for at := parent[x]; at != x; at = parent[at] {
+		backwards = append(backwards, at)
+	}
+	backwards = append(backwards, x)
+	cycle := make([]string, len(backwards)) // parents point backwards; reverse for forward order
+	for i, node := range backwards {
+		cycle[len(backwards)-1-i] = node
+	}
+	return BellmanFordResult{PathResult{distance, parent}, cycle}, nil
+```
+
+#### Step 4: Rates to weights
+
+`RateScale` is a typed `int64` constant and `WeightScale` an untyped float constant, so `-math.Log(rate) * WeightScale` is a `float64` expression without a cast. `math.Round` rounds ties away from zero and returns a `float64`, hence the explicit `int64(...)` conversion.
+
+```go
+const (
+	RateScale   int64 = 100_000_000
+	WeightScale       = 1_000_000.0
+	Source            = "__source__"
+)
+
+func WeightOf(scaledRate int64) int64 {
+	rate := float64(scaledRate) / float64(RateScale)
+	return int64(math.Round(-math.Log(rate) * WeightScale))
+}
+```
+
+#### Step 5: Arbitrage with a virtual source and an exact check
+
+`CycleProduct` holds two `*big.Int`, and `ComputeCycleProduct` multiplies in place with `num.Mul(num, ...)`, which is how `math/big` avoids allocating a new value per step. `Arbitrage` has three `nil, nil` exits (no cycle, a cycle whose exact product does not exceed one) and one error path per call it makes; the virtual `Source` edges are added by iterating over a copy of the node list that `Nodes()` returns.
+
+```go
+func ComputeCycleProduct(rates []Rate, closedWalk []string) (CycleProduct, error) {
+	num, den := big.NewInt(1), big.NewInt(1)
+	for i := 0; i+1 < len(closedWalk); i++ {
+		r, err := RateBetween(rates, closedWalk[i], closedWalk[i+1])
+		if err != nil {
+			return CycleProduct{}, err
+		}
+		num.Mul(num, big.NewInt(r))
+		den.Mul(den, big.NewInt(RateScale))
+	}
+	return CycleProduct{num, den}, nil
+}
+
+func Arbitrage(rates []Rate) ([]string, error) {
+	g := FromRates(rates)
+	for _, node := range g.Nodes() {
+		g.AddEdge(Source, node, 0)
+	}
+	r, err := BellmanFord(g, Source)
+	if err != nil {
+		return nil, err
+	}
+	if r.NegativeCycle == nil {
+		return nil, nil
+	}
+	p, err := ComputeCycleProduct(rates, r.NegativeCycle)
+	if err != nil {
+		return nil, err
+	}
+	if !p.ExceedsOne() {
+		return nil, nil
+	}
+	return r.NegativeCycle, nil
+}
+```
+
+#### Step 6: Converting money along the path
+
+Without `multiplyExact`, `Convert` forms the numerator in `big.Int` and refuses to proceed if it does not fit an `int64`; the denominator is at most 10^12 and always fits. `ConvertAlong` threads the error from every hop and uses the `if current, err = ...; err != nil` form so the converted value and the error are assigned in one statement.
+
+```go
+func (m Money) Convert(scaledRate int64, to Currency, rounding Rounding) (Money, error) {
+	num := new(big.Int).Mul(big.NewInt(m.MinorUnits), big.NewInt(scaledRate))
+	num.Mul(num, big.NewInt(to.MinorUnitsPerMajor()))
+	den := new(big.Int).Mul(big.NewInt(RateScale), big.NewInt(m.Currency.MinorUnitsPerMajor()))
+	if !num.IsInt64() {
+		return Money{}, errors.New("int64 overflow in conversion")
+	}
+	return Money{DivideRounded(num.Int64(), den.Int64(), rounding), to}, nil
+}
+```
+
+```go
+func ConvertAlong(amount Money, path []string, rates []Rate, currencies map[string]Currency) (Money, error) {
+	if len(path) == 0 || amount.Currency.Code != path[0] {
+		return Money{}, fmt.Errorf("amount is %s but path starts at %v", amount.Currency.Code, path)
+	}
+	current := amount
+	for i := 0; i+1 < len(path); i++ {
+		rate, err := RateBetween(rates, path[i], path[i+1])
+		if err != nil {
+			return Money{}, err
+		}
+		if current, err = current.Convert(rate, currencies[path[i+1]], HalfEven); err != nil {
+			return Money{}, err
+		}
+	}
+	return current, nil
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/02-algorithms/09-shortest-paths/code/go
+go run .
+go test ./...
+```
+
+The Go demo prints the Dijkstra distances one per line (there is no ordered map to print) and formats slices without commas; every number matches the Java and Python runs:
+
+```console
+== Dijkstra on non-negative spread costs (basis points) ==
+USD->JPY cheapest spread: 40 bps via [USD EUR JPY]
+  USD = 0 bps
+  EUR = 20 bps
+  JPY = 40 bps
+  GBP = 40 bps
+
+== Why Dijkstra cannot be used on these weights ==
+rejected: Dijkstra requires non-negative weights; EUR->USD is -81380
+```
 
 ## Use It
 

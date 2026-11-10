@@ -357,23 +357,280 @@ Notice `[AUTHORIZE 18, CAPTURE 18]` for the unbalanced-fee bug. Why 18 and not 1
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **`java.util.Random` is ported, not replaced:** `JavaRandom` reproduces the 48-bit LCG (`next_int`, `next_double`), so seed 42 fails at the same trials as the Java run (12, 53, 5 and 930), shrinks the same originals to the same minimal scenarios, and the integer property shrinks 749170 to 18 in 59 steps; the tests pin both the JDK's first values and the trial numbers. **Exceptions are the contract:** `IllegalStateError(RuntimeError)` stands in for `IllegalStateException` and `ValueError` for `IllegalArgumentException`; `_safe_check` and `ScenarioRunner.run` treat exactly those two as "rejected input", and anything else as a crash the property must report; `ProcessorTimeout` is its own `RuntimeError` subclass caught only inside the service. **`Money.basis_points` truncates toward zero on purpose:** Python's `//` floors, so the `HALF_EVEN` fee rounding works on `abs(product)` and reapplies the sign, and a test checks the negative tie. **Generators are small classes behind a `Gen` Protocol** (`LongGen`, `OneOfGen`, `ListGen`, `CommandGen`) instead of anonymous inner classes; `Scenario.commands` and `ScenarioRun.log` are tuples; `Bugs` prints its snake_case field names, the one cosmetic difference from the Java demo output.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The ledger and the processor's record
+
+`Ledger` holds a dict of balances keyed by the `Account` enum; `post` refuses a negative amount and moves the same amount out of one account and into another. `credit_only` is the deliberately unbalanced write reachable only through `Bugs.unbalanced_fee`, the method that exists only to let a bug in. `ProcessorPayment` is the processor's own record.
+
 ```python
-@staticmethod
-def _safe_check(check, value):
-    try:
-        return check(value)
-    except (ValueError, IllegalStateError):
-        return None            # the system rejected the input on purpose
-    except Exception as crash:
-        return f"crash: {type(crash).__name__}: {crash}"
+class Ledger:
+    """Three accounts, double-entry: every posting debits one and credits another by the same amount."""
+
+    def __init__(self, currency: Currency) -> None:
+        self._balances: dict[Account, Money] = {a: Money.zero(currency) for a in Account}
+        self.postings: list[str] = []
+
+    def post(self, from_account: Account, to_account: Account, amount: Money, memo: str) -> None:
+        if amount.is_negative():
+            raise ValueError(f"posting amount must not be negative: {amount}")
+        self._balances[from_account] = self._balances[from_account].minus(amount)
+        self._balances[to_account] = self._balances[to_account].plus(amount)
+        self.postings.append(f"{memo}: {from_account.name} -> {to_account.name} {amount}")
+
+    def credit_only(self, to_account: Account, amount: Money, memo: str) -> None:
+        """A deliberately unbalanced write, reachable only through Bugs.unbalanced_fee."""
+        self._balances[to_account] = self._balances[to_account].plus(amount)
+        self.postings.append(f"{memo}: (nothing) -> {to_account.name} {amount}")
+
+    def balance(self, a: Account) -> Money:
+        return self._balances[a]
+
+    def total(self) -> Money:
+        t = Money.zero(self._balances[Account.CUSTOMER].currency)
+        for m in self._balances.values():
+            t = t.plus(m)
+        return t
+
+class ProcessorPayment:
+    """The processor's own record of a payment. This is the external truth the ledger must reconcile to."""
+
+    def __init__(self, c: Currency) -> None:
+        self.authorized = Money.zero(c)
+        self.captured = Money.zero(c)
+        self.refunded = Money.zero(c)
+        self.voided = False
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: The fake processor
 
-- **`java.util.Random` is ported, not replaced.** `JavaRandom` reproduces the 48-bit LCG (`next_int`, `next_double`), so seed 42 fails at the same trials as the Java run (12, 53, 5 and 930), shrinks the same originals to the same minimal scenarios, and the integer property shrinks 749170 to 18 in 59 steps. The tests pin both the JDK's first values and the trial numbers.
-- **Exceptions are the contract.** `IllegalStateError(RuntimeError)` stands in for `IllegalStateException` and `ValueError` for `IllegalArgumentException`; `_safe_check` and `ScenarioRunner.run` treat exactly those two as "rejected input", and anything else as a crash the property must report. `ProcessorTimeout` is its own `RuntimeError` subclass caught only inside the service.
-- **`Money.basis_points` truncates toward zero on purpose.** Python's `//` floors, so the HALF_EVEN fee rounding works on `abs(product)` and reapplies the sign; a test checks the negative tie.
-- **Generators are small classes behind a `Gen` Protocol** (`LongGen`, `OneOfGen`, `ListGen`, `CommandGen`) instead of anonymous inner classes; `Scenario.commands` and `ScenarioRun.log` are tuples. `Bugs` prints its snake_case field names, the one cosmetic difference from the Java demo output.
+`call` consumes one scripted behaviour (`APPROVE` once the script runs out) and decides whether `apply()` runs before an exception; that ordering is the whole difference between the two timeouts. A `5xx` is `IllegalStateError`. Each operation passes a small nested `apply` closure.
+
+```python
+class FakeProcessor:
+    """A processor whose behaviour per call is scripted. Exhausting the script means APPROVE."""
+
+    def __init__(self, currency: Currency) -> None:
+        self._script: list[ProcessorBehaviour] = []
+        self._cursor = 0
+        self.record = ProcessorPayment(currency)
+        self.calls = 0
+
+    def script(self, *behaviours: ProcessorBehaviour) -> "FakeProcessor":
+        self._script.extend(behaviours)
+        return self
+
+    def _next(self) -> ProcessorBehaviour:
+        self.calls += 1
+        if self._cursor < len(self._script):
+            b = self._script[self._cursor]
+            self._cursor += 1
+            return b
+        return ProcessorBehaviour.APPROVE
+
+    def call(self, op: str, apply: Callable[[], None]) -> bool:
+        """Applies the operation if the processor would, then returns or raises according to the behaviour."""
+        b = self._next()
+        if b is ProcessorBehaviour.APPROVE:
+            apply()
+            return True
+        if b is ProcessorBehaviour.DECLINE:
+            return False
+        if b is ProcessorBehaviour.TIMEOUT_AFTER_APPLY:
+            apply()
+            raise ProcessorTimeout(op)
+        if b is ProcessorBehaviour.TIMEOUT_BEFORE_APPLY:
+            raise ProcessorTimeout(op)
+        raise IllegalStateError(f"processor 5xx on {op}")
+
+    def authorize(self, amount: Money) -> bool:
+        def apply() -> None:
+            self.record.authorized = amount
+        return self.call("authorize", apply)
+
+    def capture(self, amount: Money) -> bool:
+        def apply() -> None:
+            self.record.captured = self.record.captured.plus(amount)
+        return self.call("capture", apply)
+```
+
+#### Step 3: The service, with bugs on switches
+
+`capture` validates, checks state, enforces the authorization bound unless `allow_over_capture` is set, and on `ProcessorTimeout` posts anyway only under `post_on_timeout` before marking the state `UNKNOWN`. `_post_capture` is where `unbalanced_fee` swaps the balanced fee posting for `credit_only`.
+
+```python
+    def capture(self, amount: Money) -> bool:
+        self._require_positive(amount)
+        if self.state not in (PaymentState.AUTHORIZED, PaymentState.PARTIALLY_CAPTURED):
+            raise IllegalStateError(f"capture in state {self.state.name}")
+        if not self.bugs.allow_over_capture and self.captured.plus(amount).compare_to(self.authorized) > 0:
+            raise ValueError(f"capture {amount} exceeds remaining authorization {self.authorized.minus(self.captured)}")
+        try:
+            if not self.processor.capture(amount):
+                return False
+        except ProcessorTimeout:
+            if self.bugs.post_on_timeout:
+                self._post_capture(amount)  # the bug: assuming a timeout meant success
+            self.state = PaymentState.UNKNOWN
+            self.last_unknown_op = f"capture:{amount.minor_units}"
+            return False
+        self._post_capture(amount)
+        return True
+
+    def _post_capture(self, amount: Money) -> None:
+        fee = amount.basis_points(PaymentService.FEE_BPS)
+        self.ledger.post(Account.CUSTOMER, Account.MERCHANT, amount, "capture")
+        if self.bugs.unbalanced_fee:
+            self.ledger.credit_only(Account.PLATFORM_FEES, fee, "fee")
+        else:
+            self.ledger.post(Account.MERCHANT, Account.PLATFORM_FEES, fee, "fee")
+        self.captured = self.captured.plus(amount)
+        self.state = PaymentState.CAPTURED if self.captured.compare_to(self.authorized) >= 0 else PaymentState.PARTIALLY_CAPTURED
+```
+
+#### Step 4: Reconcile
+
+`reconcile` asks the processor's record what it has and posts only what the ledger is missing, then recomputes the state. It only ever adds, which is why the `post_on_timeout` bug is caught after reconcile rather than hidden by it.
+
+```python
+    def reconcile(self) -> None:
+        """After a timeout, ask the processor what actually happened and bring the ledger into line."""
+        if self.state is not PaymentState.UNKNOWN:
+            return
+        p = self.processor.record
+        if p.authorized != self.authorized:
+            self.authorized = p.authorized
+        missing_capture = p.captured.minus(self.captured)
+        if missing_capture.minor_units > 0:
+            self._post_capture(missing_capture)
+        missing_refund = p.refunded.minus(self.refunded)
+        if missing_refund.minor_units > 0:
+            self._post_refund(missing_refund)
+        if p.voided:
+            self.state = PaymentState.VOIDED
+        elif self.captured.is_zero():
+            self.state = PaymentState.NEW if self.authorized.is_zero() else PaymentState.AUTHORIZED
+        else:
+            self.state = PaymentState.CAPTURED if self.captured.compare_to(self.authorized) >= 0 else PaymentState.PARTIALLY_CAPTURED
+        self.last_unknown_op = None
+```
+
+#### Step 5: Generators
+
+`LongGen` is the Python form of the anonymous `Gen<Long>`: uniform in `[lo, hi]` from `next_double`, shrinking toward `lo` by halving the distance and then by one. `ListGen` and `OneOfGen` follow the same shrink order as the Java (chunk removal, single removal, element shrinking; earlier values are simpler).
+
+```python
+class LongGen:
+    """Uniform in [lo, hi]; shrinks toward lo by halving the distance, then by single steps."""
+
+    def __init__(self, lo: int, hi: int) -> None:
+        self._lo = lo
+        self._hi = hi
+
+    def generate(self, rng: JavaRandom) -> int:
+        return self._lo + int(rng.next_double() * (self._hi - self._lo + 1))
+
+    def shrink(self, v: int) -> list[int]:
+        out: list[int] = []
+        if v <= self._lo:
+            return out
+        out.append(self._lo)
+        step = (v - self._lo) // 2
+        while step > 0:
+            out.append(v - step)
+            step //= 2
+        if v - 1 not in out:
+            out.append(v - 1)
+        return out
+```
+
+#### Step 6: forAll
+
+`for_all` is the same loop: generate, check, and on the first failure shrink greedily until no candidate still fails or the step budget runs out. `_safe_check` turns `ValueError`/`IllegalStateError` into "holds" (the input was rejected on purpose) and any other exception into a `crash:` reason.
+
+```python
+class Property:
+    MAX_SHRINK_STEPS = 2_000
+
+    @staticmethod
+    def for_all(name: str, gen: Gen[T], check: Callable[[T], Optional[str]], seed: int, trials: int) -> PropertyResult[T]:
+        """Runs `check` on `trials` generated values. `check` returns None when the property holds."""
+        rng = JavaRandom(seed)
+        for i in range(1, trials + 1):
+            value = gen.generate(rng)
+            reason = Property._safe_check(check, value)
+            if reason is None:
+                continue
+            current = value
+            current_reason = reason
+            steps = 0
+            progressed = True
+            while progressed and steps < Property.MAX_SHRINK_STEPS:
+                progressed = False
+                for candidate in gen.shrink(current):
+                    steps += 1
+                    r = Property._safe_check(check, candidate)
+                    if r is not None:
+                        current, current_reason, progressed = candidate, r, True
+                        break
+                    if steps >= Property.MAX_SHRINK_STEPS:
+                        break
+            return PropertyResult(name, False, seed, i, Counterexample(value, current, steps, current_reason))
+        return PropertyResult(name, True, seed, trials, None)
+
+    @staticmethod
+    def _safe_check(check: Callable[[T], Optional[str]], value: T) -> Optional[str]:
+        try:
+            return check(value)
+        except (ValueError, IllegalStateError):
+            return None  # the system rejected the input on purpose: the property is about accepted inputs
+        except Exception as crash:  # noqa: BLE001 - any other exception is a failure the property must report
+            return f"crash: {type(crash).__name__}: {crash}"
+```
+
+#### Step 7: The scenario runner and the headline property
+
+`run` scripts one behaviour per command, dispatches on the command kind, catches the two rejection exceptions itself, and checks the invariants after every command so the violation names the command that caused it. `invariants_hold` wires the runner into `for_all` with a lambda.
+
+```python
+    def run(scenario: Scenario, bugs: Bugs) -> ScenarioRun:
+        """Applies the commands in order. Commands the service rejects as illegal are logged and skipped."""
+        processor = FakeProcessor(USD)
+        service = PaymentService(USD, processor, bugs)
+        log: list[str] = []
+        for c in scenario.commands:
+            processor.script(c.behaviour)
+            amount = Money.of_minor(c.amount_minor, USD)
+            try:
+                if c.kind is CommandKind.AUTHORIZE:
+                    outcome = "ok" if service.authorize(amount) else "declined/unknown"
+                elif c.kind is CommandKind.CAPTURE:
+                    outcome = "ok" if service.capture(amount) else "declined/unknown"
+                elif c.kind is CommandKind.REFUND:
+                    outcome = "ok" if service.refund(amount) else "declined/unknown"
+                elif c.kind is CommandKind.VOID:
+                    outcome = "ok" if service.void_authorization() else "declined/unknown"
+                else:
+                    service.reconcile()
+                    outcome = "ok"
+            except (ValueError, IllegalStateError) as rejected:
+                outcome = f"rejected: {rejected}"
+            log.append(f"{c} -> {outcome} [{service.state.name}]")
+            violation = Invariants.check(service)
+            if violation is not None:
+                return ScenarioRun(scenario, service, tuple(log), f"{violation} after {c}")
+        return ScenarioRun(scenario, service, tuple(log), None)
+
+    @staticmethod
+    def invariants_hold(bugs: Bugs, seed: int, trials: int, max_len: int) -> PropertyResult[list[Command]]:
+        """The property: no command sequence, with any processor behaviour, violates the invariants."""
+        return Property.for_all(f"invariants hold under {bugs}", ScenarioRunner.sequences(max_len),
+                                lambda cmds: ScenarioRunner.run(Scenario("generated", tuple(cmds)), bugs).violation, seed, trials)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/14-testing-payment-systems/code/python
@@ -381,42 +638,382 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Because `JavaRandom` matches the JDK, the trial numbers, originals, and shrunk counterexamples are the same as the Java run; only the `Bugs` field names differ:
+
+```console
+== Same property with real bugs switched back on (500 trials) ==
+invariants hold under Bugs[allow_over_capture=true, allow_over_refund=false, unbalanced_fee=false, post_on_timeout=false]: FAILED at trial 12 (seed 42)
+  original: [VOID, VOID/TIMEOUT_BEFORE_APPLY, REFUND 7297, AUTHORIZE 171, RECONCILE, CAPTURE 8664, CAPTURE 3107, RECONCILE, REFUND 7062, REFUND 1469, AUTHORIZE 6407, CAPTURE 4350]
+  shrunk (67 steps): [AUTHORIZE 1, CAPTURE 2]
+  reason: captured 0.02 USD > authorized 0.01 USD after CAPTURE 2
+```
+
 ### In Go
 
-```go
-// Check returns nil when the property holds. An error wrapping ErrInvalidArgument or ErrIllegalState
-// means the system rejected the input on purpose (not a failure); any other error is the violation.
-type Check[T any] func(value T) error
+The Go port (`code/go/main.go`, `javarandom.go`, `money.go`, tests in `main_test.go`) keeps the design with four differences. **The seeds are portable:** `javarandom.go` is `java.util.Random` bit for bit (the 48-bit LCG, `nextInt(bound)` with its rejection loop, `nextDouble` from 53 bits), so seed 42 generates the same 500 command sequences, fails at the same trial, and shrinks in the same 67 steps as the Java demo; `math/rand` would have been deterministic too, but its counterexamples would not match the ones printed in this lesson. **Exceptions become classified errors:** the service returns `(bool, error)`; `ErrInvalidArgument` and `ErrIllegalState` are the deliberate rejections, `ErrProcessorTimeout` is caught inside the service and turns into `UNKNOWN`, and a processor 5xx is `ErrProcessorError`, which wraps `ErrIllegalState` so it is skipped by the scenario runner exactly as the Java `IllegalStateException` was; the property `Check` returns an `error` where Java returned a nullable `String`, and a `panic` inside a check is the "crash" case, recovered by `safeCheck`. **Generics replace `Gen<T>`:** `Gen[T]` is an interface with `Generate` and `Shrink`; `Longs`, `OneOf[T comparable]`, and `Lists[T]` are small generic structs, and `ForAll[T]` returns a `PropertyResult[T]` whose `Counterexample` is a nil pointer when the property passed; `formatValue` prints slices as `[a, b, c]` so the summaries match Java's `List.toString()`. **Money is the Phase 10 type:** `BasisPoints` is `Times(bps, 10_000, HalfEven)` on the canonical `Money`, so the 2.9 percent fee rounds half-even through the same `DivideRounded` the ledger lessons use, and the ledger's own postings use `mustPlus`/`mustMinus` because every amount in one payment shares a currency by construction.
 
-func safeCheck[T any](check Check[T], value T) (reason string, failed bool) {
-    defer func() {
-        if crash := recover(); crash != nil {
-            reason, failed = fmt.Sprintf("crash: %v", crash), true
-        }
-    }()
-    err := check(value)
-    switch {
-    case err == nil:
-        return "", false
-    case errors.Is(err, ErrInvalidArgument), errors.Is(err, ErrIllegalState):
-        return "", false
-    default:
-        return err.Error(), true
-    }
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The ledger and the processor's record
+
+`Ledger.Post` returns `ErrInvalidArgument` for a negative amount and otherwise moves the amount with `mustMinus`/`mustPlus`; `CreditOnly` is the unbalanced write only `Bugs.UnbalancedFee` can reach. `Total` sums over the `accounts` slice so iteration order is fixed.
+
+```go
+type Ledger struct {
+	balances map[Account]Money
+	Postings []string
+}
+
+func NewLedger(currency Currency) *Ledger {
+	l := &Ledger{balances: map[Account]Money{}}
+	for _, a := range accounts {
+		l.balances[a] = Zero(currency)
+	}
+	return l
+}
+
+func (l *Ledger) Post(from, to Account, amount Money, memo string) error {
+	if amount.IsNegative() {
+		return fmt.Errorf("%w: posting amount must not be negative: %v", ErrInvalidArgument, amount)
+	}
+	l.balances[from] = mustMinus(l.balances[from], amount)
+	l.balances[to] = mustPlus(l.balances[to], amount)
+	l.Postings = append(l.Postings, fmt.Sprintf("%s: %v -> %v %v", memo, from, to, amount))
+	return nil
+}
+
+// CreditOnly is a deliberately unbalanced write, reachable only through Bugs.UnbalancedFee.
+func (l *Ledger) CreditOnly(to Account, amount Money, memo string) {
+	l.balances[to] = mustPlus(l.balances[to], amount)
+	l.Postings = append(l.Postings, fmt.Sprintf("%s: (nothing) -> %v %v", memo, to, amount))
+}
+
+func (l *Ledger) Balance(a Account) Money { return l.balances[a] }
+
+func (l *Ledger) Total() Money {
+	t := Zero(l.balances[CUSTOMER].Currency)
+	for _, a := range accounts {
+		t = mustPlus(t, l.balances[a])
+	}
+	return t
+}
+
+type ProcessorPayment struct {
+	Authorized, Captured, Refunded Money
+	Voided                         bool
 }
 ```
 
-Differences, all in `code/go/main.go`, `javarandom.go`, `money.go`, and `main_test.go`:
+#### Step 2: The fake processor
 
-- **The seeds are portable.** `javarandom.go` is `java.util.Random` bit for bit (the 48-bit LCG, `nextInt(bound)` with its rejection loop, `nextDouble` from 53 bits), so seed 42 generates the same 500 command sequences, fails at the same trial, and shrinks in the same 67 steps as the Java demo. `math/rand` would have been deterministic too, but its counterexamples would not match the ones printed in this lesson.
-- **Exceptions become classified errors.** The service returns `(bool, error)`; `ErrInvalidArgument` and `ErrIllegalState` are the deliberate rejections, `ErrProcessorTimeout` is caught inside the service and turns into `UNKNOWN`, and a processor 5xx is `ErrProcessorError`, which wraps `ErrIllegalState` so it is skipped by the scenario runner exactly as the Java `IllegalStateException` was. The property `Check` returns an `error` where Java returned a nullable `String`; a `panic` inside a check is the "crash" case, recovered by `safeCheck`.
-- **Generics replace `Gen<T>`.** `Gen[T]` is an interface with `Generate` and `Shrink`; `Longs`, `OneOf[T comparable]`, and `Lists[T]` are small generic structs, and `ForAll[T]` returns a `PropertyResult[T]` whose `Counterexample` is a nil pointer when the property passed. `formatValue` prints slices as `[a, b, c]` so the summaries match Java's `List.toString()`.
-- **Money is the Phase 10 type.** `BasisPoints` is `Times(bps, 10_000, HalfEven)` on the canonical `Money`, so the 2.9 percent fee rounds half-even through the same `DivideRounded` the ledger lessons use, and the ledger's own postings use `mustPlus`/`mustMinus` because every amount in one payment shares a currency by construction.
+`Call` returns `(bool, error)`: the two timeouts return the same `ErrProcessorTimeout` and differ only in whether `apply()` ran first; `ERROR` is `ErrProcessorError`. Each operation passes a closure that mutates `Record`.
+
+```go
+type FakeProcessor struct {
+	script []ProcessorBehaviour
+	cursor int
+	Record *ProcessorPayment
+	Calls  int
+}
+
+func NewFakeProcessor(currency Currency) *FakeProcessor {
+	z := Zero(currency)
+	return &FakeProcessor{Record: &ProcessorPayment{z, z, z, false}}
+}
+
+func (p *FakeProcessor) Script(behaviours ...ProcessorBehaviour) *FakeProcessor {
+	p.script = append(p.script, behaviours...)
+	return p
+}
+
+func (p *FakeProcessor) next() ProcessorBehaviour {
+	p.Calls++
+	if p.cursor < len(p.script) {
+		b := p.script[p.cursor]
+		p.cursor++
+		return b
+	}
+	return APPROVE
+}
+
+// Call applies the operation if the processor would, then returns or fails according to the behaviour.
+func (p *FakeProcessor) Call(op string, apply func()) (bool, error) {
+	switch p.next() {
+	case APPROVE:
+		apply()
+		return true, nil
+	case DECLINE:
+		return false, nil
+	case TIMEOUT_AFTER_APPLY:
+		apply()
+		return false, fmt.Errorf("%w: timed out waiting for processor response to %s", ErrProcessorTimeout, op)
+	case TIMEOUT_BEFORE_APPLY:
+		return false, fmt.Errorf("%w: timed out waiting for processor response to %s", ErrProcessorTimeout, op)
+	default: // ERROR
+		return false, fmt.Errorf("%w: processor 5xx on %s", ErrProcessorError, op)
+	}
+}
+
+func (p *FakeProcessor) Authorize(amount Money) (bool, error) {
+	return p.Call("authorize", func() { p.Record.Authorized = amount })
+}
+func (p *FakeProcessor) Capture(amount Money) (bool, error) {
+	return p.Call("capture", func() { p.Record.Captured = mustPlus(p.Record.Captured, amount) })
+}
+func (p *FakeProcessor) Refund(amount Money) (bool, error) {
+	return p.Call("refund", func() { p.Record.Refunded = mustPlus(p.Record.Refunded, amount) })
+```
+
+#### Step 3: The service, with bugs on switches
+
+`Capture` returns the rejection errors instead of throwing, posts on a timeout only under `PostOnTimeout`, and hands the error to `markUnknown`, which converts a timeout into `UNKNOWN` and passes any other error through. `postCapture` is where `UnbalancedFee` selects `CreditOnly`.
+
+```go
+func (s *PaymentService) markUnknown(op string, err error) (bool, error) {
+	if !errors.Is(err, ErrProcessorTimeout) {
+		return false, err
+	}
+	s.State = UNKNOWN
+	s.LastUnknownOp = op
+	return false, nil
+}
+
+func (s *PaymentService) Capture(amount Money) (bool, error) {
+	if err := requirePositive(amount); err != nil {
+		return false, err
+	}
+	if s.State != AUTHORIZED && s.State != PARTIALLY_CAPTURED {
+		return false, fmt.Errorf("%w: capture in state %v", ErrIllegalState, s.State)
+	}
+	if !s.Bugs.AllowOverCapture && mustPlus(s.Captured, amount).Compare(s.Authorized) > 0 {
+		return false, fmt.Errorf("%w: capture %v exceeds remaining authorization %v", ErrInvalidArgument, amount, mustMinus(s.Authorized, s.Captured))
+	}
+	ok, err := s.Processor.Capture(amount)
+	if err != nil {
+		if errors.Is(err, ErrProcessorTimeout) && s.Bugs.PostOnTimeout {
+			s.postCapture(amount) // the bug: assuming a timeout meant success
+		}
+		return s.markUnknown(fmt.Sprintf("capture:%d", amount.MinorUnits), err)
+	}
+	if !ok {
+		return false, nil
+	}
+	s.postCapture(amount)
+	return true, nil
+}
+
+func (s *PaymentService) postCapture(amount Money) {
+	fee := must(amount.BasisPoints(FEE_BPS))
+	mustOK(s.Ledger.Post(CUSTOMER, MERCHANT, amount, "capture"))
+	if s.Bugs.UnbalancedFee {
+		s.Ledger.CreditOnly(PLATFORM_FEES, fee, "fee")
+	} else {
+		mustOK(s.Ledger.Post(MERCHANT, PLATFORM_FEES, fee, "fee"))
+	}
+	s.Captured = mustPlus(s.Captured, amount)
+	if s.Captured.Compare(s.Authorized) >= 0 {
+		s.State = CAPTURED
+	} else {
+		s.State = PARTIALLY_CAPTURED
+	}
+}
+```
+
+#### Step 4: Reconcile
+
+`Reconcile` posts whatever the processor's record has that the ledger lacks and recomputes the state in a tagless `switch`; like the Java, it only ever adds.
+
+```go
+func (s *PaymentService) Reconcile() {
+	if s.State != UNKNOWN {
+		return
+	}
+	p := s.Processor.Record
+	if p.Authorized != s.Authorized {
+		s.Authorized = p.Authorized
+	}
+	if missingCapture := mustMinus(p.Captured, s.Captured); missingCapture.MinorUnits > 0 {
+		s.postCapture(missingCapture)
+	}
+	if missingRefund := mustMinus(p.Refunded, s.Refunded); missingRefund.MinorUnits > 0 {
+		s.postRefund(missingRefund)
+	}
+	switch {
+	case p.Voided:
+		s.State = VOIDED
+	case s.Captured.IsZero():
+		if s.Authorized.IsZero() {
+			s.State = NEW
+		} else {
+			s.State = AUTHORIZED
+		}
+	case s.Captured.Compare(s.Authorized) >= 0:
+		s.State = CAPTURED
+	default:
+		s.State = PARTIALLY_CAPTURED
+	}
+	s.LastUnknownOp = ""
+}
+```
+
+#### Step 5: Generators
+
+`Longs` returns a `Gen[int64]` backed by the small `longGen` struct; `Shrink` builds the same candidate list as Java (`lo`, then halving steps, then `v-1`) and uses `slices.Contains` to avoid the duplicate.
+
+```go
+func Longs(lo, hi int64) Gen[int64] { return longGen{lo, hi} }
+
+type longGen struct{ lo, hi int64 }
+
+func (g longGen) Generate(rng *JavaRandom) int64 {
+	return g.lo + int64(rng.NextDouble()*float64(g.hi-g.lo+1))
+}
+
+func (g longGen) Shrink(v int64) []int64 {
+	out := []int64{}
+	if v <= g.lo {
+		return out
+	}
+	out = append(out, g.lo)
+	d := v - g.lo
+	for step := d / 2; step > 0; step /= 2 {
+		out = append(out, v-step)
+	}
+	if !slices.Contains(out, v-1) {
+		out = append(out, v-1)
+	}
+	return out
+}
+```
+
+#### Step 6: forAll
+
+`ForAll[T]` is the same generate-check-shrink loop. `safeCheck` recovers a panic as a crash, treats `ErrInvalidArgument`/`ErrIllegalState` as "rejected on purpose", and reports any other error's text as the violation.
+
+```go
+type Check[T any] func(value T) error
+
+// ForAll runs check on trials generated values, shrinking the first counterexample it finds.
+func ForAll[T any](name string, gen Gen[T], check Check[T], seed int64, trials int) PropertyResult[T] {
+	rng := NewJavaRandom(seed)
+	for i := 1; i <= trials; i++ {
+		value := gen.Generate(rng)
+		reason, failed := safeCheck(check, value)
+		if !failed {
+			continue
+		}
+		current, currentReason := value, reason
+		steps := 0
+		progressed := true
+		for progressed && steps < MAX_SHRINK_STEPS {
+			progressed = false
+			for _, candidate := range gen.Shrink(current) {
+				steps++
+				if r, f := safeCheck(check, candidate); f {
+					current, currentReason, progressed = candidate, r, true
+					break
+				}
+				if steps >= MAX_SHRINK_STEPS {
+					break
+				}
+			}
+		}
+		return PropertyResult[T]{name, false, seed, i, &Counterexample[T]{value, current, steps, currentReason}}
+	}
+	return PropertyResult[T]{name, true, seed, trials, nil}
+}
+
+// safeCheck classifies the outcome: (reason, true) on a violation or a crash, ("", false) when the
+// property holds or the input was rejected on purpose.
+func safeCheck[T any](check Check[T], value T) (reason string, failed bool) {
+	defer func() {
+		if crash := recover(); crash != nil {
+			reason, failed = fmt.Sprintf("crash: %v", crash), true
+		}
+	}()
+	err := check(value)
+	switch {
+	case err == nil:
+		return "", false
+	case errors.Is(err, ErrInvalidArgument), errors.Is(err, ErrIllegalState):
+		return "", false // the system rejected the input on purpose: the property is about accepted inputs
+	default:
+		return err.Error(), true
+	}
+}
+```
+
+#### Step 7: The scenario runner and the headline property
+
+`RunScenario` dispatches on the command kind, classifies the returned error (a rejection is logged and skipped; anything else is a bug and panics), and checks the invariants after every command. `InvariantsHold` wraps the runner's violation string in an `error` for `ForAll`.
+
+```go
+func RunScenario(scenario Scenario, bugs Bugs) ScenarioRun {
+	processor := NewFakeProcessor(USD)
+	service := NewPaymentService(USD, processor, bugs)
+	log := []string{}
+	for _, c := range scenario.Commands {
+		processor.Script(c.Behaviour)
+		amount := OfMinor(c.AmountMinor, USD)
+		var ok bool
+		var err error
+		switch c.Kind {
+		case AUTHORIZE:
+			ok, err = service.Authorize(amount)
+		case CAPTURE:
+			ok, err = service.Capture(amount)
+		case REFUND:
+			ok, err = service.Refund(amount)
+		case VOID:
+			ok, err = service.VoidAuthorization()
+		default:
+			service.Reconcile()
+			ok = true
+		}
+		outcome := "declined/unknown"
+		switch {
+		case err != nil && (errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrIllegalState)):
+			outcome = "rejected: " + err.Error()
+		case err != nil:
+			panic(err) // nothing else can come back from the service; Java would have let it propagate too
+		case ok:
+			outcome = "ok"
+		}
+		log = append(log, fmt.Sprintf("%v -> %s [%v]", c, outcome, service.State))
+		if violation := CheckInvariants(service); violation != "" {
+			return ScenarioRun{scenario, service, log, fmt.Sprintf("%s after %v", violation, c)}
+		}
+	}
+	return ScenarioRun{scenario, service, log, ""}
+}
+
+// InvariantsHold is the property: no command sequence, with any processor behaviour, violates the invariants.
+func InvariantsHold(bugs Bugs, seed int64, trials, maxLen int) PropertyResult[[]Command] {
+	return ForAll("invariants hold under "+bugs.String(), Sequences(maxLen), func(cmds []Command) error {
+		if v := RunScenario(Scenario{"generated", cmds}, bugs).Violation; v != "" {
+			return errors.New(v)
+		}
+		return nil
+	}, seed, trials)
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/14-testing-payment-systems/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run; the integer property at the end reads:
+
+```console
+== Shrinking a plain integer property: 'truncating the 2.9% fee equals HALF_EVEN' ==
+truncated fee == rounded fee: FAILED at trial 2 (seed 7)
+  original: 749170
+  shrunk (59 steps): 18
+  reason: n=18: truncated 0 != rounded 1
 ```
 
 ## Use It

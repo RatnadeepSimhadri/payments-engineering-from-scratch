@@ -396,23 +396,266 @@ after removing every even key: size=50000 height=16, invariants hold
 
 ### In Python
 
-`code/python/main.py` has the same classes (`NaiveBst`, `AvlTree`, `RedBlackTree`) with the same methods in snake_case (`rotate_right`, `ceiling_key`, `check_invariants`, `black_height`). Four things differ:
+`code/python/main.py` has the same classes (`NaiveBst`, `AvlTree`, `RedBlackTree`) with the same methods in snake_case (`rotate_right`, `ceiling_key`, `check_invariants`, `black_height`). Four things differ. **Comparison operators instead of `compareTo`:** keys are compared with `<` and `==`, so any type with a total order (int, str, tuple) works without a `Comparable` bound. `get` returns `None` for a missing key, and `contains_key` is `get(key) is not None`, which mirrors Java's `get(key) != null` (and its blind spot for stored `None` values). **`None` stands in for `null` leaves:** `AvlTree.node_height(None)` is 0 and `is_red(None)` is `False`, so property 3 (null leaves are black) is still encoded without sentinel nodes. The invariant checkers raise `IllegalStateError`, the Python counterpart of `IllegalStateException`. **Recursion limit on the naive tree:** Python stops at about 1,000 nested calls, and the degenerate BST of 2,000 sorted keys is 2,000 levels deep, so `NaiveBst.height` walks level by level instead of recursing; the balanced trees keep the recursive `put`, `remove`, and `verify` because their depth is `O(log n)`. **Same shuffle, same numbers:** the random-order demo and tests use `JavaRandom`, a bit-exact port of `java.util.Random`, and `java_shuffle`, which is `Collections.shuffle` (swap `i - 1` with `nextInt(i)` from the end). Seed 2024 produces the same permutation as Java, so heights, rotation counts, and recoloring counts match line for line. `fmt_fixed` reproduces Java's half-up `%.1f`.
 
-- **Comparison operators instead of `compareTo`.** Keys are compared with `<` and `==`, so any type with a total order (int, str, tuple) works without a `Comparable` bound. `get` returns `None` for a missing key, and `contains_key` is `get(key) is not None`, which mirrors Java's `get(key) != null` (and its blind spot for stored `None` values).
-- **`None` stands in for `null` leaves.** `AvlTree.node_height(None)` is 0 and `is_red(None)` is `False`, so property 3 (null leaves are black) is still encoded without sentinel nodes. The invariant checkers raise `IllegalStateError`, the Python counterpart of `IllegalStateException`.
-- **Recursion limit on the naive tree.** Python stops at about 1,000 nested calls, and the degenerate BST of 2,000 sorted keys is 2,000 levels deep, so `NaiveBst.height` walks level by level instead of recursing. The balanced trees keep the recursive `put`, `remove`, and `verify` because their depth is `O(log n)`:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The naive tree, to measure the failure
+
+The iterative `put` is the Phase 1 BST with `<` in place of `compareTo`. `height` is the one method that had to change shape: a recursive height on a 2,000-deep chain would exceed CPython's recursion limit, so it walks the tree level by level with a list comprehension and counts the levels.
 
 ```python
-def height(self) -> int:
-    level = [self._root] if self._root is not None else []
-    h = 0
-    while level:
-        h += 1
-        level = [c for n in level for c in (n.left, n.right) if c is not None]
-    return h
+    def put(self, key: K, value: V) -> None:
+        if self._root is None:
+            self._root = NaiveBst.Node(key, value)
+            self._size += 1
+            return
+        cur = self._root
+        while True:
+            if key == cur.key:
+                cur.value = value
+                return
+            nxt = cur.left if key < cur.key else cur.right
+            if nxt is None:
+                if key < cur.key:
+                    cur.left = NaiveBst.Node(key, value)
+                else:
+                    cur.right = NaiveBst.Node(key, value)
+                self._size += 1
+                return
+            cur = nxt
+
+    def height(self) -> int:
+        """Iterative (level by level): a degenerate tree of 2,000 nodes would blow Python's recursion limit."""
+        level = [self._root] if self._root is not None else []
+        h = 0
+        while level:
+            h += 1
+            level = [c for n in level for c in (n.left, n.right) if c is not None]
+        return h
 ```
 
-- **Same shuffle, same numbers.** The random-order demo and tests use `JavaRandom`, a bit-exact port of `java.util.Random`, and `java_shuffle`, which is `Collections.shuffle` (swap `i - 1` with `nextInt(i)` from the end). Seed 2024 produces the same permutation as Java, so heights, rotation counts, and recoloring counts match line for line. `fmt_fixed` reproduces Java's half-up `%.1f`.
+#### Step 2: AVL nodes, heights, and the two rotations
+
+`AvlNode` uses `__slots__` so 100,000 nodes stay compact. The height helpers are static methods that accept `None`; `rotate_right` returns the new subtree root and updates `y` before `x`, in that order, because `x` now reads `y`'s height.
+
+```python
+class AvlNode:
+    __slots__ = ("key", "value", "height", "left", "right")
+
+    def __init__(self, key: Any, value: Any) -> None:
+        self.key = key
+        self.value = value
+        self.height = 1
+        self.left: Optional[AvlNode] = None
+        self.right: Optional[AvlNode] = None
+```
+
+```python
+    @staticmethod
+    def node_height(n: Optional[AvlNode]) -> int:
+        return 0 if n is None else n.height
+
+    @staticmethod
+    def balance_factor(n: Optional[AvlNode]) -> int:
+        return 0 if n is None else AvlTree.node_height(n.left) - AvlTree.node_height(n.right)
+
+    def rotate_right(self, y: AvlNode) -> AvlNode:
+        """y's left child x becomes the subtree root; x's right subtree moves under y."""
+        x = y.left
+        y.left = x.right
+        x.right = y
+        self._update(y)
+        self._update(x)
+        self._rotations += 1
+        return x
+```
+
+#### Step 3: The four cases in one method
+
+`_rebalance` and `_put` are line-for-line ports; the three-way `compareTo` branch becomes `<`, `>`, and an `else` for equality. The recursive `_put` returns the (possibly new) subtree root that the caller stores into its own pointer.
+
+```python
+    def _rebalance(self, n: AvlNode) -> AvlNode:
+        """Restore |balance| <= 1 at n. LL and RR need one rotation, LR and RL need two."""
+        self._update(n)
+        bf = self.balance_factor(n)
+        if bf > 1:
+            if self.balance_factor(n.left) < 0:
+                n.left = self.rotate_left(n.left)    # LR: straighten first
+            return self.rotate_right(n)              # LL
+        if bf < -1:
+            if self.balance_factor(n.right) > 0:
+                n.right = self.rotate_right(n.right)  # RL: straighten first
+            return self.rotate_left(n)                # RR
+        return n
+
+    def _put(self, n: Optional[AvlNode], key: K, value: V) -> AvlNode:
+        if n is None:
+            self._size += 1
+            return AvlNode(key, value)
+        if key < n.key:
+            n.left = self._put(n.left, key, value)
+        elif key > n.key:
+            n.right = self._put(n.right, key, value)
+        else:
+            n.value = value
+            return n
+        return self._rebalance(n)
+```
+
+#### Step 4: Delete by successor, then rebalance the path
+
+The same splice-or-replace logic: a node with at most one child is returned as its other child; a node with two is overwritten with its in-order successor, which is then removed from the right subtree. Every frame on the way back up ends in `_rebalance`.
+
+```python
+    def _remove(self, n: Optional[AvlNode], key: K) -> Optional[AvlNode]:
+        if n is None:
+            return None
+        if key < n.key:
+            n.left = self._remove(n.left, key)
+        elif key > n.key:
+            n.right = self._remove(n.right, key)
+        else:
+            if n.left is None or n.right is None:     # zero or one child: splice out
+                self._size -= 1
+                return n.right if n.left is None else n.left
+            successor = n.right                       # two children: replace with in-order successor
+            while successor.left is not None:
+                successor = successor.left
+            n.key = successor.key
+            n.value = successor.value
+            n.right = self._remove(n.right, successor.key)
+        return self._rebalance(n)
+```
+
+#### Step 5: The invariant checker
+
+`verify` is a static method with `None` as the unbounded window edge, raising `IllegalStateError` on the first violation. The tests hand it deliberately broken subtrees (a stale height, a disordered key, an unbalanced chain) to prove it fails when it should.
+
+```python
+    @staticmethod
+    def verify(n: Optional[AvlNode], lo: Any, hi: Any) -> int:
+        """BST order, stored height correct, |balance| <= 1. Raises IllegalStateError on the first violation."""
+        if n is None:
+            return 0
+        if lo is not None and n.key <= lo:
+            raise IllegalStateError(f"BST order violated at {n.key}")
+        if hi is not None and n.key >= hi:
+            raise IllegalStateError(f"BST order violated at {n.key}")
+        hl = AvlTree.verify(n.left, lo, n.key)
+        hr = AvlTree.verify(n.right, n.key, hi)
+        if n.height != 1 + max(hl, hr):
+            raise IllegalStateError(f"stale height at {n.key}")
+        if abs(hl - hr) > 1:
+            raise IllegalStateError(f"AVL balance violated at {n.key}")
+        return n.height
+```
+
+#### Step 6: Ordered operations
+
+`ceiling_key` returns `None` when nothing is at or above the key. `_range` prunes with the same three tests; the chained `lo <= n.key <= hi` is the inclusion check.
+
+```python
+    def ceiling_key(self, key: K) -> Optional[K]:
+        """Smallest key >= key, or None: the operation a hash map cannot do."""
+        cur, best = self._root, None
+        while cur is not None:
+            if key == cur.key:
+                return cur.key
+            if key < cur.key:
+                best = cur.key
+                cur = cur.left
+            else:
+                cur = cur.right
+        return best
+
+    def _range(self, n: Optional[AvlNode], lo: K, hi: K, out: list) -> None:
+        if n is None:
+            return
+        if lo < n.key:
+            self._range(n.left, lo, hi, out)
+        if lo <= n.key <= hi:
+            out.append(n.key)
+        if hi > n.key:
+            self._range(n.right, lo, hi, out)
+```
+
+#### Step 7: Red-black nodes with parent pointers and the fix-up
+
+`is_red(None)` is `False`, which encodes property 3 without sentinels. The loop is the Java fix-up with both mirror halves written out and the recoloring counter kept so the demo's `recolorings=` line matches. `is` compares node identity, the Python form of `p == g.left` on references.
+
+```python
+    def _insert_fixup(self, z: RbNode) -> None:
+        """Case 1 uncle red: recolor, move up. Case 2 inner grandchild: rotate parent. Case 3: recolor, rotate g."""
+        while is_red(z.parent):
+            p = z.parent
+            g = p.parent  # exists: a red parent is never the root
+            if p is g.left:
+                uncle = g.right
+                if is_red(uncle):                                  # case 1
+                    p.color = BLACK
+                    uncle.color = BLACK
+                    g.color = RED
+                    self._recolorings += 3
+                    z = g
+                else:
+                    if z is p.right:                               # case 2 -> 3
+                        z = p
+                        self._rotate_left(z)
+                        p = z.parent
+                    p.color = BLACK                                # case 3
+                    g.color = RED
+                    self._recolorings += 2
+                    self._rotate_right(g)
+            else:
+                uncle = g.left
+                if is_red(uncle):
+                    p.color = BLACK
+                    uncle.color = BLACK
+                    g.color = RED
+                    self._recolorings += 3
+                    z = g
+                else:
+                    if z is p.left:
+                        z = p
+                        self._rotate_right(z)
+                        p = z.parent
+                    p.color = BLACK
+                    g.color = RED
+                    self._recolorings += 2
+                    self._rotate_left(g)
+        if self._root.color == RED:
+            self._root.color = BLACK
+            self._recolorings += 1
+```
+
+#### Step 8: Verifying the five properties
+
+A `None` leaf returns black height 1. The parent-link check is done on both children, and the black heights of the two subtrees must agree at every node before the node's own colour is added.
+
+```python
+    def _verify(self, n: Optional[RbNode], lo: Any, hi: Any) -> int:
+        if n is None:
+            return 1  # null leaves count as one black
+        if lo is not None and n.key <= lo:
+            raise IllegalStateError(f"BST order violated at {n.key}")
+        if hi is not None and n.key >= hi:
+            raise IllegalStateError(f"BST order violated at {n.key}")
+        if is_red(n) and (is_red(n.left) or is_red(n.right)):
+            raise IllegalStateError(f"red node with red child at {n.key}")
+        if n.left is not None and n.left.parent is not n:
+            raise IllegalStateError(f"broken parent link at {n.left.key}")
+        if n.right is not None and n.right.parent is not n:
+            raise IllegalStateError(f"broken parent link at {n.right.key}")
+        bl = self._verify(n.left, lo, n.key)
+        br = self._verify(n.right, n.key, hi)
+        if bl != br:
+            raise IllegalStateError(f"black height differs at {n.key}: {bl} vs {br}")
+        return bl + (1 if n.color == BLACK else 0)
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/03-systems-data-structures/03-balanced-trees/code/python
@@ -420,28 +663,360 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Sorted inserts: what a plain BST does with timestamps ==
+naive BST, 2000 sorted keys: height=2000 (a linked list; log2(2000)=11)
+
+== AVL vs red-black on 100000 sorted keys (expiry timestamps arriving in order) ==
+AVL        height=17  bound=23.6  rotations=99983
+red-black  height=31  bound=33.2  rotations=99969  recolorings=499846  black-height=16
+```
+
+The random-order section prints the same heights and counts as Java because `java_shuffle` over `JavaRandom(2024)` is the same permutation.
+
 ### In Go
 
-`code/go/main.go` has the same three types (`NaiveBst`, `AvlTree`, `RedBlackTree`) with the same methods in exported CamelCase (`RotateRight`, `CeilingKey`, `CheckInvariants`, `BlackHeight`). Four things differ:
+`code/go/main.go` has the same three types (`NaiveBst`, `AvlTree`, `RedBlackTree`) with the same methods in exported CamelCase (`RotateRight`, `CeilingKey`, `CheckInvariants`, `BlackHeight`). Four things differ. **Generics with `cmp.Ordered` instead of `Comparable`:** `AvlTree[K cmp.Ordered, V any]` compares keys with `cmp.Compare(key, n.Key)`, which returns -1, 0, or 1 exactly like `compareTo`, so every `c < 0` / `c > 0` branch reads the same as the Java. `nil` stands in for `null` leaves: `avlHeight(nil)` is 0 and `isRed(nil)` is false, so property 3 needs no sentinel nodes. **Absence is a second return value:** Go has no `null` for an `int` value, so `Get` returns `(V, bool)` and `CeilingKey` returns `(K, bool)`; `ContainsKey` is the `bool` half of `Get`. `Verify` takes `*K` bounds so "unbounded" is `nil` rather than a null key. **Invariant violations are errors, not exceptions:** `CheckInvariants` returns `error` instead of throwing `IllegalStateException`; every violation wraps the sentinel `ErrInvariantViolated`, so the corruption tests use `errors.Is`. The `AvlNode` fields are exported for exactly that reason: the tests hand-build an unbalanced chain, a stale height, and a disordered node and check that `Verify` names each one. **Same shuffle, same numbers:** the random-order demo and tests use `JavaRandom` (`javarandom.go`), a bit-exact port of `java.util.Random`, and its `Shuffle`, which is `Collections.shuffle`. Seed 2024 produces the same permutation as Java, so heights, rotation counts, and recoloring counts match line for line.
 
-- **Generics with `cmp.Ordered` instead of `Comparable`.** `AvlTree[K cmp.Ordered, V any]` compares keys with `cmp.Compare(key, n.Key)`, which returns -1, 0, or 1 exactly like `compareTo`, so every `c < 0` / `c > 0` branch reads the same as the Java. `nil` stands in for `null` leaves: `avlHeight(nil)` is 0 and `isRed(nil)` is false, so property 3 (null leaves are black) needs no sentinel nodes.
-- **Absence is a second return value.** Go has no `null` for an `int` value, so `Get` returns `(V, bool)` and `CeilingKey` returns `(K, bool)`; `ContainsKey` is the `bool` half of `Get`. `Verify` takes `*K` bounds so "unbounded" is `nil` rather than a null key.
-- **Invariant violations are errors, not exceptions.** `CheckInvariants` returns `error` instead of throwing `IllegalStateException`; every violation wraps the sentinel `ErrInvariantViolated`, so the corruption tests use `errors.Is`. The `AvlNode` fields are exported for exactly that reason: the tests hand-build an unbalanced chain, a stale height, and a disordered node and check that `Verify` names each one:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The naive tree, to measure the failure
+
+The same iterative insert with `cmp.Compare` for the three-way comparison. A goroutine stack grows on demand, so the recursive `naiveHeight` survives the 2,000-deep chain; the test still asserts `Height() == 2000` so the degenerate shape is a number, not a footnote.
 
 ```go
-func (t *AvlTree[K, V]) CheckInvariants() error {
-    _, err := Verify(t.root, nil, nil)
-    return err
+func (t *NaiveBst[K, V]) Put(key K, value V) {
+	if t.root == nil {
+		t.root = &naiveNode[K, V]{key: key, value: value}
+		t.size++
+		return
+	}
+	cur := t.root
+	for {
+		c := cmp.Compare(key, cur.key)
+		if c == 0 {
+			cur.value = value
+			return
+		}
+		next := cur.right
+		if c < 0 {
+			next = cur.left
+		}
+		if next == nil {
+			if c < 0 {
+				cur.left = &naiveNode[K, V]{key: key, value: value}
+			} else {
+				cur.right = &naiveNode[K, V]{key: key, value: value}
+			}
+			t.size++
+			return
+		}
+		cur = next
+	}
 }
 ```
 
-- **Same shuffle, same numbers.** The random-order demo and tests use `JavaRandom` (`javarandom.go`), a bit-exact port of `java.util.Random`, and its `Shuffle`, which is `Collections.shuffle` (swap `i - 1` with `nextInt(i)` from the end). Seed 2024 produces the same permutation as Java, so heights, rotation counts, and recoloring counts match line for line.
+#### Step 2: AVL nodes, heights, and the two rotations
+
+`AvlNode` exports its fields so the tests can corrupt a tree on purpose. `avlHeight` and `BalanceFactor` are generic package-level functions that accept `nil`; `update` uses the built-in `max`. `RotateRight` is the Java method with `t.rotations++` for the demo counter.
+
+```go
+type AvlNode[K cmp.Ordered, V any] struct {
+	Key         K
+	Value       V
+	Height      int
+	Left, Right *AvlNode[K, V]
+}
+
+func avlHeight[K cmp.Ordered, V any](n *AvlNode[K, V]) int {
+	if n == nil {
+		return 0
+	}
+	return n.Height
+}
+
+func BalanceFactor[K cmp.Ordered, V any](n *AvlNode[K, V]) int {
+	if n == nil {
+		return 0
+	}
+	return avlHeight(n.Left) - avlHeight(n.Right)
+}
+
+func update[K cmp.Ordered, V any](n *AvlNode[K, V]) {
+	n.Height = 1 + max(avlHeight(n.Left), avlHeight(n.Right))
+}
+
+// RotateRight around y: y's left child x becomes the subtree root; x's right subtree moves under y.
+func (t *AvlTree[K, V]) RotateRight(y *AvlNode[K, V]) *AvlNode[K, V] {
+	x := y.Left
+	y.Left = x.Right
+	x.Right = y
+	update(y)
+	update(x)
+	t.rotations++
+	return x
+}
+```
+
+#### Step 3: The four cases in one method
+
+`rebalance` is unchanged. The recursive `put` uses a tagless `switch` on `cmp.Compare`, with the equal case updating in place and returning early so no rebalance runs.
+
+```go
+func (t *AvlTree[K, V]) rebalance(n *AvlNode[K, V]) *AvlNode[K, V] {
+	update(n)
+	bf := BalanceFactor(n)
+	if bf > 1 {
+		if BalanceFactor(n.Left) < 0 {
+			n.Left = t.RotateLeft(n.Left) // LR: straighten first
+		}
+		return t.RotateRight(n) // LL
+	}
+	if bf < -1 {
+		if BalanceFactor(n.Right) > 0 {
+			n.Right = t.RotateRight(n.Right) // RL: straighten first
+		}
+		return t.RotateLeft(n) // RR
+	}
+	return n
+}
+
+func (t *AvlTree[K, V]) put(n *AvlNode[K, V], key K, value V) *AvlNode[K, V] {
+	if n == nil {
+		t.size++
+		return NewAvlNode(key, value)
+	}
+	c := cmp.Compare(key, n.Key)
+	switch {
+	case c < 0:
+		n.Left = t.put(n.Left, key, value)
+	case c > 0:
+		n.Right = t.put(n.Right, key, value)
+	default:
+		n.Value = value
+		return n
+	}
+	return t.rebalance(n)
+}
+```
+
+#### Step 4: Delete by successor, then rebalance the path
+
+The `default` arm of the switch holds the deletion proper: splice out a node with at most one child, or copy the in-order successor in and remove it from the right subtree. The ternary becomes an `if`.
+
+```go
+func (t *AvlTree[K, V]) remove(n *AvlNode[K, V], key K) *AvlNode[K, V] {
+	if n == nil {
+		return nil
+	}
+	c := cmp.Compare(key, n.Key)
+	switch {
+	case c < 0:
+		n.Left = t.remove(n.Left, key)
+	case c > 0:
+		n.Right = t.remove(n.Right, key)
+	default:
+		if n.Left == nil || n.Right == nil { // zero or one child: splice out
+			t.size--
+			if n.Left == nil {
+				return n.Right
+			}
+			return n.Left
+		}
+		successor := n.Right // two children: replace with in-order successor
+		for successor.Left != nil {
+			successor = successor.Left
+		}
+		n.Key = successor.Key
+		n.Value = successor.Value
+		n.Right = t.remove(n.Right, successor.Key) // the successor has no left child, so this splices
+	}
+	return t.rebalance(n)
+}
+```
+
+#### Step 5: The invariant checker
+
+`Verify` returns `(height, error)` and takes `*K` bounds so `nil` means unbounded; `&n.Key` passes the current key down as the new bound. Each violation wraps `ErrInvariantViolated`, and the recursion stops at the first error.
+
+```go
+func Verify[K cmp.Ordered, V any](n *AvlNode[K, V], lo, hi *K) (int, error) {
+	if n == nil {
+		return 0, nil
+	}
+	if lo != nil && n.Key <= *lo {
+		return 0, fmt.Errorf("%w: BST order violated at %v", ErrInvariantViolated, n.Key)
+	}
+	if hi != nil && n.Key >= *hi {
+		return 0, fmt.Errorf("%w: BST order violated at %v", ErrInvariantViolated, n.Key)
+	}
+	hl, err := Verify(n.Left, lo, &n.Key)
+	if err != nil {
+		return 0, err
+	}
+	hr, err := Verify(n.Right, &n.Key, hi)
+	if err != nil {
+		return 0, err
+	}
+	if n.Height != 1+max(hl, hr) {
+		return 0, fmt.Errorf("%w: stale height at %v", ErrInvariantViolated, n.Key)
+	}
+	if abs(hl-hr) > 1 {
+		return 0, fmt.Errorf("%w: AVL balance violated at %v", ErrInvariantViolated, n.Key)
+	}
+	return n.Height, nil
+}
+```
+
+#### Step 6: Ordered operations
+
+`CeilingKey` returns `(K, bool)` because a zero `K` is a legal key. `rangeInto` appends through a pointer to the output slice; `cmp.Ordered` keys compare directly with `<` and `<=`.
+
+```go
+func (t *AvlTree[K, V]) CeilingKey(key K) (K, bool) {
+	cur := t.root
+	var best K
+	found := false
+	for cur != nil {
+		c := cmp.Compare(key, cur.Key)
+		if c == 0 {
+			return cur.Key, true
+		}
+		if c < 0 {
+			best, found = cur.Key, true
+			cur = cur.Left
+		} else {
+			cur = cur.Right
+		}
+	}
+	return best, found
+}
+
+func (t *AvlTree[K, V]) rangeInto(n *AvlNode[K, V], lo, hi K, out *[]K) {
+	if n == nil {
+		return
+	}
+	if lo < n.Key {
+		t.rangeInto(n.Left, lo, hi, out)
+	}
+	if lo <= n.Key && hi >= n.Key {
+		*out = append(*out, n.Key)
+	}
+	if hi > n.Key {
+		t.rangeInto(n.Right, lo, hi, out)
+	}
+}
+```
+
+#### Step 7: Red-black nodes with parent pointers and the fix-up
+
+Parallel assignment makes each recolouring one line. `isRed(nil)` is false, pointers compare with `==`, and the in-place `rotateLeft`/`rotateRight` rewire `Parent` and `t.root` as the Java does. Both mirror halves are written out.
+
+```go
+func (t *RedBlackTree[K, V]) insertFixup(z *RbNode[K, V]) {
+	for isRed(z.Parent) {
+		p, g := z.Parent, z.Parent.Parent // g exists: a red parent is never the root
+		if p == g.Left {
+			uncle := g.Right
+			if isRed(uncle) { // case 1
+				p.Color, uncle.Color, g.Color = BLACK, BLACK, RED
+				t.recolorings += 3
+				z = g
+			} else {
+				if z == p.Right { // case 2 -> 3
+					z = p
+					t.rotateLeft(z)
+					p = z.Parent
+				}
+				p.Color, g.Color = BLACK, RED // case 3
+				t.recolorings += 2
+				t.rotateRight(g)
+			}
+		} else {
+			uncle := g.Left
+			if isRed(uncle) {
+				p.Color, uncle.Color, g.Color = BLACK, BLACK, RED
+				t.recolorings += 3
+				z = g
+			} else {
+				if z == p.Left {
+					z = p
+					t.rotateRight(z)
+					p = z.Parent
+				}
+				p.Color, g.Color = BLACK, RED
+				t.recolorings += 2
+				t.rotateLeft(g)
+			}
+		}
+	}
+	if t.root.Color == RED {
+		t.root.Color = BLACK
+		t.recolorings++
+	}
+}
+```
+
+#### Step 8: Verifying the five properties
+
+The same checks returning `(blackHeight, error)`: a `nil` leaf is one black, red-red and broken parent links are reported by name, and the two subtrees' black heights must agree before the node's own colour is counted.
+
+```go
+func (t *RedBlackTree[K, V]) verify(n *RbNode[K, V], lo, hi *K) (int, error) {
+	if n == nil {
+		return 1, nil // nil leaves count as one black
+	}
+	if lo != nil && n.Key <= *lo {
+		return 0, fmt.Errorf("%w: BST order violated at %v", ErrInvariantViolated, n.Key)
+	}
+	if hi != nil && n.Key >= *hi {
+		return 0, fmt.Errorf("%w: BST order violated at %v", ErrInvariantViolated, n.Key)
+	}
+	if isRed(n) && (isRed(n.Left) || isRed(n.Right)) {
+		return 0, fmt.Errorf("%w: red node with red child at %v", ErrInvariantViolated, n.Key)
+	}
+	if n.Left != nil && n.Left.Parent != n {
+		return 0, fmt.Errorf("%w: broken parent link at %v", ErrInvariantViolated, n.Left.Key)
+	}
+	if n.Right != nil && n.Right.Parent != n {
+		return 0, fmt.Errorf("%w: broken parent link at %v", ErrInvariantViolated, n.Right.Key)
+	}
+	bl, err := t.verify(n.Left, lo, &n.Key)
+	if err != nil {
+		return 0, err
+	}
+	br, err := t.verify(n.Right, &n.Key, hi)
+	if err != nil {
+		return 0, err
+	}
+	if bl != br {
+		return 0, fmt.Errorf("%w: black height differs at %v: %d vs %d", ErrInvariantViolated, n.Key, bl, br)
+	}
+	if n.Color == BLACK {
+		return bl + 1, nil
+	}
+	return bl, nil
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/03-systems-data-structures/03-balanced-trees/code/go
 go run .
 go test ./...
 ```
+
+```console
+== The operation a hash map cannot do: expiries between two instants ==
+expiries in [t0+10s, t0+20s): [11307, 16649, 18279, 18708]
+first expiry at or after t0+30s: +30738 ms
+
+== Deletes keep the AVL invariant ==
+after removing every even key: size=50000 height=16, invariants hold
+```
+
+The sorted-insert and random-order sections print the same heights, rotation counts, and recoloring counts as the Java run.
 
 ## Use It
 

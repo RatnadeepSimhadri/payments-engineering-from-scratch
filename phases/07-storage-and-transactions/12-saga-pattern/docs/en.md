@@ -415,27 +415,255 @@ Section 3 is the one to keep. The balance is 45.00 before recovery and 45.00 aft
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Two exception types, caught precisely:** `StepFailedException` and `CrashException` are both `RuntimeError` subclasses, and `_forward` catches only the first, so an injected crash escapes to the caller exactly as the Java `RuntimeException` does; `CurrencyMismatchException` extends `ValueError`, the Python twin of `IllegalArgumentException`. **Interfaces and records:** `SagaStep` is a `typing.Protocol`, the three steps are plain classes with `name`, `execute` and `compensate`, and `Order`, `SagaRecord`, `CrashPoint` and `SagaOutcome` are frozen dataclasses, so `crash_point == CrashPoint.after_execute(...)` is value equality like the Java record `equals`; `status_of` and `recover` use `match` on the `SagaLog` string constants (dotted names are value patterns, never captures). **Money:** `Money` rejects floats at construction, orders with `compare_to` (and `<` via `functools.total_ordering`), and checks the signed 64-bit range by hand in `plus` and `minus`, raising `OverflowError` where Java's `Math.addExact` throws, with a Python-only test pinning it; `usd` keeps the Java helper's behaviour of stripping the dot, so always pass two decimals. **No threads:** the simulated clock and the scripted crash points make every recovery replayable, and the demo prints the same log lines, `clock=250 ms` and `log records=42` in both languages.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Money, a simulated clock, and the two failure types
+
+`plus`, `minus` and `compare_to` go through `_require_same_currency`; `_exact` is the 64-bit range check. `SimClock` only moves on `advance`. The two exception classes are deliberately distinct so a `try`/`except StepFailedException` cannot swallow a crash.
+
 ```python
-for i in range(frm, len(self._steps)):
-    step = self._steps[i]
-    self._log.append(order.saga_id, SagaLog.STEP_STARTED, step.name(), "")
-    self._clock.advance(self._step_latency_ms)
-    try:
-        step.execute(order)
-    except StepFailedException as e:
-        self._log.append(order.saga_id, SagaLog.STEP_FAILED, step.name(), str(e))
-        return self._backward(order, i - 1, step.name(), str(e))
-    if self.crash_point == CrashPoint.after_execute(step.name()):
-        raise CrashException(f"after {step.name()} executed, before STEP_COMPLETED logged")
-    self._log.append(order.saga_id, SagaLog.STEP_COMPLETED, step.name(), "")
+    def plus(self, other: "Money") -> "Money":
+        self._require_same_currency(other)
+        return Money(_exact(self.minor_units + other.minor_units), self.currency)
+
+    def minus(self, other: "Money") -> "Money":
+        self._require_same_currency(other)
+        return Money(_exact(self.minor_units - other.minor_units), self.currency)
+
+    def compare_to(self, other: "Money") -> int:
+        self._require_same_currency(other)
+        return (self.minor_units > other.minor_units) - (self.minor_units < other.minor_units)
+
+
+class SimClock:
+    def __init__(self, start_ms: int) -> None:
+        self._now_ms = start_ms
+
+    def now(self) -> int:
+        return self._now_ms
+
+    def advance(self, ms: int) -> None:
+        self._now_ms += ms
+
+
+class StepFailedException(RuntimeError):
+    """A step refused to do its work. The saga reacts by compensating everything before it."""
+
+
+class CrashException(RuntimeError):
+    """Raised at an injected crash point. The simulation catches it where the real process would die."""
+
+    def __init__(self, where: str) -> None:
+        super().__init__(f"crash at {where}")
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The saga log
 
-- **Two exception types, caught precisely.** `StepFailedException` and `CrashException` are both `RuntimeError` subclasses, and `_forward` catches only the first, so an injected crash escapes to the caller exactly as the Java `RuntimeException` does. `CurrencyMismatchException` extends `ValueError`, the Python twin of `IllegalArgumentException`.
-- **Interfaces and records.** `SagaStep` is a `typing.Protocol`; the three steps are plain classes with `name`, `execute` and `compensate`. `Order`, `SagaRecord`, `CrashPoint` and `SagaOutcome` are frozen dataclasses, so `crash_point == CrashPoint.after_execute(...)` is value equality like the Java record `equals`. `status_of` and `recover` use `match` on the `SagaLog` string constants (dotted names are value patterns, never captures).
-- **Money.** `Money` rejects floats at construction, orders with `compare_to` (and `<` via `functools.total_ordering`), and checks the signed 64-bit range by hand in `plus` and `minus`, raising `OverflowError` where Java's `Math.addExact` throws; a Python-only test pins it. `usd` keeps the Java helper's behaviour of stripping the dot, so always pass two decimals.
-- **No threads.** The simulated clock and the scripted crash points make every recovery replayable; the demo prints the same log lines, `clock=250 ms` and `log records=42` in both languages.
+The record kinds are class attributes on `SagaLog`. `append` numbers from `len + 1` and stamps the injected clock; `order` defaults to `None` and is passed only for `SAGA_STARTED`. `saga_ids` uses `dict.fromkeys` to deduplicate while keeping first-appearance order, the `LinkedHashSet` behaviour recovery relies on.
+
+```python
+@dataclass(frozen=True)
+class SagaRecord:
+    seq: int
+    at_ms: int
+    saga_id: str
+    kind: str
+    step: str
+    detail: str
+    order: Order | None
+
+
+class SagaLog:
+    SAGA_STARTED = "SAGA_STARTED"
+    STEP_STARTED = "STEP_STARTED"
+    STEP_COMPLETED = "STEP_COMPLETED"
+    STEP_FAILED = "STEP_FAILED"
+    COMP_STARTED = "COMP_STARTED"
+    COMP_COMPLETED = "COMP_COMPLETED"
+    SAGA_COMPLETED = "SAGA_COMPLETED"
+    SAGA_COMPENSATED = "SAGA_COMPENSATED"
+
+    def __init__(self, clock: SimClock) -> None:
+        self._records: list[SagaRecord] = []
+        self._clock = clock
+
+    def append(self, saga_id: str, kind: str, step: str, detail: str, order: Order | None = None) -> None:
+        self._records.append(SagaRecord(len(self._records) + 1, self._clock.now(), saga_id, kind, step, detail, order))
+
+    def for_saga(self, saga_id: str) -> list[SagaRecord]:
+        return [r for r in self._records if r.saga_id == saga_id]
+
+    def saga_ids(self) -> list[str]:
+        return list(dict.fromkeys(r.saga_id for r in self._records))  # insertion-ordered set (LinkedHashSet)
+```
+
+#### Step 3: The wallet with holds and idempotent operations
+
+Every operation bumps `calls`, checks its replay key first, and only then validates. `reserve` compares `available(account)` with `compare_to`; `capture` moves the money and records the captured amount. The compensations record that they ran even when there was nothing to undo: `release` tolerates a missing hold and `refund` credits only if a capture is on file.
+
+```python
+    def reserve(self, key: str, account: str, amount: Money) -> None:
+        self.calls += 1
+        if key in self._hold_account:
+            return  # replay
+        if account not in self._balances:
+            raise StepFailedException(f"unknown account {account}")
+        if self.available(account).compare_to(amount) < 0:
+            raise StepFailedException(f"insufficient available funds: {self.available(account)} < {amount}")
+        self._hold_account[key] = account
+        self._hold_amount[key] = amount
+
+    def capture(self, key: str) -> None:
+        self.calls += 1
+        if key in self._captured:
+            return  # replay
+        if key not in self._hold_account:
+            raise StepFailedException(f"no hold to capture for {key}")
+        account = self._hold_account[key]
+        amount = self._hold_amount[key]
+        self._balances[account] = self._balances[account].minus(amount)
+        self._hold_amount[key] = Money.zero(amount.currency)
+        del self._hold_account[key]
+        self._captured[key] = amount
+```
+
+```python
+    def release(self, key: str) -> None:
+        self.calls += 1
+        if key in self._released:
+            return
+        if key in self._hold_account:
+            self._hold_amount[key] = Money.zero(self._hold_amount[key].currency)
+            del self._hold_account[key]
+        self._released.add(key)
+
+    def refund(self, key: str, account: str) -> None:
+        self.calls += 1
+        if key in self._refunded:
+            return
+        if key in self._captured:
+            self._balances[account] = self._balances[account].plus(self._captured[key])
+        self._refunded.add(key)
+```
+
+#### Step 4: Steps as objects
+
+`SagaStep` is a `Protocol` with the three methods; `CaptureFunds` satisfies it structurally and keeps the stable name `"capture-funds"` that goes into the log.
+
+```python
+class SagaStep(Protocol):
+    def name(self) -> str: ...
+
+    def execute(self, order: Order) -> None: ...
+
+    def compensate(self, order: Order) -> None: ...
+
+
+class CaptureFunds:
+    def __init__(self, wallet: WalletService) -> None:
+        self._wallet = wallet
+
+    def name(self) -> str:
+        return "capture-funds"
+
+    def execute(self, o: Order) -> None:
+        self._wallet.capture(o.saga_id)
+
+    def compensate(self, o: Order) -> None:
+        self._wallet.refund(o.saga_id, o.customer)
+```
+
+#### Step 5: The orchestrator, forward and backward
+
+`_forward` catches only `StepFailedException` and hands off to `_backward` from `i - 1`; the crash check sits between the side effect and `STEP_COMPLETED`, and raises `CrashException`, which nothing in the orchestrator catches. `_backward` counts down with `range(frm, -1, -1)` and has no `try` around `compensate`.
+
+```python
+    def run(self, order: Order) -> SagaOutcome:
+        self._log.append(order.saga_id, SagaLog.SAGA_STARTED, "", "", order)
+        return self._forward(order, 0)
+
+    def _forward(self, order: Order, frm: int) -> SagaOutcome:
+        for i in range(frm, len(self._steps)):
+            step = self._steps[i]
+            self._log.append(order.saga_id, SagaLog.STEP_STARTED, step.name(), "")
+            self._clock.advance(self._step_latency_ms)
+            try:
+                step.execute(order)
+            except StepFailedException as e:
+                self._log.append(order.saga_id, SagaLog.STEP_FAILED, step.name(), str(e))
+                return self._backward(order, i - 1, step.name(), str(e))
+            if self.crash_point == CrashPoint.after_execute(step.name()):
+                raise CrashException(f"after {step.name()} executed, before STEP_COMPLETED logged")
+            self._log.append(order.saga_id, SagaLog.STEP_COMPLETED, step.name(), "")
+        self._log.append(order.saga_id, SagaLog.SAGA_COMPLETED, "", "")
+        return SagaOutcome(order.saga_id, SagaStatus.COMPLETED, "", "")
+```
+
+```python
+    def _backward(self, order: Order, frm: int, failed_step: str, reason: str) -> SagaOutcome:
+        for i in range(frm, -1, -1):
+            step = self._steps[i]
+            self._log.append(order.saga_id, SagaLog.COMP_STARTED, step.name(), "")
+            self._clock.advance(self._step_latency_ms)
+            step.compensate(order)
+            if self.crash_point == CrashPoint.after_compensate(step.name()):
+                raise CrashException(f"after {step.name()} compensated, before COMP_COMPLETED logged")
+            self._log.append(order.saga_id, SagaLog.COMP_COMPLETED, step.name(), "")
+        self._log.append(order.saga_id, SagaLog.SAGA_COMPENSATED, "", "")
+        return SagaOutcome(order.saga_id, SagaStatus.COMPENSATED, failed_step, reason)
+```
+
+#### Step 6: Recovery from the log alone
+
+`status_of` folds the records with a `match` on the string constants. `recover` clears the crash point, skips finished sagas, rebuilds the `Order` from the first record, computes the resume points from `*_COMPLETED` records only, and calls `_forward` or `_backward` accordingly.
+
+```python
+    @staticmethod
+    def status_of(records: list[SagaRecord]) -> SagaStatus:
+        status = SagaStatus.RUNNING
+        for r in records:
+            match r.kind:
+                case SagaLog.STEP_FAILED | SagaLog.COMP_STARTED:
+                    status = SagaStatus.COMPENSATING
+                case SagaLog.SAGA_COMPLETED:
+                    status = SagaStatus.COMPLETED
+                case SagaLog.SAGA_COMPENSATED:
+                    status = SagaStatus.COMPENSATED
+        return status
+```
+
+```python
+    def recover(self) -> list[SagaOutcome]:
+        self.crash_point = CrashPoint.NONE
+        resumed: list[SagaOutcome] = []
+        for saga_id in self._log.saga_ids():
+            records = self._log.for_saga(saga_id)
+            status = SagaOrchestrator.status_of(records)
+            if status in (SagaStatus.COMPLETED, SagaStatus.COMPENSATED):
+                continue
+            order = records[0].order
+            index = {s.name(): i for i, s in enumerate(self._steps)}
+            last_completed, last_compensated = -1, len(self._steps)
+            failed_step, reason = "", ""
+            for r in records:
+                match r.kind:
+                    case SagaLog.STEP_COMPLETED:
+                        last_completed = max(last_completed, index[r.step])
+                    case SagaLog.STEP_FAILED:
+                        failed_step, reason = r.step, r.detail
+                    case SagaLog.COMP_COMPLETED:
+                        last_compensated = min(last_compensated, index[r.step])
+            if status is SagaStatus.RUNNING:
+                resumed.append(self._forward(order, last_completed + 1))
+            else:
+                frm = min(last_compensated - 1, len(self._steps) - 1 if not failed_step else index[failed_step] - 1)
+                resumed.append(self._backward(order, frm, failed_step, reason if reason else "resumed after crash"))
+        return resumed
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/12-saga-pattern/code/python
@@ -443,42 +671,322 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Section 3 is the Java section 3, balance unchanged across recovery:
+
+```console
+== 3. Crash after capture executed, before it was logged. Recovery re-runs capture; the key makes it a no-op ==
+  orchestrator: crash at after capture-funds executed, before STEP_COMPLETED logged
+  before recovery: balance=45.00 USD (already captured), log status=RUNNING
+  recover -> [saga-3 -> COMPLETED]
+  alice balance=45.00 USD available=45.00 USD | widget stock=2
+```
+
+The run ends with `clock=250 ms, log records=42`, as in Java.
+
 ### In Go
 
-```go
-// Two sentinels tell a refusal from a death; both error types carry their message verbatim.
-var (
-    ErrStepFailed = errors.New("step failed")
-    ErrCrash      = errors.New("crash")
-)
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Two kinds of error, told apart with `errors.Is`:** `SagaStep.Execute` and `Compensate` return `error`; a `*StepFailedError` (matching `ErrStepFailed`) is the saga's business and ends in a `COMPENSATED` outcome, exactly as the Java `catch (StepFailedException)`, while a `*CrashError` (matching `ErrCrash`) is returned from `Run` and `Recover` to the caller instead of being thrown, so tests assert on it with `errors.Is` and the demo prints `err.Error()`; both types implement `Is`, so the message stays verbatim (`out of stock: widget has 3, need 4`) while the sentinel still matches. **Money is checked:** `Plus` and `Minus` return `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow`, `Compare` panics on a mismatch like the reference lesson, and inside the wallet, where the Java version relies on unchecked `Math.subtractExact`, `mustMoney` turns an impossible overflow into a panic rather than a silent wrap. **Structs where Java had records and nested types:** `CrashPoint` is a comparable struct (`==` replaces `equals`), `NoCrash` is its zero value, and `SagaRecord.Order` is a `*Order` that is non-nil only on `SAGA_STARTED`; the log kinds are untyped string constants, `SagaLog.Records()` and `SagaIDs()` return copies, and `SagaIDs` preserves first-appearance order as the `LinkedHashSet` did. **No concurrency:** the saga runs one step at a time by design, the semantic-lock demo is about visibility between sagas, not threads, and `go test -race` passes without a mutex.
 
-func (s *SagaOrchestrator) forward(order Order, from int) (SagaOutcome, error) {
-    for i := from; i < len(s.steps); i++ {
-        step := s.steps[i]
-        s.log.Append(order.SagaID, StepStarted, step.Name(), "", nil)
-        s.clock.Advance(s.stepLatencyMs)
-        if err := step.Execute(order); err != nil {
-            if !errors.Is(err, ErrStepFailed) {
-                return SagaOutcome{}, err // not the saga's business
-            }
-            s.log.Append(order.SagaID, StepFailed, step.Name(), err.Error(), nil)
-            return s.backward(order, i-1, step.Name(), err.Error())
-        }
-        if s.CrashPoint == AfterExecute(step.Name()) {
-            return SagaOutcome{}, &CrashError{"after " + step.Name() + " executed, before STEP_COMPLETED logged"}
-        }
-        s.log.Append(order.SagaID, StepCompleted, step.Name(), "", nil)
-    }
-    // ...
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same five sections as the Java version, line for line (clock=250 ms, log records=42).
+
+#### Step 1: Money, a simulated clock, and the two failure types
+
+`Plus` and `Minus` return errors from the currency check and the checked arithmetic. The two error types each carry their message and implement `Is` against their sentinel; `CrashPoint` is a comparable struct with `NoCrash` as the zero value.
+
+```go
+func (m Money) Plus(other Money) (Money, error) {
+	if err := m.requireSameCurrency(other); err != nil {
+		return Money{}, err
+	}
+	sum, err := addChecked(m.MinorUnits, other.MinorUnits)
+	return Money{sum, m.Currency}, err
+}
+
+type SimClock struct{ nowMs int64 }
+
+func (c *SimClock) Now() int64            { return c.nowMs }
+func (c *SimClock) Advance(ms int64)      { c.nowMs += ms }
+
+type StepFailedError struct{ Msg string }
+
+func (e *StepFailedError) Error() string        { return e.Msg }
+func (e *StepFailedError) Is(target error) bool { return target == ErrStepFailed }
+
+type CrashError struct{ Where string }
+
+func (e *CrashError) Error() string        { return "crash at " + e.Where }
+func (e *CrashError) Is(target error) bool { return target == ErrCrash }
+
+type CrashPoint struct {
+	Step               string
+	DuringCompensation bool
+}
+
+var NoCrash = CrashPoint{}
+
+func AfterExecute(step string) CrashPoint    { return CrashPoint{step, false} }
+func AfterCompensate(step string) CrashPoint { return CrashPoint{step, true} }
+```
+
+#### Step 2: The saga log
+
+`Append` takes a `*Order` that is nil for every kind but `SAGA_STARTED`. `Records` copies the slice; `SagaIDs` deduplicates with a seen-map while preserving first-appearance order.
+
+```go
+type SagaRecord struct {
+	Seq    int64
+	AtMs   int64
+	SagaID string
+	Kind   string
+	Step   string
+	Detail string
+	Order  *Order
+}
+
+type SagaLog struct {
+	records []SagaRecord
+	clock   *SimClock
+}
+
+func (l *SagaLog) Append(sagaID, kind, step, detail string, order *Order) {
+	l.records = append(l.records, SagaRecord{int64(len(l.records) + 1), l.clock.Now(), sagaID, kind, step, detail, order})
+}
+
+func (l *SagaLog) ForSaga(sagaID string) []SagaRecord {
+	out := []SagaRecord{}
+	for _, r := range l.records {
+		if r.SagaID == sagaID {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (l *SagaLog) SagaIDs() []string {
+	seen := map[string]bool{}
+	ids := []string{}
+	for _, r := range l.records {
+		if !seen[r.SagaID] {
+			seen[r.SagaID] = true
+			ids = append(ids, r.SagaID)
+		}
+	}
+	return ids
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: The wallet with holds and idempotent operations
 
-- **Two kinds of error, told apart with `errors.Is`.** `SagaStep.Execute` and `Compensate` return `error`. A `*StepFailedError` (matching `ErrStepFailed`) is the saga's business and ends in a `COMPENSATED` outcome, exactly as the Java `catch (StepFailedException)`; a `*CrashError` (matching `ErrCrash`) is returned from `Run` and `Recover` to the caller instead of being thrown, so tests assert on it with `errors.Is` and the demo prints `err.Error()`. Both types implement `Is`, so the message stays verbatim (`out of stock: widget has 3, need 4`) while the sentinel still matches.
-- **Money is checked.** `Plus` and `Minus` return `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow`; `Compare` panics on a mismatch like the reference lesson. Inside the wallet, where the Java version relies on unchecked `Math.subtractExact`, `mustMoney` turns an impossible overflow into a panic rather than a silent wrap.
-- **Structs where Java had records and nested types.** `CrashPoint` is a comparable struct (`==` replaces `equals`), `NoCrash` is its zero value, and `SagaRecord.Order` is a `*Order` that is non-nil only on `SAGA_STARTED`. The log kinds are untyped string constants; `SagaLog.Records()` and `SagaIDs()` return copies, and `SagaIDs` preserves first-appearance order as the `LinkedHashSet` did.
-- **No concurrency.** The saga runs one step at a time by design, and the semantic-lock demo is about visibility between sagas, not threads; `go test -race` passes without a mutex.
+`Reserve` and `Capture` return `stepFailed(...)` errors for refusals and nil on replay; the compensations return nothing because they cannot be refused. `mustMoney` unwraps the checked arithmetic inside the wallet, where a failure would be a bug.
+
+```go
+func (w *WalletService) Reserve(key, account string, amount Money) error {
+	w.Calls++
+	if _, replay := w.holdAccount[key]; replay {
+		return nil
+	}
+	if _, ok := w.balances[account]; !ok {
+		return stepFailed("unknown account %s", account)
+	}
+	if w.Available(account).Compare(amount) < 0 {
+		return stepFailed("insufficient available funds: %s < %s", w.Available(account), amount)
+	}
+	w.holdAccount[key] = account
+	w.holdAmount[key] = amount
+	return nil
+}
+
+func (w *WalletService) Capture(key string) error {
+	w.Calls++
+	if _, replay := w.captured[key]; replay {
+		return nil
+	}
+	account, held := w.holdAccount[key]
+	if !held {
+		return stepFailed("no hold to capture for %s", key)
+	}
+	amount := w.holdAmount[key]
+	w.balances[account] = mustMoney(w.balances[account].Minus(amount))
+	w.holdAmount[key] = Zero(amount.Currency)
+	delete(w.holdAccount, key)
+	w.captured[key] = amount
+	return nil
+}
+```
+
+```go
+func (w *WalletService) Release(key string) {
+	w.Calls++
+	if w.released[key] {
+		return
+	}
+	if _, held := w.holdAccount[key]; held {
+		w.holdAmount[key] = Zero(w.holdAmount[key].Currency)
+		delete(w.holdAccount, key)
+	}
+	w.released[key] = true
+}
+
+func (w *WalletService) Refund(key, account string) {
+	w.Calls++
+	if w.refunded[key] {
+		return
+	}
+	if amount, ok := w.captured[key]; ok {
+		w.balances[account] = mustMoney(w.balances[account].Plus(amount))
+	}
+	w.refunded[key] = true
+}
+```
+
+#### Step 4: Steps as objects
+
+`SagaStep` is an interface whose two actions return `error`. The three steps are one-field structs with value receivers; `Compensate` wraps a void wallet call and returns nil.
+
+```go
+type SagaStep interface {
+	Name() string
+	Execute(order Order) error
+	Compensate(order Order) error
+}
+
+type ReserveFunds struct{ wallet *WalletService }
+
+func (s ReserveFunds) Name() string             { return "reserve-funds" }
+func (s ReserveFunds) Execute(o Order) error    { return s.wallet.Reserve(o.SagaID, o.Customer, o.Amount) }
+func (s ReserveFunds) Compensate(o Order) error { s.wallet.Release(o.SagaID); return nil }
+
+type CaptureFunds struct{ wallet *WalletService }
+
+func (s CaptureFunds) Name() string             { return "capture-funds" }
+func (s CaptureFunds) Execute(o Order) error    { return s.wallet.Capture(o.SagaID) }
+func (s CaptureFunds) Compensate(o Order) error { s.wallet.Refund(o.SagaID, o.Customer); return nil }
+```
+
+#### Step 5: The orchestrator, forward and backward
+
+`forward` distinguishes a step refusal (`errors.Is(err, ErrStepFailed)`, which compensates) from any other error (returned untouched). A crash point returns a `*CrashError` instead of panicking. `backward` returns a compensation's error rather than letting it escape, since Go has no exception to propagate.
+
+```go
+func (s *SagaOrchestrator) Run(order Order) (SagaOutcome, error) {
+	o := order
+	s.log.Append(order.SagaID, SagaStarted, "", "", &o)
+	return s.forward(order, 0)
+}
+
+func (s *SagaOrchestrator) forward(order Order, from int) (SagaOutcome, error) {
+	for i := from; i < len(s.steps); i++ {
+		step := s.steps[i]
+		s.log.Append(order.SagaID, StepStarted, step.Name(), "", nil)
+		s.clock.Advance(s.stepLatencyMs)
+		if err := step.Execute(order); err != nil {
+			if !errors.Is(err, ErrStepFailed) {
+				return SagaOutcome{}, err
+			}
+			s.log.Append(order.SagaID, StepFailed, step.Name(), err.Error(), nil)
+			return s.backward(order, i-1, step.Name(), err.Error())
+		}
+		if s.CrashPoint == AfterExecute(step.Name()) {
+			return SagaOutcome{}, &CrashError{"after " + step.Name() + " executed, before STEP_COMPLETED logged"}
+		}
+		s.log.Append(order.SagaID, StepCompleted, step.Name(), "", nil)
+	}
+	s.log.Append(order.SagaID, SagaCompleted, "", "", nil)
+	return SagaOutcome{order.SagaID, Completed, "", ""}, nil
+}
+```
+
+```go
+func (s *SagaOrchestrator) backward(order Order, from int, failedStep, reason string) (SagaOutcome, error) {
+	for i := from; i >= 0; i-- {
+		step := s.steps[i]
+		s.log.Append(order.SagaID, CompStarted, step.Name(), "", nil)
+		s.clock.Advance(s.stepLatencyMs)
+		if err := step.Compensate(order); err != nil {
+			return SagaOutcome{}, err
+		}
+		if s.CrashPoint == AfterCompensate(step.Name()) {
+			return SagaOutcome{}, &CrashError{"after " + step.Name() + " compensated, before COMP_COMPLETED logged"}
+		}
+		s.log.Append(order.SagaID, CompCompleted, step.Name(), "", nil)
+	}
+	s.log.Append(order.SagaID, SagaCompensated, "", "", nil)
+	return SagaOutcome{order.SagaID, Compensated, failedStep, reason}, nil
+}
+```
+
+#### Step 6: Recovery from the log alone
+
+`StatusOf` is a package-level fold with a `switch`. `Recover` builds the step index once, dereferences the `*Order` from the first record, and computes the resume points the same way; the `forward`/`backward` result and error are captured together, and the first error stops recovery.
+
+```go
+func StatusOf(records []SagaRecord) SagaStatus {
+	status := Running
+	for _, r := range records {
+		switch r.Kind {
+		case StepFailed, CompStarted:
+			status = Compensating
+		case SagaCompleted:
+			status = Completed
+		case SagaCompensated:
+			status = Compensated
+		}
+	}
+	return status
+}
+```
+
+```go
+func (s *SagaOrchestrator) Recover() ([]SagaOutcome, error) {
+	s.CrashPoint = NoCrash
+	resumed := []SagaOutcome{}
+	index := map[string]int{}
+	for i, step := range s.steps {
+		index[step.Name()] = i
+	}
+	for _, sagaID := range s.log.SagaIDs() {
+		records := s.log.ForSaga(sagaID)
+		status := StatusOf(records)
+		if status == Completed || status == Compensated {
+			continue
+		}
+		order := *records[0].Order
+		lastCompleted, lastCompensated := -1, len(s.steps)
+		failedStep, reason := "", ""
+		for _, r := range records {
+			switch r.Kind {
+			case StepCompleted:
+				lastCompleted = max(lastCompleted, index[r.Step])
+			case StepFailed:
+				failedStep, reason = r.Step, r.Detail
+			case CompCompleted:
+				lastCompensated = min(lastCompensated, index[r.Step])
+			}
+		}
+		var out SagaOutcome
+		var err error
+		if status == Running {
+			out, err = s.forward(order, lastCompleted+1)
+		} else {
+			failedIndex := len(s.steps) - 1
+			if failedStep != "" {
+				failedIndex = index[failedStep] - 1
+			}
+			if reason == "" {
+				reason = "resumed after crash"
+			}
+			out, err = s.backward(order, min(lastCompensated-1, failedIndex), failedStep, reason)
+		}
+		if err != nil {
+			return resumed, err
+		}
+		resumed = append(resumed, out)
+	}
+	return resumed, nil
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/12-saga-pattern/code/go
@@ -486,7 +994,11 @@ go run .
 go test ./...
 ```
 
-The demo prints the same five sections as the Java version, line for line (clock=250 ms, log records=42).
+```console
+clock=250 ms, log records=42
+```
+
+The five sections before this closing line are the Java output, line for line, including the `45.00 USD` balance before and after recovery in section 3.
 
 ## Use It
 

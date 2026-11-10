@@ -384,6 +384,213 @@ The tests also cross-check 3,000 random `put`/`remove`/`rangeQuery`/`floorKey` o
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps the same tree, `TxKey`, `TransactionIndex`, and trimmed `Money`. What differs: **no `Comparable` bound.** Keys only need `<`. `TxKey` is a `@dataclass(order=True)`, which compares `(timestamp_millis, sequence)` as a tuple, exactly `Long.compare` then `Long.compare`. `_compare` stays a function so the comparison counter, and therefore the "2048.5 comparisons per lookup" line, is identical to Java. **Iteration is mandatory, not a style choice:** CPython's default recursion limit is 1,000, so a recursive in-order walk of the 4,096-node chain would raise `RecursionError`. All traversals use an explicit `list` as a stack, and the test that walks a 1,000-node chain pins that. **Integer ranges are explicit:** `Long.MIN_VALUE`/`Long.MAX_VALUE` become `LONG_MIN = -(1 << 63)` and `LONG_MAX`; `Money.plus` checks the 64-bit range by hand (`add_exact`) because Python ints never overflow, and a test asserts the `OverflowError`. A `None` key raises `TypeError` where Java throws `NullPointerException`. **Same random data:** `JavaRandom` reproduces `java.util.Random`, so the transaction amounts, the shuffled insert order (height 25), and the 3,000-operation cross-check use the same sequences; the reference model is a `dict` plus `bisect` over sorted keys instead of `TreeMap`. Nodes use `__slots__`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The node and the counter
+
+`Node` is a nested class with four slots and no type parameters. `_compare` turns Python's `<` into the `-1/0/1` contract and increments the counter once per call, so every operation's cost is measured the same way as in Java.
+
+```python
+class BinarySearchTree(Generic[K, V]):
+    class Node:
+        __slots__ = ("key", "value", "left", "right")
+
+        def __init__(self, key, value) -> None:
+            self.key = key
+            self.value = value
+            self.left: Optional[BinarySearchTree.Node] = None
+            self.right: Optional[BinarySearchTree.Node] = None
+
+    def __init__(self) -> None:
+        self._root: Optional[BinarySearchTree.Node] = None
+        self._size = 0
+        self._comparisons = 0  # instrumentation: how many key comparisons the tree has done
+
+    def _compare(self, a: K, b: K) -> int:
+        """compareTo as a function returning -1/0/1, counted once per call like the Java version."""
+        self._comparisons += 1
+        if a < b:
+            return -1
+        if b < a:
+            return 1
+        return 0
+```
+
+#### Step 2: Insert, replacing on an existing key
+
+The same iterative walk, with `is None` for the null checks and `TypeError` for a `None` key. `size` changes only when a node is created; a replaced key returns the old value and leaves `size` alone.
+
+```python
+    def put(self, key: K, value: V) -> Optional[V]:
+        if key is None:
+            raise TypeError("key")  # Java: NullPointerException from Objects.requireNonNull
+        if self._root is None:
+            self._root = BinarySearchTree.Node(key, value)
+            self._size = 1
+            return None
+        cur = self._root
+        while True:
+            c = self._compare(key, cur.key)
+            if c == 0:
+                old = cur.value
+                cur.value = value
+                return old
+            if c < 0:
+                if cur.left is None:
+                    cur.left = BinarySearchTree.Node(key, value)
+                    self._size += 1
+                    return None
+                cur = cur.left
+            else:
+                if cur.right is None:
+                    cur.right = BinarySearchTree.Node(key, value)
+                    self._size += 1
+                    return None
+                cur = cur.right
+```
+
+#### Step 3: Search, floor, and ceiling
+
+`get` returns `None` when the key is absent. `floor_key` is `get` with a memory: it records the key each time it steps right and returns the last recorded key when it falls off the tree. `ceiling_key` (in the file) swaps the directions.
+
+```python
+    def get(self, key: K) -> Optional[V]:
+        """Exact lookup: follow one path from the root. O(h)."""
+        cur = self._root
+        while cur is not None:
+            c = self._compare(key, cur.key)
+            if c == 0:
+                return cur.value
+            cur = cur.left if c < 0 else cur.right
+        return None
+
+    def floor_key(self, key: K) -> Optional[K]:
+        """Largest key less than or equal to the argument, or None."""
+        cur = self._root
+        best = None
+        while cur is not None:
+            c = self._compare(key, cur.key)
+            if c == 0:
+                return cur.key
+            if c < 0:
+                cur = cur.left
+            else:
+                best = cur.key
+                cur = cur.right
+        return best
+```
+
+#### Step 4: Delete with the in-order successor
+
+The first loop finds the node and its parent. The two-children branch copies the successor's key and value up and detaches the successor through whichever parent slot it hangs from; `succ_parent is cur` is the identity check for the "right child is itself the successor" case. The zero-or-one-child branch splices the surviving child into the parent's slot.
+
+```python
+    def remove(self, key: K) -> Optional[V]:
+        parent, cur = None, self._root
+        while cur is not None:
+            c = self._compare(key, cur.key)
+            if c == 0:
+                break
+            parent = cur
+            cur = cur.left if c < 0 else cur.right
+        if cur is None:
+            return None
+        removed = cur.value
+
+        if cur.left is not None and cur.right is not None:
+            succ_parent, succ = cur, cur.right
+            while succ.left is not None:
+                succ_parent, succ = succ, succ.left
+            cur.key = succ.key
+            cur.value = succ.value
+            if succ_parent is cur:
+                succ_parent.right = succ.right
+            else:
+                succ_parent.left = succ.right
+        else:
+            child = cur.left if cur.left is not None else cur.right
+            if parent is None:
+                self._root = child
+            elif parent.left is cur:
+                parent.left = child
+            else:
+                parent.right = child
+        self._size -= 1
+        return removed
+```
+
+#### Step 5: In-order traversal without recursion
+
+A plain `list` is the stack: `append` pushes, `pop` pops. This is not a stylistic choice in Python; the 4,096-node chain in the demo is deeper than the default recursion limit, and the explicit stack lives on the heap.
+
+```python
+    def in_order(self) -> list[Entry[K, V]]:
+        """All entries in ascending key order. Iterative in-order traversal with an explicit stack. O(n)."""
+        out: list[Entry[K, V]] = []
+        stack: list[BinarySearchTree.Node] = []
+        cur = self._root
+        while cur is not None or stack:
+            while cur is not None:
+                stack.append(cur)
+                cur = cur.left
+            cur = stack.pop()
+            out.append(Entry(cur.key, cur.value))
+            cur = cur.right
+        return out
+```
+
+#### Step 6: Range query is the traversal plus two cuts
+
+Diff against Step 5: the descent sets `cur = None` instead of `cur.left` when the key is already below `lo`, and the emit step returns as soon as a key exceeds `hi`. A reversed range raises `ValueError`.
+
+```python
+    def range_query(self, lo: K, hi: K) -> list[Entry[K, V]]:
+        """All entries with lo <= key <= hi, ascending. O(h + k): subtrees that cannot match are never entered."""
+        if self._compare(lo, hi) > 0:
+            raise ValueError("lo must not exceed hi")
+        out: list[Entry[K, V]] = []
+        stack: list[BinarySearchTree.Node] = []
+        cur = self._root
+        while cur is not None or stack:
+            while cur is not None:
+                stack.append(cur)
+                # prune: nothing in cur.left can be >= lo if cur.key < lo
+                cur = None if self._compare(cur.key, lo) < 0 else cur.left
+            cur = stack.pop()
+            vs_lo = self._compare(cur.key, lo)
+            vs_hi = self._compare(cur.key, hi)
+            if vs_hi > 0:
+                return out  # every later in-order key is larger still
+            if vs_lo >= 0:
+                out.append(Entry(cur.key, cur.value))
+            cur = cur.right
+        return out
+```
+
+#### Step 7: Height, and the composite-key index
+
+`height` is a level-order walk with a `collections.deque`; one outer iteration per level. `TxKey` gets its ordering from `order=True`, which is tuple comparison and therefore never subtracts, and the sentinel sequences are the explicit 64-bit bounds. `between` converts a timestamp range into a key range and unwraps the entries.
+
+```python
+    def height(self) -> int:
+        """Number of edges on the longest root-to-leaf path; -1 for an empty tree. Iterative level-order walk."""
+        if self._root is None:
+            return -1
+        h = -1
+        level = deque([self._root])
+        while level:
+            h += 1
+            for _ in range(len(level)):
+                n = level.popleft()
+                if n.left is not None:
+                    level.append(n.left)
+                if n.right is not None:
+                    level.append(n.right)
+        return h
+```
+
 ```python
 @dataclass(frozen=True, order=True)
 class TxKey:
@@ -393,25 +600,20 @@ class TxKey:
     @staticmethod
     def lowest(timestamp_millis: int) -> TxKey:
         return TxKey(timestamp_millis, LONG_MIN)
+
+    @staticmethod
+    def highest(timestamp_millis: int) -> TxKey:
+        return TxKey(timestamp_millis, LONG_MAX)
 ```
 
 ```python
-def _compare(self, a: K, b: K) -> int:
-    """compareTo as a function returning -1/0/1, counted once per call like the Java version."""
-    self._comparisons += 1
-    if a < b:
-        return -1
-    if b < a:
-        return 1
-    return 0
+    def between(self, from_inclusive: int, to_inclusive: int) -> list[Transaction]:
+        """Every transaction with from_inclusive <= timestamp <= to_inclusive, oldest first."""
+        entries = self._tree.range_query(TxKey.lowest(from_inclusive), TxKey.highest(to_inclusive))
+        return [e.value for e in entries]
 ```
 
-`code/python/main.py` keeps the same tree, `TxKey`, `TransactionIndex`, and trimmed `Money`. What differs:
-
-- **No `Comparable` bound.** Keys only need `<`. `TxKey` is a `@dataclass(order=True)`, which compares `(timestamp_millis, sequence)` as a tuple, exactly `Long.compare` then `Long.compare`. `_compare` stays a function so the comparison counter, and therefore the "2048.5 comparisons per lookup" line, is identical to Java.
-- **Iteration is mandatory, not a style choice.** CPython's default recursion limit is 1,000, so a recursive in-order walk of the 4,096-node chain would raise `RecursionError`. All traversals use an explicit `list` as a stack, and the test that walks a 1,000-node chain pins that.
-- **Integer ranges are explicit.** `Long.MIN_VALUE`/`Long.MAX_VALUE` become `LONG_MIN = -(1 << 63)` and `LONG_MAX`; `Money.plus` checks the 64-bit range by hand (`add_exact`) because Python ints never overflow, and a test asserts the `OverflowError`. A `None` key raises `TypeError` where Java throws `NullPointerException`.
-- **Same random data.** `JavaRandom` reproduces `java.util.Random`, so the transaction amounts, the shuffled insert order (height 25), and the 3,000-operation cross-check use the same sequences; the reference model is a `dict` plus `bisect` over sorted keys instead of `TreeMap`. Nodes use `__slots__`.
+#### Step 8: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/08-binary-search-trees/code/python
@@ -419,37 +621,360 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Insert, search, delete with successor ==
+in-order keys: [20, 30, 35, 40, 45, 50, 60, 70, 80]
+size=9 height=3 min=20 max=80
+floor(42)=40 ceiling(42)=45 get(45)=v45
+after remove(30), in-order: [20, 35, 40, 45, 50, 60, 70, 80] invariant=true
+after remove(50), in-order: [20, 35, 40, 45, 60, 70, 80] height=3
+
+== Range query over transactions by timestamp ==
+indexed 12 transactions, tree height 7
+between +10min and +45min (inclusive): 6 transactions
+  tx-3   +12 min  16.48 USD
+  tx-10  +15 min  90.93 USD
+  tx-9   +29 min  25.19 USD
+sum in window = 348.16 USD
+
+== Why unbalanced trees need balancing ==
+4096 keys inserted in sorted order:   height 4095, 2048.5 comparisons per lookup
+4096 keys inserted in shuffled order: height 25, 14.2 comparisons per lookup
+ideal balanced height for 4096 keys: 12
+```
+
+Identical to the Java run. The 4,095-deep chain is exactly the input that would raise `RecursionError` under a recursive traversal.
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the same tree, `TxKey`, `TransactionIndex`, and trimmed `Money`. What differs: **a comparator instead of a `Comparable` bound.** Go's `cmp.Ordered` constraint covers numbers and strings but not structs, so `NewBinarySearchTree` takes a `func(a, b K) int` and `NewOrderedTree[K cmp.Ordered, V]` wraps `cmp.Compare` for the common case. `TxKey` supplies `CompareTxKey`, which compares field by field with `cmp.Compare`, never by subtraction: `a.Sequence - b.Sequence` would overflow for the `math.MinInt64` sentinel that `LowestTxKey` uses. The counted `compare` method stays, so the "2048.5 comparisons per lookup" line is identical. **`(V, bool)` instead of `null`:** `Get`, `Put` (the previous value), `Remove`, `MinKey`, `MaxKey`, `FloorKey`, and `CeilingKey` return a second result that says whether a value existed; a zero `int` or empty string is a legal value, so `nil` cannot carry the signal. `RangeQuery` returns `([]Entry, error)` with `ErrInvalidRange`. **Money is checked by hand:** `Money.Plus` returns `(Money, error)`: `ErrCurrencyMismatch` for mixed currencies and `ErrOverflow` from `addChecked`, because Go's `+` on `int64` wraps silently where Java's `Math.addExact` throws. `SumBetween` propagates the error. **Same random data:** `JavaRandom` reproduces `java.util.Random`, so the transaction amounts, the shuffled insert order (height 25), and the 3,000-operation cross-check use the same sequences; the reference model in the test is a sorted key slice searched with `sort.SearchInts` plus a `map`, standing in for `TreeMap`. All traversals are iterative with an explicit slice stack, as in Java.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The node and the counter
+
+`node[K, V]` is unexported; the tree struct holds the comparator alongside the root and counters. `NewBinarySearchTree` rejects a nil comparator, and `NewOrderedTree` is the one-line convenience for built-in ordered keys. The `compare` method counts and delegates.
+
 ```go
-type BinarySearchTree[K, V any] struct {
-    cmp         func(a, b K) int
-    root        *node[K, V]
-    size        int
-    comparisons int64
+type node[K, V any] struct {
+	key         K
+	value       V
+	left, right *node[K, V]
 }
 
-// CompareTxKey orders by timestamp then sequence: compare, never subtract.
-func CompareTxKey(a, b TxKey) int {
-    if c := cmp.Compare(a.TimestampMillis, b.TimestampMillis); c != 0 {
-        return c
-    }
-    return cmp.Compare(a.Sequence, b.Sequence)
+type BinarySearchTree[K, V any] struct {
+	cmp         func(a, b K) int
+	root        *node[K, V]
+	size        int
+	comparisons int64 // instrumentation: how many key comparisons the tree has done
+}
+
+// NewBinarySearchTree builds a tree over the given ordering.
+func NewBinarySearchTree[K, V any](compare func(a, b K) int) (*BinarySearchTree[K, V], error) {
+	if compare == nil {
+		return nil, ErrNilComparator
+	}
+	return &BinarySearchTree[K, V]{cmp: compare}, nil
+}
+
+// NewOrderedTree is the common case: keys are a built-in ordered type.
+func NewOrderedTree[K cmp.Ordered, V any]() *BinarySearchTree[K, V] {
+	t, _ := NewBinarySearchTree[K, V](cmp.Compare[K])
+	return t
+}
+
+func (t *BinarySearchTree[K, V]) compare(a, b K) int {
+	t.comparisons++
+	return t.cmp(a, b)
 }
 ```
 
-`code/go/main.go` keeps the same tree, `TxKey`, `TransactionIndex`, and trimmed `Money`. What differs:
+#### Step 2: Insert, replacing on an existing key
 
-- **A comparator instead of a `Comparable` bound.** Go's `cmp.Ordered` constraint covers numbers and strings but not structs, so `NewBinarySearchTree` takes a `func(a, b K) int` and `NewOrderedTree[K cmp.Ordered, V]` wraps `cmp.Compare` for the common case. `TxKey` supplies `CompareTxKey`, which compares field by field with `cmp.Compare`, never by subtraction: `a.Sequence - b.Sequence` would overflow for the `math.MinInt64` sentinel that `LowestTxKey` uses. The counted `compare` method stays, so the "2048.5 comparisons per lookup" line is identical.
-- **`(V, bool)` instead of `null`.** `Get`, `Put` (the previous value), `Remove`, `MinKey`, `MaxKey`, `FloorKey`, and `CeilingKey` return a second result that says whether a value existed; a zero `int` or empty string is a legal value, so `nil` cannot carry the signal. `RangeQuery` returns `([]Entry, error)` with `ErrInvalidRange`.
-- **Money is checked by hand.** `Money.Plus` returns `(Money, error)`: `ErrCurrencyMismatch` for mixed currencies and `ErrOverflow` from `addChecked`, because Go's `+` on `int64` wraps silently where Java's `Math.addExact` throws. `SumBetween` propagates the error.
-- **Same random data.** `JavaRandom` reproduces `java.util.Random`, so the transaction amounts, the shuffled insert order (height 25), and the 3,000-operation cross-check use the same sequences; the reference model in the test is a sorted key slice searched with `sort.SearchInts` plus a `map`, standing in for `TreeMap`. All traversals are iterative with an explicit slice stack, as in Java.
+`Put` returns `(V, bool)`: the previous value and `true` on a replace, the zero value and `false` on a fresh insert. The walk is the Java loop with `for {}` as `while (true)`.
+
+```go
+func (t *BinarySearchTree[K, V]) Put(key K, value V) (V, bool) {
+	var zero V
+	if t.root == nil {
+		t.root = &node[K, V]{key: key, value: value}
+		t.size = 1
+		return zero, false
+	}
+	cur := t.root
+	for {
+		c := t.compare(key, cur.key)
+		if c == 0 {
+			old := cur.value
+			cur.value = value
+			return old, true
+		}
+		if c < 0 {
+			if cur.left == nil {
+				cur.left = &node[K, V]{key: key, value: value}
+				t.size++
+				return zero, false
+			}
+			cur = cur.left
+		} else {
+			if cur.right == nil {
+				cur.right = &node[K, V]{key: key, value: value}
+				t.size++
+				return zero, false
+			}
+			cur = cur.right
+		}
+	}
+}
+```
+
+#### Step 3: Search, floor, and ceiling
+
+Both return `(K or V, bool)`. `FloorKey` carries a `found` flag alongside `best` because the zero value of `K` could be a real key; it is set each time the walk steps right.
+
+```go
+func (t *BinarySearchTree[K, V]) Get(key K) (V, bool) {
+	cur := t.root
+	for cur != nil {
+		c := t.compare(key, cur.key)
+		if c == 0 {
+			return cur.value, true
+		}
+		if c < 0 {
+			cur = cur.left
+		} else {
+			cur = cur.right
+		}
+	}
+	var zero V
+	return zero, false
+}
+
+// FloorKey is the largest key less than or equal to the argument.
+func (t *BinarySearchTree[K, V]) FloorKey(key K) (K, bool) {
+	var best K
+	found := false
+	cur := t.root
+	for cur != nil {
+		c := t.compare(key, cur.key)
+		if c == 0 {
+			return cur.key, true
+		}
+		if c < 0 {
+			cur = cur.left
+		} else {
+			best, found = cur.key, true
+			cur = cur.right
+		}
+	}
+	return best, found
+}
+```
+
+#### Step 4: Delete with the in-order successor
+
+Same two cases. The one-child splice uses a tagless `switch` for the three parent slots; the successor detach checks `succParent == cur` for the case where the right child is the successor itself.
+
+```go
+func (t *BinarySearchTree[K, V]) Remove(key K) (V, bool) {
+	var parent *node[K, V]
+	cur := t.root
+	for cur != nil {
+		c := t.compare(key, cur.key)
+		if c == 0 {
+			break
+		}
+		parent = cur
+		if c < 0 {
+			cur = cur.left
+		} else {
+			cur = cur.right
+		}
+	}
+	if cur == nil {
+		var zero V
+		return zero, false
+	}
+	removed := cur.value
+
+	if cur.left != nil && cur.right != nil {
+		// find successor and its parent
+		succParent, succ := cur, cur.right
+		for succ.left != nil {
+			succParent, succ = succ, succ.left
+		}
+		cur.key = succ.key
+		cur.value = succ.value
+		// detach successor: it has no left child, so splice in its right child
+		if succParent == cur {
+			succParent.right = succ.right
+		} else {
+			succParent.left = succ.right
+		}
+	} else {
+		child := cur.left
+		if child == nil {
+			child = cur.right
+		}
+		switch {
+		case parent == nil:
+			t.root = child
+		case parent.left == cur:
+			parent.left = child
+		default:
+			parent.right = child
+		}
+	}
+	t.size--
+	return removed, true
+}
+```
+
+#### Step 5: In-order traversal without recursion
+
+A slice is the stack: `append` pushes, reslicing to `len-1` pops. The output slice is preallocated to `size` because the traversal visits every node exactly once.
+
+```go
+func (t *BinarySearchTree[K, V]) InOrder() []Entry[K, V] {
+	out := make([]Entry[K, V], 0, t.size)
+	var stack []*node[K, V]
+	cur := t.root
+	for cur != nil || len(stack) > 0 {
+		for cur != nil {
+			stack = append(stack, cur)
+			cur = cur.left
+		}
+		cur = stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		out = append(out, Entry[K, V]{cur.key, cur.value})
+		cur = cur.right
+	}
+	return out
+}
+```
+
+#### Step 6: Range query is the traversal plus two cuts
+
+The reversed-range case is `ErrInvalidRange` rather than a panic. The two cuts are the same: stop descending left when the key is below `lo`, stop entirely once a popped key exceeds `hi`.
+
+```go
+func (t *BinarySearchTree[K, V]) RangeQuery(lo, hi K) ([]Entry[K, V], error) {
+	if t.compare(lo, hi) > 0 {
+		return nil, ErrInvalidRange
+	}
+	out := []Entry[K, V]{}
+	var stack []*node[K, V]
+	cur := t.root
+	for cur != nil || len(stack) > 0 {
+		for cur != nil {
+			stack = append(stack, cur)
+			// prune: nothing in cur.left can be >= lo if cur.key < lo
+			if t.compare(cur.key, lo) < 0 {
+				cur = nil
+			} else {
+				cur = cur.left
+			}
+		}
+		cur = stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		vsLo, vsHi := t.compare(cur.key, lo), t.compare(cur.key, hi)
+		if vsHi > 0 {
+			return out, nil // every later in-order key is larger still
+		}
+		if vsLo >= 0 {
+			out = append(out, Entry[K, V]{cur.key, cur.value})
+		}
+		cur = cur.right
+	}
+	return out, nil
+}
+```
+
+#### Step 7: Height, and the composite-key index
+
+`Height` builds the next level as a fresh slice instead of draining a queue in place; the count is the same. `CompareTxKey` is the comparator the index passes to `NewBinarySearchTree`, built from `cmp.Compare` so the `math.MinInt64` sentinel in `LowestTxKey` cannot overflow a subtraction. `Between` ignores the range error because the sentinel keys are ordered by construction.
+
+```go
+func (t *BinarySearchTree[K, V]) Height() int {
+	if t.root == nil {
+		return -1
+	}
+	h := -1
+	level := []*node[K, V]{t.root}
+	for len(level) > 0 {
+		h++
+		next := make([]*node[K, V], 0, 2*len(level))
+		for _, n := range level {
+			if n.left != nil {
+				next = append(next, n.left)
+			}
+			if n.right != nil {
+				next = append(next, n.right)
+			}
+		}
+		level = next
+	}
+	return h
+}
+```
+
+```go
+// LowestTxKey is the smallest key for a timestamp.
+func LowestTxKey(timestampMillis int64) TxKey { return TxKey{timestampMillis, math.MinInt64} }
+
+// HighestTxKey is the largest key for a timestamp.
+func HighestTxKey(timestampMillis int64) TxKey { return TxKey{timestampMillis, math.MaxInt64} }
+
+// CompareTxKey orders by timestamp then sequence: compare, never subtract.
+func CompareTxKey(a, b TxKey) int {
+	if c := cmp.Compare(a.TimestampMillis, b.TimestampMillis); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Sequence, b.Sequence)
+}
+
+// Between lists every transaction with fromInclusive <= timestamp <= toInclusive, oldest first.
+func (x *TransactionIndex) Between(fromInclusive, toInclusive int64) []Transaction {
+	entries, _ := x.tree.RangeQuery(LowestTxKey(fromInclusive), HighestTxKey(toInclusive))
+	out := make([]Transaction, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Value)
+	}
+	return out
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/08-binary-search-trees/code/go
 go run .
 go test ./...
 ```
+
+```console
+== Insert, search, delete with successor ==
+in-order keys: [20, 30, 35, 40, 45, 50, 60, 70, 80]
+size=9 height=3 min=20 max=80
+floor(42)=40 ceiling(42)=45 get(45)=v45
+after remove(30), in-order: [20, 35, 40, 45, 50, 60, 70, 80] invariant=true
+after remove(50), in-order: [20, 35, 40, 45, 60, 70, 80] height=3
+
+== Range query over transactions by timestamp ==
+indexed 12 transactions, tree height 7
+between +10min and +45min (inclusive): 6 transactions
+  tx-3   +12 min  16.48 USD
+  tx-10  +15 min  90.93 USD
+  tx-9   +29 min  25.19 USD
+sum in window = 348.16 USD
+
+== Why unbalanced trees need balancing ==
+4096 keys inserted in sorted order:   height 4095, 2048.5 comparisons per lookup
+4096 keys inserted in shuffled order: height 25, 14.2 comparisons per lookup
+ideal balanced height for 4096 keys: 12
+```
+
+The Go and Python outputs are byte-identical, including the transaction amounts, because both ports replay `java.util.Random`.
 
 ## Use It
 

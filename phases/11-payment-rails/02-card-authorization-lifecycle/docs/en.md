@@ -322,53 +322,476 @@ The test file has 60-plus assertions: one per legal edge, one per illegal edge, 
 
 ### In Python
 
+The Python port keeps the same names (`CardTransaction`, `LifecyclePolicy`, `TransactionEvent`, `LEGAL`) with four differences. **Time is `datetime` with `tzinfo=timezone.utc`:** a naive `datetime` compared with an aware one raises, so every timestamp in the lesson is aware; `timedelta.days` replaces `Duration.toDays()`. **`Money` is `@total_ordering`**, so `total > ceiling` reads naturally; the comparison still raises `CurrencyMismatchError` on mixed currencies because `__lt__` checks. **The legal table is a `dict` of `frozenset`:** immutable, so no method can accidentally add a legal edge at runtime, and the test `test_terminal_states_accept_nothing` asserts the three terminal rows are empty. **`events` returns a `tuple`**, the idiomatic read-only view, where Java returns `Collections.unmodifiableList`. `IllegalTransitionError` extends `RuntimeError` and `LimitExceededError` extends `ValueError`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Money, copied, not imported
+
+The Phase 10, Lesson 01 `Money` as a frozen dataclass, trimmed to what this lesson needs. There is no `addExact` because Python ints do not overflow; `times` is the single rounded operation and the comparison operators come from `@total_ordering` on `__lt__`.
+
+```python
+    def _require_same_currency(self, other: "Money") -> None:
+        if self.currency != other.currency:
+            raise CurrencyMismatchError(self.currency, other.currency)
+
+    def plus(self, other: "Money") -> "Money":
+        self._require_same_currency(other)
+        return Money(self.minor_units + other.minor_units, self.currency)
+
+    def minus(self, other: "Money") -> "Money":
+        self._require_same_currency(other)
+        return Money(self.minor_units - other.minor_units, self.currency)
+
+    def is_zero(self) -> bool:
+        return self.minor_units == 0
+
+    def is_positive(self) -> bool:
+        return self.minor_units > 0
+
+    def times(self, numerator: int, denominator: int, rounding: Rounding) -> "Money":
+        if denominator <= 0:
+            raise ArithmeticError("denominator must be positive")
+        return Money(divide_rounded(self.minor_units * numerator, denominator, rounding), self.currency)
+```
+
+#### Step 2: The clock
+
+`Clock` is a base class with an abstract `now()`; `FakeClock` stores an aware `datetime` and moves it by a `timedelta`. Production wraps `datetime.now(timezone.utc)`.
+
+```python
+class Clock:
+    """Injected time source. Production wraps datetime.now(timezone.utc); tests and the demo use FakeClock."""
+
+    def now(self) -> datetime:
+        raise NotImplementedError
+
+
+class FakeClock(Clock):
+    def __init__(self, start: datetime) -> None:
+        self._current = start
+
+    def now(self) -> datetime:
+        return self._current
+
+    def advance(self, delta: timedelta) -> None:
+        self._current = self._current + delta
+```
+
+#### Step 3: States, actions, and the legal-move table
+
+Two `Enum`s whose values are their display names, and a module-level `dict` keyed by state whose values are `frozenset`s of actions. Every state has a row, the terminal ones empty, exactly as the `EnumMap` does.
+
+```python
+class TransactionState(Enum):
+    AUTHORIZED = "AUTHORIZED"
+    PARTIALLY_CAPTURED = "PARTIALLY_CAPTURED"
+    CAPTURED = "CAPTURED"
+    VOIDED = "VOIDED"
+    EXPIRED = "EXPIRED"
+    PARTIALLY_REFUNDED = "PARTIALLY_REFUNDED"
+    REFUNDED = "REFUNDED"
+
+    def is_terminal(self) -> bool:
+        return self in (TransactionState.VOIDED, TransactionState.EXPIRED, TransactionState.REFUNDED)
+```
+
 ```python
 LEGAL: dict[TransactionState, frozenset[Action]] = {
     TransactionState.AUTHORIZED: frozenset({Action.INCREMENT, Action.CAPTURE, Action.VOID, Action.EXPIRE}),
-    ...
+    TransactionState.PARTIALLY_CAPTURED: frozenset({Action.CAPTURE, Action.CLOSE_CAPTURE, Action.EXPIRE}),
+    TransactionState.CAPTURED: frozenset({Action.REFUND}),
+    TransactionState.PARTIALLY_REFUNDED: frozenset({Action.REFUND}),
+    TransactionState.VOIDED: frozenset(),
+    TransactionState.EXPIRED: frozenset(),
+    TransactionState.REFUNDED: frozenset(),
 }
-
-def capture(self, amount: Money, reason: str) -> None:
-    self.expire_if_due(reason)
-    self._require(Action.CAPTURE)
-    self._require_positive(amount)
-    ceiling = self._policy.capture_ceiling(self._authorized)
-    total = self._captured.plus(amount)
-    if total > ceiling:
-        raise LimitExceededError(...)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 4: The policy
 
-- **Time is `datetime` with `tzinfo=timezone.utc`.** A naive `datetime` compared with an aware one raises; every timestamp in the lesson is aware. `timedelta.days` replaces `Duration.toDays()`.
-- **`Money` is `@total_ordering`**, so `total > ceiling` reads naturally; the comparison still raises `CurrencyMismatchError` on mixed currencies because `__lt__` checks.
-- **The legal table is a `dict` of `frozenset`.** Immutable, so no method can accidentally add a legal edge at runtime. The test `test_terminal_states_accept_nothing` asserts the three terminal rows are empty.
-- **`events` returns a `tuple`**, the idiomatic read-only view; Java returns `Collections.unmodifiableList`.
+A frozen dataclass with validation in `__post_init__`. `for_mcc` is an `if` on a tuple of codes instead of a `switch`, and `STANDARD` is a module constant defined after the class. `capture_ceiling` names its rounding mode, `Rounding.DOWN`.
+
+```python
+@dataclass(frozen=True)
+class LifecyclePolicy:
+    auth_validity: timedelta
+    over_capture_tolerance_bps: int = 0
+
+    def __post_init__(self) -> None:
+        if self.auth_validity <= timedelta(0):
+            raise ValueError("validity must be positive")
+        if not 0 <= self.over_capture_tolerance_bps <= 10_000:
+            raise ValueError("tolerance must be 0..10000 bps")
+
+    @staticmethod
+    def for_mcc(mcc: str) -> "LifecyclePolicy":
+        """Illustrative mapping: gratuity-heavy categories get a 15% tolerance; everyone else gets none."""
+        if mcc in ("5812", "5813", "5814", "4121", "7230"):
+            return LifecyclePolicy(timedelta(days=7), 1500)
+        return STANDARD
+
+    def capture_ceiling(self, authorized: Money) -> Money:
+        """The most that may be captured in total, rounded toward the merchant's disadvantage."""
+        return authorized.times(10_000 + self.over_capture_tolerance_bps, 10_000, Rounding.DOWN)
+
+
+STANDARD = LifecyclePolicy(timedelta(days=7), 0)
+```
+
+#### Step 5: The event
+
+`from_state` is `Optional` and `None` only for the creating event (`from` is a keyword, hence the suffix). `__post_init__` rejects a blank reason.
+
+```python
+@dataclass(frozen=True)
+class TransactionEvent:
+    sequence: int
+    action: Action
+    amount: Money
+    from_state: Optional[TransactionState]
+    to_state: TransactionState
+    at: datetime
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason or not self.reason.strip():
+            raise ValueError("every transition needs a reason")
+```
+
+#### Step 6: The single choke point
+
+The three private helpers. `_require` indexes `LEGAL` by the current state; `_require_positive` checks currency then sign; `_transition` appends the event with the clock's timestamp and only then updates `_state`.
+
+```python
+    def _require(self, action: Action) -> None:
+        if action not in LEGAL[self._state]:
+            raise IllegalTransitionError(self._state, action)
+
+    def _require_positive(self, amount: Money) -> None:
+        if amount.currency != self._authorized.currency:
+            raise CurrencyMismatchError(self._authorized.currency, amount.currency)
+        if not amount.is_positive():
+            raise LimitExceededError(f"amount must be positive: {amount}")
+
+    def _transition(self, action: Action, amount: Money, to_state: TransactionState, reason: str) -> None:
+        self._events.append(TransactionEvent(len(self._events) + 1, action, amount, self._state, to_state,
+                                             self._clock.now(), reason))
+        self._state = to_state
+```
+
+#### Step 7: Capture, with both invariants visible
+
+The same order: expire, require, positive, ceiling check on the cumulative total, then update and transition. `total > ceiling` and `self._captured >= self._authorized` are the `compareTo` calls spelled as operators.
+
+```python
+    def capture(self, amount: Money, reason: str) -> None:
+        """Capture part or all of the authorization. Cumulative captures may not exceed the policy's ceiling."""
+        self.expire_if_due(reason)
+        self._require(Action.CAPTURE)
+        self._require_positive(amount)
+        ceiling = self._policy.capture_ceiling(self._authorized)
+        total = self._captured.plus(amount)
+        if total > ceiling:
+            raise LimitExceededError(
+                f"capture of {amount} would bring total to {total}, above ceiling {ceiling} "
+                f"(authorized {self._authorized}, tolerance {self._policy.over_capture_tolerance_bps} bps)")
+        self._captured = total
+        nxt = TransactionState.CAPTURED if self._captured >= self._authorized else TransactionState.PARTIALLY_CAPTURED
+        self._transition(Action.CAPTURE, amount, nxt, reason)
+```
+
+#### Step 8: Expiry from the clock
+
+`self._clock.now() < self._expires_at` is `isBefore`, exact to the second because both datetimes are aware. `auth_validity.days` gives the number for the reason string, and the target state depends on whether a partial capture exists.
+
+```python
+    def expire_if_due(self, attempted_reason: str) -> bool:
+        if Action.EXPIRE not in LEGAL[self._state]:
+            return False
+        if self._clock.now() < self._expires_at:
+            return False
+        days = self._policy.auth_validity.days
+        # A never-captured authorization becomes EXPIRED (terminal). A partially captured one keeps its captured
+        # funds: the remainder lapses and it becomes CAPTURED, as close_capture would leave it, so refunds still work.
+        nxt = TransactionState.CAPTURED if self._state is TransactionState.PARTIALLY_CAPTURED else TransactionState.EXPIRED
+        self._transition(Action.EXPIRE, self.remaining_authorization(), nxt,
+                         f"authorization validity of {days} days elapsed (while attempting: {attempted_reason})")
+        return True
+```
+
+#### Step 9: Run it
+
+```bash
+cd phases/11-payment-rails/02-card-authorization-lifecycle/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output matches the Java run except that `datetime.isoformat()` prints the UTC offset as `+00:00` where Java prints `Z`:
+
+```console
+== Hotel stay: estimated auth, incremental auth, partial capture, refund ==
+transaction txn-hotel-001 [PARTIALLY_REFUNDED] authorized=150.00 USD captured=100.00 USD refunded=20.00 USD net=80.00 USD
+  #1 AUTHORIZE       120.00 USD  (new) -> AUTHORIZED  @2026-03-01T09:00:00+00:00  "check-in: estimated one night plus incidentals"
+  #2 INCREMENT        30.00 USD  AUTHORIZED -> AUTHORIZED  @2026-03-02T09:00:00+00:00  "minibar and late checkout"
+  #3 CAPTURE         100.00 USD  AUTHORIZED -> PARTIALLY_CAPTURED  @2026-03-02T15:00:00+00:00  "folio: room night 100.00"
+
+== Illegal moves are exceptions, not silent no-ops ==
+  rejected: VOID is not allowed in state PARTIALLY_REFUNDED
+  rejected: CAPTURE is not allowed in state PARTIALLY_REFUNDED
+```
 
 ### In Go
 
+The Go port keeps the design with four differences. **Errors are values:** every write method returns `error`. `IllegalTransitionError` is a struct carrying `From` and `Action`, and implements `Is(ErrIllegalTransition)` so callers can match the category with `errors.Is` or extract the fields with `errors.As`; amount-rule failures wrap `ErrLimitExceeded` with `%w`. **`From` is a `*TransactionState`**, nil for the creating event, because Go has no `null` for value types and an `Optional` would be ceremony. **`Events()` returns a copy:** Go slices alias their backing array, so returning `t.events` would let a caller mutate the log; the test tampers with the returned slice and checks the original is unchanged. **`time.Time` and `time.Duration`** replace `Instant` and `Duration`; `Before` gives the same exact boundary as `isBefore`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Money, copied, not imported
+
+The Lesson 01 `Money` struct with `Plus` and `Minus` returning `(Money, error)`: `int64` wraps silently, so `addChecked` stands in for `Math.addExact`, and a currency mismatch is an error value rather than an exception.
+
 ```go
-var Legal = map[TransactionState]map[Action]bool{
-    Authorized:        {ActIncrement: true, ActCapture: true, ActVoid: true, ActExpire: true},
-    PartiallyCaptured: {ActCapture: true, ActCloseCapture: true, ActExpire: true},
-    ...
+func (m Money) Plus(other Money) (Money, error) {
+	if err := m.requireSameCurrency(other); err != nil {
+		return Money{}, err
+	}
+	sum, err := addChecked(m.MinorUnits, other.MinorUnits)
+	return Money{sum, m.Currency}, err
 }
 
-func (t *CardTransaction) Capture(amount Money, reason string) error {
-    t.ExpireIfDue(reason)
-    if err := t.require(ActCapture); err != nil {
-        return err
-    }
-    ...
+func (m Money) Minus(other Money) (Money, error) {
+	if err := m.requireSameCurrency(other); err != nil {
+		return Money{}, err
+	}
+	diff, err := addChecked(m.MinorUnits, -other.MinorUnits)
+	return Money{diff, m.Currency}, err
+}
+
+func (m Money) IsZero() bool     { return m.MinorUnits == 0 }
+func (m Money) IsPositive() bool { return m.MinorUnits > 0 }
+```
+
+#### Step 2: The clock
+
+A one-method interface and a pointer-receiver fake. `Advance` uses `time.Time.Add` with a `time.Duration`.
+
+```go
+type Clock interface {
+	Now() time.Time
+}
+
+// FakeClock is a clock that only moves when the test tells it to.
+type FakeClock struct {
+	current time.Time
+}
+
+func NewFakeClock(start time.Time) *FakeClock { return &FakeClock{current: start} }
+func (c *FakeClock) Now() time.Time           { return c.current }
+func (c *FakeClock) Advance(d time.Duration)  { c.current = c.current.Add(d) }
+```
+
+#### Step 3: States, actions, and the legal-move table
+
+Go has no enums, so both types are `int`s with `iota` constants and name tables for `String()`. The legal table is a map of maps; a missing inner key reads as `false`, and the terminal rows are explicit empty maps so every state has an entry.
+
+```go
+type TransactionState int
+
+const (
+	Authorized TransactionState = iota
+	PartiallyCaptured
+	Captured
+	Voided
+	Expired
+	PartiallyRefunded
+	Refunded
+)
+
+var stateNames = [...]string{"AUTHORIZED", "PARTIALLY_CAPTURED", "CAPTURED", "VOIDED", "EXPIRED", "PARTIALLY_REFUNDED", "REFUNDED"}
+
+func (s TransactionState) String() string { return stateNames[s] }
+
+func (s TransactionState) IsTerminal() bool { return s == Voided || s == Expired || s == Refunded }
+```
+
+```go
+var Legal = map[TransactionState]map[Action]bool{
+	Authorized:        {ActIncrement: true, ActCapture: true, ActVoid: true, ActExpire: true},
+	PartiallyCaptured: {ActCapture: true, ActCloseCapture: true, ActExpire: true},
+	Captured:          {ActRefund: true},
+	PartiallyRefunded: {ActRefund: true},
+	Voided:            {},
+	Expired:           {},
+	Refunded:          {},
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 4: The policy
 
-- **Errors are values.** Every write method returns `error`. `IllegalTransitionError` is a struct carrying `From` and `Action`, and implements `Is(ErrIllegalTransition)` so callers can match the category with `errors.Is` or extract the fields with `errors.As`. Amount-rule failures wrap `ErrLimitExceeded` with `%w`.
-- **`From` is a `*TransactionState`**, nil for the creating event, because Go has no `null` for value types and an `Optional` would be ceremony.
-- **`Events()` returns a copy.** Go slices alias their backing array, so returning `t.events` would let a caller mutate the log. The test tampers with the returned slice and checks the original is unchanged.
-- **`time.Time` and `time.Duration`** replace `Instant` and `Duration`; `Before` gives the same exact boundary as `isBefore`.
+A value struct; `NewLifecyclePolicy` validates and returns an error, `Standard` is a package-level value, and `PolicyForMCC` is a `switch` with a multi-value case. `CaptureCeiling` panics if `Times` overflows, because an authorization large enough to overflow `int64` is a bug upstream.
+
+```go
+type LifecyclePolicy struct {
+	AuthValidity            time.Duration
+	OverCaptureToleranceBps int64
+}
+
+// Standard is seven days of validity and no over-capture tolerance.
+var Standard = LifecyclePolicy{AuthValidity: 7 * 24 * time.Hour, OverCaptureToleranceBps: 0}
+
+func PolicyForMCC(mcc string) LifecyclePolicy {
+	switch mcc {
+	case "5812", "5813", "5814", "4121", "7230":
+		return LifecyclePolicy{7 * 24 * time.Hour, 1500}
+	}
+	return Standard
+}
+
+// CaptureCeiling is the most that may be captured in total, rounded toward the merchant's disadvantage.
+func (p LifecyclePolicy) CaptureCeiling(authorized Money) Money {
+	ceiling, err := authorized.Times(10_000+p.OverCaptureToleranceBps, 10_000, Down)
+	if err != nil {
+		panic(err)
+	}
+	return ceiling
+}
+```
+
+#### Step 5: The event
+
+`From` is a pointer so the creating event can carry `nil`. The blank-reason check lives in `transition` rather than in a constructor, since a struct literal has no hook.
+
+```go
+type TransactionEvent struct {
+	Sequence int
+	Action   Action
+	Amount   Money
+	From     *TransactionState // nil for the creating AUTHORIZE event
+	To       TransactionState
+	At       time.Time
+	Reason   string
+}
+
+func (e TransactionEvent) String() string {
+	origin := "(new)"
+	if e.From != nil {
+		origin = e.From.String()
+	}
+	return fmt.Sprintf("#%d %-13s %12s  %s -> %s  @%s  %q", e.Sequence, e.Action, e.Amount, origin, e.To,
+		e.At.Format(time.RFC3339), e.Reason)
+}
+```
+
+#### Step 6: The single choke point
+
+`require` returns a typed `*IllegalTransitionError`; `requirePositive` wraps the two sentinels; `transition` is where the blank-reason rule lives, takes the address of a local copy of the state for `From`, and appends before updating `t.state`.
+
+```go
+func (t *CardTransaction) require(action Action) error {
+	if !Legal[t.state][action] {
+		return &IllegalTransitionError{From: t.state, Action: action}
+	}
+	return nil
+}
+
+func (t *CardTransaction) requirePositive(amount Money) error {
+	if amount.Currency != t.authorized.Currency {
+		return fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, t.authorized.Currency.Code, amount.Currency.Code)
+	}
+	if !amount.IsPositive() {
+		return fmt.Errorf("%w: amount must be positive: %v", ErrLimitExceeded, amount)
+	}
+	return nil
+}
+
+func (t *CardTransaction) transition(action Action, amount Money, to TransactionState, reason string) error {
+	if strings.TrimSpace(reason) == "" {
+		return errors.New("every transition needs a reason")
+	}
+	from := t.state
+	t.events = append(t.events, TransactionEvent{len(t.events) + 1, action, amount, &from, to, t.clock.Now(), reason})
+	t.state = to
+	return nil
+}
+```
+
+#### Step 7: Capture, with both invariants visible
+
+Each guard is an early `return err`. `Plus` can fail (overflow or currency), so it is checked; `Compare` replaces `compareTo` for both the ceiling test and the next-state decision.
+
+```go
+func (t *CardTransaction) Capture(amount Money, reason string) error {
+	t.ExpireIfDue(reason)
+	if err := t.require(ActCapture); err != nil {
+		return err
+	}
+	if err := t.requirePositive(amount); err != nil {
+		return err
+	}
+	ceiling := t.policy.CaptureCeiling(t.authorized)
+	total, err := t.captured.Plus(amount)
+	if err != nil {
+		return err
+	}
+	if total.Compare(ceiling) > 0 {
+		return fmt.Errorf("%w: capture of %v would bring total to %v, above ceiling %v (authorized %v, tolerance %d bps)",
+			ErrLimitExceeded, amount, total, ceiling, t.authorized, t.policy.OverCaptureToleranceBps)
+	}
+	t.captured = total
+	next := PartiallyCaptured
+	if t.captured.Compare(t.authorized) >= 0 {
+		next = Captured
+	}
+	return t.transition(ActCapture, amount, next, reason)
+}
+```
+
+#### Step 8: Expiry from the clock
+
+`Before` is the exact boundary. The day count is integer division of the `time.Duration`, and the `transition` error is discarded because the reason is never blank here.
+
+```go
+func (t *CardTransaction) ExpireIfDue(attemptedReason string) bool {
+	if !Legal[t.state][ActExpire] {
+		return false
+	}
+	if t.clock.Now().Before(t.expiresAt) {
+		return false
+	}
+	days := int64(t.policy.AuthValidity / (24 * time.Hour))
+	// A never-captured authorization becomes Expired (terminal). A partially captured one keeps its captured
+	// funds: the remainder lapses and it becomes Captured, as CloseCapture would leave it, so refunds still work.
+	next := Expired
+	if t.state == PartiallyCaptured {
+		next = Captured
+	}
+	_ = t.transition(ActExpire, t.RemainingAuthorization(), next,
+		fmt.Sprintf("authorization validity of %d days elapsed (while attempting: %s)", days, attemptedReason))
+	return true
+}
+```
+
+#### Step 9: Run it
+
+```bash
+cd phases/11-payment-rails/02-card-authorization-lifecycle/code/go
+go run .
+go test ./...
+```
+
+The output matches the Java run (RFC 3339 timestamps with `Z`); the final section's heading says "errors" rather than "exceptions":
+
+```console
+== Forgotten authorization: capture attempted on day 8 ==
+  rejected: CAPTURE is not allowed in state EXPIRED
+transaction txn-stale-004 [EXPIRED] authorized=45.00 USD captured=0.00 USD refunded=0.00 USD net=0.00 USD
+
+== Illegal moves are errors, not silent no-ops ==
+  rejected: VOID is not allowed in state PARTIALLY_REFUNDED
+  rejected: CAPTURE is not allowed in state PARTIALLY_REFUNDED
+```
 
 ## Use It
 

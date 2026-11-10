@@ -382,30 +382,211 @@ The phantom row is the one to stare at: `REPEATABLE_READ` shows `Y` while the le
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`match` replaces the `switch` expressions:** each operation is a nested `op` closure handed to `_guarded`, which plays the role of the Java `Supplier`; a `ConflictException` is traced, the transaction aborts and releases its locks, and the exception is re-raised. **Two error kinds, kept apart:** `ConflictException` subclasses `Exception`, not `RuntimeError`, while using an aborted or committed transaction raises `RuntimeError` (Java's `IllegalStateException`); `_quietly` catches both, but the tests can tell them apart, and one test asserts the classes stay unrelated. **No `TreeMap`:** `committed` and the snapshot are plain `dict`s, and `_with_prefix` sorts the keys and filters by prefix, which is what `tailMap(prefix)` plus the early `break` computes; balances are `int` minor units and never overflow. **Same trace text:** `_j` prints `None` as `null` and `_jmap` prints a scan like Java's `TreeMap.toString`, so `diff` of the two demos is empty, and there are no threads, since concurrency is the scripted interleaving, exactly as in Java.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The levels and the lock table
+
+`Isolation` is an `Enum`, `ConflictException` is a direct `Exception` subclass, and `LockEntry` keeps a `set` of shared holders and an `int | None` exclusive holder. The two lock methods use `dict.setdefault` for `computeIfAbsent`, and `set.discard` for the upgrade path, which does nothing if the caller held no S lock.
+
 ```python
-def read(self, key: str) -> int | None:
-    def op() -> int | None:
-        match self.level:
-            case Isolation.READ_UNCOMMITTED:
-                v = self.store.committed.get(key)  # sees in-place writes of others
-            case Isolation.READ_COMMITTED:
-                v = self.writes[key] if key in self.writes else self.store.committed.get(key)
-            case Isolation.REPEATABLE_READ | Isolation.SERIALIZABLE:
-                if key not in self.writes:
-                    self.store.lock_shared(self.id, key)
-                v = self.writes[key] if key in self.writes else self.store.committed.get(key)
-            case Isolation.SNAPSHOT:
-                v = self.writes[key] if key in self.writes else self.snapshot.get(key)
-        ...
-    return self._guarded(op)
+class ConflictException(Exception):
+    """Raised when an operation would conflict with another live transaction. The receiver is aborted.
+
+    Deliberately not a RuntimeError, so it can never be mistaken for the "transaction is not active" error.
+    """
+
+
+class LockEntry:
+    def __init__(self) -> None:
+        self.shared: set[int] = set()
+        self.exclusive: int | None = None
+
+    def held_by_others(self, me: int) -> bool:
+        if self.exclusive is not None and self.exclusive != me:
+            return True
+        return any(s != me for s in self.shared)
 ```
 
-Differences, all in `code/python/main.py`:
+```python
+    def lock_shared(self, tx: int, key: str) -> None:
+        e = self.locks.setdefault(key, LockEntry())
+        if e.exclusive is not None and e.exclusive != tx:
+            raise ConflictException(f"T{tx} S-lock {key} blocked by X of T{e.exclusive}")
+        e.shared.add(tx)
 
-- **`match` replaces the `switch` expressions.** Each operation is a nested `op` closure handed to `_guarded`, which plays the role of the Java `Supplier`: a `ConflictException` is traced, the transaction aborts and releases its locks, and the exception is re-raised.
-- **Two error kinds, kept apart.** `ConflictException` subclasses `Exception`, not `RuntimeError`; using an aborted or committed transaction raises `RuntimeError` (Java's `IllegalStateException`). `_quietly` catches both, but the tests can tell them apart, and one test asserts the classes stay unrelated.
-- **No `TreeMap`.** `committed` and the snapshot are plain `dict`s; `_with_prefix` sorts the keys and filters by prefix, which is what `tailMap(prefix)` plus the early `break` computes. Balances are `int` minor units and never overflow.
-- **Same trace text.** `_j` prints `None` as `null` and `_jmap` prints a scan like Java's `TreeMap.toString`, so `diff` of the two demos is empty. There are no threads: concurrency is the scripted interleaving, exactly as in Java.
+    def lock_exclusive(self, tx: int, key: str) -> None:
+        e = self.locks.setdefault(key, LockEntry())
+        if e.held_by_others(tx):
+            raise ConflictException(f"T{tx} X-lock {key} blocked by {Store._describe_holders(e, tx)}")
+        e.shared.discard(tx)
+        e.exclusive = tx
+```
+
+#### Step 2: Predicate locks for the set that does not exist yet
+
+`lock_predicate` scans the existing lock entries for an X lock under the prefix, then registers the prefix. `check_predicate_conflict` is the reverse question, asked by every `SERIALIZABLE` write; the holders are iterated in sorted order so the conflict message is deterministic.
+
+```python
+    def lock_predicate(self, tx: int, prefix: str) -> None:
+        # conflict if another transaction holds X on any existing key under this prefix
+        for key, e in self.locks.items():
+            if key.startswith(prefix) and e.exclusive is not None and e.exclusive != tx:
+                raise ConflictException(f"T{tx} predicate {prefix}* blocked by X of T{e.exclusive} on {key}")
+        self.predicate_locks.setdefault(prefix, set()).add(tx)
+
+    def check_predicate_conflict(self, tx: int, key: str) -> None:
+        for prefix, holders in self.predicate_locks.items():
+            if key.startswith(prefix):
+                for holder in sorted(holders):
+                    if holder != tx:
+                        raise ConflictException(f"T{tx} write {key} blocked by predicate lock {prefix}* of T{holder}")
+```
+
+#### Step 3: Begin, and the snapshot
+
+The constructor copies `store.committed` with `dict(...)` only at `SNAPSHOT`, and records `commit_clock` as `snapshot_version` for every level. `_guarded` is the wrapper every operation runs through: it checks the status, runs the closure, and on a conflict traces, aborts, and re-raises.
+
+```python
+    def __init__(self, store: Store, id: int, level: Isolation) -> None:
+        self.store = store
+        self.id = id
+        self.level = level
+        self.status = Txn.Status.ACTIVE
+        self.writes: dict[str, int] = {}  # buffered writes (all levels except READ_UNCOMMITTED)
+        self.undo: dict[str, int | None] = {}  # READ_UNCOMMITTED: previous committed value for in-place writes
+        # SNAPSHOT: private copy taken at begin
+        self.snapshot: dict[str, int] | None = dict(store.committed) if level is Isolation.SNAPSHOT else None
+        self.snapshot_version = store.commit_clock
+        self.read_set: set[str] = set()
+
+    def _guarded(self, op: Callable[[], T]) -> T:
+        self._require_active()
+        try:
+            return op()
+        except ConflictException as c:
+            self.store.trace.append(f"  {c} -> T{self.id} ABORTED")
+            self.abort()
+            raise
+```
+
+#### Step 4: Read, per level
+
+A `match` with one arm per level, inside a closure passed to `_guarded`. The two locking levels share an arm with `|`. A missing key reads as `None`, which the trace prints as `null`.
+
+```python
+    def read(self, key: str) -> int | None:
+        def op() -> int | None:
+            match self.level:
+                case Isolation.READ_UNCOMMITTED:
+                    v = self.store.committed.get(key)  # sees in-place writes of others
+                case Isolation.READ_COMMITTED:
+                    v = self.writes[key] if key in self.writes else self.store.committed.get(key)
+                case Isolation.REPEATABLE_READ | Isolation.SERIALIZABLE:
+                    if key not in self.writes:
+                        self.store.lock_shared(self.id, key)
+                    v = self.writes[key] if key in self.writes else self.store.committed.get(key)
+                case Isolation.SNAPSHOT:
+                    v = self.writes[key] if key in self.writes else self.snapshot.get(key)
+            self.read_set.add(key)
+            self.store.trace.append(f"  T{self.id} read {key} = {_j(v)}")
+            return v
+
+        return self._guarded(op)
+```
+
+#### Step 5: Write, per level
+
+Same shape. `READ_UNCOMMITTED` saves the previous value with `undo.setdefault` and writes in place; the buffered levels take X and write to `self.writes`; `SERIALIZABLE` checks predicate locks first; `SNAPSHOT` buffers without locking.
+
+```python
+    def write(self, key: str, value: int) -> None:
+        def op() -> None:
+            match self.level:
+                case Isolation.READ_UNCOMMITTED:
+                    self.store.lock_exclusive(self.id, key)  # still no dirty WRITES: X lock held to commit
+                    self.undo.setdefault(key, self.store.committed.get(key))
+                    self.store.committed[key] = value  # applied in place, visible to everyone now
+                case Isolation.READ_COMMITTED | Isolation.REPEATABLE_READ:
+                    self.store.lock_exclusive(self.id, key)
+                    self.writes[key] = value
+                case Isolation.SERIALIZABLE:
+                    self.store.check_predicate_conflict(self.id, key)
+                    self.store.lock_exclusive(self.id, key)
+                    self.writes[key] = value
+                case Isolation.SNAPSHOT:
+                    self.writes[key] = value  # no locks; validated at commit
+            self.store.trace.append(f"  T{self.id} write {key} = {value}")
+
+        self._guarded(op)
+```
+
+#### Step 6: Commit, and first-committer-wins
+
+The `SNAPSHOT` validation iterates `self.writes` only, never `read_set`, which is why write skew passes. Then the commit clock advances, buffered writes are published and stamped (or, for `READ_UNCOMMITTED`, the in-place keys are stamped), and the locks are released.
+
+```python
+    def commit(self) -> None:
+        def op() -> None:
+            s = self.store
+            if self.level is Isolation.SNAPSHOT:
+                for k in self.writes:
+                    v = s.version_of.get(k, 0)
+                    if v > self.snapshot_version:
+                        raise ConflictException(
+                            f"T{self.id} first-committer-wins: {k} committed at v{v} after snapshot v{self.snapshot_version}")
+            s.commit_clock += 1
+            if self.level is Isolation.READ_UNCOMMITTED:
+                for k in self.undo:
+                    s.version_of[k] = s.commit_clock
+            else:
+                for k, v in self.writes.items():
+                    s.committed[k] = v
+                    s.version_of[k] = s.commit_clock
+            self.status = Txn.Status.COMMITTED
+            s.release_all(self.id)
+            s.trace.append(f"  T{self.id} COMMIT (v{s.commit_clock})")
+
+        self._guarded(op)
+```
+
+#### Step 7: The anomaly scripts
+
+Each script is a static method on `AnomalyLab`. `_quietly` swallows both `ConflictException` and `RuntimeError`, so an aborted transaction's later steps are skipped exactly as in Java. Mutable lists stand in for the Java arrays that the lambdas write into, and `matrix` is a nested dict comprehension over anomalies and levels.
+
+```python
+    @staticmethod
+    def write_skew(level: Isolation) -> Outcome:
+        s = Store()
+        s.load("acct:alice:checking", 600)
+        s.load("acct:alice:savings", 600)
+        t1, t2 = s.begin(level), s.begin(level)
+        q = AnomalyLab._quietly
+        c = [0, 0]
+        sv = [0, 0]
+
+        def check(i: int, t: Txn) -> None:
+            c[i] = t.read("acct:alice:checking")
+            sv[i] = t.read("acct:alice:savings")
+
+        q(lambda: check(0, t1))  # T1 checks: 1200 >= 1000
+        q(lambda: check(1, t2))  # T2 checks: 1200 >= 1000
+        q(lambda: t1.write("acct:alice:checking", c[0] - 1000) if c[0] + sv[0] - 1000 >= 0 else None)
+        q(lambda: t2.write("acct:alice:savings", sv[1] - 1000) if c[1] + sv[1] - 1000 >= 0 else None)
+        q(t1.commit)
+        q(t2.commit)
+        total = s.committed["acct:alice:checking"] + s.committed["acct:alice:savings"]
+        observed = total < 0
+        return Outcome("write skew", level, observed,
+                       f"combined balance {total} (invariant: >= 0); T1 {t1.status.name}, T2 {t2.status.name}", s.trace)
+
+    @staticmethod
+    def matrix() -> dict[str, dict[Isolation, bool]]:
+        return {a: {lvl: AnomalyLab.run(a, lvl).observed for lvl in Isolation} for a in AnomalyLab.ANOMALIES}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/04-isolation-levels-and-anomalies/code/python
@@ -413,33 +594,301 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The matrix and the four traces are the Java output:
+
+```console
+== Which anomalies does each level allow? (Y = anomaly observed) ==
+anomaly              READ_UNCOMMITTED   READ_COMMITTED   REPEATABLE_READ  SNAPSHOT   SERIALIZABLE
+dirty read           Y                  -                -                -          -
+non-repeatable read  Y                  Y                -                -          -
+phantom              Y                  Y                Y                -          -
+lost update          Y                  Y                -                -          -
+write skew           Y                  Y                -                Y          -
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes three things. **Conflicts are values, and they still abort:** `Read` returns `(int64, bool, error)` (the `bool` is Java's nullable `Long`), `Scan` returns `(map[string]int64, error)`, and `Write`/`Commit` return `error`; `ConflictError` implements `Is` so one sentinel `ErrConflict` matches every conflict while the message keeps the exact lock-table reason that the trace prints, `ErrNotActive` is the `IllegalStateException` for a finished transaction, and `guarded` does what the Java `guarded()` does minus the rethrow, because the scenarios simply discard the error, which is what the Java `quietly()` helper did. **Ordered maps by hand:** Java's `LinkedHashMap` for buffered writes becomes `orderedWrites` (a key slice plus a map) so `Commit` applies writes in the order they were issued, `TreeMap` iteration becomes `sortedKeys` wherever the order is observable (scan traces, `describeHolders`, the predicate-lock sweep), and `undoEntry{Value, Present}` stands in for a `null` previous value in the `READ_UNCOMMITTED` undo log. **No goroutines:** the store is single-threaded by design and concurrency is modelled by interleaving calls, so the port has no mutex and `go test -race` passes trivially; a version that drives transactions from goroutines must hold one mutex across every `Store` method, because the lock table is itself shared state.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same matrix and the same four traces as the Java version, line for line.
+
+#### Step 1: The levels and the lock table
+
+`ConflictError` carries the message and implements `Is` against the `ErrConflict` sentinel; the `conflict` helper formats one. `LockEntry.Exclusive` uses 0 for "none" because transaction ids start at 1, and `Shared` is a `map[int]bool`. The lock methods return errors instead of throwing.
+
 ```go
-// ConflictError carries the reason; errors.Is(err, ErrConflict) is true for every one of them.
 type ConflictError struct{ Msg string }
 
 func (e *ConflictError) Error() string        { return e.Msg }
 func (e *ConflictError) Is(target error) bool { return target == ErrConflict }
 
-func (t *Txn) guarded(op func() error) error {
-    if t.Status != Active {
-        return fmt.Errorf("%w: T%d is %s", ErrNotActive, t.ID, t.Status)
-    }
-    err := op()
-    if errors.Is(err, ErrConflict) {
-        t.Store.Trace = append(t.Store.Trace, fmt.Sprintf("  %s -> T%d ABORTED", err, t.ID))
-        t.Abort()
-    }
-    return err
+func conflict(format string, args ...any) error {
+	return &ConflictError{Msg: fmt.Sprintf(format, args...)}
+}
+
+type LockEntry struct {
+	Shared    map[int]bool
+	Exclusive int
+}
+
+func (e *LockEntry) HeldByOthers(me int) bool {
+	if e.Exclusive != 0 && e.Exclusive != me {
+		return true
+	}
+	for s := range e.Shared {
+		if s != me {
+			return true
+		}
+	}
+	return false
 }
 ```
 
-Differences, all in `code/go/main.go`:
+```go
+func (s *Store) LockShared(tx int, key string) error {
+	e := s.lockEntry(key)
+	if e.Exclusive != 0 && e.Exclusive != tx {
+		return conflict("T%d S-lock %s blocked by X of T%d", tx, key, e.Exclusive)
+	}
+	e.Shared[tx] = true
+	return nil
+}
 
-- **Conflicts are values, and they still abort.** `Read` returns `(int64, bool, error)` (the `bool` is Java's nullable `Long`), `Scan` returns `(map[string]int64, error)`, and `Write`/`Commit` return `error`. `ConflictError` implements `Is` so one sentinel `ErrConflict` matches every conflict while the message keeps the exact lock-table reason that the trace prints; `ErrNotActive` is the `IllegalStateException` for a finished transaction. `guarded` does what the Java `guarded()` does, minus the rethrow: the scenarios simply discard the error, which is what the Java `quietly()` helper did.
-- **Ordered maps by hand.** Java's `LinkedHashMap` for buffered writes becomes `orderedWrites` (a key slice plus a map) so `Commit` applies writes in the order they were issued; `TreeMap` iteration becomes `sortedKeys` wherever the order is observable (scan traces, `describeHolders`, the predicate-lock sweep). `undoEntry{Value, Present}` stands in for a `null` previous value in the `READ_UNCOMMITTED` undo log.
-- **No goroutines.** The store is single-threaded by design and concurrency is modelled by interleaving calls, so the port has no mutex; `go test -race` passes trivially. A version that drives transactions from goroutines must hold one mutex across every `Store` method, because the lock table is itself shared state.
+func (s *Store) LockExclusive(tx int, key string) error {
+	e := s.lockEntry(key)
+	if e.HeldByOthers(tx) {
+		return conflict("T%d X-lock %s blocked by %s", tx, key, describeHolders(e, tx))
+	}
+	delete(e.Shared, tx)
+	e.Exclusive = tx
+	return nil
+}
+```
+
+#### Step 2: Predicate locks for the set that does not exist yet
+
+Both sweeps iterate `sortedKeys(...)` because Go map order is random and the first conflict found becomes the trace line. The per-prefix holder set is created lazily.
+
+```go
+func (s *Store) LockPredicate(tx int, prefix string) error {
+	// conflict if another transaction holds X on any existing key under this prefix
+	for _, key := range sortedKeys(s.Locks) {
+		e := s.Locks[key]
+		if strings.HasPrefix(key, prefix) && e.Exclusive != 0 && e.Exclusive != tx {
+			return conflict("T%d predicate %s* blocked by X of T%d on %s", tx, prefix, e.Exclusive, key)
+		}
+	}
+	if s.PredicateLocks[prefix] == nil {
+		s.PredicateLocks[prefix] = map[int]bool{}
+	}
+	s.PredicateLocks[prefix][tx] = true
+	return nil
+}
+
+func (s *Store) CheckPredicateConflict(tx int, key string) error {
+	for _, prefix := range sortedKeys(s.PredicateLocks) {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		for _, holder := range sortedInts(s.PredicateLocks[prefix]) {
+			if holder != tx {
+				return conflict("T%d write %s blocked by predicate lock %s* of T%d", tx, key, prefix, holder)
+			}
+		}
+	}
+	return nil
+}
+```
+
+#### Step 3: Begin, and the snapshot
+
+`newTxn` copies the committed map key by key at `Snapshot` (maps are references, so assignment would alias). `guarded` returns `ErrNotActive` for a finished transaction, runs the closure, and on a conflict appends the trace line and aborts before returning the error to the caller.
+
+```go
+func newTxn(store *Store, id int, level Isolation) *Txn {
+	t := &Txn{Store: store, ID: id, Level: level, Status: Active, Writes: newOrderedWrites(), Undo: map[string]undoEntry{}, ReadSet: map[string]bool{}}
+	if level == Snapshot {
+		t.Snapshot = make(map[string]int64, len(store.Committed))
+		for k, v := range store.Committed {
+			t.Snapshot[k] = v
+		}
+	}
+	t.SnapshotVersion = store.CommitClock
+	return t
+}
+
+func (t *Txn) guarded(op func() error) error {
+	if t.Status != Active {
+		return fmt.Errorf("%w: T%d is %s", ErrNotActive, t.ID, t.Status)
+	}
+	err := op()
+	if errors.Is(err, ErrConflict) {
+		t.Store.Trace = append(t.Store.Trace, fmt.Sprintf("  %s -> T%d ABORTED", err.Error(), t.ID))
+		t.Abort()
+	}
+	return err
+}
+```
+
+#### Step 4: Read, per level
+
+Named return values let the closure set `value` and `present` and return only the error. `lookup` is the two-value map read, and `t.Writes.get` is the ordered map's equivalent. The locking levels take S only when the key is not already buffered.
+
+```go
+func (t *Txn) Read(key string) (value int64, present bool, err error) {
+	err = t.guarded(func() error {
+		switch t.Level {
+		case ReadUncommitted:
+			value, present = lookup(t.Store.Committed, key) // sees in-place writes of others
+		case ReadCommitted:
+			if value, present = t.Writes.get(key); !present {
+				value, present = lookup(t.Store.Committed, key)
+			}
+		case RepeatableRead, Serializable:
+			if _, buffered := t.Writes.get(key); !buffered {
+				if e := t.Store.LockShared(t.ID, key); e != nil {
+					return e
+				}
+			}
+			if value, present = t.Writes.get(key); !present {
+				value, present = lookup(t.Store.Committed, key)
+			}
+		case Snapshot:
+			if value, present = t.Writes.get(key); !present {
+				value, present = lookup(t.Snapshot, key)
+			}
+		}
+		t.ReadSet[key] = true
+		t.Store.Trace = append(t.Store.Trace, fmt.Sprintf("  T%d read %s = %s", t.ID, key, formatValue(value, present)))
+		return nil
+	})
+	return value, present, err
+}
+```
+
+#### Step 5: Write, per level
+
+Every lock call's error is returned immediately. The `READ_UNCOMMITTED` undo log records an `undoEntry` with a `Present` flag (there is no `null` to store) and keeps `undoKeys` for ordered replay at commit.
+
+```go
+func (t *Txn) Write(key string, value int64) error {
+	return t.guarded(func() error {
+		switch t.Level {
+		case ReadUncommitted:
+			if e := t.Store.LockExclusive(t.ID, key); e != nil { // still no dirty WRITES: X lock held to commit
+				return e
+			}
+			if _, seen := t.Undo[key]; !seen {
+				old, present := lookup(t.Store.Committed, key)
+				t.Undo[key] = undoEntry{old, present}
+				t.undoKeys = append(t.undoKeys, key)
+			}
+			t.Store.Committed[key] = value // applied in place, visible to everyone now
+		case ReadCommitted, RepeatableRead:
+			if e := t.Store.LockExclusive(t.ID, key); e != nil {
+				return e
+			}
+			t.Writes.put(key, value)
+		case Serializable:
+			if e := t.Store.CheckPredicateConflict(t.ID, key); e != nil {
+				return e
+			}
+			if e := t.Store.LockExclusive(t.ID, key); e != nil {
+				return e
+			}
+			t.Writes.put(key, value)
+		case Snapshot:
+			t.Writes.put(key, value) // no locks; validated at commit
+		}
+		t.Store.Trace = append(t.Store.Trace, fmt.Sprintf("  T%d write %s = %d", t.ID, key, value))
+		return nil
+	})
+}
+```
+
+#### Step 6: Commit, and first-committer-wins
+
+The validation and the publish loops both walk `t.Writes.keys`, the insertion-order slice, so writes land in the order they were issued. A missing `VersionOf` entry reads as 0, matching `getOrDefault(k, 0L)`.
+
+```go
+func (t *Txn) Commit() error {
+	return t.guarded(func() error {
+		if t.Level == Snapshot {
+			for _, k := range t.Writes.keys {
+				v := t.Store.VersionOf[k]
+				if v > t.SnapshotVersion {
+					return conflict("T%d first-committer-wins: %s committed at v%d after snapshot v%d", t.ID, k, v, t.SnapshotVersion)
+				}
+			}
+		}
+		t.Store.CommitClock++
+		if t.Level == ReadUncommitted {
+			for _, k := range t.undoKeys {
+				t.Store.VersionOf[k] = t.Store.CommitClock
+			}
+		} else {
+			for _, k := range t.Writes.keys {
+				t.Store.Committed[k] = t.Writes.vals[k]
+				t.Store.VersionOf[k] = t.Store.CommitClock
+			}
+		}
+		t.Status = Committed
+		t.Store.ReleaseAll(t.ID)
+		t.Store.Trace = append(t.Store.Trace, fmt.Sprintf("  T%d COMMIT (v%d)", t.ID, t.Store.CommitClock))
+		return nil
+	})
+}
+```
+
+#### Step 7: The anomaly scripts
+
+The scripts are package-level functions. Errors from refused steps are discarded with `_ =`, and `readBoth` returns early if the first read fails, so an aborted transaction's later steps do not run; `guarded` already refuses them with `ErrNotActive`. `Matrix` iterates the `Anomalies` and `Levels` slices for a stable order.
+
+```go
+func WriteSkew(level Isolation) Outcome {
+	s := NewStore()
+	s.Load("acct:alice:checking", 600)
+	s.Load("acct:alice:savings", 600)
+	t1, t2 := s.Begin(level), s.Begin(level)
+	var c, sv [2]int64
+	readBoth := func(t *Txn, i int) {
+		var err error
+		if c[i], _, err = t.Read("acct:alice:checking"); err != nil {
+			return
+		}
+		sv[i], _, _ = t.Read("acct:alice:savings")
+	}
+	readBoth(t1, 0) // T1 checks: 1200 >= 1000
+	readBoth(t2, 1) // T2 checks: 1200 >= 1000
+	if c[0]+sv[0]-1000 >= 0 {
+		_ = t1.Write("acct:alice:checking", c[0]-1000) // withdraw 10.00 from checking
+	}
+	if c[1]+sv[1]-1000 >= 0 {
+		_ = t2.Write("acct:alice:savings", sv[1]-1000) // withdraw 10.00 from savings
+	}
+	_ = t1.Commit()
+	_ = t2.Commit()
+	sum := s.Committed["acct:alice:checking"] + s.Committed["acct:alice:savings"]
+	observed := sum < 0
+	return Outcome{"write skew", level, observed,
+		fmt.Sprintf("combined balance %d (invariant: >= 0); T1 %s, T2 %s", sum, t1.Status, t2.Status), s.Trace}
+}
+
+func (lab AnomalyLab) Matrix() map[string]map[Isolation]bool {
+	m := map[string]map[Isolation]bool{}
+	for _, a := range Anomalies {
+		row := map[Isolation]bool{}
+		for _, l := range Levels {
+			out, _ := lab.Run(a, l)
+			row[l] = out.Observed
+		}
+		m[a] = row
+	}
+	return m
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/04-isolation-levels-and-anomalies/code/go
@@ -447,7 +896,13 @@ go run .
 go test ./...
 ```
 
-The demo prints the same matrix and the same four traces as the Java version, line for line.
+```console
+  T2 first-committer-wins: acct:alice committed at v1 after snapshot v0 -> T2 ABORTED
+  T2 ABORT
+  => final balance 1100 (expected 1300 if both deposits landed); T1 COMMITTED, T2 ABORTED
+```
+
+The matrix above this and the other three traces are the Java output, line for line.
 
 ## Use It
 

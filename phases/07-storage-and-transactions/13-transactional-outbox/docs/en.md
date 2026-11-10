@@ -356,34 +356,184 @@ Sections 1 and 2 are the two halves of the dual-write problem; sections 3 and 4 
 
 ### In Python
 
-```python
-def commit(self) -> None:
-    self._require_open()
-    self._open = False
-    s = self._store
-    for p in self._pending_payments:
-        s._payments[p.payment_id] = p
-    for e in self._pending_events:
-        seq = s._next_seq
-        s._next_seq += 1
-        s._outbox[seq] = replace(e, seq=seq, published=False)
-    ...
+The Python port (`code/python/main.py`) is the same design with four differences. **The transaction is also a context manager:** `Store.Tx` keeps the Java API (`insert_payment(...).insert_outbox(...).commit()`, `rollback()`) and adds `__enter__`/`__exit__`, so `with store.begin() as tx:` commits on success and rolls back on an exception; that makes "both rows or neither" the default shape of the code, not a discipline, and a Python-only test covers both exits. The inner class is a nested `class Tx` holding a reference to its `Store`, because Python has no implicit outer instance. **Records are frozen dataclasses:** `OutboxEvent.mark_published` and the seq assignment at commit use `dataclasses.replace`, the equivalent of building a new record, and `Broker.from` is `from_`, because `from` is a keyword. **Errors and money:** `CrashException` and `BrokerUnavailableException` are `RuntimeError` subclasses, and the relay catches only the broker one, so a crash escapes `poll()` as it does in Java; a closed or duplicate transaction raises `RuntimeError` (`IllegalStateException`), and `Money.plus` checks the signed 64-bit range by hand and raises `OverflowError`, as `Math.addExact` would. **Same output:** no threads, a simulated clock and scripted crash points, so the demo's counts and the broker order `11 12 13 14 15` match Java exactly.
 
-def __exit__(self, exc_type, exc, tb) -> bool:
-    if self._open:
-        if exc_type is None:
-            self.commit()
-        else:
-            self.rollback()
-    return False
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A store with real transactions
+
+The three `insert_*`/`mark_*` methods buffer and return `self` for chaining. `commit` closes the transaction, then applies payments, assigns each buffered event its `seq` with `dataclasses.replace`, and applies the marks. `__exit__` is the Python-only addition: commit on a clean exit, rollback on an exception, and never swallow the exception.
+
+```python
+        def insert_payment(self, p: Payment) -> "Store.Tx":
+            self._require_open()
+            if p.payment_id in self._store._payments:
+                raise RuntimeError(f"duplicate payment {p.payment_id}")
+            self._pending_payments.append(p)
+            return self
+
+        def insert_outbox(self, event_id: str, aggregate_id: str, type: str, payload: str, at_ms: int) -> "Store.Tx":
+            self._require_open()
+            self._pending_events.append(OutboxEvent(0, event_id, aggregate_id, type, payload, at_ms, False))
+            return self
+
+        def mark_published(self, seq: int) -> "Store.Tx":
+            self._require_open()
+            self._pending_marks.append(seq)
+            return self
+
+        def commit(self) -> None:
+            self._require_open()
+            self._open = False
+            s = self._store
+            for p in self._pending_payments:
+                s._payments[p.payment_id] = p
+            for e in self._pending_events:
+                seq = s._next_seq
+                s._next_seq += 1
+                s._outbox[seq] = replace(e, seq=seq, published=False)
+            for seq in self._pending_marks:
+                e = s._outbox.get(seq)
+                if e is not None:
+                    s._outbox[seq] = e.mark_published()
+            s.commits += 1
+
+        def rollback(self) -> None:
+            self._require_open()
+            self._open = False
+            self._store.rollbacks += 1
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            if self._open:
+                if exc_type is None:
+                    self.commit()
+                else:
+                    self.rollback()
+            return False
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The outbox row, the broker, and one payload builder
 
-- **The transaction is also a context manager.** `Store.Tx` keeps the Java API (`insert_payment(...).insert_outbox(...).commit()`, `rollback()`), and adds `__enter__`/`__exit__`, so `with store.begin() as tx:` commits on success and rolls back on an exception. That makes "both rows or neither" the default shape of the code, not a discipline; a Python-only test covers both exits. The inner class is a nested `class Tx` holding a reference to its `Store`, because Python has no implicit outer instance.
-- **Records are frozen dataclasses.** `OutboxEvent.mark_published` and the seq assignment at commit use `dataclasses.replace`, the equivalent of building a new record. `Broker.from` is `from_`, because `from` is a keyword.
-- **Errors and money.** `CrashException` and `BrokerUnavailableException` are `RuntimeError` subclasses, and the relay catches only the broker one, so a crash escapes `poll()` as it does in Java. A closed or duplicate transaction raises `RuntimeError` (`IllegalStateException`). `Money.plus` checks the signed 64-bit range by hand and raises `OverflowError`, as `Math.addExact` would.
-- **Same output.** No threads, a simulated clock and scripted crash points: the demo's counts and the broker order `11 12 13 14 15` match Java exactly.
+`OutboxEvent` is frozen and `mark_published` returns a `replace`d copy. `Broker.publish` raises `BrokerUnavailableException` when `down` and otherwise appends and returns the offset. `Events` is a namespace of two static builders shared by both services.
+
+```python
+@dataclass(frozen=True)
+class OutboxEvent:
+    seq: int
+    event_id: str
+    aggregate_id: str
+    type: str
+    payload: str
+    created_at_ms: int
+    published: bool
+
+    def mark_published(self) -> "OutboxEvent":
+        return replace(self, published=True)
+
+
+class Broker:
+    def __init__(self) -> None:
+        self._log: list[Message] = []
+        self.down = False
+        self.publish_attempts = 0
+
+    def publish(self, event_id: str, aggregate_id: str, type: str, payload: str) -> int:
+        self.publish_attempts += 1
+        if self.down:
+            raise BrokerUnavailableException()
+        offset = len(self._log)
+        self._log.append(Message(offset, event_id, aggregate_id, type, payload))
+        return offset
+
+
+class Events:
+    PAYMENT_ACCEPTED = "PaymentAccepted"
+
+    @staticmethod
+    def event_id_for(p: Payment) -> str:
+        return f"evt-{p.payment_id}"
+
+    @staticmethod
+    def payload_for(p: Payment) -> str:
+        return f"{p.payment_id}|{p.merchant}|{p.amount}"
+```
+
+#### Step 3: The dual-write service, both orders
+
+Both orders with their crash points, raising `CrashException` at the window the Java throws in. The `is` comparisons work because `CrashPoint` is an `Enum`.
+
+```python
+    def accept(self, p: Payment) -> None:
+        if self.publish_first:
+            self._broker.publish(Events.event_id_for(p), p.merchant, Events.PAYMENT_ACCEPTED, Events.payload_for(p))
+            if self.crash_point is CrashPoint.AFTER_PUBLISH_BEFORE_COMMIT:
+                raise CrashException("after publish, before commit")
+            self._store.begin().insert_payment(p).commit()
+        else:
+            self._store.begin().insert_payment(p).commit()
+            if self.crash_point is CrashPoint.AFTER_COMMIT_BEFORE_PUBLISH:
+                raise CrashException("after commit, before publish")
+            self._broker.publish(Events.event_id_for(p), p.merchant, Events.PAYMENT_ACCEPTED, Events.payload_for(p))
+```
+
+#### Step 4: The outbox service
+
+One chained transaction, no broker. The parentheses let the chain span lines without backslashes.
+
+```python
+    def accept(self, p: Payment) -> None:
+        (self._store.begin()
+         .insert_payment(p)
+         .insert_outbox(Events.event_id_for(p), p.merchant, Events.PAYMENT_ACCEPTED, Events.payload_for(p),
+                        self._clock.now())
+         .commit())
+```
+
+#### Step 5: The relay
+
+`poll` publishes then marks, one row at a time. Only `BrokerUnavailableException` is caught; the injected `CrashException` escapes, after the crash point resets itself so the restarted relay can drain.
+
+```python
+    def poll(self) -> int:
+        self.polls += 1
+        marked = 0
+        for e in self._store.unpublished(self.batch_size):
+            try:
+                self._broker.publish(e.event_id, e.aggregate_id, e.type, e.payload)
+            except BrokerUnavailableException:
+                self.failed_attempts += 1
+                return marked  # leave the row pending; retry next poll
+            self.published += 1
+            if self.crash_point is CrashPoint.AFTER_PUBLISH_BEFORE_MARK:
+                self.crash_point = CrashPoint.NONE
+                raise CrashException(f"after publish of {e.event_id}, before mark")
+            self._store.begin().mark_published(e.seq).commit()
+            marked += 1
+        return marked
+```
+
+#### Step 6: The consumer that makes duplicates harmless
+
+Python's `set.add` returns `None`, so the dedupe is a membership test followed by an add rather than Java's `if (!applied.add(...))`. The amount is parsed from the third `|` field and merged into the merchant's balance with `plus`.
+
+```python
+    def consume(self) -> int:
+        applied_now = 0
+        for m in self._broker.from_(self._offset):
+            self._offset = m.offset + 1
+            if m.event_id in self._applied:
+                self.duplicates_ignored += 1
+                continue
+            self._applied.add(m.event_id)
+            parts = m.payload.split("|")
+            amount = LedgerConsumer.parse_money(parts[2])
+            prev = self._balances.get(m.aggregate_id)
+            self._balances[m.aggregate_id] = amount if prev is None else prev.plus(amount)
+            applied_now += 1
+        return applied_now
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/13-transactional-outbox/code/python
@@ -391,40 +541,227 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Section 4 shows the at-least-once duplicate and the dedupe, as in Java:
+
+```console
+== 4. Relay crashes after publish, before mark: at-least-once, and the consumer dedupes ==
+  relay: crash after publish of evt-pay-6, before mark
+  broker has 1 message(s); store still has 2 pending rows
+  relay restarted and drained; broker now has 3 messages for 2 payments
+    offset 0 evt-pay-6
+    offset 1 evt-pay-6
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Errors are values, and the two failures are different values:** `Broker.Publish` returns `(offset, error)` with the sentinel `ErrBrokerUnavailable`, which the relay treats as the expected, transient outcome (count it, keep the row pending, return `nil`); the injected crash is a `*CrashError` that matches `ErrCrash` through `errors.Is` and is *returned* from `Poll`, `Drain` and `DualWritePaymentService.Accept` rather than thrown, so tests assert on it without `recover()` and the demo prints `err.Error()`. `Tx.Commit`/`Rollback` return `ErrTxClosed` on reuse, and a duplicate payment id is remembered by the chaining `InsertPayment` and reported by `Tx.Err()` and `Commit` as `ErrDuplicatePayment`, so the transaction fails as a whole. **Chaining without exceptions:** `store.Begin().InsertPayment(p).InsertOutbox(...).Commit()` reads exactly like the Java, because `InsertPayment`, `InsertOutbox` and `MarkPublished` keep returning `*Tx` and stash the first error for `Commit` to surface; the nested `Store.Tx` becomes a top-level `Tx` holding a `*Store`. **Ordered data without `LinkedHashMap`:** the outbox is a `map[int64]OutboxEvent` keyed by `Seq`, and `OutboxRows` walks `1..nextSeq-1` so commit order is the iteration order, with `Unpublished(limit)` built on it; `OutboxEvent.MarkPublished` returns a modified copy of a value struct, the Go spelling of the Java record's `markPublished()`. **Money and payloads:** `Money.Plus` returns `(Money, error)`, `ParseMoney` returns `(Money, error)` from `strconv.ParseInt`, so `LedgerConsumer.Consume` returns `(applied, error)` instead of silently accepting a malformed payload; no goroutines, since the relay is a polling loop driven by the test, so `go test -race` passes without a mutex, and a relay goroutine with a `time.Ticker` is the natural next step, at which point the store needs one.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same six sections as the Java version, line for line.
+
+#### Step 1: A store with real transactions
+
+`Tx` is a top-level struct with an `err` slot. Each buffering method checks `requireOpen` and funnels failures through `fail`, which keeps the first error and still returns `*Tx` so the chain compiles; `Commit` refuses on a stashed error, then applies payments, assigns sequence numbers, and applies marks.
+
 ```go
-func (r *OutboxRelay) Poll() (int, error) {
-    r.Polls++
-    marked := 0
-    for _, e := range r.store.Unpublished(r.BatchSize) {
-        if _, err := r.broker.Publish(e.EventID, e.AggregateID, e.Type, e.Payload); err != nil {
-            if errors.Is(err, ErrBrokerUnavailable) {
-                r.FailedAttempts++
-                return marked, nil // leave the row pending; retry next poll
-            }
-            return marked, err
-        }
-        r.Published++
-        if r.CrashPoint == AfterPublishBeforeMark {
-            r.CrashPoint = NoCrash
-            return marked, &CrashError{"after publish of " + e.EventID + ", before mark"}
-        }
-        if err := r.store.Begin().MarkPublished(e.Seq).Commit(); err != nil {
-            return marked, err
-        }
-        marked++
-    }
-    return marked, nil
+type Tx struct {
+	store           *Store
+	pendingPayments []Payment
+	pendingEvents   []OutboxEvent
+	pendingMarks    []int64
+	open            bool
+	err             error
+}
+
+func (t *Tx) fail(err error) *Tx {
+	if t.err == nil {
+		t.err = err
+	}
+	return t
+}
+
+func (t *Tx) InsertPayment(p Payment) *Tx {
+	if err := t.requireOpen(); err != nil {
+		return t.fail(err)
+	}
+	if _, dup := t.store.payments[p.PaymentID]; dup {
+		return t.fail(fmt.Errorf("%w: %s", ErrDuplicatePayment, p.PaymentID))
+	}
+	t.pendingPayments = append(t.pendingPayments, p)
+	return t
+}
+
+func (t *Tx) Commit() error {
+	if err := t.requireOpen(); err != nil {
+		return err
+	}
+	if t.err != nil {
+		return t.err
+	}
+	t.open = false
+	s := t.store
+	for _, p := range t.pendingPayments {
+		if _, present := s.payments[p.PaymentID]; !present {
+			s.paymentOrder = append(s.paymentOrder, p.PaymentID)
+		}
+		s.payments[p.PaymentID] = p
+	}
+	for _, e := range t.pendingEvents {
+		seq := s.nextSeq
+		s.nextSeq++
+		s.outbox[seq] = OutboxEvent{seq, e.EventID, e.AggregateID, e.Type, e.Payload, e.CreatedAtMs, false}
+	}
+	for _, seq := range t.pendingMarks {
+		if e, ok := s.outbox[seq]; ok {
+			s.outbox[seq] = e.MarkPublished()
+		}
+	}
+	s.Commits++
+	return nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The outbox row, the broker, and one payload builder
 
-- **Errors are values, and the two failures are different values.** `Broker.Publish` returns `(offset, error)` with the sentinel `ErrBrokerUnavailable`; the relay treats it as the expected, transient outcome (count it, keep the row pending, return `nil`). The injected crash is a `*CrashError` that matches `ErrCrash` through `errors.Is` and is *returned* from `Poll`, `Drain` and `DualWritePaymentService.Accept` rather than thrown, so tests assert on it without `recover()` and the demo prints `err.Error()`. `Tx.Commit`/`Rollback` return `ErrTxClosed` on reuse; a duplicate payment id is remembered by the chaining `InsertPayment` and reported by `Tx.Err()` and `Commit` as `ErrDuplicatePayment`, so the transaction fails as a whole.
-- **Chaining without exceptions.** `store.Begin().InsertPayment(p).InsertOutbox(...).Commit()` reads exactly like the Java, because `InsertPayment`, `InsertOutbox` and `MarkPublished` keep returning `*Tx` and stash the first error for `Commit` to surface. The nested `Store.Tx` becomes a top-level `Tx` holding a `*Store`.
-- **Ordered data without `LinkedHashMap`.** The outbox is a `map[int64]OutboxEvent` keyed by `Seq`, and `OutboxRows` walks `1..nextSeq-1` so commit order is the iteration order; `Unpublished(limit)` builds on it. `OutboxEvent.MarkPublished` returns a modified copy of a value struct, the Go spelling of the Java record's `markPublished()`.
-- **Money and payloads.** `Money.Plus` returns `(Money, error)`; `ParseMoney` returns `(Money, error)` from `strconv.ParseInt`, so `LedgerConsumer.Consume` returns `(applied, error)` instead of silently accepting a malformed payload. No goroutines: the relay is a polling loop driven by the test, so `go test -race` passes without a mutex. A relay goroutine with a `time.Ticker` is the natural next step, and then the store needs one.
+`MarkPublished` has a value receiver, so setting `e.Published` modifies a copy and returning it is the record-style update. `Publish` returns `ErrBrokerUnavailable` when `Down`. The two builders are package-level functions.
+
+```go
+type OutboxEvent struct {
+	Seq         int64
+	EventID     string
+	AggregateID string
+	Type        string
+	Payload     string
+	CreatedAtMs int64
+	Published   bool
+}
+
+func (e OutboxEvent) MarkPublished() OutboxEvent {
+	e.Published = true
+	return e
+}
+
+type Broker struct {
+	log             []Message
+	Down            bool
+	PublishAttempts int
+}
+
+func (b *Broker) Publish(eventID, aggregateID, typ, payload string) (int64, error) {
+	b.PublishAttempts++
+	if b.Down {
+		return 0, ErrBrokerUnavailable
+	}
+	offset := int64(len(b.log))
+	b.log = append(b.log, Message{offset, eventID, aggregateID, typ, payload})
+	return offset, nil
+}
+
+func EventIDFor(p Payment) string { return "evt-" + p.PaymentID }
+func PayloadFor(p Payment) string { return p.PaymentID + "|" + p.Merchant + "|" + p.Amount.String() }
+```
+
+#### Step 3: The dual-write service, both orders
+
+`Accept` returns an error at each of the two windows: the broker's error, a `*CrashError` at the injected point, or the commit's error. The structure is the Java `if`/`else` flattened with early returns.
+
+```go
+func (s *DualWritePaymentService) Accept(p Payment) error {
+	if s.PublishFirst {
+		if _, err := s.broker.Publish(EventIDFor(p), p.Merchant, PaymentAccepted, PayloadFor(p)); err != nil {
+			return err
+		}
+		if s.CrashPoint == AfterPublishBeforeCommit {
+			return &CrashError{"after publish, before commit"}
+		}
+		return s.store.Begin().InsertPayment(p).Commit()
+	}
+	if err := s.store.Begin().InsertPayment(p).Commit(); err != nil {
+		return err
+	}
+	if s.CrashPoint == AfterCommitBeforePublish {
+		return &CrashError{"after commit, before publish"}
+	}
+	_, err := s.broker.Publish(EventIDFor(p), p.Merchant, PaymentAccepted, PayloadFor(p))
+	return err
+}
+```
+
+#### Step 4: The outbox service
+
+The same chain as the Java, ending in `Commit()` whose error is the method's result. The broker is absent.
+
+```go
+func (s *OutboxPaymentService) Accept(p Payment) error {
+	return s.store.Begin().
+		InsertPayment(p).
+		InsertOutbox(EventIDFor(p), p.Merchant, PaymentAccepted, PayloadFor(p), s.clock.Now()).
+		Commit()
+}
+```
+
+#### Step 5: The relay
+
+`Poll` returns `(marked, error)`. A broker outage is recognised with `errors.Is` and returns `nil`, because it is the normal transient case; any other publish error, the injected crash, and a failed mark commit are returned to the caller.
+
+```go
+func (r *OutboxRelay) Poll() (int, error) {
+	r.Polls++
+	marked := 0
+	for _, e := range r.store.Unpublished(r.BatchSize) {
+		if _, err := r.broker.Publish(e.EventID, e.AggregateID, e.Type, e.Payload); err != nil {
+			if errors.Is(err, ErrBrokerUnavailable) {
+				r.FailedAttempts++
+				return marked, nil // leave the row pending; retry next poll
+			}
+			return marked, err
+		}
+		r.Published++
+		if r.CrashPoint == AfterPublishBeforeMark {
+			r.CrashPoint = NoCrash
+			return marked, &CrashError{"after publish of " + e.EventID + ", before mark"}
+		}
+		if err := r.store.Begin().MarkPublished(e.Seq).Commit(); err != nil {
+			return marked, err
+		}
+		marked++
+	}
+	return marked, nil
+}
+```
+
+#### Step 6: The consumer that makes duplicates harmless
+
+`applied` is a `map[string]bool`; a repeat is skipped before any parsing. `ParseMoney` and `Plus` both return errors, so `Consume` returns the count applied so far together with the error rather than guessing at a malformed payload.
+
+```go
+func (c *LedgerConsumer) Consume() (int, error) {
+	appliedNow := 0
+	for _, m := range c.broker.From(c.offset) {
+		c.offset = m.Offset + 1
+		if c.applied[m.EventID] {
+			c.DuplicatesIgnored++
+			continue
+		}
+		c.applied[m.EventID] = true
+		parts := strings.Split(m.Payload, "|")
+		amount, err := ParseMoney(parts[2])
+		if err != nil {
+			return appliedNow, err
+		}
+		current, ok := c.balances[m.AggregateID]
+		if !ok {
+			current = Zero(amount.Currency)
+		}
+		if c.balances[m.AggregateID], err = current.Plus(amount); err != nil {
+			return appliedNow, err
+		}
+		appliedNow++
+	}
+	return appliedNow, nil
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/13-transactional-outbox/code/go
@@ -432,7 +769,12 @@ go run .
 go test ./...
 ```
 
-The demo prints the same six sections as the Java version, line for line.
+```console
+== 6. Ordering: outbox seq is commit order, and the relay publishes in that order per aggregate ==
+  batch size 2, 3 polls, broker order: 11 12 13 14 15
+```
+
+The five sections before this are the Java output, line for line.
 
 ## Use It
 

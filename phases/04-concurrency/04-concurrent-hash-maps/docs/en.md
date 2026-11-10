@@ -360,24 +360,220 @@ The test suite runs the same single-threaded contract against all three maps, th
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps `ConcurrentStore`, `GlobalLockMap`, `StripedHashMap` (one `threading.Lock` per segment), `LockFreeReadMap`, and the barrier-forced races. Four things differ. **The hash is rebuilt in 32-bit arithmetic.** Python's `hash(str)` is salted per process, so `Hashing.stable_hash` computes `String.hashCode` over UTF-16 code units and masks to 32 bits after each step, and `spread` masks after each multiply. The segment index uses the unsigned view of the hash before shifting, which is Java's `>>>`. The result: every key lands in the same stripe and bucket as in Java (`acct-1->s8 ... acct-8->s5`), and a test pins those placements. **The publish guarantee comes from the interpreter, not `volatile`.** Python has no `final` fields and no `volatile`. Reading `self._table` and `t[i]` are single atomic operations under the GIL (and under the free-threaded build's per-object locks), so a reader still sees the old chain or the new one. Nodes are made immutable by refusing `__setattr__` after construction, and a test asserts the `AttributeError`, so the "walk without synchronization" argument holds for the same reason it does in Java: nothing a reader can reach is ever mutated. **The GIL changes the throughput story, not the race story.** Only one thread runs bytecode at a time, so striping cannot add parallelism and the benchmark measures lock and hashing overhead instead (Python runs 20,000 benchmark ops per thread rather than 100,000, and the barrier test runs 2,000 keys x 200 bumps rather than 5,000 x 1,000, to stay fast on a two-core CI runner where contended Python locks convoy). The check-then-act race is unchanged: `threading.Barrier` holds all eight threads in the gap after `get`, so all eight still believe they created the record, and `put_if_absent` still produces exactly one winner. **Counters and nulls.** `size()` uses an `AtomicInteger` built on a lock, because `+=` is a read, an add, and a write that a thread switch can split. `None` keys and values raise `TypeError` where Java throws `NullPointerException`, so `None` from `get` always means absent.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The interface and the hash
+
+`ConcurrentStore` is a plain base class whose methods raise `NotImplementedError`; the three maps subclass it so the benchmark and tests treat them alike. `stable_hash` encodes the key as UTF-16 big-endian so each two-byte pair is one `charAt()` code unit, masks with `MASK32` after each multiply-add, and finally folds to a signed `int` with `to_int32`. `spread` does the same masking dance on the unsigned view so the MurmurHash3 multiplications cannot grow past 32 bits.
+
 ```python
-def get(self, key):
-    _require(key, "key")
-    t = self._table                                   # one atomic load of the table reference
-    n = t[Hashing.bucket_index(key, len(t))]           # one atomic load of the bucket
-    while n is not None:                               # immutable nodes: no further synchronization
-        if n.key == key:
-            return n.value
-        n = n.next
-    return None
+class Hashing:
+    @staticmethod
+    def stable_hash(key) -> int:
+        """Java's String.hashCode written out; stable across processes and languages (Python's hash() is salted)."""
+        if isinstance(key, str):
+            h = 0
+            data = key.encode("utf-16-be")  # charAt() returns UTF-16 code units
+            for i in range(0, len(data), 2):
+                h = (31 * h + ((data[i] << 8) | data[i + 1])) & MASK32
+            return to_int32(h)
+        return to_int32(hash(key))  # non-string keys: only stable within one process
+
+    @staticmethod
+    def spread(h: int) -> int:
+        """The MurmurHash3 finaliser in 32-bit arithmetic: every input bit reaches every output bit."""
+        u = h & MASK32
+        u ^= u >> 16
+        u = (u * 0x85EBCA6B) & MASK32
+        u ^= u >> 13
+        u = (u * 0xC2B2AE35) & MASK32
+        u ^= u >> 16
+        return to_int32(u)
+
+    @staticmethod
+    def bucket_index(key, table_length: int) -> int:
+        return Hashing.spread(Hashing.stable_hash(key)) & (table_length - 1)
 ```
 
-`code/python/main.py` keeps `ConcurrentStore`, `GlobalLockMap`, `StripedHashMap` (one `threading.Lock` per segment), `LockFreeReadMap`, and the barrier-forced races. What differs:
+#### Step 2: A segment is a tiny single-threaded hash map
 
-- **The hash is rebuilt in 32-bit arithmetic.** Python's `hash(str)` is salted per process, so `Hashing.stable_hash` computes `String.hashCode` over UTF-16 code units and masks to 32 bits after each step, and `spread` masks after each multiply. The segment index uses the unsigned view of the hash before shifting, which is Java's `>>>`. The result: every key lands in the same stripe and bucket as in Java (`acct-1->s8 ... acct-8->s5`), and a test pins those placements.
-- **The publish guarantee comes from the interpreter, not `volatile`.** Python has no `final` fields and no `volatile`. Reading `self._table` and `t[i]` are single atomic operations under the GIL (and under the free-threaded build's per-object locks), so a reader still sees the old chain or the new one. Nodes are made immutable by refusing `__setattr__` after construction, and a test asserts the `AttributeError`, so the "walk without synchronization" argument holds for the same reason it does in Java: nothing a reader can reach is ever mutated.
-- **The GIL changes the throughput story, not the race story.** Only one thread runs bytecode at a time, so striping cannot add parallelism and the benchmark measures lock and hashing overhead instead (Python runs 20,000 benchmark ops per thread rather than 100,000, and the barrier test runs 2,000 keys x 200 bumps rather than 5,000 x 1,000, to stay fast on a two-core CI runner where contended Python locks convoy). The check-then-act race is unchanged: `threading.Barrier` holds all eight threads in the gap after `get`, so all eight still believe they created the record, and `put_if_absent` still produces exactly one winner.
-- **Counters and nulls.** `size()` uses an `AtomicInteger` built on a lock, because `+=` is a read, an add, and a write that a thread switch can split. `None` keys and values raise `TypeError` where Java throws `NullPointerException`, so `None` from `get` always means absent.
+`Segment` owns a `threading.Lock`, a list of chain heads, and a count. `find` and `insert` do no locking of their own; the caller is expected to hold `segment.lock`, which keeps the Phase 1 hash-map logic separate from the synchronization. `_StripedNode` is a mutable `__slots__` class because it is only ever touched under the segment lock.
+
+```python
+class Segment:
+    def __init__(self, initial_buckets: int) -> None:
+        self.lock = threading.Lock()
+        self.table: list[Optional[_StripedNode]] = [None] * initial_buckets
+        self.count = 0
+        self.resizes = 0
+
+    def find(self, key) -> Optional[_StripedNode]:
+        n = self.table[Hashing.bucket_index(key, len(self.table))]
+        while n is not None:
+            if n.key == key:
+                return n
+            n = n.next
+        return None
+
+    def insert(self, key, value) -> None:
+        if self.count + 1 > len(self.table) * 3 // 4:
+            self.grow()
+        i = Hashing.bucket_index(key, len(self.table))
+        self.table[i] = _StripedNode(key, value, self.table[i])
+        self.count += 1
+```
+
+#### Step 3: Choosing the segment with the high bits
+
+`bin(stripes).count("1") != 1` is the power-of-two check, and `(stripes & -stripes).bit_length() - 1` is `numberOfTrailingZeros`. Python's `>>` on a negative int would sign-extend forever, so `segment_index` masks the spread hash with `MASK32` first to get the unsigned view, which is exactly what Java's `>>>` does.
+
+```python
+class StripedHashMap(ConcurrentStore[K, V]):
+    def __init__(self, stripes: int = 16) -> None:
+        if stripes <= 0 or bin(stripes).count("1") != 1:
+            raise ValueError(f"stripes must be a power of two: {stripes}")
+        self._segments = [Segment(4) for _ in range(stripes)]
+        self._segment_shift = 32 - ((stripes & -stripes).bit_length() - 1)  # 32 - numberOfTrailingZeros
+
+    def segment_index(self, key) -> int:
+        """Segment by the HIGH bits of the spread hash (Java's >>>); the bucket inside it by the low bits."""
+        if len(self._segments) == 1:
+            return 0
+        return (Hashing.spread(Hashing.stable_hash(key)) & MASK32) >> self._segment_shift
+```
+
+#### Step 4: Every operation is find-then-act under one lock
+
+`with s.lock:` holds the segment for the whole check-and-act, and releases on any exception the way Java's `finally` does. `compute` calls the caller's `fn` inside the block, which is what makes an increment atomic and also why `fn` must never touch the map: `threading.Lock` is not reentrant, so a re-entry on the same segment would deadlock rather than recurse.
+
+```python
+    def put_if_absent(self, key, value):
+        _require(value, "value")
+        s = self._segment_for(key)
+        with s.lock:
+            n = s.find(key)  # check ...
+            if n is not None:
+                return n.value
+            s.insert(key, value)  # ... and act, under the same lock hold
+            return None
+
+    def compute(self, key, fn):
+        s = self._segment_for(key)
+        with s.lock:
+            n = s.find(key)
+            nxt = fn(key, None if n is None else n.value)
+            if nxt is None:
+                if n is not None:
+                    s.unlink(key)
+                return None
+            if n is not None:
+                n.value = nxt
+            else:
+                s.insert(key, nxt)
+            return nxt
+```
+
+#### Step 5: Immutable chains and a lock-free `get`
+
+`_FrozenNode` sets its three fields through `object.__setattr__` in `__init__` and then overrides `__setattr__` to raise, which is the closest Python gets to `final`. `get` reads `self._table` once into a local and indexes it once; both are single bytecode-level loads that the GIL makes atomic, and after that it walks fields that are never mutated. No lock, no retry.
+
+```python
+class _FrozenNode:
+    __slots__ = ("key", "value", "next")
+
+    def __init__(self, key, value, nxt) -> None:
+        object.__setattr__(self, "key", key)
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "next", nxt)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("chain nodes are immutable; build a new chain instead")
+```
+
+```python
+    def get(self, key):
+        _require(key, "key")
+        t = self._table                                   # one atomic load of the table reference
+        n = t[Hashing.bucket_index(key, len(t))]           # one atomic load of the bucket
+        while n is not None:                               # immutable nodes: no further synchronization
+            if n.key == key:
+                return n.value
+            n = n.next
+        return None
+```
+
+#### Step 6: Writers copy the prefix and publish
+
+`_without` is the same persistent-list recursion; a one-element list `removed` plays the Java `Object[]` out-parameter. `compute` builds the new chain under the stripe lock, publishes it with a single list-slot store `t[i] = ...`, and only after leaving the `with` block calls `_grow_if_crowded`, so a writer never holds one stripe while asking for all of them.
+
+```python
+    def _without(self, head: Optional[_FrozenNode], key, removed: list):
+        """Rebuild the chain without `key`; the removed node's value goes to removed[0]."""
+        if head is None:
+            return None
+        if head.key == key:
+            removed[0] = head.value
+            return head.next
+        rest = self._without(head.next, key, removed)
+        return head if removed[0] is None and rest is head.next else _FrozenNode(head.key, head.value, rest)
+```
+
+```python
+    def compute(self, key, fn):
+        _require(key, "key")
+        s = self._stripe_for(key)
+        inserted = False
+        with self._stripe_locks[s]:
+            t = self._table
+            i = Hashing.bucket_index(key, len(t))
+            removed = [None]
+            rest = self._without(t[i], key, removed)
+            old = removed[0]
+            nxt = fn(key, old)
+            if nxt is None:
+                if old is not None:
+                    t[i] = rest
+                    self._count.decrement_and_get()
+                result = None
+            else:
+                t[i] = _FrozenNode(key, nxt, rest)  # updated node in front of the untouched rest
+                if old is None:
+                    self._count.increment_and_get()
+                    inserted = True
+                result = nxt
+        if inserted:
+            self._grow_if_crowded()
+        return result
+```
+
+#### Step 7: Resize under all locks
+
+Every stripe lock is acquired in index order and released in reverse inside `finally`. Each node is copied into `fresh` (chains are frozen, so nothing can be re-linked), and `self._table = fresh` is the one attribute store that publishes the new table. A reader that already loaded the old list keeps walking it unharmed.
+
+```python
+    def resize_to(self, new_buckets: int) -> None:
+        if new_buckets <= 0 or (new_buckets & (new_buckets - 1)) != 0 or new_buckets < len(self._stripe_locks):
+            raise ValueError("bad bucket count")
+        for lock in self._stripe_locks:
+            lock.acquire()
+        try:
+            old = self._table
+            if new_buckets <= len(old):
+                return  # another thread grew first
+            fresh: list[Optional[_FrozenNode]] = [None] * new_buckets
+            for head in old:
+                n = head
+                while n is not None:
+                    j = Hashing.bucket_index(n.key, new_buckets)
+                    fresh[j] = _FrozenNode(n.key, n.value, fresh[j])
+                    n = n.next
+            self._table = fresh
+            self._resizes += 1
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/04-concurrency/04-concurrent-hash-maps/code/python
@@ -385,39 +581,312 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The stripe placements and the barrier results match Java exactly; the throughput section is where Python tells a different story:
+
+```console
+== Where keys land: 16 stripes, top 4 bits of the mixed hash ==
+acct-1->s8  acct-2->s4  acct-3->s13  acct-4->s7  acct-5->s0  acct-6->s1  acct-7->s7  acct-8->s5
+
+== Check-then-act, forced with a barrier in the gap (8 threads, one idempotency key) ==
+get-then-put on StripedHashMap:   8 threads believe they created the record
+putIfAbsent on StripedHashMap:    1 thread created it
+get-then-put on LockFreeReadMap:  8 threads believe they created the record
+putIfAbsent on LockFreeReadMap:   1 thread created it
+
+== Throughput, 4 threads x 20,000 ops, 95% get / 5% compute, 1,024 keys (ops per ms; varies by machine) ==
+GlobalLockMap          1509
+StripedHashMap          222
+LockFreeReadMap         321
+```
+
+The global-lock map wins in Python because a `dict` operation under one lock is a handful of C calls, while the striped maps run their hashing and chain walks in bytecode. The ordering says nothing about the algorithms and everything about the GIL; Lesson 10's free-threaded build is where striping starts to pay.
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps `ConcurrentStore`, `GlobalLockMap`, `StripedHashMap` (one `sync.Mutex` per segment), `LockFreeReadMap`, and the barrier-forced races. Four things differ. **`atomic.Pointer` plays `volatile` and `final`.** Go has neither keyword. Each bucket is an `atomic.Pointer[lfNode]` and the whole table sits behind another; a writer publishes a rebuilt chain with `Store`, a reader takes it with `Load`, and the Go memory model makes everything the writer did before the store visible after the load. The nodes are never mutated after publication, which is what the walk relies on. `go test -race ./...` is the proof: the race detector flags any plain read that is not ordered by an atomic or a lock, and the suite passes with two readers hammering 64 keys while two writers churn and resize. **The hash is rebuilt in 32-bit arithmetic.** `StableHash` computes `String.hashCode` over UTF-16 code units and `Spread` runs the MurmurHash3 finaliser on a `uint32`, so every key lands in the same stripe and bucket as in Java (`acct-1->s8 acct-2->s4 ... acct-8->s5`); a test pins those placements. Java's `>>>` becomes a shift on the `uint32` view. **`(V, bool)` instead of `null`.** `Get`, `Put`, `PutIfAbsent`, and `Remove` return a second result that says whether a value existed, and `Compute` takes a `ComputeFn` that receives `(current, present)` and returns `(next, absent)`, because a zero `int64` is a legal value. The constructors return `ErrBadShape` for stripe or bucket counts that are not powers of two. **A hand-written `Barrier`.** The standard library has no `CyclicBarrier`, so the port carries a small reusable one built on `sync.Cond`; it holds all eight goroutines in the gap between `Get` and `Put`, so all eight still believe they created the record and `PutIfAbsent` still produces exactly one winner. `CountDownLatch` becomes `sync.WaitGroup`. The throughput table measures real parallelism; Go's built-in `map` under one mutex is fast enough that on a small machine the global lock can win, which is a reason to measure rather than assume.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The interface and the hash
+
+The interface is generic over a `comparable` key and returns `(V, bool)` wherever Java returned a nullable `V`. `StableHash` iterates `utf16.Encode` of the key so each code unit matches `charAt()`, and `int32` arithmetic wraps the way Java `int` does. `Spread` casts to `uint32` so the shifts are logical and the multiplications truncate at 32 bits; `BucketIndex` masks on the unsigned view.
+
 ```go
-type LockFreeReadMap[V any] struct {
-    table       atomic.Pointer[lfTable[V]]   // replaced wholesale on resize
-    stripeLocks []sync.Mutex                 // writers only
-    count       atomic.Int64
+type ConcurrentStore[K comparable, V any] interface {
+	Get(key K) (V, bool)
+	Put(key K, value V) (V, bool)
+	PutIfAbsent(key K, value V) (V, bool)
+	Remove(key K) (V, bool)
+	Compute(key K, fn ComputeFn[K, V]) (V, bool)
+	Size() int
 }
 
-func (m *LockFreeReadMap[V]) Get(key string) (V, bool) {
-    t := m.table.Load()                                     // one atomic read
-    n := t.buckets[BucketIndex(key, len(t.buckets))].Load() // one atomic read
-    for ; n != nil; n = n.next {                            // immutable fields: no further synchronization
-        if n.key == key {
-            return n.value, true
-        }
-    }
-    var zero V
-    return zero, false
+func StableHash(key string) int32 {
+	var h int32
+	for _, cu := range utf16.Encode([]rune(key)) {
+		h = 31*h + int32(cu)
+	}
+	return h
+}
+
+func Spread(h int32) int32 {
+	u := uint32(h)
+	u ^= u >> 16
+	u *= 0x85ebca6b
+	u ^= u >> 13
+	u *= 0xc2b2ae35
+	u ^= u >> 16
+	return int32(u)
+}
+
+func BucketIndex(key string, tableLength int) int {
+	return int(uint32(Spread(StableHash(key))) & uint32(tableLength-1))
 }
 ```
 
-`code/go/main.go` keeps `ConcurrentStore`, `GlobalLockMap`, `StripedHashMap` (one `sync.Mutex` per segment), `LockFreeReadMap`, and the barrier-forced races. What differs:
+#### Step 2: A segment is a tiny single-threaded hash map
 
-- **`atomic.Pointer` plays `volatile` and `final`.** Go has neither keyword. Each bucket is an `atomic.Pointer[lfNode]` and the whole table sits behind another; a writer publishes a rebuilt chain with `Store`, a reader takes it with `Load`, and the Go memory model makes everything the writer did before the store visible after the load. The nodes are never mutated after publication, which is what the walk relies on. `go test -race ./...` is the proof: the race detector flags any plain read that is not ordered by an atomic or a lock, and the suite passes with two readers hammering 64 keys while two writers churn and resize.
-- **The hash is rebuilt in 32-bit arithmetic.** `StableHash` computes `String.hashCode` over UTF-16 code units and `Spread` runs the MurmurHash3 finaliser on a `uint32`, so every key lands in the same stripe and bucket as in Java (`acct-1->s8 acct-2->s4 ... acct-8->s5`); a test pins those placements. Java's `>>>` becomes a shift on the `uint32` view.
-- **`(V, bool)` instead of `null`.** `Get`, `Put`, `PutIfAbsent`, and `Remove` return a second result that says whether a value existed, and `Compute` takes a `ComputeFn` that receives `(current, present)` and returns `(next, absent)`, because a zero `int64` is a legal value. The constructors return `ErrBadShape` for stripe or bucket counts that are not powers of two.
-- **A hand-written `Barrier`.** The standard library has no `CyclicBarrier`, so the port carries a small reusable one built on `sync.Cond`; it holds all eight goroutines in the gap between `Get` and `Put`, so all eight still believe they created the record and `PutIfAbsent` still produces exactly one winner. `CountDownLatch` becomes `sync.WaitGroup`. The throughput table measures real parallelism; Go's built-in `map` under one mutex is fast enough that on a small machine the global lock can win, which is a reason to measure rather than assume.
+`Segment` embeds its own `sync.Mutex` and a slice of chain heads. `find` and `insert` are unexported and assume `mu` is held by the caller; `stripedNode` is a plain mutable struct for the same reason. The `*3/4` load check and the head insertion are the Phase 1 code unchanged.
+
+```go
+type Segment[V any] struct {
+	mu      sync.Mutex
+	table   []*stripedNode[V]
+	count   int
+	resizes int
+}
+
+func (s *Segment[V]) find(key string) *stripedNode[V] {
+	for n := s.table[BucketIndex(key, len(s.table))]; n != nil; n = n.next {
+		if n.key == key {
+			return n
+		}
+	}
+	return nil
+}
+
+func (s *Segment[V]) insert(key string, value V) {
+	if s.count+1 > len(s.table)*3/4 {
+		s.grow()
+	}
+	i := BucketIndex(key, len(s.table))
+	s.table[i] = &stripedNode[V]{key, value, s.table[i]}
+	s.count++
+}
+```
+
+#### Step 3: Choosing the segment with the high bits
+
+`bits.OnesCount` and `bits.TrailingZeros` from `math/bits` replace `Integer.bitCount` and `numberOfTrailingZeros`; a bad stripe count comes back as `ErrBadShape` rather than a panic. `SegmentIndex` shifts the `uint32` view of the spread hash, which is Java's unsigned `>>>`, and keeps the single-stripe special case because a shift by 32 on a `uint32` is zero in Go, not a no-op.
+
+```go
+func NewStripedHashMap[V any](stripes int) (*StripedHashMap[V], error) {
+	if stripes < 1 || bits.OnesCount(uint(stripes)) != 1 {
+		return nil, fmt.Errorf("%w: stripes=%d", ErrBadShape, stripes)
+	}
+	m := &StripedHashMap[V]{segments: make([]*Segment[V], stripes), segmentShift: uint(32 - bits.TrailingZeros(uint(stripes)))}
+	for i := range m.segments {
+		m.segments[i] = &Segment[V]{table: make([]*stripedNode[V], 4)}
+	}
+	return m, nil
+}
+
+func (m *StripedHashMap[V]) SegmentIndex(key string) int {
+	if len(m.segments) == 1 {
+		return 0
+	}
+	return int(uint32(Spread(StableHash(key))) >> m.segmentShift)
+}
+```
+
+#### Step 4: Every operation is find-then-act under one lock
+
+`defer s.mu.Unlock()` is the `finally`. `Compute` cannot pass `nil` for "absent" with a generic `V`, so the callback receives `(current, present)` and signals removal by returning `absent == true`; the rest is the Java logic. As with `ReentrantLock`, the callback runs under the segment mutex, and `sync.Mutex` is not reentrant, so a callback that touches the map deadlocks immediately.
+
+```go
+func (m *StripedHashMap[V]) PutIfAbsent(key string, value V) (V, bool) {
+	s := m.segmentFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n := s.find(key); n != nil { // check ...
+		return n.value, true
+	}
+	s.insert(key, value) // ... and act, under the same lock hold
+	var zero V
+	return zero, false
+}
+
+func (m *StripedHashMap[V]) Compute(key string, fn ComputeFn[string, V]) (V, bool) {
+	s := m.segmentFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.find(key)
+	var cur V
+	if n != nil {
+		cur = n.value
+	}
+	next, absent := fn(key, cur, n != nil)
+	if absent {
+		if n != nil {
+			s.unlink(key)
+		}
+		var zero V
+		return zero, false
+	}
+	if n != nil {
+		n.value = next
+	} else {
+		s.insert(key, next)
+	}
+	return next, true
+}
+```
+
+#### Step 5: Immutable chains and a lock-free `get`
+
+`lfNode` has no `final`, but its fields are written once before the node is handed to an atomic `Store`, and nothing ever writes them again; that discipline plus the atomic publish is what the Go memory model needs. The table is an `atomic.Pointer[lfTable]` whose buckets are each an `atomic.Pointer[lfNode]`, which replaces `AtomicReferenceArray`. `Get` is two `Load`s and a walk.
+
+```go
+type lfNode[V any] struct {
+	key   string
+	value V
+	next  *lfNode[V]
+}
+
+type lfTable[V any] struct {
+	buckets []atomic.Pointer[lfNode[V]]
+}
+
+type LockFreeReadMap[V any] struct {
+	table       atomic.Pointer[lfTable[V]]
+	stripeLocks []sync.Mutex
+	count       atomic.Int64 // like ConcurrentHashMap, Size is a weakly consistent snapshot
+	resizes     atomic.Int32
+}
+
+func (m *LockFreeReadMap[V]) Get(key string) (V, bool) {
+	t := m.table.Load()                                     // one atomic read
+	n := t.buckets[BucketIndex(key, len(t.buckets))].Load() // one atomic read
+	for ; n != nil; n = n.next {                            // immutable fields: no further synchronization
+		if n.key == key {
+			return n.value, true
+		}
+	}
+	var zero V
+	return zero, false
+}
+```
+
+#### Step 6: Writers copy the prefix and publish
+
+`without` returns three values instead of filling an out-array: the rebuilt rest, the removed value, and whether it was found. `Compute` holds the stripe mutex with explicit `Lock`/`Unlock` rather than `defer`, because `growIfCrowded` must run *after* the unlock; the bucket `Store` is the publish point.
+
+```go
+func without[V any](head *lfNode[V], key string) (rest *lfNode[V], removed V, found bool) {
+	if head == nil {
+		return nil, removed, false
+	}
+	if head.key == key {
+		return head.next, head.value, true
+	}
+	rest, removed, found = without(head.next, key)
+	if !found {
+		return head, removed, false
+	}
+	return &lfNode[V]{head.key, head.value, rest}, removed, true
+}
+```
+
+```go
+func (m *LockFreeReadMap[V]) Compute(key string, fn ComputeFn[string, V]) (V, bool) {
+	s := m.stripeFor(key)
+	m.stripeLocks[s].Lock()
+	t := m.table.Load()
+	i := BucketIndex(key, len(t.buckets))
+	rest, old, had := without(t.buckets[i].Load(), key)
+	next, absent := fn(key, old, had)
+	inserted := false
+	var result V
+	present := false
+	if absent {
+		if had {
+			t.buckets[i].Store(rest)
+			m.count.Add(-1)
+		}
+	} else {
+		t.buckets[i].Store(&lfNode[V]{key, next, rest}) // updated node in front of the untouched rest
+		if !had {
+			m.count.Add(1)
+			inserted = true
+		}
+		result, present = next, true
+	}
+	m.stripeLocks[s].Unlock()
+	if inserted {
+		m.growIfCrowded()
+	}
+	return result, present
+}
+```
+
+#### Step 7: Resize under all locks
+
+`ResizeTo` locks every stripe in index order and defers a reverse unlock. The copy loop reads old buckets with `Load` and fills fresh ones with `Store`; nobody else can see `fresh` yet, but using the atomic API keeps the race detector satisfied and the code uniform. `m.table.Store(fresh)` is the single publish.
+
+```go
+func (m *LockFreeReadMap[V]) ResizeTo(newBuckets int) error {
+	if newBuckets < 1 || bits.OnesCount(uint(newBuckets)) != 1 || newBuckets < len(m.stripeLocks) {
+		return fmt.Errorf("%w: buckets=%d", ErrBadShape, newBuckets)
+	}
+	for i := range m.stripeLocks {
+		m.stripeLocks[i].Lock()
+	}
+	defer func() {
+		for i := len(m.stripeLocks) - 1; i >= 0; i-- {
+			m.stripeLocks[i].Unlock()
+		}
+	}()
+	old := m.table.Load()
+	if newBuckets <= len(old.buckets) { // another goroutine grew first
+		return nil
+	}
+	fresh := &lfTable[V]{buckets: make([]atomic.Pointer[lfNode[V]], newBuckets)}
+	for i := range old.buckets {
+		for n := old.buckets[i].Load(); n != nil; n = n.next {
+			j := BucketIndex(n.key, newBuckets)
+			fresh.buckets[j].Store(&lfNode[V]{n.key, n.value, fresh.buckets[j].Load()})
+		}
+	}
+	m.table.Store(fresh)
+	m.resizes.Add(1)
+	return nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/04-concurrency/04-concurrent-hash-maps/code/go
 go run .
 go test -race ./...
+```
+
+Placements and barrier results are identical to Java; absent values print as `present=false`. On this two-core machine the throughput table already shows lock-free reads ahead:
+
+```console
+== Where keys land: 16 stripes, top 4 bits of the mixed hash ==
+acct-1->s8  acct-2->s4  acct-3->s13  acct-4->s7  acct-5->s0  acct-6->s1  acct-7->s7  acct-8->s5
+
+== Check-then-act, forced with a barrier in the gap (8 goroutines, one idempotency key) ==
+get-then-put on StripedHashMap:   8 goroutines believe they created the record
+putIfAbsent on StripedHashMap:    1 goroutine created it
+get-then-put on LockFreeReadMap:  8 goroutines believe they created the record
+putIfAbsent on LockFreeReadMap:   1 goroutine created it
+
+== Throughput, 4 goroutines x 100,000 ops, 95% get / 5% compute, 1,024 keys (ops per ms; varies by machine) ==
+GlobalLockMap          5555
+StripedHashMap         5970
+LockFreeReadMap       15384
 ```
 
 ## Use It

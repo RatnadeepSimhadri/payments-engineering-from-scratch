@@ -326,20 +326,174 @@ The whole run takes well under a second because no code path sleeps. The 800 ms 
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps `ScriptedAdapter`, `ManualTimer`, `FanOut` (`with_timeout`, `quote_all`, `first_ok`, `cheapest`), `BlockingFanOut`, and `count_started_before_release`, and prints the same timeline and outcomes. Four things differ. **`CompletableFuture` becomes `concurrent.futures.Future` plus five helpers.** A `Future` runs its done-callbacks synchronously in the completing thread, just as a `CompletableFuture` runs its dependents, so `then_apply`, `when_complete`, `apply_to_either`, `exceptionally`, and `all_of` are a few lines each and the simulated clock stays deterministic. One trap is real: `Future` runs callbacks in registration order, while `CompletableFuture` keeps its dependents on a stack and typically runs the most recently registered first. Registering the alarm cancellation before the race (the Java order) lets the cancelled alarm win, and every quote that arrives after the fan-out starts comes back `FAILED (CancelledError)`. The port registers `apply_to_either` first, and `test_answer_wins_over_its_own_alarm_cancellation` pins it. **There are no virtual threads.** Model 1 is `ThreadPoolExecutor(max_workers=2)` and starves exactly as the Java pool does: 2 of 3 gated tasks start. Model 2 uses `ThreadPerTaskExecutor`, a small `Executor` that starts a fresh OS thread per task. It has the same shape as `newVirtualThreadPerTaskExecutor`, so all 3 tasks (and, in the tests, all 200) start, but each blocked task holds a real kernel thread, so it does not scale to a hundred thousand waits. The scalable Python model is `asyncio`, where a waiting coroutine holds no thread at all. **`asyncio.wait_for` cancels; this port abandons.** `FanOut.with_timeout`, like Java's `applyToEither` and the gamma line in the demo, stops waiting and leaves the request outstanding. `asyncio.wait_for` cancels the awaited task. `wait_for_cancels_inner` shows this with `timeout=0`, so nothing waits on a real clock, and `AsyncioContrastTest` asserts the inner task was cancelled. **Exceptions and names.** `IllegalStateException` from `fail` becomes `RuntimeError`, so the demo prints `FAILED (RuntimeError: HTTP 503 from processor)`. `Optional` becomes `None`. Python has no `CountDownLatch`, so the port defines one on `threading.Condition`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The adapter and a deterministic stand-in
+
+`ProcessorAdapter` is an abstract base whose `quote` returns a `concurrent.futures.Future`. `ScriptedAdapter` holds a `threading.Lock` where Java used `synchronized`; `respond` and `fail` swap the pending list out under the lock and complete the futures *after* releasing it, because completing a `Future` runs its callbacks on the calling thread and those callbacks may call back into the adapter. `fail` raises `RuntimeError` in place of `IllegalStateException`.
+
 ```python
-alarm = timer.after(timeout_millis)
-deadline = then_apply(alarm, lambda _: Quote.timed_out(adapter.name(), timeout_millis))
-either = apply_to_either(call, deadline)
-when_complete(call, lambda: alarm.cancel())  # the answer arrived: the alarm is no longer needed
-return exceptionally(either, lambda t: Quote.failed(adapter.name(), t))
+class ScriptedAdapter(ProcessorAdapter):
+    def __init__(self, name: str, immediate_fee: Optional[Money]) -> None:
+        self._name = name
+        self._immediate_fee = immediate_fee  # None -> scripted
+        self._pending: list[Future] = []
+        self._calls = AtomicInteger()
+        self._lock = threading.Lock()  # Java: synchronized
+
+    def quote(self, request: PaymentRequest) -> Future:
+        with self._lock:
+            self._calls.increment_and_get()
+            if self._immediate_fee is not None:
+                return completed_future(Quote.ok(self._name, self._immediate_fee))
+            f: Future = Future()
+            self._pending.append(f)
+            return f
+
+    def respond(self, fee: Money) -> None:
+        """Answer every outstanding call with this fee."""
+        with self._lock:
+            pending, self._pending = self._pending, []
+        for f in pending:
+            complete(f, Quote.ok(self._name, fee))
+
+    def fail(self, message: str) -> None:
+        with self._lock:
+            pending, self._pending = self._pending, []
+        for f in pending:
+            complete_exceptionally(f, RuntimeError(message))  # Java: IllegalStateException
 ```
 
-`code/python/main.py` keeps `ScriptedAdapter`, `ManualTimer`, `FanOut` (`with_timeout`, `quote_all`, `first_ok`, `cheapest`), `BlockingFanOut`, and `count_started_before_release`, and prints the same timeline and outcomes. What differs:
+#### Step 2: Time as an interface
 
-- **`CompletableFuture` becomes `concurrent.futures.Future` plus five helpers.** A `Future` runs its done-callbacks synchronously in the completing thread, just as a `CompletableFuture` runs its dependents, so `then_apply`, `when_complete`, `apply_to_either`, `exceptionally`, and `all_of` are a few lines each and the simulated clock stays deterministic. One trap is real: `Future` runs callbacks in registration order, while `CompletableFuture` keeps its dependents on a stack and typically runs the most recently registered first. Registering the alarm cancellation before the race (the Java order) lets the cancelled alarm win, and every quote that arrives after the fan-out starts comes back `FAILED (CancelledError)`. The port registers `apply_to_either` first, and `test_answer_wins_over_its_own_alarm_cancellation` pins it.
-- **There are no virtual threads.** Model 1 is `ThreadPoolExecutor(max_workers=2)` and starves exactly as the Java pool does: 2 of 3 gated tasks start. Model 2 uses `ThreadPerTaskExecutor`, a small `Executor` that starts a fresh OS thread per task. It has the same shape as `newVirtualThreadPerTaskExecutor`, so all 3 tasks (and, in the tests, all 200) start, but each blocked task holds a real kernel thread, so it does not scale to a hundred thousand waits. The scalable Python model is `asyncio`, where a waiting coroutine holds no thread at all.
-- **`asyncio.wait_for` cancels; this port abandons.** `FanOut.with_timeout`, like Java's `applyToEither` and the gamma line in the demo, stops waiting and leaves the request outstanding. `asyncio.wait_for` cancels the awaited task. `wait_for_cancels_inner` shows this with `timeout=0`, so nothing waits on a real clock, and `AsyncioContrastTest` asserts the inner task was cancelled.
-- **Exceptions and names.** `IllegalStateException` from `fail` becomes `RuntimeError`, so the demo prints `FAILED (RuntimeError: HTTP 503 from processor)`. `Optional` becomes `None`. Python has no `CountDownLatch`, so the port defines one on `threading.Condition`.
+Pending alarms are `(deadline, seq, future)` tuples sorted by the first two fields, so firing order is deadline then creation. `advance` partitions the list under the lock, drops cancelled alarms, and completes the due ones outside the lock, for the same reason as the Java: `complete` runs callbacks, and a callback that calls `after` must not find the lock held.
+
+```python
+class ManualTimer(Timer):
+    def after(self, millis: int) -> Future:
+        if millis < 0:
+            raise ValueError("negative delay")
+        with self._lock:
+            f: Future = Future()
+            self._pending.append((self._now + millis, self._seq, f))
+            self._seq += 1
+            return f
+
+    def advance(self, millis: int) -> None:
+        due = []
+        with self._lock:
+            self._now += millis
+            self._pending.sort(key=lambda p: (p[0], p[1]))
+            keep = []
+            for p in self._pending:
+                if p[2].cancelled():
+                    continue  # the caller no longer needs this alarm
+                if p[0] <= self._now:
+                    due.append(p)
+                else:
+                    keep.append(p)
+            self._pending = keep
+        for p in due:
+            complete(p[2], None)  # outside the lock: completion runs callbacks
+```
+
+#### Step 3: A call that races its deadline
+
+The five helpers map one-to-one onto the Java calls: `then_apply` turns the alarm into a `TIMED_OUT` quote, `apply_to_either` is the race, `when_complete` cancels the alarm, `exceptionally` converts any failure into a `FAILED` quote. The one ordering difference is spelled out in the comment: the race must be registered before the cancellation, or the cancelled alarm reaches `either` first and every real answer reads as `CancelledError`.
+
+```python
+    @staticmethod
+    def with_timeout(adapter: ProcessorAdapter, request: PaymentRequest, timeout_millis: int, timer: Timer) -> Future:
+        try:
+            call = adapter.quote(request)
+        except Exception as e:  # a synchronous throw is still a failed quote, not a crashed fan-out
+            return completed_future(Quote.failed(adapter.name(), e))
+        alarm = timer.after(timeout_millis)
+        deadline = then_apply(alarm, lambda _: Quote.timed_out(adapter.name(), timeout_millis))
+        # Register the race before the alarm cancellation: Future runs callbacks in registration order, so the call's
+        # answer must reach apply_to_either before cancelling the alarm completes `deadline` with CancelledError.
+        # (CompletableFuture keeps dependents on a stack and typically runs the newest first, which is why the Java
+        # version can register in the opposite order.)
+        either = apply_to_either(call, deadline)
+        when_complete(call, lambda: alarm.cancel())  # the answer arrived: the alarm is no longer needed
+        return exceptionally(either, lambda t: Quote.failed(adapter.name(), t))
+```
+
+`apply_to_either` itself is two done-callbacks feeding one destination; `complete` is "complete if not already done", so the second arrival is a no-op.
+
+```python
+def apply_to_either(a: Future, b: Future) -> Future:
+    """Completes with whichever of a or b completes first (a is checked first when both are already done)."""
+    dst: Future = Future()
+    a.add_done_callback(lambda s: _propagate(s, dst, lambda v: v))
+    b.add_done_callback(lambda s: _propagate(s, dst, lambda v: v))
+    return dst
+```
+
+#### Step 4: Fan-out and fan-in
+
+`quote_all` is one line because the port's `all_of` already collects results in input order (it folds Java's `allOf(...).thenApply(join)` into one helper). `first_ok` uses the idempotent `complete` for the winner and an `AtomicInteger` countdown for the all-failed case, completing with `None` where Java used `Optional.empty()`.
+
+```python
+    @staticmethod
+    def quote_all(adapters: list[ProcessorAdapter], request: PaymentRequest, timeout_millis: int,
+                  timer: Timer) -> Future:
+        return all_of([FanOut.with_timeout(a, request, timeout_millis, timer) for a in adapters])
+
+    @staticmethod
+    def first_ok(adapters: list[ProcessorAdapter], request: PaymentRequest, timeout_millis: int,
+                 timer: Timer) -> Future:
+        futures = [FanOut.with_timeout(a, request, timeout_millis, timer) for a in adapters]
+        winner: Future = Future()
+        remaining = AtomicInteger(len(futures))
+
+        def on_quote(f: Future) -> None:
+            q = f.result()
+            if q.outcome is Outcome.OK:
+                complete(winner, q)  # first OK completes; later ones are no-ops
+            if remaining.decrement_and_get() == 0:
+                complete(winner, None)  # everyone answered, none OK
+
+        for f in futures:
+            f.add_done_callback(on_quote)
+        return winner
+```
+
+#### Step 5: The same fan-out, blocking, on two kinds of thread
+
+`BlockingFanOut.quote_all` calls `.result()` inside each task, which blocks that task's thread; `invoke_all` is a small reimplementation of `ExecutorService.invokeAll` over any `concurrent.futures.Executor`. The lambda default argument `a=a` pins the adapter per task, the Python equivalent of the effectively-final capture in Java.
+
+```python
+class BlockingFanOut:
+    @staticmethod
+    def quote_all(executor: Executor, adapters: list[ProcessorAdapter], request: PaymentRequest) -> list[Quote]:
+        tasks = [(lambda a=a: a.quote(request).result()) for a in adapters]  # result() blocks this task's thread
+        out = []
+        for i, f in enumerate(invoke_all(executor, tasks)):
+            exc = f.exception()
+            out.append(Quote.failed(adapters[i].name(), exc) if exc is not None else f.result())
+        return out
+```
+
+The starvation demo uses a `threading.Event` as the one-shot gate and the port's own `CountDownLatch` for "N tasks have started". With `ThreadPoolExecutor(2)` the latch for 2 releases while the third task has no thread to run on; with `ThreadPerTaskExecutor` all 3 start.
+
+```python
+def count_started_before_release(executor: Executor, tasks: int, expected_started: int) -> int:
+    gate = threading.Event()  # CountDownLatch(1)
+    started_latch = CountDownLatch(expected_started)
+    started = AtomicInteger()
+    futures = [executor.submit(GatedTask(i, gate, started, started_latch)) for i in range(tasks)]
+    started_latch.await_()
+    observed = started.get()  # tasks beyond the pool size cannot have started: no thread exists for them
+    gate.set()
+    for f in futures:
+        f.result()
+    return observed
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/04-concurrency/06-executors-goroutines-and-async/code/python
@@ -347,48 +501,295 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### In Go
+Model 2's heading is honest about what Python provides, and delta's failure carries the Python exception name; otherwise the timeline matches Java:
 
-```go
-// FixedPool is Model 1: a bounded semaphore channel plays the pool's n threads.
-func (p *FixedPool) Execute(task func()) {
-    p.wg.Add(1)
-    go func() {
-        defer p.wg.Done()
-        p.permits <- struct{}{} // no permit free: this task waits for a goroutine that is itself waiting
-        defer func() { <-p.permits }()
-        task()
-    }()
-}
+```console
+== Model 1: a fixed thread pool and blocking calls ==
+3 blocking adapter calls on a pool of 2 threads: 2 started; the third waits for a thread that is itself waiting
 
-// WithTimeout races the call against its own alarm; the first to settle completes the result.
-call.OnComplete(func(q Quote, err error) {
-    alarm.Cancel() // the answer arrived: the alarm is no longer needed
-    if err != nil {
-        result.Complete(quoteFailed(adapter.Name(), err))
-        return
-    }
-    result.Complete(q)
-})
-alarm.OnComplete(func(_ struct{}, err error) {
-    if err == nil { // fired, not cancelled
-        result.Complete(quoteTimedOut(adapter.Name(), timeoutMillis))
-    }
-})
+== Model 2: a thread per task, same blocking code (Python has no virtual threads) ==
+3 blocking adapter calls on a thread per task: 3 started; no task waits for a pool slot, but each blocked one holds an OS thread
+
+== Model 3: Future fan-out with per-adapter timeouts (simulated clock) ==
+t=0ms  fan-out issued to 4 processors; alpha answered immediately; combined future done: false
+t=250ms  beta answered; combined future done: false
+t=550ms  delta failed; gamma silent; combined future done: false
+t=800ms  deadline passed; combined future done: true
+  alpha   OK fee 3.29 USD
+  beta    OK fee 2.75 USD
+  gamma   TIMED_OUT (no answer within 800 ms)
+  delta   FAILED (RuntimeError: HTTP 503 from processor)
+cheapest OK quote: beta at 2.75 USD
+gamma still has 1 outstanding call: the timeout abandoned the wait, it did not cancel the request
 ```
 
-`code/go/main.go` and `future.go` keep `ScriptedAdapter`, `ManualTimer`, `WithTimeout`, `QuoteAll`, `FirstOK`, `Cheapest`, `BlockingQuoteAll`, and `CountStartedBeforeRelease`, and print the same timeline and outcomes. What differs:
+### In Go
 
-- **Goroutines are the virtual threads.** Model 2 is `GoroutinePerTask`, which runs `go task()` and nothing else: a blocked goroutine costs a few kilobytes of stack and no OS thread, so all 3 gated tasks (and all 200 in the test) start, exactly as under `newVirtualThreadPerTaskExecutor`. Model 1 is `FixedPool`, a semaphore channel of `n` permits; a task that blocks while holding a permit starves the task behind it, so 2 of 3 start. `Executor` is the one-method `java.util.concurrent.Executor` shape plus `Close`, which waits on a `sync.WaitGroup`, and a generic `Submit[T]` plays `ExecutorService.submit`.
-- **`CompletableFuture` becomes a 100-line `Future[T]`.** The standard library has no promise type, so `future.go` defines one on a mutex, a closed-on-settle channel, and callbacks that run synchronously in the completing goroutine. That synchronous rule is what keeps `ManualTimer.Advance` deterministic: when it returns, every consequence of the alarms it fired has already happened, so the tests assert `IsDone()` without sleeping or polling. `Then` and `AllOf` are `thenApply` and `allOf`; `Get` is `join()`; `Done()` returns the channel for callers who prefer `select`. The race in `WithTimeout` is first-completion-wins, which is what `applyToEither` computes.
-- **Errors instead of exceptions.** `ProcessorAdapter.Quote` returns `(*Future[Quote], error)`, so a client library that fails before sending is an error value rather than a synchronous throw, and `WithTimeout` turns it into a `FAILED` quote with the same message. `Fail` settles a future with an `error`; `Quote.Detail` carries `err.Error()`, so the demo prints `FAILED (HTTP 503 from processor)` where Java prefixes the exception class. `Optional<Quote>` becomes `*Quote` (nil for none) and `Cheapest` returns `(Quote, bool)`.
-- **The abandon-versus-cancel point is the same.** `WithTimeout` stops waiting and leaves gamma's request outstanding, as Java's `applyToEither` does; a production Go service would pass a `context.WithTimeout` into the adapter so the HTTP call is cancelled too. `CountDownLatch` is a few lines on a channel in `future.go`. The suite passes under `go test -race ./...`.
+The Go port (`code/go/main.go` and `future.go`) keeps `ScriptedAdapter`, `ManualTimer`, `WithTimeout`, `QuoteAll`, `FirstOK`, `Cheapest`, `BlockingQuoteAll`, and `CountStartedBeforeRelease`, and prints the same timeline and outcomes. Four things differ. **Goroutines are the virtual threads.** Model 2 is `GoroutinePerTask`, which runs `go task()` and nothing else: a blocked goroutine costs a few kilobytes of stack and no OS thread, so all 3 gated tasks (and all 200 in the test) start, exactly as under `newVirtualThreadPerTaskExecutor`. Model 1 is `FixedPool`, a semaphore channel of `n` permits; a task that blocks while holding a permit starves the task behind it, so 2 of 3 start. `Executor` is the one-method `java.util.concurrent.Executor` shape plus `Close`, which waits on a `sync.WaitGroup`, and a generic `Submit[T]` plays `ExecutorService.submit`. **`CompletableFuture` becomes a 100-line `Future[T]`.** The standard library has no promise type, so `future.go` defines one on a mutex, a closed-on-settle channel, and callbacks that run synchronously in the completing goroutine. That synchronous rule is what keeps `ManualTimer.Advance` deterministic: when it returns, every consequence of the alarms it fired has already happened, so the tests assert `IsDone()` without sleeping or polling. `Then` and `AllOf` are `thenApply` and `allOf`; `Get` is `join()`; `Done()` returns the channel for callers who prefer `select`. The race in `WithTimeout` is first-completion-wins, which is what `applyToEither` computes. **Errors instead of exceptions.** `ProcessorAdapter.Quote` returns `(*Future[Quote], error)`, so a client library that fails before sending is an error value rather than a synchronous throw, and `WithTimeout` turns it into a `FAILED` quote with the same message. `Fail` settles a future with an `error`; `Quote.Detail` carries `err.Error()`, so the demo prints `FAILED (HTTP 503 from processor)` where Java prefixes the exception class. `Optional<Quote>` becomes `*Quote` (nil for none) and `Cheapest` returns `(Quote, bool)`. **The abandon-versus-cancel point is the same.** `WithTimeout` stops waiting and leaves gamma's request outstanding, as Java's `applyToEither` does; a production Go service would pass a `context.WithTimeout` into the adapter so the HTTP call is cancelled too. `CountDownLatch` is a few lines on a channel in `future.go`. The suite passes under `go test -race ./...`.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The adapter and a deterministic stand-in
+
+`Quote` returns `(*Future[Quote], error)`: the error is the synchronous failure path that Java expressed as a throw. `ScriptedAdapter` guards its pending slice with a `sync.Mutex`; `takePending` swaps the slice out under the lock so `Respond` and `Fail` complete futures with the lock released, since completion runs callbacks synchronously. `immediateFee` is a `*Money` so `nil` can mean "scripted".
+
+```go
+type ProcessorAdapter interface {
+	Name() string
+	Quote(request PaymentRequest) (*Future[Quote], error)
+}
+
+func (a *ScriptedAdapter) Quote(PaymentRequest) (*Future[Quote], error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls.Add(1)
+	if a.immediateFee != nil {
+		return Completed(quoteOK(a.name, *a.immediateFee)), nil
+	}
+	f := NewFuture[Quote]()
+	a.pending = append(a.pending, f)
+	return f, nil
+}
+
+func (a *ScriptedAdapter) takePending() []*Future[Quote] {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	pending := a.pending
+	a.pending = nil
+	return pending
+}
+
+func (a *ScriptedAdapter) Respond(fee Money) {
+	for _, f := range a.takePending() {
+		f.Complete(quoteOK(a.name, fee))
+	}
+}
+
+func (a *ScriptedAdapter) Fail(message string) {
+	for _, f := range a.takePending() {
+		f.Fail(errors.New(message))
+	}
+}
+```
+
+#### Step 2: Time as an interface
+
+`After` returns a `*Future[struct{}]`, the Go spelling of `CompletableFuture<Void>`. `Advance` sorts with `sort.SliceStable` on `(deadline, seq)`, filters in place with the `keep := t.pending[:0]` idiom, and unlocks explicitly before completing the due alarms, because `Complete` runs callbacks that may call `After` and take the same mutex.
+
+```go
+func (t *ManualTimer) After(millis int64) *Future[struct{}] {
+	if millis < 0 {
+		panic("negative delay")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	f := NewFuture[struct{}]()
+	t.pending = append(t.pending, pendingAlarm{t.now + millis, t.seq, f})
+	t.seq++
+	return f
+}
+
+func (t *ManualTimer) Advance(millis int64) {
+	var due []pendingAlarm
+	t.mu.Lock()
+	t.now += millis
+	sort.SliceStable(t.pending, func(i, j int) bool {
+		if t.pending[i].deadline != t.pending[j].deadline {
+			return t.pending[i].deadline < t.pending[j].deadline
+		}
+		return t.pending[i].seq < t.pending[j].seq
+	})
+	keep := t.pending[:0]
+	for _, p := range t.pending {
+		switch {
+		case p.future.IsCancelled(): // the caller no longer needs this alarm
+		case p.deadline <= t.now:
+			due = append(due, p)
+		default:
+			keep = append(keep, p)
+		}
+	}
+	t.pending = keep
+	t.mu.Unlock()
+	for _, p := range due {
+		p.future.Complete(struct{}{})
+	}
+}
+```
+
+#### Step 3: A call that races its deadline
+
+With no `applyToEither`, the race is written out: one `result` future and two `OnComplete` callbacks, each trying to `Complete` it. `Complete` is first-wins, so whichever settles first decides. The call's callback cancels the alarm (hygiene) and maps an error to `FAILED`; the alarm's callback only fires a `TIMED_OUT` quote when the alarm completed normally, not when it was cancelled. Every path yields exactly one `Quote`.
+
+```go
+func WithTimeout(adapter ProcessorAdapter, request PaymentRequest, timeoutMillis int64, timer Timer) *Future[Quote] {
+	call, err := adapter.Quote(request)
+	if err != nil { // a synchronous error is still a failed quote, not a crashed fan-out
+		return Completed(quoteFailed(adapter.Name(), err))
+	}
+	result := NewFuture[Quote]()
+	alarm := timer.After(timeoutMillis)
+	call.OnComplete(func(q Quote, err error) {
+		alarm.Cancel() // the answer arrived: the alarm is no longer needed
+		if err != nil {
+			result.Complete(quoteFailed(adapter.Name(), err))
+			return
+		}
+		result.Complete(q)
+	})
+	alarm.OnComplete(func(_ struct{}, err error) {
+		if err == nil { // fired, not cancelled
+			result.Complete(quoteTimedOut(adapter.Name(), timeoutMillis))
+		}
+	})
+	return result
+}
+```
+
+`OnComplete` in `future.go` either appends the callback or, if the future is already settled, runs it immediately on the caller's goroutine; that is what makes an `Immediate` adapter's answer flow through the same code path.
+
+```go
+func (f *Future[T]) OnComplete(cb func(T, error)) {
+	f.mu.Lock()
+	if !f.completed {
+		f.callbacks = append(f.callbacks, cb)
+		f.mu.Unlock()
+		return
+	}
+	value, err := f.value, f.err
+	f.mu.Unlock()
+	cb(value, err)
+}
+```
+
+#### Step 4: Fan-out and fan-in
+
+`AllOf` returns a `*Future[[]Quote]` in adapter order, folding Java's `allOf` plus `thenApply(join)`. `FirstOK` completes a `*Future[*Quote]` with a pointer to the first OK quote and `nil` when the atomic countdown reaches zero without one; `quote := q` takes a per-callback copy so the pointer does not alias a loop variable.
+
+```go
+func QuoteAll(adapters []ProcessorAdapter, request PaymentRequest, timeoutMillis int64, timer Timer) *Future[[]Quote] {
+	futures := make([]*Future[Quote], 0, len(adapters))
+	for _, a := range adapters {
+		futures = append(futures, WithTimeout(a, request, timeoutMillis, timer))
+	}
+	return AllOf(futures)
+}
+
+func FirstOK(adapters []ProcessorAdapter, request PaymentRequest, timeoutMillis int64, timer Timer) *Future[*Quote] {
+	winner := NewFuture[*Quote]()
+	var remaining atomic.Int32
+	remaining.Store(int32(len(adapters)))
+	if len(adapters) == 0 {
+		winner.Complete(nil)
+	}
+	for _, a := range adapters {
+		WithTimeout(a, request, timeoutMillis, timer).OnComplete(func(q Quote, _ error) {
+			if q.Outcome == OK {
+				quote := q
+				winner.Complete(&quote) // first OK completes; later ones are no-ops
+			}
+			if remaining.Add(-1) == 0 {
+				winner.Complete(nil) // everyone answered, none OK
+			}
+		})
+	}
+	return winner
+}
+```
+
+#### Step 5: The same fan-out, blocking, on two kinds of thread
+
+`BlockingQuoteAll` submits one closure per adapter that calls `call.Get()`, blocking its goroutine, and then `Get`s each result in order. What differs between the two models is only the `Executor`: `FixedPool.Execute` must send on a buffered permit channel before running the task, so the third task waits for a permit held by a blocked task, while `GoroutinePerTask.Execute` just starts a goroutine.
+
+```go
+func BlockingQuoteAll(ex Executor, adapters []ProcessorAdapter, request PaymentRequest) []Quote {
+	futures := make([]*Future[Quote], len(adapters))
+	for i, a := range adapters {
+		adapter := a
+		futures[i] = Submit(ex, func() (Quote, error) {
+			call, err := adapter.Quote(request)
+			if err != nil {
+				return Quote{}, err
+			}
+			return call.Get() // blocks this task's goroutine
+		})
+	}
+	out := make([]Quote, len(adapters))
+	for i, f := range futures {
+		q, err := f.Get() // returns only when every task is done
+		if err != nil {
+			q = quoteFailed(adapters[i].Name(), err)
+		}
+		out[i] = q
+	}
+	return out
+}
+```
+
+```go
+func (p *FixedPool) Execute(task func()) {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		p.permits <- struct{}{} // no permit free: this task waits for a goroutine that is itself waiting
+		defer func() { <-p.permits }()
+		task()
+	}()
+}
+
+func CountStartedBeforeRelease(ex Executor, tasks, expectedStarted int) int {
+	gate := make(chan struct{})
+	startedLatch := NewCountDownLatch(expectedStarted)
+	var started atomic.Int32
+	futures := make([]*Future[int], 0, tasks)
+	for i := 0; i < tasks; i++ {
+		id := i
+		futures = append(futures, Submit(ex, func() (int, error) {
+			started.Add(1)
+			startedLatch.CountDown()
+			<-gate // a blocked goroutine: a card network that has not answered yet
+			return id, nil
+		}))
+	}
+	startedLatch.Await()
+	observed := int(started.Load()) // tasks beyond the pool size cannot have started: no permit exists for them
+	close(gate)
+	for _, f := range futures {
+		f.MustGet()
+	}
+	return observed
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/04-concurrency/06-executors-goroutines-and-async/code/go
 go run .
 go test -race ./...
 ```
+
+```console
+== Model 1: a bounded pool and blocking calls ==
+3 blocking adapter calls on a pool of 2: 2 started; the third waits for a permit held by a task that is itself waiting
+
+== Model 2: a goroutine per task, same blocking code ==
+3 blocking adapter calls on goroutines: 3 started; a blocked goroutine parks, it does not hold an OS thread
+
+== Model 3: Future fan-out with per-adapter timeouts (simulated clock) ==
+t=0ms  fan-out issued to 4 processors; alpha answered immediately; combined future done: false
+t=250ms  beta answered; combined future done: false
+t=550ms  delta failed; gamma silent; combined future done: false
+t=800ms  deadline passed; combined future done: true
+  alpha   OK fee 3.29 USD
+  beta    OK fee 2.75 USD
+  gamma   TIMED_OUT (no answer within 800 ms)
+  delta   FAILED (HTTP 503 from processor)
+cheapest OK quote: beta at 2.75 USD
+gamma still has 1 outstanding call: the timeout abandoned the wait, it did not cancel the request
+```
+
+The run finishes in milliseconds: the 800 ms is `ManualTimer` time, and nothing in the program sleeps.
 
 ## Use It
 

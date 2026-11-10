@@ -347,25 +347,175 @@ The depth figure varies by machine and JVM flags. The test run prints `41 passed
 
 ### In Python
 
+The enumerations, the allocator (recursive and explicit-stack), and N-Queens are the same code with `snake_case` names, and every count in the demo matches the Java run. Three things differ in `code/python/main.py`. **The depth limit is a counter, not a stack size:** CPython raises `RecursionError` when the number of Python frames passes `sys.getrecursionlimit()`, which defaults to 1,000. So the demo's measured-depth line reads "about 997 trivial frames (sys.getrecursionlimit() = 1000)" where the JVM reports a machine-dependent figure in the thousands, and `sum_recursive(1_000)` (1,001 frames), which the JVM handles easily, fails at the default limit. `Depth.recursion_limit` is the Python counterpart of `-Xss`: the demo and the tests use it to raise the limit for that call and to lower it so the failure shows up quickly. No test depends on the exact depth; they assert that the failure happens and that the probe stays under whatever limit is set. **`RecursionError` is an ordinary exception:** it subclasses `RuntimeError`, so unlike `StackOverflowError` a broad `except Exception` swallows it. The probe catches it by name, and the rule stays the same: convert the recursion, do not catch the error. **Interpreter cost is visible:** the unpruned 24-receivable search visits 32,838,111 nodes, which takes several seconds in CPython instead of well under one on the JVM. The visit counts match exactly; the gap is the reason the node counter, not the clock, is the instrument.
+
+Lists print through a small `jstr` helper so the output matches `List.toString`, `Frame` is a frozen dataclass, and `IllegalArgumentException` maps to `ValueError`. `itertools.permutations`, `combinations`, and `product` are the library versions; they yield lazily instead of building lists. Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v` (the Java's 41 checks plus 4 for the recursion-limit behaviour).
+
+#### Step 1: Permutations with choose, explore, un-choose
+
+`used` is a list of booleans and `current` a list shared across the whole search; `list(current)` at the leaf is the copy that the Java makes with `new ArrayList<>(current)`. `current.pop()` is the un-choose.
+
 ```python
-@staticmethod
-@contextmanager
-def recursion_limit(limit: int) -> Iterator[None]:
-    old = sys.getrecursionlimit()
-    sys.setrecursionlimit(limit)
-    try:
-        yield
-    finally:
-        sys.setrecursionlimit(old)
+    @staticmethod
+    def _permute(items: list[T], used: list[bool], current: list[T], out: list[list[T]]) -> None:
+        if len(current) == len(items):
+            out.append(list(current))  # leaf: copy the path
+            return
+        for i in range(len(items)):
+            if used[i]:
+                continue
+            used[i] = True
+            current.append(items[i])  # choose
+            Enumerate._permute(items, used, current, out)  # explore
+            current.pop()
+            used[i] = False  # un-choose: the backtrack step
 ```
 
-The enumerations, the allocator (recursive and explicit-stack), and N-Queens are the same code with `snake_case` names, and every count in the demo matches the Java run. Three things differ, all in `code/python/main.py`:
+#### Step 2: Subsets by include/exclude
 
-- **The depth limit is a counter, not a stack size.** CPython raises `RecursionError` when the number of Python frames passes `sys.getrecursionlimit()`, which defaults to 1,000. So the demo's measured-depth line reads "about 997 trivial frames (sys.getrecursionlimit() = 1000)" where the JVM reports a machine-dependent figure in the thousands, and `sum_recursive(1_000)` (1,001 frames), which the JVM handles easily, fails at the default limit. `Depth.recursion_limit` is the Python counterpart of `-Xss`: the demo and the tests use it to raise the limit for that call and to lower it so the failure shows up quickly. No test depends on the exact depth; they assert that the failure happens and that the probe stays under whatever limit is set.
-- **`RecursionError` is an ordinary exception.** It subclasses `RuntimeError`, so unlike `StackOverflowError` a broad `except Exception` swallows it. The probe catches it by name, and the rule stays the same: convert the recursion, do not catch the error.
-- **Interpreter cost is visible.** The unpruned 24-receivable search visits 32,838,111 nodes, which takes several seconds in CPython instead of well under one on the JVM. The visit counts match exactly; the gap is the reason the node counter, not the clock, is the instrument.
+Two recursive calls per level, no loop. The "leave it out" branch runs first, which is why the empty set is the first subset in the output.
 
-Lists print through a small `jstr` helper so the output matches `List.toString`, `Frame` is a frozen dataclass, and `IllegalArgumentException` maps to `ValueError`. `itertools.permutations`, `combinations`, and `product` are the library versions; they yield lazily instead of building lists.
+```python
+    @staticmethod
+    def _subsets_from(items: list[T], index: int, current: list[T], out: list[list[T]]) -> None:
+        if index == len(items):
+            out.append(list(current))
+            return
+        Enumerate._subsets_from(items, index + 1, current, out)  # branch 1: leave items[index] out
+        current.append(items[index])
+        Enumerate._subsets_from(items, index + 1, current, out)  # branch 2: take it
+        current.pop()
+```
+
+#### Step 3: Combinations with a cheap prune
+
+The `range` upper bound is the Java loop's `<=` bound plus one, because `range` is exclusive. Starting the next level at `i + 1` is what makes these combinations rather than permutations.
+
+```python
+    @staticmethod
+    def _combine(items: list[T], k: int, start: int, current: list[T], out: list[list[T]]) -> None:
+        if len(current) == k:
+            out.append(list(current))
+            return
+        # prune: if even taking every remaining item cannot reach k, stop
+        for i in range(start, len(items) - (k - len(current)) + 1):
+            current.append(items[i])
+            Enumerate._combine(items, k, i + 1, current, out)
+            current.pop()
+```
+
+#### Step 4: The settlement allocator
+
+`sum_` carries an underscore because `sum` is a builtin. The two prunes and the early return on an exact hit are the Java ones; `counter.visited` is incremented on entry so the demo can compare the pruned and unpruned node counts.
+
+```python
+    @staticmethod
+    def _search(items: list[Money], suffix: list[int], index: int, sum_: int, target: int,
+                chosen: list[Money], out: list[list[Money]], prune: bool, counter: Counter) -> None:
+        counter.visited += 1
+        if sum_ == target:
+            out.append(list(chosen))  # found one; nothing more can be added (positive amounts)
+            return
+        if index == len(items):
+            return
+        if prune:
+            if sum_ > target:
+                return  # overshot: no positive amount can fix it
+            if sum_ + suffix[index] < target:
+                return  # even taking everything left falls short
+        item = items[index]
+        chosen.append(item)
+        SettlementAllocator._search(items, suffix, index + 1, sum_ + item.minor_units, target,
+                                    chosen, out, prune, counter)
+        chosen.pop()
+        SettlementAllocator._search(items, suffix, index + 1, sum_, target, chosen, out, prune, counter)
+```
+
+#### Step 5: The same search with an explicit stack
+
+`Frame` is a frozen dataclass and the stack is a plain list (`append`/`pop`). `f.chosen + [item]` builds the taken path as a fresh list, so frames never share storage. The skip branch is pushed first so the take branch is popped first, matching the recursion's order and its node count.
+
+```python
+    @staticmethod
+    def allocations_iterative(receivables: list[Money], target: Money, counter: Counter) -> list[list[Money]]:
+        """Same search, no recursion: an explicit stack of frames. Same allocations in the same order."""
+        sorted_ = sorted(receivables, key=lambda m: -m.minor_units)
+        suffix = [0] * (len(sorted_) + 1)
+        for i in range(len(sorted_) - 1, -1, -1):
+            suffix[i] = suffix[i + 1] + sorted_[i].minor_units
+        t = target.minor_units
+
+        out: list[list[Money]] = []
+        stack: list[Frame] = [Frame(0, 0, [])]
+        while stack:
+            f = stack.pop()
+            counter.visited += 1
+            if f.sum == t:
+                out.append(f.chosen)
+                continue
+            if f.index == len(sorted_) or f.sum > t or f.sum + suffix[f.index] < t:
+                continue
+            # push the "skip" branch first so the "take" branch is popped (explored) first, matching the recursion
+            stack.append(Frame(f.index + 1, f.sum, f.chosen))
+            taken = f.chosen + [sorted_[f.index]]
+            stack.append(Frame(f.index + 1, f.sum + sorted_[f.index].minor_units, taken))
+        return out
+```
+
+#### Step 6: N-Queens
+
+Three boolean lists and a chained assignment to set and clear all three in one statement. The constraint check runs before descending, which is the prune.
+
+```python
+    @staticmethod
+    def _place(n: int, row: int, cols: list[bool], diag1: list[bool], diag2: list[bool], counter: Counter) -> int:
+        counter.visited += 1
+        if row == n:
+            return 1
+        found = 0
+        for col in range(n):
+            d1, d2 = row + col, row - col + n
+            if cols[col] or diag1[d1] or diag2[d2]:
+                continue  # constraint check before descending: the prune
+            cols[col] = diag1[d1] = diag2[d2] = True
+            found += NQueens._place(n, row + 1, cols, diag1, diag2, counter)
+            cols[col] = diag1[d1] = diag2[d2] = False
+        return found
+```
+
+#### Step 7: Depth
+
+The probe catches `RecursionError` by name; a one-element list is the mutable cell that survives the unwinding. `recursion_limit` is a context manager that plays the role of `-Xss`, restoring the old limit in `finally`.
+
+```python
+    @staticmethod
+    def measure_max_depth() -> int:
+        """Depth at which this call chain hits RecursionError for a trivial frame; measured, not assumed."""
+        depth = [0]
+        try:
+            Depth._probe(depth)
+        except RecursionError:
+            pass  # expected
+        return depth[0]
+
+    @staticmethod
+    def _probe(depth: list[int]) -> None:
+        depth[0] += 1
+        Depth._probe(depth)
+
+    @staticmethod
+    @contextmanager
+    def recursion_limit(limit: int) -> Iterator[None]:
+        """Temporarily set sys.setrecursionlimit; the Python equivalent of running with a different -Xss."""
+        old = sys.getrecursionlimit()
+        sys.setrecursionlimit(limit)
+        try:
+            yield
+        finally:
+            sys.setrecursionlimit(old)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/02-algorithms/04-recursion-and-backtracking/code/python
@@ -373,28 +523,220 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-Apart from the depth line, the demo output matches the Java run line for line. The suite covers the Java's 41 checks plus 4 for the recursion-limit behaviour.
+```console
+== Settlement allocation: which receivables exactly cover 120.00 USD? ==
+3 allocations; nodes visited: no pruning 113, pruning 21, iterative 21; same results: true
+
+== Pruning at scale: 24 receivables, one target ==
+51433 allocations found both ways; nodes visited without pruning: 32,838,111 (2^25 - 1 = 33,554,431), with pruning: 917,829
+
+== N-Queens: constraint checks before descending ==
+  n=8: 92 solutions, 2,057 nodes visited (of 16,777,216 leaves in the unpruned tree)
+
+== Recursion depth is finite ==
+sumRecursive(1_000) = 500500, sumIterative(10_000_000) = 50000005000000
+this thread overflowed at a recursion depth of about 997 trivial frames (sys.getrecursionlimit() = 1000; sys.setrecursionlimit changes it)
+```
+
+Every node count matches Java. The depth line is the one that differs: 997 frames against the default limit of 1,000, and the demo takes several seconds because of the 32-million-node unpruned search.
 
 ### In Go
 
+The enumerations, the allocator (recursive and explicit-stack), and N-Queens are the same code, and every count in the demo matches the Java run. Three things differ in `code/go/main.go`. **The stack is not where the limit is:** a goroutine starts with a few kilobytes of stack and the runtime copies it to a larger one on demand, up to `debug.SetMaxStack` (1,000,000,000 bytes on 64-bit targets). The demo's probe, which overflows a JVM thread at roughly 10,000 trivial frames, runs to 1,000,000 frames in Go and stops because it is told to. When the ceiling *is* reached, the runtime prints `fatal error: stack overflow` and exits; it is not a panic, so `recover` never sees it. There is no Go equivalent of catching `StackOverflowError`. Code that recurses over untrusted depth carries its own budget: `SumRecursiveBounded` returns `ErrDepthBudget` where the Java test expects the error. No test depends on the depth the runtime allows; they assert that the budget fires and that the probe reaches a depth the JVM cannot. **Slices alias:** `append` to the `current` path may write into a backing array an earlier frame still references, so every leaf copies with `slices.Clone` before saving it, exactly where the Java copies `current`. The iterative version clones `f.Chosen` before appending the taken item for the same reason; a test checks that no two subsets share storage. **Errors are values:** `Combinations` and `Allocations` return `(T, error)` where the Java throws; `ErrKOutOfRange`, `ErrMixedCurrency`, and `ErrNonPositive` support `errors.Is`. Generics (`Permutations[T any]`) replace Java's erased `<T>`, and `[][]T` replaces `List<List<T>>`; a small `jstr` helper prints slices as `[A, B, C]` so the demo reads like the Java.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...` (the Java's 41 checks, with the stack-overflow check becoming the depth-budget check, plus 7 that pin the demo's node counts, the aliasing rule, and the probe).
+
+#### Step 1: Permutations with choose, explore, un-choose
+
+`out` is a pointer to the result slice because `append` may reallocate it. `current` is extended with `append` and shrunk with a reslice; the leaf stores `slices.Clone(current)` because later appends would otherwise overwrite the saved permutation in place.
+
 ```go
-func SumRecursiveBounded(n, maxDepth int64) (int64, error) {
-    if maxDepth <= 0 {
-        return 0, ErrDepthBudget
-    }
-    if n == 0 {
-        return 0, nil
-    }
-    rest, err := SumRecursiveBounded(n-1, maxDepth-1)
-    return n + rest, err
+func permute[T any](items []T, used []bool, current []T, out *[][]T) {
+	if len(current) == len(items) { // leaf: copy the path
+		*out = append(*out, slices.Clone(current))
+		return
+	}
+	for i := range items {
+		if used[i] {
+			continue
+		}
+		used[i] = true
+		current = append(current, items[i]) // choose
+		permute(items, used, current, out)  // explore
+		current = current[:len(current)-1]  // un-choose: the backtrack step
+		used[i] = false
+	}
 }
 ```
 
-The enumerations, the allocator (recursive and explicit-stack), and N-Queens are the same code, and every count in the demo matches the Java run. Three things differ, all in `code/go/main.go`:
+#### Step 2: Subsets by include/exclude
 
-- **The stack is not where the limit is.** A goroutine starts with a few kilobytes of stack and the runtime copies it to a larger one on demand, up to `debug.SetMaxStack` (1,000,000,000 bytes on 64-bit targets). The demo's probe, which overflows a JVM thread at roughly 10,000 trivial frames, runs to 1,000,000 frames in Go and stops because it is told to. When the ceiling *is* reached, the runtime prints `fatal error: stack overflow` and exits; it is not a panic, so `recover` never sees it. There is no Go equivalent of catching `StackOverflowError`. Code that recurses over untrusted depth carries its own budget: `SumRecursiveBounded` returns `ErrDepthBudget` where the Java test expects the error. No test depends on the depth the runtime allows; they assert that the budget fires and that the probe reaches a depth the JVM cannot.
-- **Slices alias.** `append` to the `current` path may write into a backing array an earlier frame still references, so every leaf copies with `slices.Clone` before saving it, exactly where the Java copies `current`. The iterative version clones `f.Chosen` before appending the taken item for the same reason; a test checks that no two subsets share storage.
-- **Errors are values.** `Combinations` and `Allocations` return `(T, error)` where the Java throws; `ErrKOutOfRange`, `ErrMixedCurrency`, and `ErrNonPositive` support `errors.Is`. Generics (`Permutations[T any]`) replace Java's erased `<T>`, and `[][]T` replaces `List<List<T>>`; a small `jstr` helper prints slices as `[A, B, C]` so the demo reads like the Java.
+The explicit un-choose is absent because `current` is a value: the appended slice is passed to the second call and the caller's `current` is unchanged when it returns. The clone at the leaf is still mandatory.
+
+```go
+func subsetsFrom[T any](items []T, index int, current []T, out *[][]T) {
+	if index == len(items) {
+		*out = append(*out, slices.Clone(current))
+		return
+	}
+	subsetsFrom(items, index+1, current, out) // branch 1: leave items[index] out
+	current = append(current, items[index])
+	subsetsFrom(items, index+1, current, out) // branch 2: take it
+}
+```
+
+#### Step 3: Combinations with a cheap prune
+
+`Combinations` returns `ErrKOutOfRange` for a bad `k`. Inside the loop `append(current, items[i])` is passed directly, so each level's path is extended without mutating the caller's slice header; the prune bound is identical.
+
+```go
+// Combinations returns all C(n, k) combinations of size k, in lexicographic index order.
+func Combinations[T any](items []T, k int) ([][]T, error) {
+	if k < 0 || k > len(items) {
+		return nil, fmt.Errorf("%w: %d", ErrKOutOfRange, k)
+	}
+	out := [][]T{}
+	combine(items, k, 0, []T{}, &out)
+	return out, nil
+}
+
+func combine[T any](items []T, k, start int, current []T, out *[][]T) {
+	if len(current) == k {
+		*out = append(*out, slices.Clone(current))
+		return
+	}
+	// prune: if even taking every remaining item cannot reach k, stop
+	for i := start; i <= len(items)-(k-len(current)); i++ {
+		combine(items, k, i+1, append(current, items[i]), out)
+	}
+}
+```
+
+#### Step 4: The settlement allocator
+
+`Allocations` validates and returns an error; `sortedWithSuffix` clones, sorts descending with `slices.SortStableFunc`, and precomputes the suffix sums. `search` is the Java method with the "take" branch passing `append(chosen, items[index])` and the "skip" branch passing `chosen` unchanged.
+
+```go
+func search(items []Money, suffix []int64, index int, sum, target int64, chosen []Money, out *[][]Money, prune bool, counter *Counter) {
+	counter.Visited++
+	if sum == target { // found one; nothing more can be added (positive amounts)
+		*out = append(*out, slices.Clone(chosen))
+		return
+	}
+	if index == len(items) {
+		return
+	}
+	if prune {
+		if sum > target { // overshot: no positive amount can fix it
+			return
+		}
+		if sum+suffix[index] < target { // even taking everything left falls short
+			return
+		}
+	}
+	search(items, suffix, index+1, sum+items[index].MinorUnits, target, append(chosen, items[index]), out, prune, counter)
+	search(items, suffix, index+1, sum, target, chosen, out, prune, counter)
+}
+```
+
+#### Step 5: The same search with an explicit stack
+
+`Frame` is a struct and the stack is a slice. `slices.Clone(f.Chosen)` before the append is the aliasing guard: without it two frames could share a backing array and one's append would corrupt the other's path. Push order is skip then take, so take pops first.
+
+```go
+// Frame is one suspended call of the recursive search, made explicit.
+type Frame struct {
+	Index  int
+	Sum    int64
+	Chosen []Money
+}
+
+// AllocationsIterative is the same search, no recursion: an explicit stack of frames. Same allocations, same order.
+func AllocationsIterative(receivables []Money, target Money, counter *Counter) [][]Money {
+	sorted, suffix := sortedWithSuffix(receivables)
+	t := target.MinorUnits
+	out := [][]Money{}
+	stack := []Frame{{0, 0, []Money{}}}
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		counter.Visited++
+		if f.Sum == t {
+			out = append(out, f.Chosen)
+			continue
+		}
+		if f.Index == len(sorted) || f.Sum > t || f.Sum+suffix[f.Index] < t {
+			continue
+		}
+		// push the "skip" branch first so the "take" branch is popped (explored) first, matching the recursion's order
+		stack = append(stack, Frame{f.Index + 1, f.Sum, f.Chosen})
+		taken := append(slices.Clone(f.Chosen), sorted[f.Index])
+		stack = append(stack, Frame{f.Index + 1, f.Sum + sorted[f.Index].MinorUnits, taken})
+	}
+	return out
+}
+```
+
+#### Step 6: N-Queens
+
+Identical to the Java, with a parallel assignment to set and clear the three constraint slots.
+
+```go
+func place(n, row int, cols, diag1, diag2 []bool, counter *Counter) int64 {
+	counter.Visited++
+	if row == n {
+		return 1
+	}
+	var found int64
+	for col := 0; col < n; col++ {
+		d1, d2 := row+col, row-col+n
+		if cols[col] || diag1[d1] || diag2[d2] { // constraint check before descending: the prune
+			continue
+		}
+		cols[col], diag1[d1], diag2[d2] = true, true, true
+		found += place(n, row+1, cols, diag1, diag2, counter)
+		cols[col], diag1[d1], diag2[d2] = false, false, false
+	}
+	return found
+}
+```
+
+#### Step 7: Depth
+
+There is nothing to catch: a real overflow is a fatal runtime error. `SumRecursiveBounded` is the honest alternative, threading a depth budget down the recursion and returning `ErrDepthBudget` when it runs out. `ProbeDepth` recurses to a caller-supplied limit, which is how the demo shows a depth the JVM cannot reach.
+
+```go
+// SumRecursiveBounded is SumRecursive with a self-imposed depth budget. Go's runtime cannot recover from a real
+// stack overflow (it is `fatal error: stack overflow`, which `recover` never sees), so production code that recurses
+// over untrusted depth carries its own budget and returns ErrDepthBudget instead of taking the process down.
+func SumRecursiveBounded(n, maxDepth int64) (int64, error) {
+	if maxDepth <= 0 {
+		return 0, ErrDepthBudget
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	rest, err := SumRecursiveBounded(n-1, maxDepth-1)
+	return n + rest, err
+}
+
+// ProbeDepth recurses `limit` trivial frames deep and reports the depth reached. The JVM's probe stops where the
+// fixed thread stack ends (about 10,000 frames); Go grows the goroutine stack until debug.SetMaxStack (1 GB on 64-bit).
+func ProbeDepth(limit int) int {
+	depth := 0
+	probe(&depth, limit)
+	return depth
+}
+
+func probe(depth *int, limit int) {
+	*depth++
+	if *depth < limit {
+		probe(depth, limit)
+	}
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/02-algorithms/04-recursion-and-backtracking/code/go
@@ -402,7 +744,23 @@ go run .
 go test ./...
 ```
 
-Apart from the depth lines, the demo output matches the Java run line for line. The suite covers the Java's 41 checks (the stack-overflow check becomes the depth-budget check) plus 7 that pin the demo's node counts, the aliasing rule, and the probe.
+```console
+== Settlement allocation: which receivables exactly cover 120.00 USD? ==
+3 allocations; nodes visited: no pruning 113, pruning 21, iterative 21; same results: true
+
+== Pruning at scale: 24 receivables, one target ==
+51433 allocations found both ways; nodes visited without pruning: 32,838,111 (2^25 - 1 = 33,554,431), with pruning: 917,829
+
+== N-Queens: constraint checks before descending ==
+  n=8: 92 solutions, 2,057 nodes visited (of 16,777,216 leaves in the unpruned tree)
+
+== Recursion depth is finite ==
+sumRecursive(1_000) = 500500, sumIterative(10_000_000) = 50000005000000
+the probe that overflows a JVM thread at about 10,000 trivial frames reached 1,000,000 frames here: Go grows the goroutine stack on demand, up to debug.SetMaxStack = 1,000,000,000 bytes
+past that ceiling the runtime dies with an unrecoverable 'fatal error: stack overflow', so SumRecursiveBounded carries its own budget: recursion depth budget exceeded
+```
+
+Every node count matches Java and Python. The depth section is where Go tells a different story: the stack grows until the runtime's ceiling, and the only safe guard is a budget the code enforces itself.
 
 ## Use It
 

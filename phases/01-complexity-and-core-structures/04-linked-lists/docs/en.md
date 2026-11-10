@@ -373,11 +373,132 @@ The test harness prints `46 passed, 0 failed`. The timings will differ on your m
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps all three lists, the sentinel, ownership checks, and `PendingAuthorization`. What differs: **`__slots__` on every node.** Without it each node carries a per-instance `__dict__` and the memory-per-element row of the cost table roughly doubles; `IntrusiveNode` declares `prev`, `next`, `owner`, and subclasses such as `PendingAuthorization` add their own slots. **Exceptions:** `IndexOutOfBoundsException` and `NoSuchElementException` both become `IndexError` (what `list.pop()` raises on an empty list), `IllegalArgumentException` becomes `ValueError`, and `IllegalStateException` (adding an element that is already in a list) becomes `RuntimeError`. **The benchmark measures the interpreter, not the cache.** The shuffle uses a `JavaRandom` that reproduces `java.util.Random`, so the shuffled permutation is identical to Java's and all three sums print `499999500000`. The ratios are not: every `c.value` is a bytecode dispatch and a reference-count update, so the array scan is tens of milliseconds rather than under 1 ms, and the shuffled list is roughly 10x the array instead of 200x. The ordering (array < in-order list < shuffled list) still holds. Python takes the best of 3 rounds instead of 5 to stay under ten seconds.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Singly linked, with the tail pointer that makes `addLast` O(1)
+
+`_Node` is a nested class with `__slots__` and no generics (Python erases nothing, it simply does not check). `add_last` and `remove_first` are the Java methods with `is None` in place of `== null`; the `self._tail = None` line when the list empties is the same bug guard, and the test "singly add_last after emptying works" exists for it.
+
+```python
+class SinglyLinkedList(Generic[T]):
+    class _Node:
+        __slots__ = ("value", "next")
+
+        def __init__(self, value) -> None:
+            self.value = value
+            self.next = None
+
+    def __init__(self) -> None:
+        self._head: Optional[SinglyLinkedList._Node] = None
+        self._tail: Optional[SinglyLinkedList._Node] = None
+        self._size = 0
+
+    def add_last(self, value: T) -> None:
+        n = SinglyLinkedList._Node(value)
+        if self._tail is None:
+            self._head = self._tail = n
+        else:
+            self._tail.next = n
+            self._tail = n
+        self._size += 1
+
+    def remove_first(self) -> T:
+        if self._head is None:
+            raise IndexError("empty")  # Java: NoSuchElementException
+        v = self._head.value
+        self._head = self._head.next
+        if self._head is None:
+            self._tail = None
+        self._size -= 1
+        return v
+```
+
+#### Step 2: Removal by value needs the predecessor
+
+The loop carries `prev` alongside `cur` for the same reason as in Java: unlinking means writing `prev.next`. `==` compares values (Python's `Objects.equals`) while `is` compares identity for the tail check.
+
+```python
+    def remove_first_occurrence(self, value: T) -> bool:
+        """O(n): find the node *before* the match so it can be unlinked."""
+        prev, cur = None, self._head
+        while cur is not None:
+            if cur.value == value:
+                if prev is None:
+                    self._head = cur.next
+                else:
+                    prev.next = cur.next
+                if cur is self._tail:
+                    self._tail = prev
+                self._size -= 1
+                return True
+            prev = cur
+            cur = cur.next
+        return False
+```
+
+#### Step 3: Reversal in place
+
+Three references, one pass, no allocation. `nxt` is used as the name because `next` is a builtin; `self._tail = self._head` before the loop is the line that keeps `add_last` correct afterwards.
+
+```python
+    def reverse(self) -> None:
+        """In-place reversal with three pointers; O(n) time, O(1) extra space."""
+        prev, cur = None, self._head
+        self._tail = self._head
+        while cur is not None:
+            nxt = cur.next
+            cur.next = prev
+            prev = cur
+            cur = nxt
+        self._head = prev
+```
+
+#### Step 4: The sentinel, and one `linkBefore` for every position
+
+`Node` is a public nested class, because callers hold node handles. The constructor points the sentinel at itself, so `_link_before` has no empty-list branch; `add_first` and `add_last` are one-liners that differ only in which node they link before.
+
 ```python
 class DoublyLinkedList(Generic[T]):
     class Node:
         __slots__ = ("value", "prev", "next", "owner")
 
+        def __init__(self, value) -> None:
+            self.value = value
+            self.prev: Optional[DoublyLinkedList.Node] = None
+            self.next: Optional[DoublyLinkedList.Node] = None
+            self.owner: Optional[DoublyLinkedList] = None  # which list this node is linked into; None once unlinked
+
+    def __init__(self) -> None:
+        self._sentinel = DoublyLinkedList.Node(None)
+        self._sentinel.prev = self._sentinel.next = self._sentinel
+        self._size = 0
+
+    def _link_before(self, value: T, succ: Node) -> Node:
+        """Link a fresh node holding `value` immediately before `succ`. Works for every position."""
+        n = DoublyLinkedList.Node(value)
+        pred = succ.prev
+        n.prev = pred
+        n.next = succ
+        pred.next = n
+        succ.prev = n
+        n.owner = self
+        self._size += 1
+        return n
+
+    def add_first(self, value: T) -> Node:
+        return self._link_before(value, self._sentinel.next)
+
+    def add_last(self, value: T) -> Node:
+        return self._link_before(value, self._sentinel)
+```
+
+#### Step 5: O(1) unlink and move-to-front, guarded by ownership
+
+`_require_owned` raises `ValueError` when the node is `None` or belongs to another list (or to no list, after an earlier `unlink`). `unlink` clears the node's links and owner so a stale handle is rejected rather than corrupting `size`; `move_to_front` is six attribute writes and no allocation.
+
+```python
     def unlink(self, node: Node) -> T:
         """O(1): the node knows both neighbours, so no search is needed."""
         self._require_owned(node)
@@ -387,13 +508,99 @@ class DoublyLinkedList(Generic[T]):
         node.owner = None
         self._size -= 1
         return node.value
+
+    def move_to_front(self, node: Node) -> None:
+        """O(1) relink without allocation: the LRU "touch" operation."""
+        self._require_owned(node)
+        s = self._sentinel
+        if s.next is node:
+            return
+        node.prev.next = node.next
+        node.next.prev = node.prev
+        node.prev = s
+        node.next = s.next
+        s.next.prev = node
+        s.next = node
+
+    def _require_owned(self, node: Optional[Node]) -> None:
+        if node is None or node.owner is not self:
+            raise ValueError("node is not linked into this list")
 ```
 
-`code/python/main.py` keeps all three lists, the sentinel, ownership checks, and `PendingAuthorization`. What differs:
+#### Step 6: Splice
 
-- **`__slots__` on every node.** Without it each node carries a per-instance `__dict__` and the memory-per-element row of the cost table roughly doubles. `IntrusiveNode` declares `prev`, `next`, `owner`, and subclasses such as `PendingAuthorization` add their own slots.
-- **Exceptions.** `IndexOutOfBoundsException` and `NoSuchElementException` both become `IndexError` (what `list.pop()` raises on an empty list), `IllegalArgumentException` becomes `ValueError`, and `IllegalStateException` (adding an element that is already in a list) becomes `RuntimeError`.
-- **The benchmark measures the interpreter, not the cache.** The shuffle uses a `JavaRandom` that reproduces `java.util.Random`, so the shuffled permutation is identical to Java's and all three sums print `499999500000`. The ratios are not: every `c.value` is a bytecode dispatch and a reference-count update, so the array scan is around 30 ms rather than under 1 ms, and the shuffled list is roughly 10x the array instead of 200x. The ordering (array < in-order list < shuffled list) still holds. Python takes the best of 3 rounds instead of 5 to stay under ten seconds.
+Four pointer writes relink the two lists; the `while` loop that reassigns `owner` is the only O(n) part and exists only because of the ownership guard. `other is self` is the identity check for the self-splice error.
+
+```python
+    def splice_all(self, other: DoublyLinkedList[T]) -> None:
+        """O(1) relink regardless of either list's length; ownership transfer is the one O(n) walk."""
+        if other is self:
+            raise ValueError("cannot splice a list into itself")
+        if other._size == 0:
+            return
+        s = self._sentinel
+        other_first = other._sentinel.next
+        other_last = other._sentinel.prev
+        my_last = s.prev
+        my_last.next = other_first
+        other_first.prev = my_last
+        other_last.next = s
+        s.prev = other_last
+        n = other_first
+        while n is not s:
+            n.owner = self
+            n = n.next
+        self._size += other._size
+        other._sentinel.next = other._sentinel.prev = other._sentinel
+        other._size = 0
+```
+
+#### Step 7: The intrusive list
+
+`IntrusiveNode` is an ordinary base class with three slots; `PendingAuthorization(IntrusiveNode)` adds its own. `add_last` allocates nothing: it writes four links into the element itself. Adding an element that is already linked raises `RuntimeError`, removing one that is not in this list raises `ValueError`, and `contains` is a single identity comparison.
+
+```python
+class IntrusiveNode:
+    __slots__ = ("prev", "next", "owner")
+
+    def __init__(self) -> None:
+        self.prev: Optional[IntrusiveNode] = None
+        self.next: Optional[IntrusiveNode] = None
+        self.owner: Optional[IntrusiveList] = None
+
+    def is_linked(self) -> bool:
+        return self.owner is not None
+
+
+class IntrusiveList(Generic[T]):
+    def add_last(self, element: IntrusiveNode) -> None:
+        if element.owner is not None:
+            raise RuntimeError("element is already in a list")  # Java: IllegalStateException
+        s = self._sentinel
+        last = s.prev
+        element.prev = last
+        element.next = s
+        last.next = element
+        s.prev = element
+        element.owner = self
+        self._size += 1
+
+    def remove(self, element: IntrusiveNode) -> None:
+        """O(1), no lookup: the element is its own handle."""
+        if element.owner is not self:
+            raise ValueError("element is not in this list")
+        element.prev.next = element.next
+        element.next.prev = element.prev
+        element.prev = element.next = None
+        element.owner = None
+        self._size -= 1
+
+    def contains(self, element: IntrusiveNode) -> bool:
+        """O(1) membership test, because ownership is recorded in the element."""
+        return element.owner is self
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/04-linked-lists/code/python
@@ -401,48 +608,329 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Doubly linked with a sentinel: O(1) unlink given the node ==
+recency order (front = most recent): [idem-key-1, idem-key-2, idem-key-3]
+touch key-3 -> [idem-key-3, idem-key-1, idem-key-2]
+touch key-1 -> [idem-key-1, idem-key-3, idem-key-2]
+evict least recent (removeLast) -> idem-key-2, now [idem-key-1, idem-key-3]
+
+== Intrusive list: the element is its own node ==
+pending: auth-7f3a(1999) auth-9c21(4500) auth-0b77(250)
+capture auth-9c21: remove(a2) is O(1) with no search; linked before? true
+pending: auth-7f3a(1999) auth-0b77(250)  linked after? false
+
+== Measured: summing 1,000,000 longs, array vs linked list (sequential vs shuffled memory order) ==
+all three sums equal 499999500000: true
+long[] sequential scan :  22.97 ms
+list, nodes in memory order :  59.77 ms  (2.6x the array)
+list, nodes in shuffled order: 296.17 ms  (12.9x the array)
+```
+
+The list sections are identical to Java. The benchmark ratios are compressed by interpreter overhead, as the introduction warns; the ordering is the same.
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps all three lists, the sentinel, ownership checks, and `PendingAuthorization`. What differs: **generics instead of erasure.** `SinglyLinkedList[T comparable]` (it needs `==` for `RemoveFirstOccurrence`), `DoublyLinkedList[T any]` with a `*Node[T]` handle, and `IntrusiveList[T Intrusive]`, where `Intrusive` is a constraint satisfied by any pointer type that embeds `IntrusiveNode`. The sentinel is a plain `Node[T]` value inside the list struct, so an empty list is one allocation. **Embedding replaces inheritance:** Java's `abstract class IntrusiveNode` becomes a struct the element embeds; the promoted `hook()` method gives the list access to the links. Linux's `container_of` macro has no Go equivalent, so `AddLast` stores the element in the hook's `self` field and iteration reads it back. **Errors are values:** `Get`, `Unlink`, `RemoveFirst`, and `RemoveLast` return `(T, error)`; `InsertBefore`, `MoveToFront`, `SpliceAll`, `AddLast`, and `Remove` return `error`; the sentinels `ErrEmpty`, `ErrIndexOutOfBounds`, `ErrNotOwned`, `ErrAlreadyLinked`, and `ErrSpliceSelf` are matched with `errors.Is`. **The benchmark measures the cache, like Java.** The shuffle uses a `JavaRandom` that reproduces `java.util.Random`, so the permutation is identical and all three sums print `499999500000`. Go has no JIT, so the in-order list sits a little further from the slice than in Java, but the ordering (slice < in-order list < shuffled list) and the hundreds-of-times gap for the shuffled list are the same.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Singly linked, with the tail pointer that makes `addLast` O(1)
+
+`singlyNode[T]` is unexported because callers never hold singly-linked nodes. The zero value of the struct is a valid empty list, so there is no constructor. `RemoveFirst` returns `(T, error)` with `ErrEmpty`; the `l.tail = nil` reset when the list empties is the same guard as in Java.
+
 ```go
-// IntrusiveNode is embedded in the element; the element is its own list cell.
-type IntrusiveNode struct {
-    prev, next *IntrusiveNode
-    owner      any // the *IntrusiveList[T] this element is linked into; nil once unlinked
-    self       any // the element that embeds this hook: Go's stand-in for container_of
+type singlyNode[T any] struct {
+	value T
+	next  *singlyNode[T]
 }
 
-type PendingAuthorization struct {
-    IntrusiveNode
-    ID          string
-    AmountMinor int64
+type SinglyLinkedList[T comparable] struct {
+	head *singlyNode[T]
+	tail *singlyNode[T]
+	size int
 }
 
-func (l *DoublyLinkedList[T]) Unlink(node *Node[T]) (T, error) {
-    if err := l.requireOwned(node); err != nil {
-        var zero T
-        return zero, err
-    }
-    node.prev.next = node.next
-    node.next.prev = node.prev
-    node.prev, node.next = nil, nil // nil the links so the GC can collect the node
-    node.owner = nil
-    l.size--
-    return node.Value, nil
+// AddLast links a new tail.
+func (l *SinglyLinkedList[T]) AddLast(value T) {
+	n := &singlyNode[T]{value: value}
+	if l.tail == nil {
+		l.head, l.tail = n, n
+	} else {
+		l.tail.next = n
+		l.tail = n
+	}
+	l.size++
+}
+
+// RemoveFirst unlinks the head.
+func (l *SinglyLinkedList[T]) RemoveFirst() (T, error) {
+	if l.head == nil {
+		var zero T
+		return zero, ErrEmpty
+	}
+	v := l.head.value
+	l.head = l.head.next
+	if l.head == nil {
+		l.tail = nil
+	}
+	l.size--
+	return v, nil
 }
 ```
 
-`code/go/main.go` keeps all three lists, the sentinel, ownership checks, and `PendingAuthorization`. What differs:
+#### Step 2: Removal by value needs the predecessor
 
-- **Generics instead of erasure.** `SinglyLinkedList[T comparable]` (it needs `==` for `RemoveFirstOccurrence`), `DoublyLinkedList[T any]` with a `*Node[T]` handle, and `IntrusiveList[T Intrusive]`, where `Intrusive` is a constraint satisfied by any pointer type that embeds `IntrusiveNode`. The sentinel is a plain `Node[T]` value inside the list struct, so an empty list is one allocation.
-- **Embedding replaces inheritance.** Java's `abstract class IntrusiveNode` becomes a struct the element embeds; the promoted `hook()` method gives the list access to the links. Linux's `container_of` macro has no Go equivalent, so `AddLast` stores the element in the hook's `self` field and iteration reads it back.
-- **Errors are values.** `Get`, `Unlink`, `RemoveFirst`, and `RemoveLast` return `(T, error)`; `InsertBefore`, `MoveToFront`, `SpliceAll`, `AddLast`, and `Remove` return `error`. The sentinels `ErrEmpty`, `ErrIndexOutOfBounds`, `ErrNotOwned`, `ErrAlreadyLinked`, and `ErrSpliceSelf` are matched with `errors.Is`.
-- **The benchmark measures the cache, like Java.** The shuffle uses a `JavaRandom` that reproduces `java.util.Random`, so the permutation is identical and all three sums print `499999500000`. Go has no JIT, so the in-order list sits a little further from the slice than in Java, but the ordering (slice < in-order list < shuffled list) and the hundreds-of-times gap for the shuffled list are the same.
+The `comparable` constraint is what allows `cur.value == value`. Otherwise the loop is the Java one: carry `prev`, unlink through it, fix `tail` if the removed node was last.
+
+```go
+func (l *SinglyLinkedList[T]) RemoveFirstOccurrence(value T) bool {
+	var prev *singlyNode[T]
+	cur := l.head
+	for cur != nil {
+		if cur.value == value {
+			if prev == nil {
+				l.head = cur.next
+			} else {
+				prev.next = cur.next
+			}
+			if cur == l.tail {
+				l.tail = prev
+			}
+			l.size--
+			return true
+		}
+		prev = cur
+		cur = cur.next
+	}
+	return false
+}
+```
+
+#### Step 3: Reversal in place
+
+Identical to the Java apart from syntax; `var prev *singlyNode[T]` is the typed nil that starts the chain, and `l.tail = l.head` before the loop keeps the tail pointer honest.
+
+```go
+// Reverse is in-place with three pointers; O(n) time, O(1) extra space.
+func (l *SinglyLinkedList[T]) Reverse() {
+	var prev *singlyNode[T]
+	cur := l.head
+	l.tail = l.head
+	for cur != nil {
+		next := cur.next
+		cur.next = prev
+		prev = cur
+		cur = next
+	}
+	l.head = prev
+}
+```
+
+#### Step 4: The sentinel, and one `linkBefore` for every position
+
+`Node[T]` is exported with an exported `Value`; `owner` is a typed `*DoublyLinkedList[T]`. The sentinel is a field, not a pointer, so `NewDoublyLinkedList` must exist to point it at itself (`&l.sentinel`), and every comparison with the sentinel takes its address. `linkBefore` is otherwise the Java method.
+
+```go
+type Node[T any] struct {
+	Value T
+	prev  *Node[T]
+	next  *Node[T]
+	owner *DoublyLinkedList[T] // which list this node is linked into; nil once unlinked
+}
+
+type DoublyLinkedList[T any] struct {
+	sentinel Node[T]
+	size     int
+}
+
+// NewDoublyLinkedList makes an empty list whose sentinel points at itself.
+func NewDoublyLinkedList[T any]() *DoublyLinkedList[T] {
+	l := &DoublyLinkedList[T]{}
+	l.sentinel.prev = &l.sentinel
+	l.sentinel.next = &l.sentinel
+	return l
+}
+
+// linkBefore links a fresh node holding value immediately before succ. Works for every position including the ends.
+func (l *DoublyLinkedList[T]) linkBefore(value T, succ *Node[T]) *Node[T] {
+	n := &Node[T]{Value: value}
+	pred := succ.prev
+	n.prev = pred
+	n.next = succ
+	pred.next = n
+	succ.prev = n
+	n.owner = l
+	l.size++
+	return n
+}
+
+func (l *DoublyLinkedList[T]) AddFirst(value T) *Node[T] { return l.linkBefore(value, l.sentinel.next) }
+func (l *DoublyLinkedList[T]) AddLast(value T) *Node[T]  { return l.linkBefore(value, &l.sentinel) }
+```
+
+#### Step 5: O(1) unlink and move-to-front, guarded by ownership
+
+`requireOwned` returns `ErrNotOwned`; `Unlink` propagates it with the zero value, `MoveToFront` returns it alone. Nil-ing the links in `Unlink` lets the garbage collector reclaim the node and makes a stale handle fail the ownership check on reuse.
+
+```go
+// Unlink is O(1): the node knows both neighbours, so no search is needed.
+func (l *DoublyLinkedList[T]) Unlink(node *Node[T]) (T, error) {
+	if err := l.requireOwned(node); err != nil {
+		var zero T
+		return zero, err
+	}
+	node.prev.next = node.next
+	node.next.prev = node.prev
+	node.prev, node.next = nil, nil // nil the links so the GC can collect the node
+	node.owner = nil
+	l.size--
+	return node.Value, nil
+}
+
+// MoveToFront is an O(1) relink without allocation: the LRU "touch" operation.
+func (l *DoublyLinkedList[T]) MoveToFront(node *Node[T]) error {
+	if err := l.requireOwned(node); err != nil {
+		return err
+	}
+	if l.sentinel.next == node {
+		return nil
+	}
+	node.prev.next = node.next
+	node.next.prev = node.prev
+	node.prev = &l.sentinel
+	node.next = l.sentinel.next
+	l.sentinel.next.prev = node
+	l.sentinel.next = node
+	return nil
+}
+
+func (l *DoublyLinkedList[T]) requireOwned(node *Node[T]) error {
+	if node == nil || node.owner != l {
+		return ErrNotOwned
+	}
+	return nil
+}
+```
+
+#### Step 6: Splice
+
+Same four relinks, same ownership walk. The self-splice case returns `ErrSpliceSelf`, and because the sentinel is a value field, the emptied list is reset by pointing `other.sentinel` back at its own address.
+
+```go
+func (l *DoublyLinkedList[T]) SpliceAll(other *DoublyLinkedList[T]) error {
+	if other == l {
+		return ErrSpliceSelf
+	}
+	if other.size == 0 {
+		return nil
+	}
+	otherFirst := other.sentinel.next
+	otherLast := other.sentinel.prev
+	myLast := l.sentinel.prev
+	myLast.next = otherFirst
+	otherFirst.prev = myLast
+	otherLast.next = &l.sentinel
+	l.sentinel.prev = otherLast
+	// Ownership must follow the nodes: this is the one O(n) walk the splice cannot avoid if nodes track their owner.
+	for n := otherFirst; n != &l.sentinel; n = n.next {
+		n.owner = l
+	}
+	l.size += other.size
+	other.sentinel.next = &other.sentinel
+	other.sentinel.prev = &other.sentinel
+	other.size = 0
+	return nil
+}
+```
+
+#### Step 7: The intrusive list
+
+`IntrusiveNode` is a struct the element embeds; the unexported `hook()` method is promoted to the embedding type, and the `Intrusive` constraint demands it (plus `comparable`). Because `owner` must hold a list of any element type it is an `any`, and `Remove` compares it with `any(l)`. `self` is the `container_of` stand-in: `AddLast` stores the element in it, and `Each` reads it back with a type assertion.
+
+```go
+type IntrusiveNode struct {
+	prev, next *IntrusiveNode
+	owner      any // the *IntrusiveList[T] this element is linked into; nil once unlinked
+	self       any // the element that embeds this hook: Go's stand-in for container_of
+}
+
+// IsLinked reports whether the element is in a list.
+func (n *IntrusiveNode) IsLinked() bool { return n.owner != nil }
+
+// hook lets IntrusiveList reach the embedded links through any element type.
+func (n *IntrusiveNode) hook() *IntrusiveNode { return n }
+
+// Intrusive is satisfied by any pointer type that embeds IntrusiveNode.
+type Intrusive interface {
+	comparable
+	hook() *IntrusiveNode
+}
+
+// AddLast links the element at the tail without allocating.
+func (l *IntrusiveList[T]) AddLast(element T) error {
+	h := element.hook()
+	if h.owner != nil {
+		return ErrAlreadyLinked
+	}
+	last := l.sentinel.prev
+	h.prev = last
+	h.next = &l.sentinel
+	last.next = h
+	l.sentinel.prev = h
+	h.owner = l
+	h.self = element
+	l.size++
+	return nil
+}
+
+// Remove is O(1), no lookup: the element is its own handle.
+func (l *IntrusiveList[T]) Remove(element T) error {
+	h := element.hook()
+	if h.owner != any(l) {
+		return fmt.Errorf("%w: element is not in this list", ErrNotOwned)
+	}
+	h.prev.next = h.next
+	h.next.prev = h.prev
+	h.prev, h.next = nil, nil
+	h.owner = nil
+	h.self = nil
+	l.size--
+	return nil
+}
+
+// Contains is an O(1) membership test, because ownership is recorded in the element.
+func (l *IntrusiveList[T]) Contains(element T) bool { return element.hook().owner == any(l) }
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/04-linked-lists/code/go
 go run .
 go test ./...
 ```
+
+```console
+== Doubly linked with a sentinel: O(1) unlink given the node ==
+recency order (front = most recent): [idem-key-1, idem-key-2, idem-key-3]
+touch key-3 -> [idem-key-3, idem-key-1, idem-key-2]
+touch key-1 -> [idem-key-1, idem-key-3, idem-key-2]
+evict least recent (removeLast) -> idem-key-2, now [idem-key-1, idem-key-3]
+
+== Intrusive list: the element is its own node ==
+pending: auth-7f3a(1999) auth-9c21(4500) auth-0b77(250)
+capture auth-9c21: remove(a2) is O(1) with no search; linked before? true
+pending: auth-7f3a(1999) auth-0b77(250)  linked after? false
+
+== Measured: summing 1,000,000 int64s, slice vs linked list (sequential vs shuffled memory order) ==
+all three sums equal 499999500000: true
+[]int64 sequential scan :   0.45 ms
+list, nodes in memory order :  16.67 ms  (36.6x the array)
+list, nodes in shuffled order: 176.45 ms  (387.8x the array)
+```
+
+Timings will differ on your machine; the sums and the ordering will not. The shuffled list is hundreds of times slower than the slice for the same O(n) work, which is the cache-miss argument from The Concept measured rather than asserted.
 
 ## Use It
 

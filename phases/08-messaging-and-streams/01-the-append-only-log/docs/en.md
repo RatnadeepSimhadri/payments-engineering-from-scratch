@@ -380,48 +380,504 @@ Read the hex: `00000020` is 32, the bytes after the prefix; `0000000000000007` i
 
 ### In Python
 
-```python
-_LENGTH_PREFIX = struct.Struct(">i")
-_HEAD = struct.Struct(">qqi")
+The Python port (`code/python/main.py`) is the same design with the same type names and four differences. **`struct` instead of `ByteBuffer`:** two precompiled `struct.Struct` objects, `">i"` (big-endian int32) and `">qqi"` (int64, int64, int32), pack and unpack the frame; `unpack_from(data, position)` reads at an offset without copying, which is what `frame_length_at` needs. **Integers do not wrap:** FNV-1a depends on 32-bit overflow, so `fnv1a32` masks with `& 0xFFFFFFFF` after every multiply; forget the mask and the hash diverges from Java and Go after the first byte, and every key lands in a different partition than the other two implementations would choose. **Iterating `bytes` yields ints:** `for b in data` already gives `0..255`, so there is no signed-byte problem to fix; Java needed `& 0xFF` for the same reason. **Exceptions are `OffsetOutOfRangeError` and `SegmentFullError`**, subclasses of `Exception`, raised where Java throws; `LogConfig` validation raises `ValueError`.
 
-def fnv1a32(data: bytes) -> int:
-    h = 0x811C9DC5
-    for b in data:
-        h ^= b
-        h = (h * 0x01000193) & 0xFFFFFFFF
-    return h
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Configuration, records, and the storage boundary
+
+Frozen dataclasses play the role of the Java records, with the validation in `__post_init__`. `StoredRecord.key` is `Optional[bytes]` because `None` means "no key", exactly the distinction the partitioner needs. The two storage contracts are plain classes whose methods raise `NotImplementedError`; `InMemoryStorage` (further down in `main.py`) keeps a `dict` of `dict`s, partition to base offset to `bytearray`, which is the `<topic>-<partition>/<baseOffset>.log` layout, and raises `RuntimeError` on a duplicate `create`.
+
+```python
+@dataclass(frozen=True)
+class LogConfig:
+    segment_bytes: int
+    index_interval_bytes: int
+    retention_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.segment_bytes <= 0:
+            raise ValueError("segmentBytes must be positive")
+        if self.index_interval_bytes <= 0:
+            raise ValueError("indexIntervalBytes must be positive")
+        if self.retention_bytes <= 0:
+            raise ValueError("retentionBytes must be positive")
+
+
+@dataclass(frozen=True)
+class StoredRecord:
+    offset: int
+    timestamp: int
+    key: Optional[bytes]
+    value: bytes
+
+
+class SegmentStorage:
+    def create(self, partition: int, base_offset: int) -> SegmentData:
+        raise NotImplementedError
+
+    def delete(self, partition: int, base_offset: int) -> None:
+        raise NotImplementedError
+
+    def base_offsets(self, partition: int) -> List[int]:
+        raise NotImplementedError
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The frame codec
 
-- **`struct` instead of `ByteBuffer`.** `">i"` and `">qqi"` are big-endian int32 and (int64, int64, int32). `unpack_from(data, position)` reads at an offset without copying, which is what `frame_length_at` needs.
-- **Integers do not wrap.** FNV-1a depends on 32-bit overflow, so the Python version masks with `& 0xFFFFFFFF` after every multiply. Forget the mask and the hash diverges from Java and Go after the first byte, and every key lands in a different partition than the other two implementations would choose.
-- **Iterating `bytes` yields ints.** `for b in data` already gives `0..255`, so there is no signed-byte problem to fix; Java needed `& 0xFF` for the same reason.
-- **Exceptions are `OffsetOutOfRangeError` and `SegmentFullError`**, subclasses of `Exception`, raised where Java throws.
+`encode` builds the frame in a `bytearray` and returns immutable `bytes`. The null key is `_HEAD.pack(offset, timestamp, -1)`; `struct` writes `-1` as `ffffffff`, so the bytes are identical to Java's `putInt(-1)`. `frame_length_at` reads only the four-byte prefix and adds it back on, which is the hop the sparse-index scan performs. The hash sits beside the codec as a static method; the `& 0xFFFFFFFF` after the multiply is the whole difference from Java.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo prints the same offsets, segment layout, byte counts, and frame hex as the Java version.
+```python
+    @staticmethod
+    def encode(offset: int, timestamp: int, key: Optional[bytes], value: bytes) -> bytes:
+        if value is None:
+            raise TypeError("value")
+        size = RecordCodec.frame_size(key, value)
+        out = bytearray()
+        out += _LENGTH_PREFIX.pack(size - RecordCodec.LENGTH_PREFIX)
+        if key is None:
+            out += _HEAD.pack(offset, timestamp, -1)
+        else:
+            out += _HEAD.pack(offset, timestamp, len(key))
+            out += key
+        out += _LENGTH_PREFIX.pack(len(value))
+        out += value
+        return bytes(out)
+
+    @staticmethod
+    def frame_length_at(data: bytes, position: int) -> int:
+        return RecordCodec.LENGTH_PREFIX + _LENGTH_PREFIX.unpack_from(data, position)[0]
+```
+
+```python
+    @staticmethod
+    def fnv1a32(data: bytes) -> int:
+        h = 0x811C9DC5
+        for b in data:
+            h ^= b
+            h = (h * 0x01000193) & 0xFFFFFFFF
+        return h
+```
+
+#### Step 3: Segment append with a sparse index
+
+Line for line the Java method. `_bytes_since_index_entry` is initialised to `2**31 - 1` in `__init__` so the first record always gets the index entry at `(0, 0)`, and the `not self.is_empty()` guard is what lets an oversized frame land alone in an empty segment instead of being rejected forever.
+
+```python
+    def append(self, key: Optional[bytes], value: bytes, timestamp: int) -> int:
+        frame = RecordCodec.frame_size(key, value)
+        if not self.is_empty() and not self.has_room_for(frame):
+            raise SegmentFullError(self.base_offset)
+        offset = self._next_offset
+        encoded = RecordCodec.encode(offset, timestamp, key, value)
+        if self._bytes_since_index_entry >= self._index_interval_bytes:
+            self._index.append(IndexEntry(offset - self.base_offset, self._data.size()))
+            self._bytes_since_index_entry = 0
+        self._data.append(encoded)
+        self._bytes_since_index_entry += len(encoded)
+        self._next_offset += 1
+        return offset
+```
+
+#### Step 4: Resolving an offset to a byte position
+
+The "last entry `<=` target" binary search, then a forward scan that reads one length prefix per hop through `_frame_length_at`, which asks the storage for exactly four bytes. Python's `(lo + hi) // 2` cannot overflow, so the `>>> 1` trick is not needed; the search is otherwise identical.
+
+```python
+    def position_of(self, offset: int) -> int:
+        if offset < self.base_offset or offset >= self._next_offset:
+            raise OffsetOutOfRangeError(offset, self.base_offset, self._next_offset - 1)
+        relative = offset - self.base_offset
+        lo, hi, best = 0, len(self._index) - 1, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._index[mid].relative_offset <= relative:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        entry = self._index[best]
+        position = entry.position
+        current = self.base_offset + entry.relative_offset
+        while current < offset:
+            position += self._frame_length_at(position)
+            current += 1
+        return position
+```
+
+#### Step 5: Partition append, roll, and cross-segment read
+
+The partition decides the roll because it owns the list; the new segment's base is the old one's `next_offset()`, so offsets stay dense across the boundary. `read` keeps Kafka's three cases: `from_offset == end` returns `[]`, outside `[start, end]` raises `OffsetOutOfRangeError`, and anything else walks segments from `_segment_index_for` (a binary search over base offsets) in a `while` loop until it has `max_records` or runs out.
+
+```python
+    def append(self, key: Optional[bytes], value: bytes, timestamp: int) -> int:
+        active = self._active()
+        frame = RecordCodec.frame_size(key, value)
+        if not active.is_empty() and not active.has_room_for(frame):
+            active = self._new_segment(active.next_offset())
+            self._segments.append(active)
+        return active.append(key, value, timestamp)
+
+    def read(self, from_offset: int, max_records: int) -> List[StoredRecord]:
+        start, end = self.log_start_offset(), self.log_end_offset()
+        if from_offset < start or from_offset > end:
+            raise OffsetOutOfRangeError(from_offset, start, end)
+        out: List[StoredRecord] = []
+        if from_offset == end:
+            return out
+        nxt = from_offset
+        i = self._segment_index_for(from_offset)
+        while i < len(self._segments) and len(out) < max_records:
+            chunk = self._segments[i].read(nxt, max_records - len(out))
+            out.extend(chunk)
+            if chunk:
+                nxt = chunk[-1].offset + 1
+            i += 1
+        return out
+```
+
+#### Step 6: Retention and the partitioner
+
+`pop(0)` drops the oldest segment and the storage is told to delete it; the `len(self._segments) > 1` guard keeps the active segment alive so the offset counter survives. `partition_for` lives on `Topic`: the round-robin counter is advanced by hand (no `++` in Python), and the hash is masked with `0x7FFFFFFF` before the modulo even though Python's `%` of a non-negative number is already non-negative, so that all three languages pick the same partition for the same key.
+
+```python
+    def enforce_retention(self) -> int:
+        removed = 0
+        while len(self._segments) > 1 and self.size_bytes() > self._config.retention_bytes:
+            oldest = self._segments.pop(0)
+            self._storage.delete(self.id, oldest.base_offset)
+            removed += 1
+        return removed
+```
+
+```python
+    def partition_for(self, key: Optional[bytes]) -> int:
+        if key is None:
+            p = self._round_robin % len(self._partitions)
+            self._round_robin += 1
+            return p
+        return (RecordCodec.fnv1a32(key) & 0x7FFFFFFF) % len(self._partitions)
+```
+
+#### Step 7: Consumer position and commit
+
+The constructor covers both reset cases (no commit yet, or a commit that retention has retired) by falling back to `log_start_offset()`. `poll` advances `_position` to last-delivered plus one, and `commit` stores exactly that number in the `OffsetStore`, whose `NONE` sentinel is `-1` as in Java.
+
+```python
+    def __init__(self, partition: Partition, group: str, offsets: OffsetStore) -> None:
+        self._partition = partition
+        self._group = group
+        self._offsets = offsets
+        committed = offsets.committed(group, partition.id)
+        if committed == OffsetStore.NONE or committed < partition.log_start_offset() or committed > partition.log_end_offset():
+            self._position = partition.log_start_offset()
+        else:
+            self._position = committed
+
+    def poll(self, max_records: int) -> List[StoredRecord]:
+        batch = self._partition.read(self._position, max_records)
+        if batch:
+            self._position = batch[-1].offset + 1
+        return batch
+
+    def commit(self) -> None:
+        self._offsets.commit(self._group, self._partition.id, self._position)
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/08-messaging-and-streams/01-the-append-only-log/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output is identical to the Java run: the same partition assignments, the same segment layout, the same byte counts, and the same frame hex.
+
+```console
+== Partition layout after segment rolls (segmentBytes=160) ==
+partition 0: logStart=0 logEnd=3 segments(base offsets)=[0] bytes=159
+partition 1: logStart=0 logEnd=6 segments(base offsets)=[0, 2, 4] bytes=330
+partition 2: logStart=0 logEnd=3 segments(base offsets)=[0, 2] bytes=162
+
+== Commit, crash, resume (partition 1, six records) ==
+fresh consumer with no commit starts at logStart: position 0
+processed 2 and committed: committed offset = 2
+processed 2 more without committing: position 4 (then the process dies)
+restart resumes at the committed offset: position 2 -> offsets 2 and 3 are delivered again (at-least-once)
+
+== The frame on the wire ==
+36 bytes: 0000002000000000000000070000018bcfe56800000000066d2d6675656c000000026f6b
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes how failure is reported. **Errors are values:** `Segment.Append`, `Read`, `PositionOf`, `SeekTo`, and `Commit` return `error`; `outOfRange(...)` wraps the sentinel `ErrOffsetOutOfRange` so tests use `errors.Is` where Java uses `checkThrows`. `SeekTo` is Java's `seek`, renamed because `go vet` reserves the name `Seek` for `io.Seeker`'s signature. `Partition.Append` returns a plain `int64`: a fresh segment accepts any frame, so the roll can never fail. **`binary.BigEndian.AppendUint32`** (Go 1.19+) builds the frame without a `bytes.Buffer`; `-1` for a null key is written as `uint32(0xFFFFFFFF)` and read back as `int32`, which is the two's-complement round trip Java gets for free. **`nil` versus empty slice:** a nil key means "no key"; an empty `[]byte{}` is a zero-length key with its own partition, and `Decode` returns `nil` when `keyLength` is -1 so the partitioner's `key == nil` check agrees with Java's `null`. **`Fnv1a32` returns `uint32`**, so `PartitionFor` casts to `int` after masking the top bit; no negative modulo is possible.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Configuration, records, and the storage boundary
+
+Structs with exported fields replace the records; a struct literal has no constructor, so `NewLogConfig` is the validating path and returns an error where Java's compact constructor throws. `StoredRecord.Key` is a `[]byte` whose `nil` value means "no key". The two storage contracts are interfaces; `InMemoryStorage` (also in `main.go`) keeps `map[int]map[int64]*InMemorySegmentData` and panics on a duplicate `Create`, because that is a programming error, as Java's `IllegalStateException` says.
+
 ```go
-func Encode(offset, timestamp int64, key, value []byte) []byte {
-    buf := make([]byte, 0, FrameSize(key, value))
-    buf = binary.BigEndian.AppendUint32(buf, uint32(FrameSize(key, value)-lengthPrefix))
-    buf = binary.BigEndian.AppendUint64(buf, uint64(offset))
-    ...
+type LogConfig struct {
+	SegmentBytes       int
+	IndexIntervalBytes int
+	RetentionBytes     int64
 }
 
-func (s *Segment) Read(offset int64, maxRecords int) ([]StoredRecord, error)
+func NewLogConfig(segmentBytes, indexIntervalBytes int, retentionBytes int64) (LogConfig, error) {
+	if segmentBytes <= 0 {
+		return LogConfig{}, errors.New("segmentBytes must be positive")
+	}
+	if indexIntervalBytes <= 0 {
+		return LogConfig{}, errors.New("indexIntervalBytes must be positive")
+	}
+	if retentionBytes <= 0 {
+		return LogConfig{}, errors.New("retentionBytes must be positive")
+	}
+	return LogConfig{segmentBytes, indexIntervalBytes, retentionBytes}, nil
+}
+
+type StoredRecord struct {
+	Offset    int64
+	Timestamp int64
+	Key       []byte
+	Value     []byte
+}
+
+type SegmentData interface {
+	Append(bytes []byte)
+	Size() int
+	Read(position, length int) []byte
+}
+
+type SegmentStorage interface {
+	Create(partition int, baseOffset int64) SegmentData
+	Delete(partition int, baseOffset int64)
+	BaseOffsets(partition int) []int64
+}
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The frame codec
 
-- **Errors are values.** `Segment.Append`, `Read`, `PositionOf`, `SeekTo`, and `Commit` return `error`; `outOfRange(...)` wraps the sentinel `ErrOffsetOutOfRange` so tests use `errors.Is` where Java uses `checkThrows`. `SeekTo` is Java's `seek`, renamed because `go vet` reserves the name `Seek` for `io.Seeker`'s signature. `Partition.Append` returns a plain `int64`: a fresh segment accepts any frame, so the roll can never fail.
-- **`binary.BigEndian.AppendUint32`** (Go 1.19+) builds the frame without a bytes.Buffer. `-1` for a null key is written as `uint32(0xFFFFFFFF)` and read back as `int32`, which is the two's-complement round trip Java gets for free.
-- **`nil` versus empty slice.** A nil key means "no key"; an empty `[]byte{}` is a zero-length key with its own partition. `Decode` returns `nil` when `keyLength` is -1 so the partitioner's `key == nil` check agrees with Java's `null`.
-- **`Fnv1a32` returns `uint32`**, so `PartitionFor` casts to `int` after masking the top bit; no negative modulo is possible.
+`Encode` appends each field to a slice pre-sized by `FrameSize`; every integer goes through `binary.BigEndian`, which is network byte order and what Kafka's wire protocol uses. `FrameLengthAt` converts the prefix through `int32` before `int` so a corrupt negative length is seen as negative rather than as four billion. `Fnv1a32` needs no mask: `uint32` multiplication wraps at 32 bits by definition, and `uint32(b)` on a Go `byte` is already `0..255`.
 
-Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same offsets, segment layout, byte counts, and frame hex as the Java version.
+```go
+func Encode(offset, timestamp int64, key, value []byte) []byte {
+	if value == nil {
+		panic("value must not be nil")
+	}
+	buf := make([]byte, 0, FrameSize(key, value))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(FrameSize(key, value)-lengthPrefix))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(offset))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(timestamp))
+	if key == nil {
+		buf = binary.BigEndian.AppendUint32(buf, uint32(0xFFFFFFFF))
+	} else {
+		buf = binary.BigEndian.AppendUint32(buf, uint32(len(key)))
+		buf = append(buf, key...)
+	}
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(value)))
+	buf = append(buf, value...)
+	return buf
+}
+
+func FrameLengthAt(data []byte, position int) int {
+	return lengthPrefix + int(int32(binary.BigEndian.Uint32(data[position:])))
+}
+```
+
+```go
+func Fnv1a32(bytes []byte) uint32 {
+	hash := uint32(0x811C9DC5)
+	for _, b := range bytes {
+		hash ^= uint32(b)
+		hash *= 0x01000193
+	}
+	return hash
+}
+```
+
+#### Step 3: Segment append with a sparse index
+
+The same three invariants: `nextOffset` starts at `BaseOffset` (set in `NewSegment`), `bytesSinceIndexEntry` starts at the largest `int` (`int(^uint(0) >> 1)`) so the first record is indexed at `(0, 0)`, and an empty segment accepts any frame. A full segment returns `ErrSegmentFull` wrapped with the base offset instead of throwing.
+
+```go
+func (s *Segment) Append(key, value []byte, timestamp int64) (int64, error) {
+	frame := FrameSize(key, value)
+	if !s.IsEmpty() && !s.HasRoomFor(frame) {
+		return 0, fmt.Errorf("%w: segment %d", ErrSegmentFull, s.BaseOffset)
+	}
+	offset := s.nextOffset
+	encoded := Encode(offset, timestamp, key, value)
+	if s.bytesSinceIndexEntry >= s.indexIntervalBytes {
+		s.index = append(s.index, IndexEntry{int(offset - s.BaseOffset), s.data.Size()})
+		s.bytesSinceIndexEntry = 0
+	}
+	s.data.Append(encoded)
+	s.bytesSinceIndexEntry += len(encoded)
+	s.nextOffset++
+	return offset, nil
+}
+```
+
+#### Step 4: Resolving an offset to a byte position
+
+`int(uint(lo+hi) >> 1)` is the Go spelling of Java's `>>> 1`: the unsigned shift keeps the midpoint correct even if `lo + hi` would overflow a signed `int`. The rest is the same last-entry-`<=`-target search followed by a forward scan that reads one length prefix per hop; an out-of-range offset returns the wrapped sentinel rather than panicking.
+
+```go
+func (s *Segment) PositionOf(offset int64) (int, error) {
+	if offset < s.BaseOffset || offset >= s.nextOffset {
+		return 0, outOfRange(offset, s.BaseOffset, s.nextOffset-1)
+	}
+	relative := int(offset - s.BaseOffset)
+	lo, hi, best := 0, len(s.index)-1, 0
+	for lo <= hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s.index[mid].RelativeOffset <= relative {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	entry := s.index[best]
+	position := entry.Position
+	current := s.BaseOffset + int64(entry.RelativeOffset)
+	for current < offset {
+		position += s.frameLengthAt(position)
+		current++
+	}
+	return position, nil
+}
+```
+
+#### Step 5: Partition append, roll, and cross-segment read
+
+`Partition.Append` has no error return: after a roll the active segment is empty and accepts any frame, so the `panic(err)` branch is unreachable and says so. `Read` keeps the three Kafka cases and threads each segment's error upward; note that it returns a non-nil empty slice at `LogEndOffset` so callers can `range` over it without a nil check.
+
+```go
+func (p *Partition) Append(key, value []byte, timestamp int64) int64 {
+	active := p.active()
+	frame := FrameSize(key, value)
+	if !active.IsEmpty() && !active.HasRoomFor(frame) {
+		active = p.newSegment(active.NextOffset())
+		p.segments = append(p.segments, active)
+	}
+	offset, err := active.Append(key, value, timestamp)
+	if err != nil {
+		panic(err) // unreachable: a fresh segment accepts any size
+	}
+	return offset
+}
+
+func (p *Partition) Read(fromOffset int64, maxRecords int) ([]StoredRecord, error) {
+	start, end := p.LogStartOffset(), p.LogEndOffset()
+	if fromOffset < start || fromOffset > end {
+		return nil, outOfRange(fromOffset, start, end)
+	}
+	out := []StoredRecord{}
+	if fromOffset == end {
+		return out, nil
+	}
+	next := fromOffset
+	for i := p.segmentIndexFor(fromOffset); i < len(p.segments) && len(out) < maxRecords; i++ {
+		chunk, err := p.segments[i].Read(next, maxRecords-len(out))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, chunk...)
+		if len(chunk) > 0 {
+			next = chunk[len(chunk)-1].Offset + 1
+		}
+	}
+	return out, nil
+}
+```
+
+#### Step 6: Retention and the partitioner
+
+Reslicing `p.segments[1:]` drops the oldest segment in O(1); the `len(p.segments) > 1` guard protects the active segment and its offset counter. `PartitionFor` masks the `uint32` hash to 31 bits and converts to `int` before the modulo, so the result is non-negative without the sign-bit worry Java has; the round-robin counter is an `int64` field on `Topic`.
+
+```go
+func (p *Partition) EnforceRetention() int {
+	removed := 0
+	for len(p.segments) > 1 && p.SizeBytes() > p.config.RetentionBytes {
+		oldest := p.segments[0]
+		p.segments = p.segments[1:]
+		p.storage.Delete(p.ID, oldest.BaseOffset)
+		removed++
+	}
+	return removed
+}
+```
+
+```go
+func (t *Topic) PartitionFor(key []byte) int {
+	if key == nil {
+		p := int(t.roundRobin % int64(len(t.partitions)))
+		t.roundRobin++
+		return p
+	}
+	return int(Fnv1a32(key)&0x7FFFFFFF) % len(t.partitions)
+}
+```
+
+#### Step 7: Consumer position and commit
+
+`NewConsumer` applies the same two reset rules and falls back to `LogStartOffset`; `None` is the package-level `-1` sentinel that `OffsetStore.Committed` returns for a group that never committed. `Poll` propagates the read error and otherwise advances `position` to last-delivered plus one; `Commit` returns whatever error the store returns (only a negative offset can fail).
+
+```go
+func NewConsumer(partition *Partition, group string, offsets *OffsetStore) *Consumer {
+	c := &Consumer{partition: partition, group: group, offsets: offsets}
+	committed := offsets.Committed(group, partition.ID)
+	if committed == None || committed < partition.LogStartOffset() || committed > partition.LogEndOffset() {
+		c.position = partition.LogStartOffset()
+	} else {
+		c.position = committed
+	}
+	return c
+}
+
+func (c *Consumer) Poll(maxRecords int) ([]StoredRecord, error) {
+	batch, err := c.partition.Read(c.position, maxRecords)
+	if err != nil {
+		return nil, err
+	}
+	if len(batch) > 0 {
+		c.position = batch[len(batch)-1].Offset + 1
+	}
+	return batch, nil
+}
+
+func (c *Consumer) Commit() error { return c.offsets.Commit(c.group, c.partition.ID, c.position) }
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/08-messaging-and-streams/01-the-append-only-log/code/go
+go run .
+go test ./...
+```
+
+The output is identical to the Java and Python runs, down to the frame hex:
+
+```console
+== Partition layout after segment rolls (segmentBytes=160) ==
+partition 0: logStart=0 logEnd=3 segments(base offsets)=[0] bytes=159
+partition 1: logStart=0 logEnd=6 segments(base offsets)=[0, 2, 4] bytes=330
+partition 2: logStart=0 logEnd=3 segments(base offsets)=[0, 2] bytes=162
+
+== Reading partition 0 from offset 1, three at a time ==
+offset 1 ts 1700000000007 key m-fuel value auth-1007 19.99 USD
+offset 2 ts 1700000000011 key m-fuel value auth-1011 19.99 USD
+
+== The frame on the wire ==
+36 bytes: 0000002000000000000000070000018bcfe56800000000066d2d6675656c000000026f6b
+```
 
 ## Use It
 

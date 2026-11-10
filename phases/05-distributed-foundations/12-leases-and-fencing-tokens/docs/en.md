@@ -339,24 +339,177 @@ The test file has 32 assertions. The pair to read first is "pause after the chec
 
 ### In Python
 
-`code/python/main.py` keeps the lesson's types and method names (`Lease`, `LeaseLock.try_acquire`, `FencedStorage`, `PayoutWorker.payout`, `RaceStudy.run`) and prints the same demo as Java, including `lost updates=995` for the seed-7 study. Three things differ.
+The Python port (`code/python/main.py`) keeps the lesson's types and method names (`Lease`, `LeaseLock.try_acquire`, `FencedStorage`, `PayoutWorker.payout`, `RaceStudy.run`) and prints the same demo as Java, including `lost updates=995` for the seed-7 study. Three things differ. **`Optional<Lease>` is `Lease | None`.** `try_acquire` returns `None` when the lock is held, and the demo's `orElseThrow()` becomes a small `or_else_throw` helper. Forgetting the check is the same bug in both languages, but Python only reports it when `None.token` is read, which is exactly the moment the lease mattered; the type hint `Optional[Lease]` is the only warning. **Same exceptions, Python base classes.** `LeaseExpiredException` and `StaleTokenException` keep their names and subclass `RuntimeError`; `StaleTokenException` still carries `presented` and `highest_seen`, and a test reads them. `IllegalArgumentException` for a non-positive ttl is `ValueError`. The worker's `Result` enum stays nested as `PayoutWorker.Result`, and `Lease` is a frozen dataclass, so a renewal returns a new `Lease` rather than mutating the one a paused client is still holding. **The race study uses `java.util.Random`, ported.** `random.Random(7)` would also reproduce, but it would draw different pauses from Java's generator, so `JavaRandom` ports the JDK's 48-bit LCG and `nextInt(bound)`. The 2,000 pauses, and therefore the 995 lost updates, match the Java run exactly. Tokens and balances are plain `int`s: tokens because the comparison must be exact, balances because they are minor units (Phase 10, Lesson 01).
 
-- **`Optional<Lease>` is `Lease | None`.** `try_acquire` returns `None` when the lock is held, and the demo's `orElseThrow()` becomes a small `or_else_throw` helper. Forgetting the check is the same bug in both languages, but Python only reports it when `None.token` is read, which is exactly the moment the lease mattered; the type hint `Optional[Lease]` is the only warning.
-- **Same exceptions, Python base classes.** `LeaseExpiredException` and `StaleTokenException` keep their names and subclass `RuntimeError`; `StaleTokenException` still carries `presented` and `highest_seen`, and a test reads them. `IllegalArgumentException` for a non-positive ttl is `ValueError`. The worker's `Result` enum stays nested as `PayoutWorker.Result`, and `Lease` is a frozen dataclass, so a renewal returns a new `Lease` rather than mutating the one a paused client is still holding.
-- **The race study uses `java.util.Random`, ported.** `random.Random(7)` would also reproduce, but it would draw different pauses from Java's generator, so `JavaRandom` ports the JDK's 48-bit LCG and `nextInt(bound)`. The 2,000 pauses, and therefore the 995 lost updates, match the Java run exactly.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The lease
+
+A frozen dataclass with the three questions as methods. `is_expired` is the service's view, `is_safe_to_use` the client's with its margin, and `ttl_ms` the difference of the two stamps.
 
 ```python
-def write(self, key: str, value: int, token: int) -> None:
-    seen = self._highest_token.get(key, 0)
-    if token < seen:
-        self._log.append(f"REJECTED {key}={value} (token {token} < {seen})")
-        raise StaleTokenException(key, token, seen)
-    self._highest_token[key] = token
-    self._data[key] = value
-    self._log.append(f"{key}={value} (token {token})")
+@dataclass(frozen=True)
+class Lease:
+    resource: str
+    owner: str
+    token: int
+    granted_at_ms: int
+    expires_at_ms: int
+
+    def is_expired(self, clock: Clock) -> bool:
+        """Expiry according to the lock service's clock."""
+        return clock.now_ms() >= self.expires_at_ms
+
+    def is_safe_to_use(self, clock: Clock, margin_ms: int) -> bool:
+        """The client-side question: is it still safe to act? Stop trusting a lease a margin before nominal expiry."""
+        return clock.now_ms() + margin_ms < self.expires_at_ms
+
+    def ttl_ms(self) -> int:
+        return self.expires_at_ms - self.granted_at_ms
 ```
 
-Tokens and balances are plain `int`s: tokens because the comparison must be exact, balances because they are minor units (Phase 10, Lesson 01).
+#### Step 2: The lock service
+
+`try_acquire` returns `None` instead of `Optional.empty()`; a non-positive ttl is a `ValueError`. The token comes from `_next_token`, which only ever increments, and every decision is appended to `_history` so the demo can print it.
+
+```python
+    def try_acquire(self, owner: str, ttl_ms: int) -> Optional[Lease]:
+        """Grant the lock if it is free or the previous lease has expired. Expiry is decided here, by this clock."""
+        if ttl_ms <= 0:
+            raise ValueError(f"ttl must be positive: {ttl_ms}")
+        now = self._clock.now_ms()
+        cur = self._current
+        if cur is not None and not cur.is_expired(self._clock):
+            self._history.append(f"t={now} {owner} denied (held by {cur.owner} token {cur.token})")
+            return None
+        if cur is not None:
+            self._history.append(f"t={now} lease of {cur.owner} (token {cur.token}) expired at t={cur.expires_at_ms}")
+        self._current = Lease(self._resource, owner, self._next_token, now, now + ttl_ms)
+        self._next_token += 1
+        self._history.append(f"t={now} {owner} acquired token {self._current.token} until t={self._current.expires_at_ms}")
+        return self._current
+```
+
+#### Step 3: Renew and release only what you still hold
+
+`renew` builds a new frozen `Lease` with the same token and a later expiry; `_require_held` raises `LeaseExpiredException` when the token presented is not the live one or has expired. `release` goes through the same check.
+
+```python
+    def renew(self, lease: Lease, ttl_ms: int) -> Lease:
+        """Extend a lease the caller still holds. Renewing an expired or superseded lease is an error."""
+        self._require_held(lease, "renew")
+        self._current = Lease(self._resource, lease.owner, lease.token, lease.granted_at_ms,
+                              self._clock.now_ms() + ttl_ms)
+        self._history.append(f"t={self._clock.now_ms()} {lease.owner} renewed token {lease.token} "
+                             f"until t={self._current.expires_at_ms}")
+        return self._current
+
+    def release(self, lease: Lease) -> None:
+        self._require_held(lease, "release")
+        self._history.append(f"t={self._clock.now_ms()} {lease.owner} released token {lease.token}")
+        self._current = None
+
+    def _require_held(self, lease: Lease, action: str) -> None:
+        cur = self._current
+        if cur is None or cur.token != lease.token or cur.is_expired(self._clock):
+            raise LeaseExpiredException(f"{lease.owner} cannot {action}: token {lease.token} is no longer the live "
+                                        f"lease at t={self._clock.now_ms()}")
+```
+
+#### Step 4: Storage that trusts, and storage that checks
+
+`FencedStorage.write` is the four-line check in front of the plain write: compare against the highest token seen for the key, log and raise on a smaller one, otherwise record both the token and the value. `<` rather than `<=` lets the current holder retry.
+
+```python
+    def write(self, key: str, value: int, token: int) -> None:
+        seen = self._highest_token.get(key, 0)
+        if token < seen:
+            self._log.append(f"REJECTED {key}={value} (token {token} < {seen})")
+            raise StaleTokenException(key, token, seen)
+        self._highest_token[key] = token
+        self._data[key] = value
+        self._log.append(f"{key}={value} (token {token})")
+
+    def highest_token_seen(self, key: str) -> int:
+        return self._highest_token.get(key, 0)
+```
+
+#### Step 5: The worker, with the pause in two possible places
+
+The two `advance` calls are the two pause positions. A `StaleTokenException` from the write maps to `FENCED_OFF`; the release afterwards swallows `LeaseExpiredException`, because a lease that has already lapsed has nothing to release and the write was what mattered.
+
+```python
+    def payout(self, account: str, amount_minor: int, ttl_ms: int, pause_after_read_ms: int,
+               pause_after_check_ms: int) -> "PayoutWorker.Result":
+        lease = self._lock.try_acquire(self.name, ttl_ms)
+        if lease is None:
+            return PayoutWorker.Result.LOCK_BUSY
+        balance = self._storage.read(account)
+        self._clock.advance(pause_after_read_ms)                   # the pause nobody planned for
+        if not lease.is_safe_to_use(self._clock, 0):
+            return PayoutWorker.Result.FENCED_OFF                  # client-side check: necessary, not sufficient
+        self._clock.advance(pause_after_check_ms)                  # the check is already stale when the write lands
+        try:
+            self._storage.write(account, balance - amount_minor, lease.token)
+        except StaleTokenException:
+            return PayoutWorker.Result.FENCED_OFF
+        try:
+            self._lock.release(lease)
+        except LeaseExpiredException:
+            pass  # the lease is already gone; there is nothing to release. The write above is what mattered.
+        return PayoutWorker.Result.APPLIED
+```
+
+#### Step 6: The race, replayed with random pauses
+
+`JavaRandom(seed).next_int(2_000)` draws A's pause so the Python study samples the same 2,000 pauses as Java. The oracle check computes the one correct balance from which payouts were applied and counts any other value as a lost update.
+
+```python
+        for _ in range(runs):
+            clock = FakeClock(0)
+            lock = LeaseLock(clock, "payout:acct-7")
+            storage: Storage = FencedStorage() if fenced else UnfencedStorage()
+            storage.write("acct-7", 100_000, 0)
+            ttl = 1_000
+            pause_a = rng.next_int(2_000)             # sometimes shorter than the ttl, sometimes longer
+            b = PayoutWorker("B", clock, lock, storage)
+
+            # A acquires, reads, then stalls; B tries while A is stalled; then A's write lands.
+            lease_a = lock.try_acquire("A", ttl)
+            balance_a = storage.read("acct-7")
+            clock.advance(pause_a)
+            rb = b.payout("acct-7", 30_000, ttl, 0, 0)
+            try:
+                storage.write("acct-7", balance_a - 20_000, lease_a.token)
+                ra = applied
+            except StaleTokenException:
+                ra = fenced_result
+            expected = 100_000 - (20_000 if ra is applied else 0) - (30_000 if rb is applied else 0)
+            if storage.read("acct-7") != expected:
+                lost += 1
+            if ra is fenced_result:
+                fenced_off += 1
+            if ra is applied and rb is applied:
+                both += 1
+```
+
+#### Step 7: What the service can tell an operator
+
+`holder` applies the same expiry rule as `try_acquire` and returns `None` for a free lock; `highest_token_issued` is `_next_token - 1`; `history` returns a copy.
+
+```python
+    def holder(self) -> Optional[Lease]:
+        cur = self._current
+        return None if cur is None or cur.is_expired(self._clock) else cur
+
+    def highest_token_issued(self) -> int:
+        return self._next_token - 1
+
+    def history(self) -> list[str]:
+        return list(self._history)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/05-distributed-foundations/12-leases-and-fencing-tokens/code/python
@@ -364,34 +517,246 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Identical to the Java run, including the 995:
+
+```console
+== The bug: lock with a timeout, storage that trusts the lock ==
+t=0 A holds token 1, reads 100000, plans payout of 20000
+t=1500 A has been paused 1500 ms; lease expired at t=1000
+t=1500 B: APPLIED, balance now 70000 (B held token 2)
+t=1500 A writes 80000 with token 1: ACCEPTED
+LOST UPDATE: B's payout of 30000 vanished from the balance but the money left the building.
+storage write log: [acct-7=100000 (token 0), acct-7=70000 (token 2), acct-7=80000 (token 1)]
+
+== The fix: the same lock, storage that checks the fencing token ==
+t=1500 A writes with token 1: stale fencing token 1 for acct-7; storage has already seen 2
+A's stale write was fenced off. A must re-acquire, re-read, and recompute.
+storage write log: [acct-7=100000 (token 0), acct-7=70000 (token 2), REJECTED acct-7=80000 (token 1 < 2)]
+
+== 2000 randomized races, seed 7 ==
+unfenced: lost updates=995 fencedOff=0 bothApplied=995
+fenced  : lost updates=0 fencedOff=995 bothApplied=0
+```
+
 ### In Go
 
-`code/go/main.go` keeps the lesson's types and method names (`Lease`, `LeaseLock.TryAcquire`, `FencedStorage`, `PayoutWorker.Payout`, `RunRaceStudy`) and prints the same demo as Java, including `lost updates=995` for the seed-7 study from the ported `java.util.Random` (`javarandom.go`). Three things differ.
+The Go port (`code/go/main.go`) keeps the lesson's types and method names (`Lease`, `LeaseLock.TryAcquire`, `FencedStorage`, `PayoutWorker.Payout`, `RunRaceStudy`) and prints the same demo as Java, including `lost updates=995` for the seed-7 study from the ported `java.util.Random` (`javarandom.go`). Three things differ. **`Optional<Lease>` is `(Lease, bool)`, and failures are errors.** `TryAcquire` returns `ok == false` when the lock is held, which is an expected outcome, not a fault. `Renew` and `Release` return a `*LeaseExpiredError` (matching `ErrLeaseExpired`), and `Storage.Write` returns a `*StaleTokenError` carrying `Presented` and `HighestSeen` (matching `ErrStaleToken`). The worker's `errors.Is(err, ErrStaleToken)` is the `catch` block; the release after a successful write discards its error on purpose, because a lease that already expired has nothing left to release. **The lock service is guarded by a `sync.Mutex`.** Even in a simulation the lock service is shared state, so every method on `LeaseLock` takes the mutex, and a test lets 50 goroutines race for one lease under `go test -race` to prove exactly one wins and exactly one token is minted. `Lease` is a value type, so a renewal returns a new `Lease` rather than mutating the one a paused client is still holding. **Two programming errors panic.** A non-positive ttl and a clock moved backwards are caller bugs, so `TryAcquire` and `FakeClock.Advance` panic where every other failure is a returned error. Tokens and balances are `int64`: tokens because the comparison must be exact, balances because they are minor units (Phase 10, Lesson 01). A float timestamp as a token would reintroduce the ordering ambiguity the lesson removes.
 
-- **`Optional<Lease>` is `(Lease, bool)`, and failures are errors.** `TryAcquire` returns `ok == false` when the lock is held, which is an expected outcome, not a fault. `Renew` and `Release` return a `*LeaseExpiredError` (matching `ErrLeaseExpired`), and `Storage.Write` returns a `*StaleTokenError` carrying `Presented` and `HighestSeen` (matching `ErrStaleToken`). The worker's `errors.Is(err, ErrStaleToken)` is the `catch` block; the release after a successful write discards its error on purpose, because a lease that already expired has nothing left to release.
-- **The lock service is guarded by a `sync.Mutex`.** Even in a simulation the lock service is shared state, so every method on `LeaseLock` takes the mutex, and a test lets 50 goroutines race for one lease under `go test -race` to prove exactly one wins and exactly one token is minted. `Lease` is a value type, so a renewal returns a new `Lease` rather than mutating the one a paused client is still holding.
-- **Two programming errors panic.** A non-positive ttl and a clock moved backwards are caller bugs, so `TryAcquire` and `FakeClock.Advance` panic where every other failure is a returned error.
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The lease
+
+A five-field value struct with value receivers; copying a `Lease` is the point, since a paused client keeps its own copy while the service moves on.
 
 ```go
-func (s *FencedStorage) Write(key string, value, token int64) error {
-    seen := s.highestToken[key]
-    if token < seen {
-        s.log = append(s.log, fmt.Sprintf("REJECTED %s=%d (token %d < %d)", key, value, token, seen))
-        return &StaleTokenError{key, token, seen}
-    }
-    s.highestToken[key] = token
-    s.data[key] = value
-    s.log = append(s.log, fmt.Sprintf("%s=%d (token %d)", key, value, token))
-    return nil
+type Lease struct {
+	Resource    string
+	Owner       string
+	Token       int64
+	GrantedAtMs int64
+	ExpiresAtMs int64
+}
+
+// IsExpired is expiry according to the lock service's clock.
+func (l Lease) IsExpired(clock Clock) bool { return clock.NowMs() >= l.ExpiresAtMs }
+
+func (l Lease) IsSafeToUse(clock Clock, marginMs int64) bool {
+	return clock.NowMs()+marginMs < l.ExpiresAtMs
+}
+
+func (l Lease) TTLMs() int64 { return l.ExpiresAtMs - l.GrantedAtMs }
+```
+
+#### Step 2: The lock service
+
+`TryAcquire` panics on a non-positive ttl, then takes the mutex for the rest. `current` is a `*Lease` so `nil` means free; the returned `Lease` is a copy, and `ok == false` is the denial.
+
+```go
+func (l *LeaseLock) TryAcquire(owner string, ttlMs int64) (Lease, bool) {
+	if ttlMs <= 0 {
+		panic(fmt.Sprintf("ttl must be positive: %d", ttlMs))
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.clock.NowMs()
+	if l.current != nil && !l.current.IsExpired(l.clock) {
+		l.history = append(l.history, fmt.Sprintf("t=%d %s denied (held by %s token %d)", now, owner, l.current.Owner, l.current.Token))
+		return Lease{}, false
+	}
+	if l.current != nil {
+		l.history = append(l.history, fmt.Sprintf("t=%d lease of %s (token %d) expired at t=%d", now, l.current.Owner, l.current.Token, l.current.ExpiresAtMs))
+	}
+	lease := Lease{l.resource, owner, l.nextToken, now, now + ttlMs}
+	l.nextToken++
+	l.current = &lease
+	l.history = append(l.history, fmt.Sprintf("t=%d %s acquired token %d until t=%d", now, owner, lease.Token, lease.ExpiresAtMs))
+	return lease, true
 }
 ```
 
-Tokens and balances are `int64`: tokens because the comparison must be exact, balances because they are minor units (Phase 10, Lesson 01). A float timestamp as a token would reintroduce the ordering ambiguity the lesson removes.
+#### Step 3: Renew and release only what you still hold
+
+`requireHeld` returns a `*LeaseExpiredError` rather than throwing; `Renew` and `Release` propagate it after taking the mutex. The renewed lease is a fresh value installed behind `current`.
+
+```go
+func (l *LeaseLock) Renew(lease Lease, ttlMs int64) (Lease, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.requireHeld(lease, "renew"); err != nil {
+		return Lease{}, err
+	}
+	now := l.clock.NowMs()
+	renewed := Lease{l.resource, lease.Owner, lease.Token, lease.GrantedAtMs, now + ttlMs}
+	l.current = &renewed
+	l.history = append(l.history, fmt.Sprintf("t=%d %s renewed token %d until t=%d", now, lease.Owner, lease.Token, renewed.ExpiresAtMs))
+	return renewed, nil
+}
+
+func (l *LeaseLock) Release(lease Lease) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.requireHeld(lease, "release"); err != nil {
+		return err
+	}
+	l.history = append(l.history, fmt.Sprintf("t=%d %s released token %d", l.clock.NowMs(), lease.Owner, lease.Token))
+	l.current = nil
+	return nil
+}
+
+func (l *LeaseLock) requireHeld(lease Lease, action string) error {
+	if l.current == nil || l.current.Token != lease.Token || l.current.IsExpired(l.clock) {
+		return &LeaseExpiredError{fmt.Sprintf("%s cannot %s: token %d is no longer the live lease at t=%d",
+			lease.Owner, action, lease.Token, l.clock.NowMs())}
+	}
+	return nil
+}
+```
+
+#### Step 4: Storage that trusts, and storage that checks
+
+The fenced `Write` returns a `*StaleTokenError` for a token below the highest seen; a missing key reads as `0` from the map, so the first write with any positive token is accepted.
+
+```go
+func (s *FencedStorage) Write(key string, value, token int64) error {
+	seen := s.highestToken[key]
+	if token < seen {
+		s.log = append(s.log, fmt.Sprintf("REJECTED %s=%d (token %d < %d)", key, value, token, seen))
+		return &StaleTokenError{key, token, seen}
+	}
+	s.highestToken[key] = token
+	s.data[key] = value
+	s.log = append(s.log, fmt.Sprintf("%s=%d (token %d)", key, value, token))
+	return nil
+}
+```
+
+#### Step 5: The worker, with the pause in two possible places
+
+`errors.Is(err, ErrStaleToken)` on the write result is the `catch`. The final `Release` discards its error with `_ =` because an expired lease has nothing to release.
+
+```go
+func (w *PayoutWorker) Payout(account string, amountMinor, ttlMs, pauseAfterReadMs, pauseAfterCheckMs int64) Result {
+	lease, ok := w.lock.TryAcquire(w.Name, ttlMs)
+	if !ok {
+		return LockBusy
+	}
+	balance := w.storage.Read(account)
+	w.clock.Advance(pauseAfterReadMs) // the pause nobody planned for
+	if !lease.IsSafeToUse(w.clock, 0) {
+		return FencedOff // client-side check: necessary, not sufficient
+	}
+	w.clock.Advance(pauseAfterCheckMs) // the check is already stale by the time the write lands
+	if err := w.storage.Write(account, balance-amountMinor, lease.Token); errors.Is(err, ErrStaleToken) {
+		return FencedOff
+	}
+	// The lease may already be gone; then there is nothing to release. The write above is what mattered.
+	_ = w.lock.Release(lease)
+	return Applied
+}
+```
+
+#### Step 6: The race, replayed with random pauses
+
+The study loop is the Java one with Go's `if` blocks in place of the ternaries; `NewJavaRandom(seed).NextInt(2_000)` keeps the pauses identical across languages.
+
+```go
+		leaseA, _ := lock.TryAcquire("A", ttl)
+		balanceA := storage.Read("acct-7")
+		clock.Advance(pauseA)
+		rb := b.Payout("acct-7", 30_000, ttl, 0, 0)
+		ra := Applied
+		if err := storage.Write("acct-7", balanceA-20_000, leaseA.Token); errors.Is(err, ErrStaleToken) {
+			ra = FencedOff
+		}
+		expected := int64(100_000)
+		if ra == Applied {
+			expected -= 20_000
+		}
+		if rb == Applied {
+			expected -= 30_000
+		}
+		if storage.Read("acct-7") != expected {
+			lost++
+		}
+		if ra == FencedOff {
+			fencedOff++
+		}
+		if ra == Applied && rb == Applied {
+			both++
+		}
+```
+
+#### Step 7: What the service can tell an operator
+
+`Holder` returns `(Lease, bool)` under the mutex; `HighestTokenIssued` and `History` lock too, since the test hammers the lock from many goroutines under `-race`.
+
+```go
+// Holder is the live lease, if any.
+func (l *LeaseLock) Holder() (Lease, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.current == nil || l.current.IsExpired(l.clock) {
+		return Lease{}, false
+	}
+	return *l.current, true
+}
+
+func (l *LeaseLock) HighestTokenIssued() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.nextToken - 1
+}
+
+func (l *LeaseLock) History() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.history...)
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/05-distributed-foundations/12-leases-and-fencing-tokens/code/go
 go run .
 go test -race ./...
+```
+
+`diff <(go run .) <(python3 ../python/main.py)` is empty; the Go output is identical to the Java and Python runs:
+
+```console
+== The bug: lock with a timeout, storage that trusts the lock ==
+t=1500 B: APPLIED, balance now 70000 (B held token 2)
+t=1500 A writes 80000 with token 1: ACCEPTED
+LOST UPDATE: B's payout of 30000 vanished from the balance but the money left the building.
+
+== The fix: the same lock, storage that checks the fencing token ==
+t=1500 A writes with token 1: stale fencing token 1 for acct-7; storage has already seen 2
+A's stale write was fenced off. A must re-acquire, re-read, and recompute.
+
+== 2000 randomized races, seed 7 ==
+unfenced: lost updates=995 fencedOff=0 bothApplied=995
+fenced  : lost updates=0 fencedOff=995 bothApplied=0
 ```
 
 ## Use It

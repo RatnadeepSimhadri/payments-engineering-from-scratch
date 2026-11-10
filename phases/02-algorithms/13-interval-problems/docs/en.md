@@ -353,21 +353,162 @@ The 46 tests cover the half-open predicates on touching intervals, the hand-trac
 
 ### In Python
 
+`Interval`, `Intervals`, `Hold`, `HoldBook`, `Peak`, and `PeakExposure` keep their names and algorithms in `code/python/main.py`; three things differ. **Ordering comes from the dataclass:** `Interval` is `@dataclass(frozen=True, order=True)` with fields `(start, end)`, so `sorted(intervals)` uses exactly the start-then-end order of the Java `compareTo` (also provided as `compare_to`). Events are tuples, and `sort(key=(time, delta))` is stable like `List.sort`, so hold events that tie on both keep insertion order and the peak is reported at the same instant with the same count. **`Money` guards by hand:** Python integers do not overflow, so `plus`/`minus` raise `ArithmeticError` outside the signed 64-bit range where `Math.addExact` would throw, and `Money` rejects a `float` (or `bool`) amount at construction with `TypeError`, as Phase 10, Lesson 01's Python port does; one extra test pins it. **Half-open is spelled `start <= t < end`:** chained comparison makes `contains` read like the definition. The `-1 before +1` rule is the second element of the sort key; changing `-1` to `1` and `+1` to `0` (a common "make it a boolean" refactor) silently counts touching windows as overlapping, which the "touching intervals count as 1" test catches. The test file carries a port of `java.util.Random` so the 100 random instances match.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo output is identical to the Java run; the suite covers the Java's 46 checks plus the float guard.
+
+#### Step 1: The interval type
+
+`order=True` generates `<`, `<=`, and friends from the field order `(start, end)`, which is the Java `compareTo`; `compare_to` is kept for readers who want it spelled out. `__post_init__` rejects `end < start` and allows the empty interval. The two overlap predicates differ only in `<` versus `<=`, and `contains` is one chained comparison.
+
 ```python
-events: list[tuple[int, int]] = []
-for iv in input_:
-    if iv.is_empty():
-        continue
-    events.append((iv.start, +1))
-    events.append((iv.end, -1))
-events.sort(key=lambda e: (e[0], e[1]))  # -1 sorts before +1
+@dataclass(frozen=True, order=True)
+class Interval:
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if self.end < self.start:
+            raise ValueError(f"end {self.end} is before start {self.start}")
+
+    def length(self) -> int:
+        return self.end - self.start
+
+    def is_empty(self) -> bool:
+        return self.end == self.start
+
+    def overlaps(self, o: Interval) -> bool:
+        """True if the two intervals share at least one instant. Touching intervals do not."""
+        return self.start < o.end and o.start < self.end
+
+    def overlaps_or_touches(self, o: Interval) -> bool:
+        """True if they overlap or touch, i.e. their union is a single interval."""
+        return self.start <= o.end and o.start <= self.end
+
+    def contains(self, t: int) -> bool:
+        return self.start <= t < self.end
+
+    def compare_to(self, o: Interval) -> int:
+        """Sort by start, then by end. The order every algorithm below relies on."""
+        c = compare(self.start, o.start)
+        return c if c != 0 else compare(self.end, o.end)
 ```
 
-`Interval`, `Intervals`, `Hold`, `HoldBook`, `Peak`, and `PeakExposure` keep their names and algorithms; three things differ, all in `code/python/main.py`:
+#### Step 2: Merge
 
-- **Ordering comes from the dataclass.** `Interval` is `@dataclass(frozen=True, order=True)` with fields `(start, end)`, so `sorted(intervals)` uses exactly the start-then-end order of the Java `compareTo` (which is also provided as `compare_to`). Events are tuples, and `sort(key=(time, delta))` is stable like `List.sort`, so the hold events that tie on both keep insertion order and the peak is reported at the same instant with the same count.
-- **`Money` guards by hand.** Python integers do not overflow, so `plus`/`minus` raise `ArithmeticError` outside the signed 64-bit range where `Math.addExact` would throw. `Money` also rejects a `float` (or `bool`) amount at construction with `TypeError`, as Phase 10, Lesson 01's Python port does; Java's `long` field makes that mistake a compile error, Python needs the runtime check, and one extra test pins it.
-- **Half-open is spelled `start <= t < end`.** Chained comparison makes `contains` read like the definition. The `-1 before +1` rule is the second element of the sort key; changing `-1` to `1` and `+1` to `0` (a common "make it a boolean" refactor) silently counts touching windows as overlapping, which the "touching intervals count as 1" test catches.
+`sorted(input_)` returns a new list, so the caller's list is never reordered, and it uses the dataclass ordering. `out[-1]` is the last merged interval; `pop` then `append` replaces it with the extended one, with `max` on the end so a contained interval does not shrink the result.
+
+```python
+    @staticmethod
+    def merge(input_: list[Interval]) -> list[Interval]:
+        """Merge overlapping or touching intervals into a disjoint, sorted list. O(n log n)."""
+        out: list[Interval] = []
+        for iv in sorted(input_):
+            if iv.is_empty():
+                continue
+            if not out or not out[-1].overlaps_or_touches(iv):
+                out.append(iv)
+            else:
+                last = out.pop()
+                out.append(Interval(last.start, max(last.end, iv.end)))
+        return out
+```
+
+#### Step 3: Gaps
+
+A direct port; the parameter is `range_` because `range` is a builtin. The cursor is the earliest instant not yet known to be covered, and the `max` handles a merged interval that began before the range.
+
+```python
+    @staticmethod
+    def gaps(input_: list[Interval], range_: Interval) -> list[Interval]:
+        """The parts of `range_` not covered by any input interval, in order."""
+        out: list[Interval] = []
+        cursor = range_.start
+        for iv in Intervals.merge(input_):
+            if iv.end <= range_.start:
+                continue
+            if iv.start >= range_.end:
+                break
+            if iv.start > cursor:
+                out.append(Interval(cursor, iv.start))
+            cursor = max(cursor, iv.end)
+        if cursor < range_.end:
+            out.append(Interval(cursor, range_.end))
+        return out
+```
+
+#### Step 4: The sweep
+
+Events are `(time, delta)` tuples and the sort key is the tuple itself, so `-1` sorts before `+1` at equal times. `open` is a builtin, hence `open_`. `LONG_MIN` stands in for `Long.MIN_VALUE` as the "not yet set" marker, and the strict `>` reports the first instant the peak is reached.
+
+```python
+    @staticmethod
+    def max_overlap(input_: list[Interval]) -> Peak:
+        events: list[tuple[int, int]] = []
+        for iv in input_:
+            if iv.is_empty():
+                continue
+            events.append((iv.start, +1))
+            events.append((iv.end, -1))
+        events.sort(key=lambda e: (e[0], e[1]))  # -1 sorts before +1
+        open_ = best = 0
+        best_at = 0 if not input_ else LONG_MIN
+        for time, delta in events:
+            open_ += delta
+            if open_ > best:
+                best = open_
+                best_at = time
+        return Peak(best, 0 if best == 0 else best_at)
+```
+
+#### Step 5: Earliest-finish scheduling
+
+The explicit comparator becomes a `key` of `(end, start)`; `sorted` is stable and returns a copy. `>=` allows touching slots.
+
+```python
+    @staticmethod
+    def max_non_overlapping(input_: list[Interval]) -> list[Interval]:
+        """Interval scheduling by earliest end time (Phase 2, Lesson 07); ties broken by start. O(n log n)."""
+        chosen: list[Interval] = []
+        last_end = LONG_MIN
+        for iv in sorted(input_, key=lambda iv: (iv.end, iv.start)):
+            if iv.is_empty():
+                continue
+            if iv.start >= last_end:
+                chosen.append(iv)
+                last_end = iv.end
+        return chosen
+```
+
+#### Step 6: Weighted sweep for exposure
+
+The event tuple grows a third element, the hold's index, which is deliberately *not* part of the sort key: `list.sort` is stable, so two holds with equal `(time, delta)` are processed in insertion order, matching `List.sort`. `Money.plus`/`minus` enforce one currency and the 64-bit range; `compare_to` picks the new peak.
+
+```python
+    def peak_exposure(self) -> PeakExposure:
+        """+amount at each start, -amount at each end, releases before reservations at equal instants."""
+        events: list[tuple[int, int, int]] = []
+        for i, h in enumerate(self._holds):
+            if h.window.is_empty():
+                continue
+            events.append((h.window.start, +1, i))
+            events.append((h.window.end, -1, i))
+        events.sort(key=lambda e: (e[0], e[1]))  # stable: equal (time, delta) keep insertion order, like List.sort
+        open_ = best = Money.zero(self._currency)
+        best_at = 0
+        open_count = best_count = 0
+        for time, delta, i in events:
+            amt = self._holds[i].amount
+            open_ = open_.plus(amt) if delta > 0 else open_.minus(amt)
+            open_count += delta
+            if open_.compare_to(best) > 0:
+                best = open_
+                best_at = time
+                best_count = open_count
+        return PeakExposure(best, best_at, best_count)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/13-interval-problems/code/python
@@ -375,33 +516,202 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 46 checks plus the float guard. The test file carries a port of `java.util.Random` so the 100 random instances match.
+`Interval.__str__` prints `[start, end)` and a `jstr` helper formats lists the way `List.toString` does, so the output is identical to the Java run:
+
+```console
+== Settlement windows: merge overlapping cutoffs ==
+input:  [[840, 930), [900, 960), [960, 1005), [540, 600), [1080, 1080)]
+merged: [[540, 600), [840, 1005)]
+coverage: 225 minutes; gaps in 08:00-19:00: [[480, 540), [600, 840), [1005, 1140)]
+```
 
 ### In Go
 
+`Interval`, `Peak`, `Hold`, `HoldBook`, and `PeakExposure` keep their names and algorithms in `code/go/main.go`; three things differ. **Ordering is a function, and the event sort is stable on purpose:** `Interval.Compare` is the start-then-end order of the Java `compareTo`, passed as a method expression to `slices.SortFunc(sorted, Interval.Compare)`. Events are a small struct rather than a `long[]`, and `byTimeThenDelta` is the two-key comparator; `MaxOverlap` and `PeakExposure` sort with `slices.SortStableFunc` because Java's `List.sort` is stable and two holds that start at the same instant must be processed in insertion order for `HoldsOpen` to match. Changing `-1`/`+1` to a boolean silently counts touching windows as overlapping; the "touching intervals count as 1" test catches it. **`Money` arithmetic is checked:** Go's `int64` wraps like Java's `long`, so `Plus` and `Minus` in `money.go` go through `addChecked`/`subChecked` and return `ErrOverflow` where `Math.addExact` throws. That makes `Coverage`, `ExposureAt`, and `PeakExposure` return `(T, error)`; a test sums an interval of length `MaxInt64` with another to see `Coverage` report rather than wrap. **Errors are values:** `NewInterval`, `NewHold`, and `HoldBook.Add` return errors with the sentinels `ErrEndBeforeStart`, `ErrNonPositive`, and `ErrWrongBook`; `NewCurrency` rejects a lowercase code as the Java compact constructor does. Structs compare with `==`, so `MaxOverlap(windows) == Peak{2, 900}` reads like the Java record equality. The test file replays `java.util.Random(13)` through `javarandom.go`, so the 100 random instances are the ones the Java test checks.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo output is identical to the Java run; the suite covers the Java's 46 checks plus 4 for the overflow guards and the currency-code rule.
+
+#### Step 1: The interval type
+
+A struct literal cannot validate, so `NewInterval` is the checked constructor returning `ErrEndBeforeStart`; the algorithms build intervals they already know are valid with a literal. The predicates are one-liners, and `Compare` chains two `cmp.Compare` calls with `cmp.Or`, which returns the first non-zero result.
+
 ```go
-// event is one endpoint of an interval in a sweep: +1 at a start, -1 at an end.
-type event struct {
-    time  int64
-    delta int
-    idx   int
+type Interval struct {
+	Start, End int64
 }
 
-// -1 before +1 at equal times: an interval ending at t does not overlap one starting at t.
-func byTimeThenDelta(a, b event) int {
-    return cmp.Or(cmp.Compare(a.time, b.time), cmp.Compare(a.delta, b.delta))
+func NewInterval(start, end int64) (Interval, error) {
+	if end < start {
+		return Interval{}, fmt.Errorf("%w: end %d, start %d", ErrEndBeforeStart, end, start)
+	}
+	return Interval{start, end}, nil
 }
-...
-slices.SortStableFunc(events, byTimeThenDelta)
+
+func (iv Interval) Length() int64 { return iv.End - iv.Start }
+
+func (iv Interval) IsEmpty() bool { return iv.End == iv.Start }
+
+func (iv Interval) Overlaps(o Interval) bool { return iv.Start < o.End && o.Start < iv.End }
+
+func (iv Interval) OverlapsOrTouches(o Interval) bool { return iv.Start <= o.End && o.Start <= iv.End }
+
+func (iv Interval) Contains(t int64) bool { return iv.Start <= t && t < iv.End }
+
+func (iv Interval) Compare(o Interval) int {
+	return cmp.Or(cmp.Compare(iv.Start, o.Start), cmp.Compare(iv.End, o.End))
+}
 ```
 
-`Interval`, `Peak`, `Hold`, `HoldBook`, and `PeakExposure` keep their names and algorithms; three things differ, all in `code/go/main.go`:
+#### Step 2: Merge
 
-- **Ordering is a function, and the event sort is stable on purpose.** `Interval.Compare` is the start-then-end order of the Java `compareTo`, passed as a method expression to `slices.SortFunc(sorted, Interval.Compare)`. Events are a small struct rather than a `long[]`, and `byTimeThenDelta` is the two-key comparator; `MaxOverlap` and `PeakExposure` sort with `slices.SortStableFunc` because Java's `List.sort` is stable and two holds that start at the same instant must be processed in insertion order for `HoldsOpen` to match. Changing `-1`/`+1` to a boolean silently counts touching windows as overlapping; the "touching intervals count as 1" test catches it.
-- **`Money` arithmetic is checked.** Go's `int64` wraps like Java's `long`, so `Plus` and `Minus` in `money.go` go through `addChecked`/`subChecked` and return `ErrOverflow` where `Math.addExact` throws. That makes `Coverage`, `ExposureAt`, and `PeakExposure` return `(T, error)`; a test sums an interval of length `MaxInt64` with another to see `Coverage` report rather than wrap.
-- **Errors are values.** `NewInterval`, `NewHold`, and `HoldBook.Add` return errors with the sentinels `ErrEndBeforeStart`, `ErrNonPositive`, and `ErrWrongBook`; `NewCurrency` rejects a lowercase code as the Java compact constructor does. Structs compare with `==`, so `MaxOverlap(windows) == Peak{2, 900}` reads like the Java record equality.
+`slices.Clone` is the defensive copy and `Interval.Compare` as a method expression is the comparator. Instead of remove-then-add, the last element is overwritten in place; the `max` on the end is the built-in generic `max`.
 
-The test file replays `java.util.Random(13)` through `javarandom.go`, so the 100 random instances are the ones the Java test checks.
+```go
+func Merge(input []Interval) []Interval {
+	sorted := slices.Clone(input)
+	slices.SortFunc(sorted, Interval.Compare)
+	out := []Interval{}
+	for _, iv := range sorted {
+		if iv.IsEmpty() {
+			continue
+		}
+		if len(out) == 0 || !out[len(out)-1].OverlapsOrTouches(iv) {
+			out = append(out, iv)
+		} else {
+			last := out[len(out)-1]
+			out[len(out)-1] = Interval{last.Start, max(last.End, iv.End)}
+		}
+	}
+	return out
+}
+```
+
+#### Step 3: Gaps
+
+Line for line the Java, with `rng` for the range parameter (`range` is a keyword). The result starts as an empty non-nil slice so an input with no gaps prints as `[]`.
+
+```go
+func Gaps(input []Interval, rng Interval) []Interval {
+	out := []Interval{}
+	cursor := rng.Start
+	for _, iv := range Merge(input) {
+		if iv.End <= rng.Start {
+			continue
+		}
+		if iv.Start >= rng.End {
+			break
+		}
+		if iv.Start > cursor {
+			out = append(out, Interval{cursor, iv.Start})
+		}
+		cursor = max(cursor, iv.End)
+	}
+	if cursor < rng.End {
+		out = append(out, Interval{cursor, rng.End})
+	}
+	return out
+}
+```
+
+#### Step 4: The sweep
+
+`event` is a struct with `time`, `delta`, and the source index; `byTimeThenDelta` orders by time then delta so `-1` precedes `+1`. The sort is stable, which `MaxOverlap` does not strictly need but `PeakExposure` does, so both use the same call. `math.MinInt64` is the unset marker and the post-loop fix-up handles the all-empty case.
+
+```go
+type event struct {
+	time  int64
+	delta int
+	idx   int
+}
+
+func byTimeThenDelta(a, b event) int {
+	return cmp.Or(cmp.Compare(a.time, b.time), cmp.Compare(a.delta, b.delta))
+}
+
+func MaxOverlap(input []Interval) Peak {
+	events := make([]event, 0, 2*len(input))
+	for i, iv := range input {
+		if iv.IsEmpty() {
+			continue
+		}
+		events = append(events, event{iv.Start, +1, i}, event{iv.End, -1, i})
+	}
+	slices.SortStableFunc(events, byTimeThenDelta) // -1 sorts before +1
+	open, best := 0, 0
+	bestAt := int64(math.MinInt64)
+	if len(input) == 0 {
+		bestAt = 0
+	}
+	for _, e := range events {
+		open += e.delta
+		if open > best {
+			best = open
+			bestAt = e.time
+		}
+	}
+	if best == 0 {
+		bestAt = 0
+	}
+	return Peak{best, bestAt}
+}
+```
+
+#### Step 5: Earliest-finish scheduling
+
+The `(end, start)` comparator is an inline closure over `cmp.Or`; the clone keeps the function pure, and `>=` admits touching slots.
+
+```go
+func MaxNonOverlapping(input []Interval) []Interval {
+	byEnd := slices.Clone(input)
+	slices.SortStableFunc(byEnd, func(a, b Interval) int {
+		return cmp.Or(cmp.Compare(a.End, b.End), cmp.Compare(a.Start, b.Start))
+	})
+	chosen := []Interval{}
+	lastEnd := int64(math.MinInt64)
+	for _, iv := range byEnd {
+		if iv.IsEmpty() {
+			continue
+		}
+		if iv.Start >= lastEnd {
+			chosen = append(chosen, iv)
+			lastEnd = iv.End
+		}
+	}
+	return chosen
+}
+```
+
+#### Step 6: Weighted sweep for exposure
+
+The same sweep over `event` values, now returning `(PeakExposure, error)` because `Plus` and `Minus` can report `ErrOverflow` or a currency mismatch. The stable sort keeps same-instant holds in insertion order so `HoldsOpen` matches the Java count; `open.Compare(best) > 0` picks the first time the maximum is reached.
+
+```go
+	slices.SortStableFunc(events, byTimeThenDelta)
+	open, best := Zero(b.currency), Zero(b.currency)
+	var bestAt int64
+	openCount, bestCount := 0, 0
+	for _, e := range events {
+		amt := b.holds[e.idx].Amount
+		var err error
+		if e.delta > 0 {
+			open, err = open.Plus(amt)
+		} else {
+			open, err = open.Minus(amt)
+		}
+		if err != nil {
+			return PeakExposure{}, err
+		}
+		openCount += e.delta
+		if open.Compare(best) > 0 {
+			best = open
+			bestAt = e.time
+			bestCount = openCount
+		}
+	}
+	return PeakExposure{best, bestAt, bestCount}, nil
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/13-interval-problems/code/go
@@ -409,7 +719,15 @@ go run .
 go test ./...
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 46 checks plus 4 for the overflow guards and the currency-code rule.
+```console
+exposure at 12:30 = 830.00 USD
+exposure at 17:00 = 6.00 USD  (hotel released at 17:00, coffee starts: half-open)
+peak exposure 875.00 USD with 3 holds open, first at minute 660
+busy periods: [[540, 1035)]
+expired by 14:00: [fuel, restaurant, parking]
+```
+
+The earlier sections match the Java run; `Interval.String()` prints `[start, end)` and a generic `jstr` joins slices with `", "`.
 
 ## Use It
 

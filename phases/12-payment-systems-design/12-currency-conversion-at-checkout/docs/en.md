@@ -360,26 +360,222 @@ effective markup  = 3.4971% after rounding the amount
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **`Rational` is a frozen dataclass over two `int`s**, normalized in `__post_init__` with `math.gcd` and a positive denominator, exactly as the Java record's compact constructor did; `Rational.parse` borrows `fractions.Fraction(str)` only to read the decimal string exactly, never a float, and `BigInteger` is unnecessary because Python ints do not overflow. **`RoundingMode` is a small `Enum` and rounding is integer arithmetic:** there is no `BigDecimal.divide(scale, mode)`, so `round_to_long` implements `CEILING`, `FLOOR`, `UP`, `DOWN` and the three `HALF` modes from `divmod` and a `2r` vs `den` comparison; `to_decimal(scale)` is "multiply by 10^scale, round `HALF_EVEN`, insert the point", which reproduces `toPlainString`, and a test pins every mode on 2.5 and -2.5. **Field names avoid keywords:** `FxRate.from_currency`/`to_currency` for `from`/`to`; `ONE` is a module constant (also reachable as `Rational.ONE`). **Exceptions:** a zero denominator raises `ZeroDivisionError` (an `ArithmeticError`, as `ArithmeticException` was); `QuoteExpiredError` is a `RuntimeError`; argument problems raise `ValueError` and `CurrencyMismatchError` is a `ValueError` subclass; `allocate` returns a `list[Money]`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: An exact rational
+
+`__post_init__` normalizes sign and lowest terms with `object.__setattr__`, which is how a frozen dataclass rewrites its own fields. `round_to_long` is the only place a rational becomes an integer: `divmod` floors (so `0 <= r < den`), the directed modes adjust by sign, and the half modes compare `2r` with `den`.
+
 ```python
-def round_to_long(self, mode: RoundingMode) -> int:
-    q, r = divmod(self.num, self.den)        # floor division: 0 <= r < den
-    if r == 0:
-        return q
-    if mode is RoundingMode.FLOOR:
-        return q
-    if mode is RoundingMode.CEILING:
-        return q + 1
-    ...
-    twice = 2 * r                            # the half-way cases compare 2r with den
-    return q if q % 2 == 0 else q + 1        # HALF_EVEN
+@dataclass(frozen=True)
+class Rational:
+    num: int
+    den: int
+
+    def __post_init__(self) -> None:
+        num, den = self.num, self.den
+        if den == 0:
+            raise ZeroDivisionError("zero denominator")
+        if den < 0:
+            num, den = -num, -den
+        g = math.gcd(num, den)
+        if g != 1:
+            num, den = num // g, den // g
+        object.__setattr__(self, "num", num)
+        object.__setattr__(self, "den", den)
+
+    @staticmethod
+    def of(num: int, den: int) -> "Rational":
+        return Rational(num, den)
+
+    @staticmethod
+    def parse(decimal: str) -> "Rational":
+        """Exact parse of a decimal string: "1.0850" is 10850/10000 = 217/200."""
+        f = Fraction(decimal.strip())
+        return Rational(f.numerator, f.denominator)
+
+    def round_to_long(self, mode: RoundingMode) -> int:
+        """Round to an integer with an explicit mode, by integer arithmetic only (den is always positive)."""
+        q, r = divmod(self.num, self.den)  # floor division: 0 <= r < den
+        if r == 0:
+            return q
+        if mode is RoundingMode.FLOOR:
+            return q
+        if mode is RoundingMode.CEILING:
+            return q + 1
+        negative = self.num < 0
+        if mode is RoundingMode.DOWN:
+            return q + 1 if negative else q
+        if mode is RoundingMode.UP:
+            return q if negative else q + 1
+        twice = 2 * r
+        if twice > self.den:
+            return q + 1
+        if twice < self.den:
+            return q
+        # exactly half way
+        if mode is RoundingMode.HALF_UP:
+            return q if negative else q + 1
+        if mode is RoundingMode.HALF_DOWN:
+            return q + 1 if negative else q
+        return q if q % 2 == 0 else q + 1  # HALF_EVEN
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: Rates and conversion
 
-- **`Rational` is a frozen dataclass over two `int`s**, normalized in `__post_init__` with `math.gcd` and a positive denominator, exactly as the Java record's compact constructor did; `Rational.parse` borrows `fractions.Fraction(str)` only to read the decimal string exactly, never a float. `BigInteger` is unnecessary because Python ints do not overflow.
-- **`RoundingMode` is a small `Enum` and rounding is integer arithmetic.** There is no `BigDecimal.divide(scale, mode)`, so `round_to_long` implements CEILING, FLOOR, UP, DOWN and the three HALF modes from `divmod` and a `2r` vs `den` comparison; `to_decimal(scale)` is "multiply by 10^scale, round HALF_EVEN, insert the point", which reproduces `toPlainString`. A test pins every mode on 2.5 and -2.5.
-- **Field names avoid keywords:** `FxRate.from_currency`/`to_currency` for `from`/`to`. `ONE` is a module constant (also reachable as `Rational.ONE`).
-- **Exceptions:** a zero denominator raises `ZeroDivisionError` (an `ArithmeticError`, as `ArithmeticException` was); `QuoteExpiredError` is a `RuntimeError`; argument problems raise `ValueError` and `CurrencyMismatchError` is a `ValueError` subclass. `allocate` returns a `list[Money]`.
+`FxRate` validates a positive rate and the same-currency identity in `__post_init__`; `adjusted_by` multiplies by `1 + bps/10000` exactly. `convert` stays rational through the exponent shift and rounds once with the caller's mode.
+
+```python
+class FxRate:
+    """1 unit of `from_currency` = `rate` units of `to_currency`, in major units."""
+
+    from_currency: Currency
+    to_currency: Currency
+    rate: Rational
+
+    def __post_init__(self) -> None:
+        if self.rate.signum() <= 0:
+            raise ValueError("rate must be positive")
+        if self.from_currency == self.to_currency and self.rate.compare_to(ONE) != 0:
+            raise ValueError("same-currency rate must be 1")
+
+    def inverse(self) -> "FxRate":
+        return FxRate(self.to_currency, self.from_currency, self.rate.inverse())
+
+    def adjusted_by(self, basis_points: int) -> "FxRate":
+        """Multiply the rate by (1 + bps/10000); a negative bps scales it down."""
+        return FxRate(self.from_currency, self.to_currency, self.rate.times(ONE.plus(Rational.bps(basis_points))))
+
+
+class FxConverter:
+    @staticmethod
+    def convert(amount: Money, rate: FxRate, mode: RoundingMode) -> Money:
+        """Exact conversion in minor units, one rounding at the end with an explicit mode."""
+        if amount.currency != rate.from_currency:
+            raise CurrencyMismatchError(amount.currency, rate.from_currency)
+        minor = (Rational.of(amount.minor_units, 1)
+                 .times(rate.rate)
+                 .times(Rational.pow10(rate.to_currency.exponent - rate.from_currency.exponent)))
+        return Money.of_minor(minor.round_to_long(mode), rate.to_currency)
+```
+
+#### Step 3: The desk issues quotes
+
+`quote` reads the injected clock, asks the injected rate source for the mid, applies the spread, and stores the quote with both rates so the margin stays auditable. `presentment_price` rounds with `CEILING`, so the shopper never pays less than the locked rate implies.
+
+```python
+    def quote(self, settlement: Currency, presentment: Currency) -> RateQuote:
+        """Lock a rate now. The shopper's rate is mid plus the spread, so the shopper pays more presentment currency."""
+        now = self._clock.now_millis()
+        mid = self._rates.mid(settlement, presentment)
+        customer = FxRate(settlement, presentment, mid).adjusted_by(self._spread_bps)
+        self._seq += 1
+        q = RateQuote(f"fxq_{self._seq:04d}", customer, mid, self._spread_bps, now, now + self._lock_millis)
+        self._quotes[q.id] = q
+        return q
+
+    @staticmethod
+    def presentment_price(settlement_price: Money, q: RateQuote) -> Money:
+        """The price to display. Rounded up so the shopper never pays less than the locked rate implies."""
+        return FxConverter.convert(settlement_price, q.customer_rate, RoundingMode.CEILING)
+```
+
+#### Step 4: Confirm inside the window, or not at all
+
+`confirm` checks the quote exists, the currency matches, and `valid_at(now)` holds (half-open window), raising `QuoteExpiredError` otherwise, then binds quote, settlement amount, and presentment amount into a `LockedCharge`.
+
+```python
+    def confirm(self, quote_id: str, settlement_price: Money) -> LockedCharge:
+        """Checkout confirmation: only inside the lock window. After it, the shopper must see a new price."""
+        q = self._quotes.get(quote_id)
+        if q is None:
+            raise ValueError(f"unknown quote {quote_id}")
+        if settlement_price.currency != q.settlement():
+            raise CurrencyMismatchError(settlement_price.currency, q.settlement())
+        now = self._clock.now_millis()
+        if not q.valid_at(now):
+            raise QuoteExpiredError(q.id, now, q.expires_at_millis)
+        return LockedCharge(q, settlement_price, FxDesk.presentment_price(settlement_price, q))
+```
+
+#### Step 5: Settlement and break-even
+
+`settle` copies the promised settlement amount from the charge and converts the presentment amount at the market mid with `HALF_EVEN`; `break_even_rate` is the exact rational at which P&L is zero.
+
+```python
+    @staticmethod
+    def settle(charge: LockedCharge, market_mid_presentment_to_settlement: Rational) -> SettlementResult:
+        """Days later the PSP sells the presentment currency at the then-market mid. The merchant gets the
+        promised amount regardless; the difference is the PSP's FX P&L (spread minus market movement)."""
+        market = FxRate(charge.quote.presentment(), charge.quote.settlement(), market_mid_presentment_to_settlement)
+        proceeds = FxConverter.convert(charge.presentment_amount, market, RoundingMode.HALF_EVEN)
+        return SettlementResult(charge.settlement_amount, proceeds, proceeds.minus(charge.settlement_amount))
+
+    @staticmethod
+    def break_even_rate(charge: LockedCharge) -> Rational:
+        """The settlement-time rate at which the PSP's P&L is exactly zero."""
+        return (Rational.of(charge.settlement_amount.minor_units, 1)
+                .divided_by(Rational.of(charge.presentment_amount.minor_units, 1))
+                .times(Rational.pow10(charge.quote.presentment().exponent - charge.quote.settlement().exponent)))
+```
+
+#### Step 6: DCC
+
+`Dcc.offer` validates, builds the marked-up rate, and rounds the card amount once. `markup_percent` divides rate by rate exactly, so 350 bps discloses as `7/2`; `disclosure` renders the rate, markup, and reference with `to_decimal`.
+
+```python
+    def markup_percent(self) -> Rational:
+        """Markup over the reference rate, as an exact percentage: (dcc / reference - 1) * 100."""
+        return self.dcc_rate.rate.divided_by(self.reference_rate).minus(ONE).times(Rational.of(100, 1))
+
+    def disclosure(self) -> str:
+        return (f"Pay {self.card_amount} (rate 1 {self.merchant_amount.currency.code} = {self.dcc_rate.rate.to_decimal(6)} "
+                f"{self.card_amount.currency.code}, including a {self.markup_percent().to_decimal(2)}% markup over the ECB "
+                f"reference rate {self.reference_rate.to_decimal(4)}) or pay {self.merchant_amount} and let your card issuer convert.")
+
+
+class Dcc:
+    @staticmethod
+    def offer(merchant_amount: Money, card_currency: Currency, reference_rate: Rational, markup_bps: int) -> DccOffer:
+        if merchant_amount.currency == card_currency:
+            raise ValueError("DCC needs a different card currency")
+        if markup_bps < 0:
+            raise ValueError("markup must be >= 0")
+        rate = FxRate(merchant_amount.currency, card_currency, reference_rate).adjusted_by(markup_bps)
+        card_amount = FxConverter.convert(merchant_amount, rate, RoundingMode.HALF_EVEN)
+        return DccOffer(merchant_amount, card_amount, rate, reference_rate, markup_bps)
+```
+
+#### Step 7: The margin and the alternative
+
+`gross_margin` is the card amount minus the reference conversion, in card currency; `issuer_conversion` converts at the network rate and adds the issuer fee as its own `HALF_EVEN`-rounded amount.
+
+```python
+    def _at_reference(self) -> Money:
+        return FxConverter.convert(self.merchant_amount,
+                                   FxRate(self.merchant_amount.currency, self.card_amount.currency, self.reference_rate),
+                                   RoundingMode.HALF_EVEN)
+
+    def effective_markup_percent(self) -> Rational:
+        """What the cardholder actually pays over the reference conversion, after rounding the amount."""
+        return Rational.of(self.card_amount.minor_units, self._at_reference().minor_units).minus(ONE).times(Rational.of(100, 1))
+
+    def gross_margin(self) -> Money:
+        """DCC gross margin in card currency: cardholder amount minus the reference conversion."""
+        return self.card_amount.minus(self._at_reference())
+
+    @staticmethod
+    def issuer_conversion(merchant_amount: Money, card_currency: Currency, network_rate: Rational, issuer_fee_bps: int) -> Money:
+        """What declining DCC costs: the network converts at its rate and the issuer may add a foreign transaction fee."""
+        converted = FxConverter.convert(merchant_amount, FxRate(merchant_amount.currency, card_currency, network_rate), RoundingMode.HALF_EVEN)
+        fee = Money.of_minor(Rational.of(converted.minor_units, 1).times(Rational.bps(issuer_fee_bps)).round_to_long(RoundingMode.HALF_EVEN),
+                             card_currency)
+        return converted.plus(fee)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/12-currency-conversion-at-checkout/code/python
@@ -387,35 +583,276 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run:
+
+```console
+== Presentment vs settlement: a US merchant shows EUR to a German shopper ==
+mid USD->EUR      = 200/217 = 0.9216589862
+customer USD->EUR = 204/217 = 0.9400921659 (mid + 2.00%)
+lock window       = [t0, t0 + 15 min)
+confirmed at +9m: shopper pays 112.82 EUR, merchant is promised 120.00 USD
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`, `money.go`, tests in `main_test.go`) keeps the design with four differences. **`math/big.Rat` plays `Rational`, behind a value type:** `big.Rat` methods mutate their receiver and alias their arguments, so `Rational` wraps a pointer and every method (`Times`, `Plus`, `Inverse`, ...) allocates a fresh `big.Rat`; a quote's locked rate can never be changed by arithmetic done elsewhere; `SetString("1.0850")` is the exact parse and normalizes to lowest terms with the sign in the numerator, as the Java constructor did; equality is `Equal`/`Compare`, never `==`. **Go has no `RoundingMode`:** `roundBig` divides with `big.Int.QuoRem` (truncated, like Java) and spells out the six cases this lesson needs, `Down`, `Up`, `HalfUp`, `HalfEven` from the Phase 10 `Money` plus `Ceiling` and `Floor` declared here; `ToDecimal(scale)` scales by 10^scale, rounds half-even, and pads, which is what `BigDecimal.divide(..., scale, HALF_EVEN).toPlainString()` prints. **Errors are values, with one deliberate panic:** `NewFxRate`, `Convert`, `Quote`, `Confirm`, `Settle`, `Offer`, and `IssuerConversion` return `(T, error)`; `ErrQuoteExpired`, `ErrInvalidArgument`, and `ErrCurrencyMismatch` are checked with `errors.Is`, and the lock window stays half-open; `Of(num, 0)` panics with `ErrZeroDenominator`, because a zero denominator in a rate is a programming error, the same reasoning as `Money.Compare`, and the test recovers it. **Round-trip to minor units is checked:** `RoundToInt64` returns `ErrOverflow` instead of silently truncating a `big.Int` that does not fit an `int64`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: An exact rational
+
+`Rational` wraps a `*big.Rat`; `Of` and `ofBig` panic on a zero denominator, `ParseRational` returns an error for a malformed string, and `SetFrac`/`SetString` normalize to lowest terms. `RoundToInt64` delegates the mode handling to `roundBig` and refuses a result that does not fit `int64`.
+
 ```go
-// Rational wraps *big.Rat and never mutates a shared value: every operation allocates a result.
 type Rational struct{ r *big.Rat }
 
-func (a Rational) Times(o Rational) Rational { return Rational{new(big.Rat).Mul(a.r, o.r)} }
+var ONE = Of(1, 1)
 
-// RoundToInt64 rounds to an integer with the given mode; ErrOverflow where Java's longValueExact throws.
+// Of builds num/den in lowest terms. A zero denominator panics with ErrZeroDenominator, as the Java
+// constructor throws: it is a programming error, not a runtime condition.
+func Of(num, den int64) Rational {
+	if den == 0 {
+		panic(ErrZeroDenominator)
+	}
+	return Rational{new(big.Rat).SetFrac64(num, den)}
+}
+
+func ofBig(num, den *big.Int) Rational {
+	if den.Sign() == 0 {
+		panic(ErrZeroDenominator)
+	}
+	return Rational{new(big.Rat).SetFrac(num, den)}
+}
+
+// ParseRational is an exact parse of a decimal string: "1.0850" is 10850/10000 = 217/200.
+func ParseRational(decimal string) (Rational, error) {
+	r, ok := new(big.Rat).SetString(strings.TrimSpace(decimal))
+	if !ok {
+		return Rational{}, fmt.Errorf("%w: not a decimal: %q", ErrInvalidArgument, decimal)
+	}
+	return Rational{r}, nil
+}
+
 func (a Rational) RoundToInt64(mode Rounding) (int64, error) {
-    v := roundBig(a.r.Num(), a.r.Denom(), mode)
-    if !v.IsInt64() {
-        return 0, ErrOverflow
-    }
-    return v.Int64(), nil
+	v := roundBig(a.r.Num(), a.r.Denom(), mode)
+	if !v.IsInt64() {
+		return 0, ErrOverflow
+	}
+	return v.Int64(), nil
 }
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+#### Step 2: Rates and conversion
 
-- **`math/big.Rat` plays `Rational`, behind a value type.** `big.Rat` methods mutate their receiver and alias their arguments, so `Rational` wraps a pointer and every method (`Times`, `Plus`, `Inverse`, ...) allocates a fresh `big.Rat`; a quote's locked rate can never be changed by arithmetic done elsewhere. `SetString("1.0850")` is the exact parse and normalizes to lowest terms with the sign in the numerator, as the Java constructor did. Equality is `Equal`/`Compare`, never `==`.
-- **Go has no `RoundingMode`.** `roundBig` divides with `big.Int.QuoRem` (truncated, like Java) and spells out the six cases this lesson needs: `Down`, `Up`, `HalfUp`, `HalfEven` from the Phase 10 `Money`, plus `Ceiling` and `Floor` declared here. `ToDecimal(scale)` scales by 10^scale, rounds half-even, and pads, which is what `BigDecimal.divide(..., scale, HALF_EVEN).toPlainString()` prints.
-- **Errors are values, with one deliberate panic.** `NewFxRate`, `Convert`, `Quote`, `Confirm`, `Settle`, `Offer`, and `IssuerConversion` return `(T, error)`; `ErrQuoteExpired`, `ErrInvalidArgument`, and `ErrCurrencyMismatch` are checked with `errors.Is`, and the lock window stays half-open. `Of(num, 0)` panics with `ErrZeroDenominator`, because a zero denominator in a rate is a programming error, the same reasoning as `Money.Compare`; the test recovers it.
-- **Round-trip to minor units is checked.** `RoundToInt64` returns `ErrOverflow` instead of silently truncating a `big.Int` that does not fit an `int64`.
+`NewFxRate` is the validating constructor; `AdjustedBy` goes back through it, so it also returns `(FxRate, error)`. `Convert` does the exponent shift in rationals and reports `ErrOverflow` from `RoundToInt64` rather than truncating.
+
+```go
+type FxRate struct {
+	From Currency
+	To   Currency
+	Rate Rational
+}
+
+func NewFxRate(from, to Currency, rate Rational) (FxRate, error) {
+	if rate.Signum() <= 0 {
+		return FxRate{}, fmt.Errorf("%w: rate must be positive", ErrInvalidArgument)
+	}
+	if from == to && rate.Compare(ONE) != 0 {
+		return FxRate{}, fmt.Errorf("%w: same-currency rate must be 1", ErrInvalidArgument)
+	}
+	return FxRate{from, to, rate}, nil
+}
+
+// Inverse cannot fail: the inverse of a positive rate is positive.
+func (f FxRate) Inverse() FxRate { return FxRate{f.To, f.From, f.Rate.Inverse()} }
+
+// AdjustedBy multiplies the rate by (1 + bps/10000); a negative bps scales it down.
+func (f FxRate) AdjustedBy(basisPoints int64) (FxRate, error) {
+	return NewFxRate(f.From, f.To, f.Rate.Times(ONE.Plus(Bps(basisPoints))))
+}
+
+// Convert is the exact conversion in minor units, one rounding at the end with an explicit mode.
+func Convert(amount Money, rate FxRate, mode Rounding) (Money, error) {
+	if amount.Currency != rate.From {
+		return Money{}, fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, amount.Currency.Code, rate.From.Code)
+	}
+	minor := Of(amount.MinorUnits, 1).Times(rate.Rate).Times(Pow10(rate.To.Exponent - rate.From.Exponent))
+	rounded, err := minor.RoundToInt64(mode)
+	if err != nil {
+		return Money{}, err
+	}
+	return OfMinor(rounded, rate.To), nil
+}
+```
+
+#### Step 3: The desk issues quotes
+
+`Quote` threads three possible errors (rate source, base rate, spread) before storing the quote; `PresentmentPrice` is `Convert` with `Ceiling`.
+
+```go
+func (d *FxDesk) Quote(settlement, presentment Currency) (RateQuote, error) {
+	now := d.clock.NowMillis()
+	mid, err := d.rates.Mid(settlement, presentment)
+	if err != nil {
+		return RateQuote{}, err
+	}
+	base, err := NewFxRate(settlement, presentment, mid)
+	if err != nil {
+		return RateQuote{}, err
+	}
+	customer, err := base.AdjustedBy(d.spreadBps)
+	if err != nil {
+		return RateQuote{}, err
+	}
+	d.seq++
+	q := RateQuote{fmt.Sprintf("fxq_%04d", d.seq), customer, mid, d.spreadBps, now, now + d.lockMillis}
+	d.quotes[q.ID] = q
+	return q, nil
+}
+
+// PresentmentPrice is the price to display. Rounded up so the shopper never pays less than the locked rate implies.
+func PresentmentPrice(settlementPrice Money, q RateQuote) (Money, error) {
+	return Convert(settlementPrice, q.CustomerRate, Ceiling)
+}
+```
+
+#### Step 4: Confirm inside the window, or not at all
+
+`Confirm` returns `ErrInvalidArgument` for an unknown quote, `ErrCurrencyMismatch` for the wrong settlement currency, and `ErrQuoteExpired` (with the expiry and `now` in the message) when `ValidAt` is false.
+
+```go
+func (d *FxDesk) Confirm(quoteID string, settlementPrice Money) (LockedCharge, error) {
+	q, ok := d.quotes[quoteID]
+	if !ok {
+		return LockedCharge{}, fmt.Errorf("%w: unknown quote %s", ErrInvalidArgument, quoteID)
+	}
+	if settlementPrice.Currency != q.Settlement() {
+		return LockedCharge{}, fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, settlementPrice.Currency.Code, q.Settlement().Code)
+	}
+	now := d.clock.NowMillis()
+	if !q.ValidAt(now) {
+		return LockedCharge{}, fmt.Errorf("%w: quote %s expired at %d, now %d", ErrQuoteExpired, q.ID, q.ExpiresAtMillis, now)
+	}
+	presentment, err := PresentmentPrice(settlementPrice, q)
+	if err != nil {
+		return LockedCharge{}, err
+	}
+	return LockedCharge{q, settlementPrice, presentment}, nil
+}
+```
+
+#### Step 5: Settlement and break-even
+
+`Settle` builds the market rate, converts with `HalfEven`, and returns the promised amount, the proceeds, and their difference; `BreakEvenRate` is exact and cannot fail.
+
+```go
+func Settle(charge LockedCharge, marketMidPresentmentToSettlement Rational) (SettlementResult, error) {
+	market, err := NewFxRate(charge.Quote.Presentment(), charge.Quote.Settlement(), marketMidPresentmentToSettlement)
+	if err != nil {
+		return SettlementResult{}, err
+	}
+	proceeds, err := Convert(charge.PresentmentAmount, market, HalfEven)
+	if err != nil {
+		return SettlementResult{}, err
+	}
+	pnl, err := proceeds.Minus(charge.SettlementAmount)
+	if err != nil {
+		return SettlementResult{}, err
+	}
+	return SettlementResult{charge.SettlementAmount, proceeds, pnl}, nil
+}
+
+// BreakEvenRate is the settlement-time rate at which the PSP's P&L is exactly zero.
+func BreakEvenRate(charge LockedCharge) Rational {
+	return Of(charge.SettlementAmount.MinorUnits, 1).
+		DividedBy(Of(charge.PresentmentAmount.MinorUnits, 1)).
+		Times(Pow10(charge.Quote.Presentment().Exponent - charge.Quote.Settlement().Exponent))
+}
+```
+
+#### Step 6: DCC
+
+`Offer` validates, builds the marked-up rate through `NewFxRate` and `AdjustedBy`, and rounds the card amount once. `MarkupPercent` is the exact rational `(dcc / reference - 1) * 100`.
+
+```go
+func (o DccOffer) MarkupPercent() Rational {
+	return o.DccRate.Rate.DividedBy(o.ReferenceRate).Minus(ONE).Times(Of(100, 1))
+}
+
+func Offer(merchantAmount Money, cardCurrency Currency, referenceRate Rational, markupBps int64) (DccOffer, error) {
+	if merchantAmount.Currency == cardCurrency {
+		return DccOffer{}, fmt.Errorf("%w: DCC needs a different card currency", ErrInvalidArgument)
+	}
+	if markupBps < 0 {
+		return DccOffer{}, fmt.Errorf("%w: markup must be >= 0", ErrInvalidArgument)
+	}
+	base, err := NewFxRate(merchantAmount.Currency, cardCurrency, referenceRate)
+	if err != nil {
+		return DccOffer{}, err
+	}
+	rate, err := base.AdjustedBy(markupBps)
+	if err != nil {
+		return DccOffer{}, err
+	}
+	cardAmount, err := Convert(merchantAmount, rate, HalfEven)
+	if err != nil {
+		return DccOffer{}, err
+	}
+	return DccOffer{merchantAmount, cardAmount, rate, referenceRate, markupBps}, nil
+}
+```
+
+#### Step 7: The margin and the alternative
+
+`atReference` uses `must` because `Offer` already validated the currencies; `GrossMargin` is the card amount minus that reference conversion. `IssuerConversion` converts at the network rate and adds the issuer fee as its own rounded amount, propagating any error.
+
+```go
+func (o DccOffer) atReference() Money {
+	rate := must(NewFxRate(o.MerchantAmount.Currency, o.CardAmount.Currency, o.ReferenceRate))
+	return must(Convert(o.MerchantAmount, rate, HalfEven))
+}
+
+// EffectiveMarkupPercent is what the cardholder actually pays over the reference conversion, after rounding the amount.
+func (o DccOffer) EffectiveMarkupPercent() Rational {
+	return Of(o.CardAmount.MinorUnits, o.atReference().MinorUnits).Minus(ONE).Times(Of(100, 1))
+}
+
+// GrossMargin is the DCC gross margin in card currency: cardholder amount minus the reference conversion.
+func (o DccOffer) GrossMargin() Money { return must(o.CardAmount.Minus(o.atReference())) }
+
+func IssuerConversion(merchantAmount Money, cardCurrency Currency, networkRate Rational, issuerFeeBps int64) (Money, error) {
+	rate, err := NewFxRate(merchantAmount.Currency, cardCurrency, networkRate)
+	if err != nil {
+		return Money{}, err
+	}
+	converted, err := Convert(merchantAmount, rate, HalfEven)
+	if err != nil {
+		return Money{}, err
+	}
+	feeMinor, err := Of(converted.MinorUnits, 1).Times(Bps(issuerFeeBps)).RoundToInt64(HalfEven)
+	if err != nil {
+		return Money{}, err
+	}
+	return converted.Plus(OfMinor(feeMinor, cardCurrency))
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/12-currency-conversion-at-checkout/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run; the DCC section reads:
+
+```console
+== DCC: a UK card at a German merchant, EUR 100.00 ==
+Pay 88.49 GBP (rate 1 EUR = 0.884925 GBP, including a 3.50% markup over the ECB reference rate 0.8550) or pay 100.00 EUR and let your card issuer convert.
+disclosed markup  = 3.5000% (exact: 7/2)
+effective markup  = 3.4971% after rounding the amount
+DCC gross margin  = 2.99 GBP: merchant rebate 0.90 GBP, DCC provider 2.09 GBP
 ```
 
 ## Use It

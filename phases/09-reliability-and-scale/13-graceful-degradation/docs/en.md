@@ -352,26 +352,205 @@ The number to carry into the design review is CRITICAL p99: 2,700 ms versus 25 m
 
 ### In Python
 
-```python
-def _do_dequeue(self, now: int) -> tuple[Optional[Request], bool]:
-    if not self._queue:
-        self._first_above_time = 0
-        return None, False
-    r = self._queue.popleft()
-    sojourn = now - r.enqueued_millis
-    ...
-    return r, now >= self._first_above_time  # above target for a whole interval: ok to drop
+The Python port (`code/python/main.py`) is the same design with four differences. **The `DoDequeue` record is a tuple:** `_do_dequeue` returns `(request, ok_to_drop)` and `dequeue` unpacks it in place, so the RFC 8289 state machine reads line for line like the Java. `(long)(interval / Math.sqrt(c))` is `int(...)`, which also truncates toward zero for the positive values here; `target / 2` becomes `target // 2`. **Enums carry their data:** `Priority` is an `Enum` with an `ordinal` property, and `Level`'s value is `(ordinal, shed_at_or_below, fraud_mode)`, so `sheds` and the one-level-per-window escalation (`LEVELS[level.ordinal + 1]`) are the same ordinal arithmetic. `EnumMap` is a `dict` keyed by the enum members, built in declaration order. **Arrivals come from `java.util.Random`:** `JavaRandom.next_double` reproduces `nextDouble()` so seed 11 offers the same 12,038 requests, the brownout flips at the same milliseconds (2100, 2200, 2900, ...), and both tables match the Java output digit for digit. **`Policy` is an `ABC`**, `null` is `None`, and `deque.popleft()` on an empty queue raises, so `FifoPolicy.next` checks emptiness first where Java's `pollFirst` returns `null`.
 
-def _control_law(self, t: int, c: int) -> int:
-    return t + int(self._interval_millis / math.sqrt(c))
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Requests and priorities
+
+`Priority` is an `Enum` whose value is the ordinal, exposed as a property so `sheds` can compare importance. `Request` is a plain class because `enqueued_millis` is mutated when the request enters a queue.
+
+```python
+class Priority(Enum):
+    CRITICAL = 0  # authorize, capture: money moving now
+    HIGH = 1  # refunds, webhooks: money moving soon
+    NORMAL = 2  # balance reads, status polls
+    LOW = 3  # reporting, exports, analytics
+
+    @property
+    def ordinal(self) -> int:
+        return self.value
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Request:
+    def __init__(self, id_: int, priority: Priority, arrival_millis: int) -> None:
+        self.id = id_
+        self.priority = priority
+        self.arrival_millis = arrival_millis
+        self.enqueued_millis = arrival_millis
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: CoDel
 
-- **The `DoDequeue` record is a tuple.** `_do_dequeue` returns `(request, ok_to_drop)` and `dequeue` unpacks it in place, so the RFC 8289 state machine reads line for line like the Java. `(long)(interval / Math.sqrt(c))` is `int(...)`, which also truncates toward zero for the positive values here; `target / 2` becomes `target // 2`.
-- **Enums carry their data.** `Priority` is an `Enum` with an `ordinal` property, and `Level`'s value is `(ordinal, shed_at_or_below, fraud_mode)`, so `sheds` and the one-level-per-window escalation (`LEVELS[level.ordinal + 1]`) are the same ordinal arithmetic. `EnumMap` is a `dict` keyed by the enum members, built in declaration order.
-- **Arrivals come from `java.util.Random`.** `JavaRandom.next_double` reproduces `nextDouble()` so seed 11 offers the same 12,038 requests, the brownout flips at the same milliseconds (2100, 2200, 2900, ...), and both tables match the Java output digit for digit.
-- **`Policy` is an `ABC`**, `null` is `None`, and `deque.popleft()` on an empty queue raises, so `FifoPolicy.next` checks emptiness first where Java's `pollFirst` returns `null`.
+`_do_dequeue` returns the `(request, ok_to_drop)` pair and `dequeue` unpacks it, so RFC 8289 Sections 5.3 and 5.4 read line for line like the Java. The `deque` is popped from the left; `_control_law` uses `int()` for the truncating cast and `math.sqrt` as the RFC does.
+
+```python
+    def _do_dequeue(self, now: int) -> tuple[Optional[Request], bool]:
+        if not self._queue:
+            self._first_above_time = 0
+            return None, False
+        r = self._queue.popleft()
+        sojourn = now - r.enqueued_millis
+        self.max_sojourn_seen = max(self.max_sojourn_seen, sojourn)
+        if sojourn < self._target_millis:
+            self._first_above_time = 0  # delay is fine; reset the "above target since" clock
+            return r, False
+        if self._first_above_time == 0:
+            self._first_above_time = now + self._interval_millis  # start the interval timer; do not drop yet
+            return r, False
+        return r, now >= self._first_above_time  # above target for a whole interval: ok to drop
+
+    def _control_law(self, t: int, c: int) -> int:
+        return t + int(self._interval_millis / math.sqrt(c))
+
+    def dequeue(self, now: int) -> Optional[Request]:
+        r, ok = self._do_dequeue(now)
+        if self._dropping:
+            if not ok:
+                self._dropping = False  # sojourn fell under target: leave dropping state
+            else:
+                while now >= self._drop_next and self._dropping:
+                    self.dropped += 1  # drop r
+                    self._count += 1
+                    r, ok = self._do_dequeue(now)
+                    if not ok:
+                        self._dropping = False
+                    else:
+                        self._drop_next = self._control_law(self._drop_next, self._count)
+        elif ok:
+            self.dropped += 1  # first drop of a new episode
+            r, ok = self._do_dequeue(now)
+            self._dropping = True
+            # If we were dropping recently, resume at a higher rate instead of restarting from count = 1.
+            delta = self._count - self._last_count
+            self._count = delta if (delta > 1 and now - self._drop_next < 16 * self._interval_millis) else 1
+            self._drop_next = self._control_law(now, self._count)
+            self._last_count = self._count
+        return r
+```
+
+#### Step 3: The brownout controller
+
+Three bands, one step per window. `LEVELS` is `list(Level)` in declaration order, so `LEVELS[self._level.ordinal + 1]` is `Level.values()[ordinal + 1]`; `//` is the integer half-target. The flag write is the only side effect outside the controller.
+
+```python
+    def tick(self, now_millis: int) -> None:
+        self.millis_at_level[self._level.ordinal] += now_millis - self._last_tick
+        self._last_tick = now_millis
+        if now_millis - self._window_start < self._window_millis:
+            return
+        before = self._level
+        if self._window_max_sojourn > self._target_millis:
+            self._calm_windows = 0
+            if self._level.ordinal < len(LEVELS) - 1:
+                self._level = LEVELS[self._level.ordinal + 1]
+        elif self._window_max_sojourn <= self._target_millis // 2:
+            self._calm_windows += 1
+            if self._calm_windows >= self._cooldown_windows and self._level != Level.NORMAL:
+                self._level = LEVELS[self._level.ordinal - 1]
+                self._calm_windows = 0
+        else:
+            self._calm_windows = 0  # in the hysteresis band: hold
+        if self._level != before:
+            self.transitions.append(f"{now_millis}ms {before} -> {self._level}")
+            self._flags.set("fraud.mode", self._level.fraud_mode)
+        self._window_max_sojourn = 0
+        self._window_start = now_millis
+```
+
+#### Step 4: The degrading policy
+
+`admit` sheds at the door by priority; `next` walks `Priority` in declaration order (strict priority) and feeds only CRITICAL and HIGH sojourns to the controller. The per-priority dicts in `Outcome` replace the `EnumMap.merge` calls with `+=`.
+
+```python
+    def admit(self, r: Request, now: int, out: Outcome) -> bool:
+        if self.brownout.level().sheds(r.priority):
+            out.shed_at_door[r.priority] += 1
+            return False
+        self.queues[r.priority].enqueue(r, now)
+        return True
+
+    def next(self, now: int, out: Outcome) -> Optional[Request]:
+        for p in Priority:
+            q = self.queues[p]
+            before = q.dropped
+            r = q.dequeue(now)
+            dropped_now = q.dropped - before
+            if dropped_now > 0:
+                out.dropped_in_queue[p] += dropped_now
+            if r is not None:
+                if p in (Priority.CRITICAL, Priority.HIGH):
+                    self.brownout.observe(now - r.enqueued_millis)
+                return r
+        return None
+
+    def service_millis(self, r: Request) -> int:
+        return base_service_millis(r.priority) + (self._fraud.service_millis(self.flags) if r.priority == Priority.CRITICAL else 0)
+```
+
+#### Step 4b: The FIFO baseline
+
+One `deque`, admit everything, serve in order. `next` checks emptiness because `popleft()` on an empty deque raises rather than returning `None`.
+
+```python
+class FifoPolicy(Policy):
+    def __init__(self) -> None:
+        self._queue: deque[Request] = deque()
+        self._flags = Flags()
+        self._fraud = FraudScorer()
+
+    def name(self) -> str:
+        return "fifo, no shedding"
+
+    def admit(self, r: Request, now: int, out: Outcome) -> bool:
+        self._queue.append(r)
+        return True
+
+    def next(self, now: int, out: Outcome) -> Optional[Request]:
+        return self._queue.popleft() if self._queue else None
+```
+
+#### Step 5: The simulator
+
+One millisecond per iteration, up to three Bernoulli arrivals drawn from `JavaRandom`, eight workers that finish then pull. The chained comparison `overload_from <= now < overload_to` picks the rate; floating point appears only in the arrival draw.
+
+```python
+    def run(self, policy: Policy) -> Outcome:
+        random = JavaRandom(self.seed)
+        out = Outcome()
+        busy_until = [0] * self.workers
+        in_service: list[Optional[Request]] = [None] * self.workers
+        next_id = 1
+        for now in range(self.duration_millis):
+            rps = self.overload_rps if self.overload_from_millis <= now < self.overload_to_millis else self.normal_rps
+            # arrivals this millisecond: expected rps/1000, drawn as up to three Bernoulli trials for a Poisson-ish shape
+            p = rps / 3000.0
+            for _ in range(3):
+                if random.next_double() < p:
+                    r = Request(next_id, pick(random.next_double()), now)
+                    next_id += 1
+                    out.offered[r.priority] += 1
+                    policy.admit(r, now, out)
+            # workers: finish what is due, then pull the next request
+            for w in range(self.workers):
+                cur = in_service[w]
+                if cur is not None and busy_until[w] <= now:
+                    out.latencies[cur.priority].append(now - cur.arrival_millis)
+                    in_service[w] = None
+                if in_service[w] is None:
+                    r = policy.next(now, out)
+                    if r is not None:
+                        in_service[w] = r
+                        busy_until[w] = now + policy.service_millis(r)
+            policy.tick(now)
+        out.still_queued = policy.queued() + sum(1 for r in in_service if r is not None)
+        return out
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/13-graceful-degradation/code/python
@@ -379,38 +558,308 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Both tables and the brownout transitions match the Java output digit for digit:
+
+```console
+brownout transitions:
+  2100ms NORMAL -> SHED_LOW
+  2200ms SHED_LOW -> SHED_NORMAL
+  2900ms SHED_NORMAL -> SHED_LOW
+  3400ms SHED_LOW -> NORMAL
+  3500ms NORMAL -> SHED_LOW
+  3600ms SHED_LOW -> SHED_NORMAL
+  4300ms SHED_NORMAL -> SHED_LOW
+  5400ms SHED_LOW -> NORMAL
+time at each level (ms):  NORMAL=5799  SHED_LOW=1800  SHED_NORMAL=1400  CRITICAL_ONLY=0
+fraud.mode at end: full
+```
+
 ### In Go
 
+The Go port (`code/go/main.go` and `javarandom.go`) keeps the design with four differences. **The `DoDequeue` record is a pair of return values:** `doDequeue` returns `(*Request, bool)` and `Dequeue` unpacks it in place, so the RFC 8289 state machine reads line for line like the Java. `(long)(interval / Math.sqrt(c))` is `int64(float64(...) / math.Sqrt(...))`, which truncates toward zero exactly as the Java cast does; `target / 2` on `int64` truncates like Java `long`. The deque is a slice (`append` to push, `q.queue[1:]` to pop); `nil` replaces `null` for an empty queue. **Enums are typed integers with lookup tables:** `Priority` and `Level` are `int` constants with `Priorities`/`Levels` arrays standing in for `values()`, `String()` methods for the names, and `levelShedAtOrBelow` using `-1` where the Java `Level.NORMAL` carries `null`. The one-level-per-window escalation is `b.level++` / `b.level--`, the same ordinal arithmetic. `EnumMap<Priority, ...>` becomes fixed-size arrays indexed by `Priority` (`Offered[CRITICAL]`), which is what an `EnumMap` is underneath. **Constructor checks are errors:** `NewCoDelQueue` returns `error` for `target >= interval` and `NewDegradingPolicy` propagates it, where Java throws `IllegalArgumentException`; the demo unwraps with `mustQueue`/`mustPolicy` because its arguments are constants. **Arrivals come from `java.util.Random`:** `JavaRandom.NextDouble` reproduces `nextDouble()`, so seed 11 offers the same 12,038 requests, the brownout flips at the same milliseconds (2100, 2200, 2900, ...), and both tables match the Java output digit for digit; `TestOverloadProtectsCritical` pins 10403/1635 for FIFO and 9212/2814/3 for the degrading policy. A port that let real goroutines act as workers would need a `sync.Mutex` around each `CoDelQueue` and the controller; the single-threaded simulation here is the deterministic oracle such a port would be tested against.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Requests and priorities
+
+`Priority` is an `int` with `iota` constants; `Priorities` is the `values()` array and `priorityNames` backs `String()`. `Request` is handled through a pointer because `EnqueuedMillis` changes when the request is queued.
+
 ```go
-// doDequeue is RFC 8289 Section 5.3. The Java DoDequeue record is the pair of return values.
-func (q *CoDelQueue) doDequeue(now int64) (*Request, bool) {
-    if len(q.queue) == 0 {
-        q.firstAboveTime = 0
-        return nil, false
-    }
-    r := q.queue[0]
-    q.queue = q.queue[1:]
-    sojourn := now - r.EnqueuedMillis
-    ...
-    return r, now >= q.firstAboveTime // above target for a whole interval: ok to drop
+type Priority int
+
+const (
+	CRITICAL Priority = iota // authorize, capture: money moving now
+	HIGH                     // refunds, webhooks: money moving soon
+	NORMAL                   // balance reads, status polls
+	LOW                      // reporting, exports, analytics
+)
+
+var Priorities = [...]Priority{CRITICAL, HIGH, NORMAL, LOW}
+
+var priorityNames = [...]string{"CRITICAL", "HIGH", "NORMAL", "LOW"}
+
+func (p Priority) String() string { return priorityNames[p] }
+
+type Request struct {
+	Id             int64
+	Priority       Priority
+	ArrivalMillis  int64
+	EnqueuedMillis int64
 }
 
-func (q *CoDelQueue) controlLaw(t int64, c int) int64 {
-    return t + int64(float64(q.intervalMillis)/math.Sqrt(float64(c)))
+func NewRequest(id int64, priority Priority, arrivalMillis int64) *Request {
+	return &Request{id, priority, arrivalMillis, arrivalMillis}
 }
 ```
 
-Differences, all in `code/go/main.go` and `javarandom.go`:
+#### Step 2: CoDel
 
-- **The `DoDequeue` record is a pair of return values.** `doDequeue` returns `(*Request, bool)` and `Dequeue` unpacks it in place, so the RFC 8289 state machine reads line for line like the Java. `(long)(interval / Math.sqrt(c))` is `int64(float64(...) / math.Sqrt(...))`, which truncates toward zero exactly as the Java cast does; `target / 2` on `int64` truncates like Java `long`. The deque is a slice (`append` to push, `q.queue[1:]` to pop); `nil` replaces `null` for an empty queue.
-- **Enums are typed integers with lookup tables.** `Priority` and `Level` are `int` constants with `Priorities`/`Levels` arrays standing in for `values()`, `String()` methods for the names, and `levelShedAtOrBelow` using `-1` where the Java `Level.NORMAL` carries `null`. The one-level-per-window escalation is `b.level++` / `b.level--`, the same ordinal arithmetic. `EnumMap<Priority, ...>` becomes fixed-size arrays indexed by `Priority` (`Offered[CRITICAL]`), which is what an `EnumMap` is underneath.
-- **Constructor checks are errors.** `NewCoDelQueue` returns `error` for `target >= interval` and `NewDegradingPolicy` propagates it, where Java throws `IllegalArgumentException`; the demo unwraps with `mustQueue`/`mustPolicy` because its arguments are constants.
-- **Arrivals come from `java.util.Random`.** `JavaRandom.NextDouble` reproduces `nextDouble()`, so seed 11 offers the same 12,038 requests, the brownout flips at the same milliseconds (2100, 2200, 2900, ...), and both tables match the Java output digit for digit; `TestOverloadProtectsCritical` pins 10403/1635 for FIFO and 9212/2814/3 for the degrading policy. A port that let real goroutines act as workers would need a `sync.Mutex` around each `CoDelQueue` and the controller; the single-threaded simulation here is the deterministic oracle such a port would be tested against.
+`doDequeue` pops by reslicing and returns `(*Request, bool)`. `Dequeue` is the Section 5.4 state machine with the ternary on `count` written as an `if`; the builtin `max` tracks `MaxSojournSeen`.
+
+```go
+func (q *CoDelQueue) doDequeue(now int64) (*Request, bool) {
+	if len(q.queue) == 0 {
+		q.firstAboveTime = 0
+		return nil, false
+	}
+	r := q.queue[0]
+	q.queue = q.queue[1:]
+	sojourn := now - r.EnqueuedMillis
+	q.MaxSojournSeen = max(q.MaxSojournSeen, sojourn)
+	if sojourn < q.targetMillis {
+		q.firstAboveTime = 0 // delay is fine; reset the "above target since" clock
+		return r, false
+	}
+	if q.firstAboveTime == 0 {
+		q.firstAboveTime = now + q.intervalMillis // start the interval timer; do not drop yet
+		return r, false
+	}
+	return r, now >= q.firstAboveTime // above target for a whole interval: ok to drop
+}
+
+func (q *CoDelQueue) controlLaw(t int64, c int) int64 {
+	return t + int64(float64(q.intervalMillis)/math.Sqrt(float64(c)))
+}
+
+func (q *CoDelQueue) Dequeue(now int64) *Request {
+	r, ok := q.doDequeue(now)
+	if q.dropping {
+		if !ok {
+			q.dropping = false // sojourn fell under target: leave dropping state
+		} else {
+			for now >= q.dropNext && q.dropping {
+				q.Dropped++ // drop r
+				q.count++
+				r, ok = q.doDequeue(now)
+				if !ok {
+					q.dropping = false
+				} else {
+					q.dropNext = q.controlLaw(q.dropNext, q.count)
+				}
+			}
+		}
+	} else if ok {
+		q.Dropped++ // first drop of a new episode
+		r, _ = q.doDequeue(now)
+		q.dropping = true
+		// If we were dropping recently, resume at a higher rate instead of restarting from count = 1.
+		delta := q.count - q.lastCount
+		if delta > 1 && now-q.dropNext < 16*q.intervalMillis {
+			q.count = delta
+		} else {
+			q.count = 1
+		}
+		q.dropNext = q.controlLaw(now, q.count)
+		q.lastCount = q.count
+	}
+	return r
+}
+```
+
+#### Step 3: The brownout controller
+
+A tagless `switch` for the three bands; escalation is `b.level++` and de-escalation `b.level--` on the typed integer. `MillisAtLevel` is an array indexed by level.
+
+```go
+func (b *BrownoutController) Tick(nowMillis int64) {
+	b.MillisAtLevel[b.level] += nowMillis - b.lastTick
+	b.lastTick = nowMillis
+	if nowMillis-b.windowStart < b.windowMillis {
+		return
+	}
+	before := b.level
+	switch {
+	case b.windowMaxSojourn > b.targetMillis:
+		b.calmWindows = 0
+		if int(b.level) < len(Levels)-1 {
+			b.level++
+		}
+	case b.windowMaxSojourn <= b.targetMillis/2:
+		b.calmWindows++
+		if b.calmWindows >= b.cooldownWindows && b.level != LevelNormal {
+			b.level--
+			b.calmWindows = 0
+		}
+	default:
+		b.calmWindows = 0 // in the hysteresis band: hold
+	}
+	if b.level != before {
+		b.Transitions = append(b.Transitions, fmt.Sprintf("%dms %s -> %s", nowMillis, before, b.level))
+		b.flags.Set("fraud.mode", b.level.FraudMode())
+	}
+	b.windowMaxSojourn = 0
+	b.windowStart = nowMillis
+}
+```
+
+#### Step 4: The degrading policy
+
+`Queues` and the `Outcome` counters are arrays indexed by `Priority`, so `out.ShedAtDoor[r.Priority]++` is the `EnumMap.merge`. `Next` ranges over `Priorities` in order and observes only CRITICAL and HIGH sojourns.
+
+```go
+func (d *DegradingPolicy) Admit(r *Request, now int64, out *Outcome) bool {
+	if d.Brownout.Level().Sheds(r.Priority) {
+		out.ShedAtDoor[r.Priority]++
+		return false
+	}
+	d.Queues[r.Priority].Enqueue(r, now)
+	return true
+}
+
+func (d *DegradingPolicy) Next(now int64, out *Outcome) *Request {
+	for _, p := range Priorities {
+		q := d.Queues[p]
+		before := q.Dropped
+		r := q.Dequeue(now)
+		if droppedNow := q.Dropped - before; droppedNow > 0 {
+			out.DroppedInQueue[p] += droppedNow
+		}
+		if r != nil {
+			if p == CRITICAL || p == HIGH {
+				d.Brownout.Observe(now - r.EnqueuedMillis)
+			}
+			return r
+		}
+	}
+	return nil
+}
+
+func (d *DegradingPolicy) ServiceMillis(r *Request) int64 {
+	cost := BaseServiceMillis(r.Priority)
+	if r.Priority == CRITICAL {
+		cost += d.fraud.ServiceMillis(d.Flags)
+	}
+	return cost
+}
+```
+
+#### Step 4b: The FIFO baseline
+
+A slice as the queue; `Next` returns `nil` when empty and reslices otherwise.
+
+```go
+type FifoPolicy struct {
+	queue []*Request
+	flags *Flags
+	fraud FraudScorer
+}
+
+func NewFifoPolicy() *FifoPolicy { return &FifoPolicy{flags: NewFlags()} }
+
+func (f *FifoPolicy) Name() string { return "fifo, no shedding" }
+
+func (f *FifoPolicy) Admit(r *Request, now int64, out *Outcome) bool {
+	f.queue = append(f.queue, r)
+	return true
+}
+
+func (f *FifoPolicy) Next(now int64, out *Outcome) *Request {
+	if len(f.queue) == 0 {
+		return nil
+	}
+	r := f.queue[0]
+	f.queue = f.queue[1:]
+	return r
+}
+```
+
+#### Step 5: The simulator
+
+The same millisecond loop with `NewJavaRandom(s.Seed)` driving the arrivals; `Latencies` is an array of slices indexed by `Priority`, and the final loop counts the requests still in service.
+
+```go
+func (s Simulation) Run(policy Policy) *Outcome {
+	random := NewJavaRandom(s.Seed)
+	out := NewOutcome()
+	busyUntil := make([]int64, s.Workers)
+	inService := make([]*Request, s.Workers)
+	nextId := int64(1)
+	for now := int64(0); now < s.DurationMillis; now++ {
+		rps := s.NormalRps
+		if now >= s.OverloadFromMillis && now < s.OverloadToMillis {
+			rps = s.OverloadRps
+		}
+		// arrivals this millisecond: expected rps/1000, drawn as up to three Bernoulli trials for a Poisson-ish shape
+		p := rps / 3000.0
+		for k := 0; k < 3; k++ {
+			if random.NextDouble() < p {
+				r := NewRequest(nextId, Pick(random.NextDouble()), now)
+				nextId++
+				out.Offered[r.Priority]++
+				policy.Admit(r, now, out)
+			}
+		}
+		// workers: finish what is due, then pull the next request
+		for w := 0; w < s.Workers; w++ {
+			if inService[w] != nil && busyUntil[w] <= now {
+				out.Latencies[inService[w].Priority] = append(out.Latencies[inService[w].Priority], now-inService[w].ArrivalMillis)
+				inService[w] = nil
+			}
+			if inService[w] == nil {
+				if r := policy.Next(now, out); r != nil {
+					inService[w] = r
+					busyUntil[w] = now + policy.ServiceMillis(r)
+				}
+			}
+		}
+		policy.Tick(now)
+	}
+	out.StillQueued = int64(policy.Queued())
+	for _, r := range inService {
+		if r != nil {
+			out.StillQueued++
+		}
+	}
+	return out
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/13-graceful-degradation/code/go
 go run .
 go test ./...
+```
+
+Both tables match the Java output digit for digit:
+
+```console
+-- fifo, no shedding --
+priority   offered     shed  dropped completed   p50 ms   p99 ms
+CRITICAL      3577        0        0      3078     1362     2700
+HIGH          1206        0        0      1045     1421     2674
+NORMAL        4799        0        0      4150     1404     2693
+LOW           2456        0        0      2130     1410     2694
+total: offered 12038, completed 10403, shed at door 0, dropped in queue 0, still queued at end 1635
+
+-- priority + CoDel + brownout --
+priority   offered     shed  dropped completed   p50 ms   p99 ms
+CRITICAL      3577        0        0      3571        5       25
+HIGH          1206        0        0      1205        4       75
+NORMAL        4799     1358        3      3438        3      144
+LOW           2456     1456        0       998        6      317
+total: offered 12038, completed 9212, shed at door 2814, dropped in queue 3, still queued at end 9
 ```
 
 ## Use It

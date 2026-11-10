@@ -419,20 +419,244 @@ payouts 200, total 10451307.57 USD, carried 0, ties out true, file valid true
 
 ### In Python
 
-`code/python/main.py` has the same classes (`FeeSchedule`, `Ledger`, `Platform`, `BatchSettler`, `SettlementFile`, `RealTimeSettler`, `LiquidityComparison`) and prints the same demo, down to the 43,711 real-time transfers of the seeded day. What differs:
+The Python port (`code/python/main.py`, tests in `test_main.py`) has the same classes (`FeeSchedule`, `Ledger`, `Platform`, `BatchSettler`, `SettlementFile`, `RealTimeSettler`, `LiquidityComparison`) and prints the same demo, down to the 43,711 real-time transfers of the seeded day. What differs: **Half-even division works on magnitudes.** `//` floors toward negative infinity, so `divide_rounded` uses `divmod(abs(dividend), abs(divisor))` and reapplies the sign, exactly as Phase 10, Lesson 01 does; otherwise a negative fee would round the wrong way, and the fee on 45.50 is 1.62 in both languages because of this. **Instants are aware `datetime`s:** event times and the cutoff are `datetime` objects with `timezone.utc`; comparing one with a naive `datetime` raises `TypeError`, which is better than the silent offset Java's `LocalDateTime` would give, and `instant("2026-03-31T23:00:00Z")` is the port's `Instant.parse`. **Sorted iteration is explicit:** Java's `TreeMap` gives the netting loop and the ledger view their deterministic order for free; the port keeps plain dicts and iterates `sorted(net)` and `sorted(self._balances)` where the order is visible (instruction sequence numbers, the ledger printout). **The seeded day uses `java.util.Random`, reimplemented:** `generated_day` draws from a 20-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop), so seed 7 yields the same 50,000 events and the same totals as the Java run. `UnbalancedJournalException` is a `RuntimeError`, `CurrencyMismatchError` a `ValueError`, and the idempotent rerun is checked with `is`, the identity test behind Java's `==` on references. The Python tests port every Java check (51 assertions).
 
-- **Half-even division works on magnitudes.** `//` floors toward negative infinity, so `divide_rounded` uses `divmod(abs(dividend), abs(divisor))` and reapplies the sign, exactly as Phase 10, Lesson 01 does; otherwise a negative fee would round the wrong way. The fee on 45.50 is 1.62 in both languages because of this.
-- **Instants are aware `datetime`s.** Event times and the cutoff are `datetime` objects with `timezone.utc`; comparing one with a naive `datetime` raises `TypeError`, which is better than the silent offset Java's `LocalDateTime` would give. `instant("2026-03-31T23:00:00Z")` is the port's `Instant.parse`.
-- **Sorted iteration is explicit.** Java's `TreeMap` gives the netting loop and the ledger view their deterministic order for free; the port keeps plain dicts and iterates `sorted(net)` and `sorted(self._balances)` where the order is visible (instruction sequence numbers, the ledger printout).
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Money, copied
+
+`divide_rounded` takes the sign out, uses `divmod` on magnitudes, applies the rounding rule, and puts the sign back, because Python's `//` floors where Java's `/` truncates. `times` multiplies the exact rational and rounds once; Python ints make `multiplyExact` unnecessary.
 
 ```python
-for merchant_id in sorted(net):  # TreeMap order: one deterministic sequence per merchant id
-    amount = net[merchant_id]
-    if amount.is_positive() and amount >= self.minimum_payout:
-        instructions.append(PayoutInstruction(len(instructions) + 1, merchant_id, m.routing, m.account, amount))
+def divide_rounded(dividend: int, divisor: int, rounding: Rounding) -> int:
+    """Integer division with an explicit rounding rule. Python's // floors toward -inf, so the work is done on
+    magnitudes and the sign reapplied, which is what Java's truncating / and % give."""
+    sign = -1 if (dividend < 0) != (divisor < 0) else 1
+    quotient, remainder = divmod(abs(dividend), abs(divisor))
+    abs_divisor = abs(divisor)
+    if remainder == 0:
+        return sign * quotient
+    twice = remainder * 2
+    if rounding is Rounding.UP:
+        quotient += 1
+    elif rounding is Rounding.HALF_UP:
+        if twice >= abs_divisor:
+            quotient += 1
+    elif rounding is Rounding.HALF_EVEN:
+        if twice > abs_divisor or (twice == abs_divisor and quotient % 2 == 1):
+            quotient += 1
+    return sign * quotient
+
+    def times(self, numerator: int, denominator: int, rounding: Rounding) -> "Money":
+        return Money(divide_rounded(self.minor_units * numerator, denominator, rounding), self.currency)
 ```
 
-- **The seeded day uses `java.util.Random`, reimplemented.** `generated_day` draws from a 20-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop), so seed 7 yields the same 50,000 events and the same totals as the Java run. `UnbalancedJournalException` is a `RuntimeError`, `CurrencyMismatchError` a `ValueError`, and the idempotent rerun is checked with `is`, the identity test behind Java's `==` on references.
+#### Step 2: Events and the fee schedule
+
+`SettlementEvent.__post_init__` rejects a non-positive amount, so the type alone carries the sign. `fee_for` and `merchant_effect` are `if` chains over `EventType`; `merchant_effect` is the single definition of what an event does to a merchant balance.
+
+```python
+class SettlementEvent:
+    """One money-moving event that the acquirer will settle with the platform: amount is always positive."""
+
+    id: str
+    merchant_id: str
+    type: EventType
+    amount: Money
+    at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.amount.is_positive():
+            raise ValueError(f"event amounts are positive; the type gives the sign: {self.id}")
+
+
+@dataclass(frozen=True)
+class FeeSchedule:
+    """Percentage fee (numerator/denominator) plus a fixed fee per capture, and a flat chargeback fee."""
+
+    percent_numerator: int
+    percent_denominator: int
+    fixed: Money
+    chargeback_fee: Money
+
+    @staticmethod
+    def standard(c: Currency) -> "FeeSchedule":
+        return FeeSchedule(29, 1000, Money.of_minor(30, c), Money.of_minor(1500, c))  # 2.9% + 0.30, 15.00
+
+    def fee_for(self, e: SettlementEvent) -> Money:
+        """Fee the platform keeps on this event. Refunds return no fee (the common card-acquiring policy)."""
+        if e.type is EventType.CAPTURE:
+            return e.amount.times(self.percent_numerator, self.percent_denominator, Rounding.HALF_EVEN).plus(self.fixed)
+        if e.type is EventType.REFUND:
+            return Money.zero(e.amount.currency)
+        return self.chargeback_fee
+
+    def merchant_effect(self, e: SettlementEvent) -> Money:
+        """Signed effect of the event on what the platform owes the merchant."""
+        if e.type is EventType.CAPTURE:
+            return e.amount.minus(self.fee_for(e))
+        if e.type is EventType.REFUND:
+            return e.amount.negate()
+        return e.amount.plus(self.chargeback_fee).negate()
+```
+
+#### Step 3: The ledger
+
+`post` returns `False` for a repeated journal id, raises `UnbalancedJournalException` when the postings do not sum to zero, applies the postings, and tracks `_min_cash` for `peak_prefunding`.
+
+```python
+    def post(self, journal_id: str, postings: list) -> bool:
+        """Post a balanced journal once. Returns False (and changes nothing) if the id was already posted."""
+        if journal_id in self._journals:
+            return False
+        total = sum(p.minor for p in postings)
+        if total != 0:
+            raise UnbalancedJournalException(journal_id, total)
+        for p in postings:
+            self._balances[p.account] = self._balances.get(p.account, 0) + p.minor
+        self._journals[journal_id] = tuple(postings)
+        self._min_cash = min(self._min_cash, self._balances.get(self.CASH, 0))
+        return True
+```
+
+#### Step 4: Booking events as they happen
+
+`book` validates merchant and currency, builds the posting list from the Concept's table, and posts under `evt:<id>` so a webhook delivered twice books once; the event is recorded only when the journal was fresh.
+
+```python
+    def book(self, e: SettlementEvent) -> bool:
+        """Post the event's journal at the moment it happens. Idempotent on event id."""
+        if e.merchant_id not in self.merchants:
+            raise ValueError(f"unknown merchant {e.merchant_id}")
+        if e.amount.currency != self.ledger.currency:
+            raise CurrencyMismatchError(self.ledger.currency, e.amount.currency)
+        payable = Ledger.merchant_payable(e.merchant_id)
+        amount = e.amount.minor_units
+        fee = self.fees.fee_for(e).minor_units
+        if e.type is EventType.CAPTURE:
+            postings = [Posting(Ledger.PROCESSOR_RECEIVABLE, amount),
+                        Posting(payable, -(amount - fee)),
+                        Posting(Ledger.FEE_REVENUE, -fee)]
+        elif e.type is EventType.REFUND:
+            postings = [Posting(payable, amount),
+                        Posting(Ledger.PROCESSOR_RECEIVABLE, -amount)]
+        else:
+            postings = [Posting(payable, amount + fee),
+                        Posting(Ledger.PROCESSOR_RECEIVABLE, -amount),
+                        Posting(Ledger.FEE_REVENUE, -fee)]
+        fresh = self.ledger.post(f"evt:{e.id}", postings)
+        if fresh:
+            self.events.append(e)
+        return fresh
+```
+
+#### Step 5: Selecting and netting the batch
+
+`run` returns the existing batch for a repeated id, selects unsettled events strictly before the cutoff for merchants not on hold, nets `merchant_effect` per merchant into a dict, accumulates the acquirer funding, and adds in the carries.
+
+```python
+    def run(self, business_date: date, cutoff: datetime) -> SettlementBatch:
+        """Close the books for one business date. Every booked, unsettled event before the cutoff for a merchant not
+        on hold is netted into one amount per merchant. Positive nets at or above the minimum become payout
+        instructions; the rest are carried to the next batch. Running the same business date twice returns the
+        first batch unchanged: the batch id is the idempotency key."""
+        batch_id = f"BATCH-{business_date}"
+        existing = self._batches.get(batch_id)
+        if existing is not None:
+            return existing
+
+        c = self.platform.ledger.currency
+        net: dict[str, Money] = {}
+        included: dict[str, list[str]] = {}
+        funding = Money.zero(c)
+        for e in self.platform.events:
+            if e.id in self._settled_by or not e.at < cutoff:
+                continue
+            m = self.platform.merchants[e.merchant_id]
+            if m.on_hold:
+                continue
+            net[e.merchant_id] = net.get(e.merchant_id, Money.zero(c)).plus(self.platform.fees.merchant_effect(e))
+            included.setdefault(e.merchant_id, []).append(e.id)
+            funding = funding.plus(FeeSchedule.processor_effect(e))
+        for merchant_id, carried in self._carry.items():
+            if not self.platform.merchants[merchant_id].on_hold:
+                net[merchant_id] = net.get(merchant_id, Money.zero(c)).plus(carried)
+```
+
+#### Step 6: Instructions and carries
+
+`sorted(net)` plays the `TreeMap`, so instruction sequence numbers are deterministic by merchant id. A positive net at or above the minimum becomes an instruction plus a `payout:` journal; anything else non-zero is carried; included events are marked with the batch id.
+
+```python
+        instructions: list[PayoutInstruction] = []
+        carried_out: dict[str, Money] = {}
+        for merchant_id in sorted(net):  # TreeMap order: one deterministic sequence per merchant id
+            amount = net[merchant_id]
+            m = self.platform.merchants[merchant_id]
+            if amount.is_positive() and amount >= self.minimum_payout:
+                p = PayoutInstruction(len(instructions) + 1, merchant_id, m.routing, m.account, amount)
+                instructions.append(p)
+                self.platform.ledger.post(f"payout:{batch_id}:{merchant_id}", [
+                    Posting(Ledger.merchant_payable(merchant_id), amount.minor_units),
+                    Posting(Ledger.PAYOUTS_IN_TRANSIT, -amount.minor_units)])
+                self._carry.pop(merchant_id, None)
+            elif amount.minor_units != 0:
+                self._carry[merchant_id] = amount
+                carried_out[merchant_id] = amount
+            else:
+                self._carry.pop(merchant_id, None)
+        event_ids: list[str] = []
+        for merchant_id in sorted(included):
+            for event_id in included[merchant_id]:
+                self._settled_by[event_id] = batch_id
+                event_ids.append(event_id)
+        batch = SettlementBatch(batch_id, business_date, cutoff, tuple(event_ids), tuple(instructions),
+                                {k: carried_out[k] for k in sorted(carried_out)}, funding)
+        self._batches[batch_id] = batch
+        return batch
+```
+
+#### Step 7: The file and the tie-out
+
+`entry_hash` sums the first eight digits of each routing number modulo 10^10. `ties_out` derives each merchant's expected balance from carries plus unsettled events and compares it with the ledger's `owed_to`, then checks the trial balance.
+
+```python
+    def entry_hash(instructions) -> int:
+        return sum(int(p.routing[:8]) for p in instructions) % 10_000_000_000
+
+    def ties_out(self) -> bool:
+        """The tie-out: for every merchant, the ledger's payable balance must equal what is carried plus the effect
+        of events not yet settled. If this is False, a payout was lost or paid twice."""
+        expected: dict[str, Money] = {mid: self.carried(mid) for mid in self.platform.merchants}
+        for e in self.platform.events:
+            if e.id not in self._settled_by:
+                expected[e.merchant_id] = expected[e.merchant_id].plus(self.platform.fees.merchant_effect(e))
+        for merchant_id, amount in expected.items():
+            if self.platform.ledger.owed_to(merchant_id) != amount:
+                return False
+        return self.platform.ledger.trial_balance() == 0
+```
+
+#### Step 8: The real-time settler
+
+`on_event` books through the same `Platform.book`, then sweeps the whole positive balance to `CASH` under `rt:<id>`; there is no in-transit state on an instant rail.
+
+```python
+    def on_event(self, e: SettlementEvent) -> None:
+        """Book the event, then sweep the merchant's positive balance over an instant rail."""
+        if not self.platform.book(e):
+            return
+        owed = self.platform.ledger.owed_to(e.merchant_id)
+        if not owed.is_positive():
+            return
+        self._transfers += 1
+        self._gross_paid = self._gross_paid.plus(owed)
+        self.platform.ledger.post(f"rt:{e.id}", [
+            Posting(Ledger.merchant_payable(e.merchant_id), owed.minor_units),
+            Posting(Ledger.CASH, -owed.minor_units)])
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/14-payments-at-scale/05-batch-vs-real-time-settlement/code/python
@@ -440,25 +664,352 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The Python tests port every Java check (51 assertions) and the demo output is identical to the Java run.
+The output is identical to the Java run:
+
+```console
+== Settlement file ==
+H|BATCH-2026-03-31|2026-03-31|USD
+D|000001|m_acme|021000021|100200300|17360
+D|000002|m_cora|011000138|987654321|121315
+T|2|138675|0003200015
+receiver validation: true
+```
 
 ### In Go
 
-`code/go/main.go` has the same types (`FeeSchedule`, `Ledger`, `Platform`, `BatchSettler`, `SettlementFile`, `RealTimeSettler`, `LiquidityComparison`) and prints the same demo, down to the 43,711 real-time transfers of the seeded day (`javarandom.go` is the JDK generator). What differs:
+The Go port (`code/go/main.go`, tests in `main_test.go`) has the same types and prints the same demo, down to the 43,711 real-time transfers of the seeded day (`javarandom.go` is the JDK generator). What differs: **Errors are values, identity is a pointer.** `Ledger.Post` returns `(bool, error)` with `ErrUnbalancedJournal`; `Platform.Book` returns `ErrUnknownMerchant` or `ErrCurrencyMismatch`; `BatchSettler.Run` returns `(*SettlementBatch, error)`, and because the batch is a pointer the idempotent rerun check is the same `again == batch` the Java writes; `NewMerchant` and `NewSettlementEvent` validate where the Java compact constructors threw. Inside `Run` a `need(...)` helper panics on an error and a deferred `catch` converts it to the return value, so the netting loop stays readable. **Sorted iteration is explicit:** Go maps are unordered, so `Run` sorts the merchant ids before assigning instruction sequence numbers and `BalancesView` returns a sorted slice. **Half-even division needs no sign dance:** Go's `/` and `%` truncate toward zero like Java's, so `DivideRounded` is a line-for-line port and the fee on 45.50 is 1.62; `Times` and `Plus` go through `mulChecked`/`addChecked` where Java used `Math.multiplyExact`/`addExact`. **Instants are UTC `time.Time`:** `e.At.Before(cutoff)` is `Instant.isBefore`, and the seeded day's timestamps come from the same integer arithmetic as the Java; the file validator returns `false` on a malformed number instead of throwing `NumberFormatException`. The Go tests port every Java check (47 assertions).
 
-- **Errors are values, identity is a pointer.** `Ledger.Post` returns `(bool, error)` with `ErrUnbalancedJournal`; `Platform.Book` returns `ErrUnknownMerchant` or `ErrCurrencyMismatch`; `BatchSettler.Run` returns `(*SettlementBatch, error)`, and because the batch is a pointer the idempotent rerun check is the same `again == batch` the Java writes. `NewMerchant` and `NewSettlementEvent` validate where the Java compact constructors threw. Inside `Run` a `need(...)` helper panics on an error and a deferred `catch` converts it to the return value, so the netting loop stays readable.
-- **Sorted iteration is explicit.** Java's `TreeMap` orders the netting loop, the carried-forward map, and the ledger printout for free; Go maps are unordered, so `Run` sorts the merchant ids before assigning instruction sequence numbers and `BalancesView` returns a sorted slice:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Money, copied
+
+`Times` multiplies through `mulChecked` and hands the product to `DivideRounded`, which works on the signed quotient directly because Go's `/` and `%` truncate like Java's; `HalfEven` is the `default` arm.
 
 ```go
-sort.Strings(merchantIds) // TreeMap order: one deterministic sequence per merchant id
-for _, merchantId := range merchantIds {
-    amount := net[merchantId]
-    if amount.IsPositive() && amount.Compare(s.minimumPayout) >= 0 {
-        instructions = append(instructions, PayoutInstruction{len(instructions) + 1, merchantId, m.Routing, m.Account, amount})
+func (m Money) Times(numerator, denominator int64, rounding Rounding) (Money, error) {
+	product, err := mulChecked(m.MinorUnits, numerator)
+	if err != nil {
+		return Money{}, err
+	}
+	return Money{DivideRounded(product, denominator, rounding), m.Currency}, nil
+}
+
+// DivideRounded is integer division with an explicit rounding rule; Go's / and % truncate like Java's.
+func DivideRounded(dividend, divisor int64, rounding Rounding) int64 {
+	quotient := dividend / divisor
+	remainder := dividend % divisor
+	if remainder == 0 {
+		return quotient
+	}
+	sign := int64(1)
+	if (dividend < 0) != (divisor < 0) {
+		sign = -1
+	}
+	twice, abs := abs64(remainder)*2, abs64(divisor)
+	switch rounding {
+	case Down:
+		return quotient
+	case Up:
+		return quotient + sign
+	case HalfUp:
+		if twice >= abs {
+			return quotient + sign
+		}
+		return quotient
+	default: // HalfEven
+		if twice > abs {
+			return quotient + sign
+		}
+		if twice < abs || quotient%2 == 0 {
+			return quotient
+		}
+		return quotient + sign
+	}
+}
 ```
 
-- **Half-even division needs no sign dance.** Go's `/` and `%` truncate toward zero like Java's, so `DivideRounded` is a line-for-line port and the fee on 45.50 is 1.62; `Times` and `Plus` go through `mulChecked`/`addChecked` where Java used `Math.multiplyExact`/`addExact`.
-- **Instants are UTC `time.Time`.** `e.At.Before(cutoff)` is `Instant.isBefore`, and the seeded day's timestamps come from `time.Unix(dayStart+int64(i)*86_400/int64(count), 0)`, the same integer arithmetic as the Java. The file validator returns `false` on a malformed number instead of throwing `NumberFormatException`.
+#### Step 2: Events and the fee schedule
+
+`NewSettlementEvent` is the validating constructor. `FeeFor` and `MerchantEffect` are `switch`es over `EventType` that return `(Money, error)` because `Times`, `Plus`, and `Minus` are checked.
+
+```go
+type SettlementEvent struct {
+	Id         string
+	MerchantId string
+	Type       EventType
+	Amount     Money
+	At         time.Time
+}
+
+func NewSettlementEvent(id, merchantId string, t EventType, amount Money, at time.Time) (SettlementEvent, error) {
+	if !amount.IsPositive() {
+		return SettlementEvent{}, fmt.Errorf("event amounts are positive; the type gives the sign: %s", id)
+	}
+	return SettlementEvent{id, merchantId, t, amount, at}, nil
+}
+
+// FeeSchedule is a percentage fee (numerator/denominator) plus a fixed fee per capture, and a flat chargeback fee.
+type FeeSchedule struct {
+	PercentNumerator   int64
+	PercentDenominator int64
+	Fixed              Money
+	ChargebackFee      Money
+}
+
+func StandardFees(c Currency) FeeSchedule {
+	return FeeSchedule{29, 1000, OfMinor(30, c), OfMinor(1500, c)} // 2.9% + 0.30, 15.00
+}
+
+// FeeFor is the fee the platform keeps on this event. Refunds return no fee (the common card-acquiring policy).
+func (f FeeSchedule) FeeFor(e SettlementEvent) (Money, error) {
+	switch e.Type {
+	case Capture:
+		pct, err := e.Amount.Times(f.PercentNumerator, f.PercentDenominator, HalfEven)
+		if err != nil {
+			return Money{}, err
+		}
+		return pct.Plus(f.Fixed)
+	case Refund:
+		return Zero(e.Amount.Currency), nil
+	default:
+		return f.ChargebackFee, nil
+	}
+}
+
+// MerchantEffect is the signed effect of the event on what the platform owes the merchant.
+func (f FeeSchedule) MerchantEffect(e SettlementEvent) (Money, error) {
+	switch e.Type {
+	case Capture:
+		fee, err := f.FeeFor(e)
+		if err != nil {
+			return Money{}, err
+		}
+		return e.Amount.Minus(fee)
+	case Refund:
+		return e.Amount.Negate(), nil
+	default:
+		sum, err := e.Amount.Plus(f.ChargebackFee)
+		return sum.Negate(), err
+	}
+}
+```
+
+#### Step 3: The ledger
+
+`Post` returns `(false, nil)` for a duplicate id, sums with `addChecked`, wraps `ErrUnbalancedJournal` on a non-zero sum, applies the postings, copies them into the journal map, and updates `minCash` with the built-in `min`.
+
+```go
+func (l *Ledger) Post(journalId string, postings []Posting) (bool, error) {
+	if _, dup := l.journals[journalId]; dup {
+		return false, nil
+	}
+	var sum int64
+	for _, p := range postings {
+		var err error
+		if sum, err = addChecked(sum, p.Minor); err != nil {
+			return false, err
+		}
+	}
+	if sum != 0 {
+		return false, fmt.Errorf("%w: journal %s does not balance: sum %d", ErrUnbalancedJournal, journalId, sum)
+	}
+	for _, p := range postings {
+		next, err := addChecked(l.balances[p.Account], p.Minor)
+		if err != nil {
+			return false, err
+		}
+		l.balances[p.Account] = next
+	}
+	l.journals[journalId] = append([]Posting{}, postings...)
+	l.minCash = min(l.minCash, l.balances[Cash])
+	return true, nil
+}
+```
+
+#### Step 4: Booking events as they happen
+
+`Book` wraps `ErrUnknownMerchant` and `ErrCurrencyMismatch`, builds the posting slice from a `switch`, and appends the event only when the `evt:` journal was fresh.
+
+```go
+func (p *Platform) Book(e SettlementEvent) (bool, error) {
+	if _, ok := p.Merchants[e.MerchantId]; !ok {
+		return false, fmt.Errorf("%w %s", ErrUnknownMerchant, e.MerchantId)
+	}
+	if e.Amount.Currency != p.Ledger.Currency {
+		return false, fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, p.Ledger.Currency.Code, e.Amount.Currency.Code)
+	}
+	payable := MerchantPayable(e.MerchantId)
+	amount := e.Amount.MinorUnits
+	feeMoney, err := p.Fees.FeeFor(e)
+	if err != nil {
+		return false, err
+	}
+	fee := feeMoney.MinorUnits
+	var postings []Posting
+	switch e.Type {
+	case Capture:
+		postings = []Posting{{ProcessorReceivable, amount}, {payable, -(amount - fee)}, {FeeRevenue, -fee}}
+	case Refund:
+		postings = []Posting{{payable, amount}, {ProcessorReceivable, -amount}}
+	default:
+		postings = []Posting{{payable, amount + fee}, {ProcessorReceivable, -amount}, {FeeRevenue, -fee}}
+	}
+	fresh, err := p.Ledger.Post("evt:"+e.Id, postings)
+	if err != nil {
+		return false, err
+	}
+	if fresh {
+		p.Events = append(p.Events, e)
+	}
+	return fresh, nil
+}
+```
+
+#### Step 5: Selecting and netting the batch
+
+`Run` uses `defer catch(&err)` and `need(...)` so the loop reads like the Java; `addNet` merges into the `net` map, and the same half-open cutoff and hold rules apply.
+
+```go
+func (s *BatchSettler) Run(businessDate, cutoff time.Time) (batch *SettlementBatch, err error) {
+	defer catch(&err)
+	batchId := "BATCH-" + isoDate(businessDate)
+	if existing, ok := s.batches[batchId]; ok {
+		return existing, nil
+	}
+
+	c := s.platform.Ledger.Currency
+	net := map[string]Money{}
+	included := map[string][]string{}
+	funding := Zero(c)
+	addNet := func(id string, m Money) {
+		cur, ok := net[id]
+		if !ok {
+			net[id] = m
+			return
+		}
+		net[id] = need(cur.Plus(m))
+	}
+	for _, e := range s.platform.Events {
+		if s.IsSettled(e.Id) || !e.At.Before(cutoff) {
+			continue
+		}
+		if s.platform.Merchants[e.MerchantId].OnHold {
+			continue
+		}
+		addNet(e.MerchantId, need(s.platform.Fees.MerchantEffect(e)))
+		included[e.MerchantId] = append(included[e.MerchantId], e.Id)
+		funding = need(funding.Plus(ProcessorEffect(e)))
+	}
+	for id, carried := range s.carry {
+		if !s.platform.Merchants[id].OnHold {
+			addNet(id, carried)
+		}
+	}
+```
+
+#### Step 6: Instructions and carries
+
+`sort.Strings(merchantIds)` supplies the `TreeMap` order; the tagless `switch` issues an instruction and a `payout:` journal, carries a non-zero remainder, or clears the carry. Included ids are also sorted before being marked settled.
+
+```go
+	merchantIds := make([]string, 0, len(net))
+	for id := range net {
+		merchantIds = append(merchantIds, id)
+	}
+	sort.Strings(merchantIds) // TreeMap order: one deterministic sequence per merchant id
+	instructions := []PayoutInstruction{}
+	carriedOut := map[string]Money{}
+	for _, merchantId := range merchantIds {
+		amount := net[merchantId]
+		m := s.platform.Merchants[merchantId]
+		switch {
+		case amount.IsPositive() && amount.Compare(s.minimumPayout) >= 0:
+			instructions = append(instructions, PayoutInstruction{len(instructions) + 1, merchantId, m.Routing, m.Account, amount})
+			need(s.platform.Ledger.Post("payout:"+batchId+":"+merchantId, []Posting{
+				{MerchantPayable(merchantId), amount.MinorUnits}, {PayoutsInTransit, -amount.MinorUnits}}))
+			delete(s.carry, merchantId)
+		case amount.MinorUnits != 0:
+			s.carry[merchantId] = amount
+			carriedOut[merchantId] = amount
+		default:
+			delete(s.carry, merchantId)
+		}
+	}
+	eventIds := []string{}
+	includedIds := make([]string, 0, len(included))
+	for id := range included {
+		includedIds = append(includedIds, id)
+	}
+	sort.Strings(includedIds)
+	for _, merchantId := range includedIds {
+		for _, id := range included[merchantId] {
+			s.settledBy[id] = batchId
+			eventIds = append(eventIds, id)
+		}
+	}
+	batch = &SettlementBatch{batchId, businessDate, cutoff, eventIds, instructions, carriedOut, funding}
+	s.batches[batchId] = batch
+	return batch, nil
+}
+```
+
+#### Step 7: The file and the tie-out
+
+`EntryHash` parses the first eight routing digits with `strconv.ParseInt`. `TiesOut` builds the expected map from carries and unsettled events (unwrapping with `need`) and compares with `OwedTo` and the trial balance.
+
+```go
+func (settlementFile) EntryHash(instructions []PayoutInstruction) int64 {
+	var hash int64
+	for _, p := range instructions {
+		n, _ := strconv.ParseInt(p.Routing[:8], 10, 64)
+		hash += n
+	}
+	return hash % 10_000_000_000
+}
+
+func (s *BatchSettler) TiesOut() bool {
+	expected := map[string]Money{}
+	for _, id := range s.platform.merchantIds() {
+		expected[id] = s.Carried(id)
+	}
+	for _, e := range s.platform.Events {
+		if !s.IsSettled(e.Id) {
+			expected[e.MerchantId] = need(expected[e.MerchantId].Plus(need(s.platform.Fees.MerchantEffect(e))))
+		}
+	}
+	for id, amount := range expected {
+		if s.platform.Ledger.OwedTo(id) != amount {
+			return false
+		}
+	}
+	return s.platform.Ledger.TrialBalance() == 0
+}
+```
+
+#### Step 8: The real-time settler
+
+`OnEvent` returns the `Book` error or `nil` for a rebooked event, then posts the sweep to `Cash` under `rt:<id>`, accumulating `grossPaid` through the checked `Plus`.
+
+```go
+func (r *RealTimeSettler) OnEvent(e SettlementEvent) error {
+	fresh, err := r.platform.Book(e)
+	if err != nil || !fresh {
+		return err
+	}
+	owed := r.platform.Ledger.OwedTo(e.MerchantId)
+	if !owed.IsPositive() {
+		return nil
+	}
+	r.transfers++
+	if r.grossPaid, err = r.grossPaid.Plus(owed); err != nil {
+		return err
+	}
+	_, err = r.platform.Ledger.Post("rt:"+e.Id, []Posting{{MerchantPayable(e.MerchantId), owed.MinorUnits}, {Cash, -owed.MinorUnits}})
+	return err
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/14-payments-at-scale/05-batch-vs-real-time-settlement/code/go
@@ -466,7 +1017,16 @@ go run .
 go test ./...
 ```
 
-The Go tests port every Java check (47 assertions) and the demo output is identical to the Java run.
+The output is identical to the Java run; the seeded day reads:
+
+```console
+== 200 merchants, 50,000 events, seed 7 ==
+payouts 200, total 10451307.57 USD, carried 0, ties out true, file valid true
+                             batch (T+1)        real time
+  transfers sent             200                43711
+  value paid to merchants    10451307.57 USD    10456712.42 USD
+  peak prefunding            0.00 USD           10456712.42 USD
+```
 
 ## Use It
 

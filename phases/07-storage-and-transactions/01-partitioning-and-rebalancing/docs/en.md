@@ -367,23 +367,205 @@ The three percentages in the middle block are the lesson. Keep them for the next
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **64-bit wraparound is explicit:** Python integers never overflow, so every multiply in `fnv1a64` and `hash64` is masked with `MASK64 = 0xFFFFFFFFFFFFFFFF`, and forgetting one mask makes the hash grow without bound and changes every partition number; the hash iterates UTF-16 code units, which is exactly what Java's `charAt` sees (and the same as the bytes for ASCII keys), so both languages route every key to the same partition, and Python's built-in `hash()` is randomised per process and is never used. **Unsigned by default:** the masked value is already non-negative, so `hash64(key) % P` replaces `Long.remainderUnsigned`, and the test compares `fnv1a64("")` with `0xCBF29CE484222325` directly where in Java the same bits are a negative `long`; the ring sorts unsigned values where Java's `TreeMap` sorts signed ones, which is a rotation of the same circle, so "first node clockwise" picks the same owner. **The ring is a sorted list plus `bisect`:** `bisect_left` on the sorted hashes is `TreeMap.ceilingEntry`, with an explicit wrap to index 0; `partitions_per_node` returns a dict built from `sorted(...)`, and dict insertion order stands in for `LinkedHashMap` in the rebalancer's donor choice. **Exceptions:** `IllegalArgumentException` maps to `ValueError`, `IllegalStateException` to `RuntimeError`, and `WrongOwnerException` is a `RuntimeError` subclass carrying `partition` and `current_version`; `Rebalancer.Move` is a frozen dataclass whose source field is `from_`, because `from` is a keyword.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo prints the same numbers as the Java version (79.8%, 18.9%, 21.2%, 236 keys copied).
+
+#### Step 1: A stable hash
+
+`Partitioner` is a base class with two abstract methods and two static hash helpers. `fnv1a64` walks the UTF-16 big-endian encoding two bytes at a time, xors the code unit in, multiplies, and masks; `hash64` applies the SplitMix64 finaliser with a mask after each multiply. The right shifts are logical because the value is kept non-negative.
+
 ```python
-@staticmethod
-def fnv1a64(key: str) -> int:
-    h = 0xCBF29CE484222325
-    data = key.encode("utf-16-be")
-    for i in range(0, len(data), 2):
-        h ^= (data[i] << 8) | data[i + 1]
-        h = (h * 0x100000001B3) & MASK64
-    return h
+    @staticmethod
+    def fnv1a64(key: str) -> int:
+        h = 0xCBF29CE484222325
+        data = key.encode("utf-16-be")
+        for i in range(0, len(data), 2):
+            h ^= (data[i] << 8) | data[i + 1]
+            h = (h * 0x100000001B3) & MASK64
+        return h
+
+    @staticmethod
+    def hash64(key: str) -> int:
+        z = Partitioner.fnv1a64(key)
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        return z ^ (z >> 31)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: Range and hash partitioners
 
-- **64-bit wraparound is explicit.** Python integers never overflow, so every multiply in `fnv1a64` and `hash64` is masked with `MASK64 = 0xFFFFFFFFFFFFFFFF`. Forget one mask and the hash grows without bound and every partition number changes. The hash iterates UTF-16 code units, which is exactly what Java's `charAt` sees (and the same as the bytes for ASCII keys), so both languages route every key to the same partition. Python's built-in `hash()` is randomised per process and is never used.
-- **Unsigned by default.** The masked value is already non-negative, so `hash64(key) % P` replaces `Long.remainderUnsigned`. The test compares `fnv1a64("")` with `0xCBF29CE484222325` directly; in Java the same bits are a negative `long`. The ring sorts unsigned values where Java's `TreeMap` sorts signed ones; that is a rotation of the same circle, so "first node clockwise" picks the same owner.
-- **The ring is a sorted list plus `bisect`.** `bisect_left` on the sorted hashes is `TreeMap.ceilingEntry`, with an explicit wrap to index 0. `partitions_per_node` returns a dict built from `sorted(...)`, and dict insertion order stands in for `LinkedHashMap` in the rebalancer's donor choice.
-- **Exceptions.** `IllegalArgumentException` maps to `ValueError`, `IllegalStateException` to `RuntimeError`, and `WrongOwnerException` is a `RuntimeError` subclass carrying `partition` and `current_version`. `Rebalancer.Move` is a frozen dataclass whose source field is `from_`, because `from` is a keyword.
+The range partitioner validates strict ordering in `__init__` with `ValueError` and stores the split points as a tuple; `partition_of` is the same binary search for "how many split points are at or below this key", using `<=` on strings. The hash partitioner takes a plain `%` because the hash is already unsigned.
+
+```python
+class RangePartitioner(Partitioner):
+    def __init__(self, split_points: list[str]) -> None:
+        for i in range(1, len(split_points)):
+            if split_points[i - 1] >= split_points[i]:
+                raise ValueError("split points must be strictly increasing")
+        self._split_points = tuple(split_points)
+
+    def partition_of(self, key: str) -> int:
+        lo, hi = 0, len(self._split_points)  # find the number of split points <= key
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if self._split_points[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def partition_count(self) -> int:
+        return len(self._split_points) + 1
+
+
+class HashPartitioner(Partitioner):
+    def partition_of(self, key: str) -> int:
+        return Partitioner.hash64(key) % self._partitions  # unsigned already: Java needs Long.remainderUnsigned
+```
+
+#### Step 3: Hot-key detection and salting
+
+`skew` divides the hottest partition's hits by the mean, with 1.0 for an empty detector. `salt` derives the suffix from `hash64(secondary) % fanout`, so the same payment always lands on the same salted key.
+
+```python
+    def skew(self) -> float:
+        if self._total == 0:
+            return 1.0
+        mean = self._total / len(self._hits)
+        return self._hits[self.hottest_partition()] / mean
+
+    @staticmethod
+    def salt(key: str, secondary: str, fanout: int) -> str:
+        s = Partitioner.hash64(secondary) % fanout
+        return f"{key}#{s}"
+```
+
+#### Step 4: The versioned routing table
+
+The owner array is a list comprehension over the partition count with a round-robin layout. `assign` rejects `None` explicitly (Java would throw on `equals`) and bumps the version only when the owner actually changes.
+
+```python
+class RoutingTable:
+    def __init__(self, partitioner: Partitioner, nodes: list[str]) -> None:
+        if not nodes:
+            raise ValueError("need at least one node")
+        self._partitioner = partitioner
+        self._owner = [nodes[p % len(nodes)] for p in range(partitioner.partition_count())]  # round-robin layout
+        self._version = 1
+
+    def owner_of(self, partition: int) -> str:
+        return self._owner[partition]
+
+    def node_for(self, key: str) -> str:
+        return self._owner[self._partitioner.partition_of(key)]
+
+    def assign(self, partition: int, node: str) -> None:
+        if node is None:
+            raise TypeError("node must not be None")
+        if node != self._owner[partition]:
+            self._owner[partition] = node
+            self._version += 1
+```
+
+#### Step 5: Planning the minimum rebalance
+
+`owned` is a dict comprehension, and because dicts keep insertion order, `_most_loaded` breaks ties the way the Java `LinkedHashMap` loop does. `list.pop()` takes the highest-numbered partition from the donor, and each move is a frozen `Move(partition, from_, to)`.
+
+```python
+    @staticmethod
+    def plan_add_node(table: RoutingTable, new_node: str) -> list["Rebalancer.Move"]:
+        if new_node in table.nodes():
+            raise ValueError(f"node already present: {new_node}")
+        moves: list[Rebalancer.Move] = []
+        owned: dict[str, list[int]] = {n: list(table.partitions_of(n)) for n in table.nodes()}
+        owned[new_node] = []
+        target = table.partition_count() // len(owned)  # the new node gets floor(P / N)
+        while len(owned[new_node]) < target:
+            donor = Rebalancer._most_loaded(owned)
+            partition = owned[donor].pop()  # take the highest-numbered partition: deterministic
+            owned[new_node].append(partition)
+            moves.append(Rebalancer.Move(partition, donor, new_node))
+        return moves
+
+    @staticmethod
+    def _most_loaded(owned: dict[str, list[int]]) -> str:
+        best = None
+        for name, parts in owned.items():  # dict order is insertion order, like LinkedHashMap
+            if best is None or len(parts) > len(owned[best]):
+                best = name
+        return best
+```
+
+#### Step 6: Nodes that know what they own
+
+`put` and `get` call `_require_owner`, which raises `WrongOwnerException` with the partition and the table's current version; `get` returns `None` for an absent key. `put_direct` skips the check for the migration's use.
+
+```python
+class WrongOwnerException(RuntimeError):
+    def __init__(self, partition: int, current_version: int) -> None:
+        super().__init__(f"partition {partition} not owned here; routing table is now at version {current_version}")
+        self.partition = partition
+        self.current_version = current_version
+
+
+class StorageNode:
+    def put(self, key: str, value: str) -> None:
+        self._require_owner(key)
+        self._data[key] = value
+
+    def get(self, key: str) -> str | None:
+        self._require_owner(key)
+        return self._data.get(key)
+
+    def put_direct(self, key: str, value: str) -> None:
+        self._data[key] = value
+
+    def _require_owner(self, key: str) -> None:
+        p = self._table.partitioner().partition_of(key)
+        if self._table.owner_of(p) != self.name:
+            raise WrongOwnerException(p, self._table.version())
+```
+
+#### Step 7: The migration state machine
+
+`State` is an `Enum` nested in the class, compared with `is`. Each transition calls `_require_state`, which raises `RuntimeError`; `write` additionally rejects a key outside the partition with `ValueError` and then routes by phase exactly as the Java does.
+
+```python
+    def start_copy(self) -> None:
+        self._require_state(PartitionMigration.State.PLANNED)
+        self._state = PartitionMigration.State.COPYING
+        for k, v in self.source.snapshot_of_partition(self.partition).items():
+            self.destination.put_direct(k, v)
+            self.copied += 1
+        self._state = PartitionMigration.State.DUAL_WRITE
+
+    def write(self, key: str, value: str) -> None:
+        if self._table.partitioner().partition_of(key) != self.partition:
+            raise ValueError("key not in partition")
+        s = PartitionMigration.State
+        if self._state is s.DUAL_WRITE:
+            self.source.put(key, value)
+            self.destination.put_direct(key, value)
+            self.dual_writes += 1
+        elif self._state in (s.PLANNED, s.COPYING):
+            self.source.put(key, value)
+        else:
+            self.destination.put(key, value)
+
+    def cut_over(self) -> None:
+        self._require_state(PartitionMigration.State.DUAL_WRITE)
+        self._table.assign(self.partition, self.destination.name)
+        self._state = PartitionMigration.State.CUT_OVER
+
+    def drop_source(self) -> int:
+        self._require_state(PartitionMigration.State.CUT_OVER)
+        dropped = self.source.drop_partition(self.partition)
+        self._state = PartitionMigration.State.DONE
+        return dropped
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/01-partitioning-and-rebalancing/code/python
@@ -391,31 +573,269 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo prints the same numbers as the Java version (79.8%, 18.9%, 21.2%, 236 keys copied).
+The middle block carries the three numbers the lesson is about, identical to the Java run:
+
+```console
+== Adding a 5th node: how many keys move? ==
+  hash mod N, N 4 -> 5:               79.8% of keys move (almost everything)
+  64 fixed partitions, 4 -> 5 nodes:  18.9% of keys move (12 partition moves, layout {node-a=13, node-b=13, node-c=13, node-d=13, node-e=12})
+  consistent hashing, 150 vnodes:     21.2% of keys move (ideal 1/5 = 20.0%)
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Wraparound is free, signedness is explicit:** Go's `uint64` multiply wraps exactly like Java's `long`, so `Fnv1a64` and `Hash64` need no masks; they compute in `uint64` and convert to `int64` at the end so the ring sorts the same signed values Java's `TreeMap<Long>` does, and `remainderUnsigned` is `Long.remainderUnsigned` written out, cast back to `uint64` then `%`. The hash iterates UTF-16 code units via `unicode/utf16`, which is what Java's `charAt` sees, so every key lands on the same partition in all three languages. **Errors are values:** every `IllegalArgumentException`/`IllegalStateException` becomes a sentinel (`ErrSplitPointsUnsorted`, `ErrNodePresent`, `ErrLastNode`, `ErrWrongState`, `ErrKeyNotInPartition`, ...) returned from a constructor or a state-machine method and checked with `errors.Is`; `WrongOwnerException` becomes `*WrongOwnerError` carrying `Partition` and `CurrentVersion`, which callers unwrap with `errors.As`, and the one `panic` is `ConsistentHashRing.NodeFor` on an empty ring, a programming error with no caller that could handle it. **Ordered containers by hand:** the ring is a sorted `[]int64` plus a `map[int64]string`, `sort.Search` is `TreeMap.ceilingEntry` with an explicit wrap to index 0, `partitionsPerNode` returns a plain map and `formatLayout` sorts the keys to print `{node-a=13, ...}` the way Java's `TreeMap` does, and the rebalancer's `LinkedHashMap` is an `ownedLoad` struct holding an insertion-order slice next to the map, so the donor on a tie is the same node Java picks and the plan is identical. **Map iteration is random:** `StartCopy` sorts the snapshot's keys before copying so the copy order (and the `Copied` count) is deterministic, and `DropPartition` deletes during a range loop, which Go permits.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same numbers as the Java version (79.8%, 18.9%, 21.2%, 236 keys copied).
+
+#### Step 1: A stable hash
+
+`Partitioner` is an interface; the hash helpers are package-level functions. Both compute in `uint64`, where `*=` wraps silently, and return `int64` so the bits match Java's signed `long`. `remainderUnsigned` casts back to `uint64` before the modulo.
+
 ```go
-func Fnv1a64(key string) int64 {
-    hash := uint64(0xcbf29ce484222325)
-    for _, unit := range utf16.Encode([]rune(key)) {
-        hash ^= uint64(unit)
-        hash *= 0x100000001b3
-    }
-    return int64(hash)
+type Partitioner interface {
+	PartitionOf(key string) int
+	PartitionCount() int
 }
 
-func (h *HashPartitioner) PartitionOf(key string) int {
-    return remainderUnsigned(Hash64(key), h.partitions) // int(uint64(hash) % uint64(n))
+func Fnv1a64(key string) int64 {
+	hash := uint64(0xcbf29ce484222325)
+	for _, unit := range utf16.Encode([]rune(key)) {
+		hash ^= uint64(unit)
+		hash *= 0x100000001b3
+	}
+	return int64(hash)
+}
+
+func Hash64(key string) int64 {
+	z := uint64(Fnv1a64(key))
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return int64(z ^ (z >> 31))
+}
+
+func remainderUnsigned(hash int64, n int) int {
+	return int(uint64(hash) % uint64(n))
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: Range and hash partitioners
 
-- **Wraparound is free, signedness is explicit.** Go's `uint64` multiply wraps exactly like Java's `long`, so `Fnv1a64` and `Hash64` need no masks; they compute in `uint64` and convert to `int64` at the end so the ring sorts the same signed values Java's `TreeMap<Long>` does. `remainderUnsigned` is `Long.remainderUnsigned` written out: cast back to `uint64`, then `%`. The hash iterates UTF-16 code units via `unicode/utf16`, which is what Java's `charAt` sees, so every key lands on the same partition in all three languages.
-- **Errors are values.** Every `IllegalArgumentException`/`IllegalStateException` becomes a sentinel (`ErrSplitPointsUnsorted`, `ErrNodePresent`, `ErrLastNode`, `ErrWrongState`, `ErrKeyNotInPartition`, ...) returned from a constructor or a state-machine method and checked with `errors.Is`. `WrongOwnerException` becomes `*WrongOwnerError` carrying `Partition` and `CurrentVersion`, which callers unwrap with `errors.As`. The one `panic` is `ConsistentHashRing.NodeFor` on an empty ring, a programming error with no caller that could handle it.
-- **Ordered containers by hand.** The ring is a sorted `[]int64` plus a `map[int64]string`; `sort.Search` is `TreeMap.ceilingEntry` with an explicit wrap to index 0. `partitionsPerNode` returns a plain map and `formatLayout` sorts the keys to print `{node-a=13, ...}` the way Java's `TreeMap` does. The rebalancer's `LinkedHashMap` is an `ownedLoad` struct holding an insertion-order slice next to the map, so the donor on a tie is the same node Java picks and the plan is identical.
-- **Map iteration is random.** `StartCopy` sorts the snapshot's keys before copying so the copy order (and the `Copied` count) is deterministic; `DropPartition` deletes during a range loop, which Go permits.
+The binary search uses `uint(lo+hi) >> 1` as the overflow-safe midpoint, the Go spelling of Java's `>>>`. Validation of the split points lives in `NewRangePartitioner`, which returns `ErrSplitPointsUnsorted`; the hash partitioner's constructor returns `ErrPartitionCount` for a non-positive count.
+
+```go
+func (r *RangePartitioner) PartitionOf(key string) int {
+	lo, hi := 0, len(r.splitPoints) // find the number of split points <= key
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if r.splitPoints[mid] <= key {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+func (r *RangePartitioner) PartitionCount() int { return len(r.splitPoints) + 1 }
+
+func NewHashPartitioner(partitions int) (*HashPartitioner, error) {
+	if partitions <= 0 {
+		return nil, ErrPartitionCount
+	}
+	return &HashPartitioner{partitions: partitions}, nil
+}
+
+func (h *HashPartitioner) PartitionOf(key string) int {
+	return remainderUnsigned(Hash64(key), h.partitions)
+}
+```
+
+#### Step 3: Hot-key detection and salting
+
+`Skew` converts the integer counters to `float64` for the division. `Salt` is a package-level function because Go has no static methods, and uses `remainderUnsigned` for the suffix.
+
+```go
+func (d *HotKeyDetector) Skew() float64 {
+	if d.total == 0 {
+		return 1.0
+	}
+	mean := float64(d.total) / float64(len(d.hits))
+	return float64(d.hits[d.HottestPartition()]) / mean
+}
+
+func Salt(key, secondary string, fanout int) string {
+	s := remainderUnsigned(Hash64(secondary), fanout)
+	return fmt.Sprintf("%s#%d", key, s)
+}
+```
+
+#### Step 4: The versioned routing table
+
+`NewRoutingTable` returns `ErrNoNodes` for an empty node list and lays the owners out round-robin into a slice. `Assign` bumps the version only on an actual change; Go strings compare with `!=` directly.
+
+```go
+type RoutingTable struct {
+	partitioner Partitioner
+	owner       []string
+	version     int64
+}
+
+func NewRoutingTable(partitioner Partitioner, nodes []string) (*RoutingTable, error) {
+	if len(nodes) == 0 {
+		return nil, ErrNoNodes
+	}
+	owner := make([]string, partitioner.PartitionCount())
+	for p := range owner {
+		owner[p] = nodes[p%len(nodes)] // round-robin initial layout
+	}
+	return &RoutingTable{partitioner: partitioner, owner: owner, version: 1}, nil
+}
+
+func (t *RoutingTable) NodeFor(key string) string { return t.owner[t.partitioner.PartitionOf(key)] }
+
+func (t *RoutingTable) Assign(partition int, node string) {
+	if node != t.owner[partition] {
+		t.owner[partition] = node
+		t.version++
+	}
+}
+```
+
+#### Step 5: Planning the minimum rebalance
+
+`ownedLoad` is the hand-written `LinkedHashMap`: `order` remembers insertion order and `mostLoaded` walks it, so ties resolve to the same donor as the Java. The highest-numbered partition is taken with a reslice, and the plan is returned as a `[]Move` with an error for a duplicate node.
+
+```go
+type ownedLoad struct {
+	order []string
+	parts map[string][]int
+}
+
+func (o *ownedLoad) mostLoaded() string {
+	best := ""
+	for i, n := range o.order {
+		if i == 0 || len(o.parts[n]) > len(o.parts[best]) {
+			best = n
+		}
+	}
+	return best
+}
+
+func (Rebalancer) PlanAddNode(table *RoutingTable, newNode string) ([]Move, error) {
+	if contains(table.Nodes(), newNode) {
+		return nil, fmt.Errorf("%w: %s", ErrNodePresent, newNode)
+	}
+	moves := []Move{}
+	owned := newOwnedLoad()
+	for _, n := range table.Nodes() {
+		owned.put(n, table.PartitionsOf(n))
+	}
+	owned.put(newNode, []int{})
+	nodes := len(owned.order)
+	target := table.PartitionCount() / nodes // the new node gets floor(P / N)
+	for len(owned.parts[newNode]) < target {
+		donor := owned.mostLoaded()
+		donorParts := owned.parts[donor]
+		partition := donorParts[len(donorParts)-1] // take the highest-numbered partition: deterministic
+		owned.parts[donor] = donorParts[:len(donorParts)-1]
+		owned.parts[newNode] = append(owned.parts[newNode], partition)
+		moves = append(moves, Move{partition, donor, newNode})
+	}
+	return moves, nil
+}
+```
+
+#### Step 6: Nodes that know what they own
+
+`Put` returns an error and `Get` returns `(value, error)`, with `""` for an absent key. `requireOwner` builds a `*WrongOwnerError` carrying the partition and the current table version, which is what a client would `errors.As` to find the version to fetch.
+
+```go
+type WrongOwnerError struct {
+	Partition      int
+	CurrentVersion int64
+}
+
+func (n *StorageNode) Put(key, value string) error {
+	if err := n.requireOwner(key); err != nil {
+		return err
+	}
+	n.data[key] = value
+	return nil
+}
+
+func (n *StorageNode) Get(key string) (string, error) {
+	if err := n.requireOwner(key); err != nil {
+		return "", err
+	}
+	return n.data[key], nil
+}
+
+func (n *StorageNode) PutDirect(key, value string) { n.data[key] = value }
+
+func (n *StorageNode) requireOwner(key string) error {
+	p := n.table.Partitioner().PartitionOf(key)
+	if n.table.OwnerOf(p) != n.Name {
+		return &WrongOwnerError{Partition: p, CurrentVersion: n.table.Version()}
+	}
+	return nil
+}
+```
+
+#### Step 7: The migration state machine
+
+`MigrationState` is an `iota` enum. `StartCopy` sorts the snapshot's keys before copying, since a Go map ranges in random order. `Write` is a `switch` on the state and propagates the owner check's error from `Source.Put`. `requireState` wraps `ErrWrongState` with the expected and actual states.
+
+```go
+func (m *PartitionMigration) StartCopy() error {
+	if err := m.requireState(Planned); err != nil {
+		return err
+	}
+	m.state = Copying
+	snapshot := m.Source.SnapshotOfPartition(m.Partition)
+	keys := make([]string, 0, len(snapshot))
+	for k := range snapshot {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // TreeMap order in Java; deterministic copy order here
+	for _, k := range keys {
+		m.Destination.PutDirect(k, snapshot[k])
+		m.Copied++
+	}
+	m.state = DualWrite
+	return nil
+}
+
+func (m *PartitionMigration) Write(key, value string) error {
+	if m.table.Partitioner().PartitionOf(key) != m.Partition {
+		return ErrKeyNotInPartition
+	}
+	switch m.state {
+	case DualWrite:
+		if err := m.Source.Put(key, value); err != nil {
+			return err
+		}
+		m.Destination.PutDirect(key, value)
+		m.DualWrites++
+		return nil
+	case Planned, Copying:
+		return m.Source.Put(key, value)
+	default:
+		return m.Destination.Put(key, value)
+	}
+}
+
+func (m *PartitionMigration) CutOver() error {
+	if err := m.requireState(DualWrite); err != nil {
+		return err
+	}
+	m.table.Assign(m.Partition, m.Destination.Name)
+	m.state = CutOver
+	return nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/01-partitioning-and-rebalancing/code/go
@@ -423,7 +843,14 @@ go run .
 go test ./...
 ```
 
-The demo prints the same numbers as the Java version (79.8%, 18.9%, 21.2%, 236 keys copied).
+```console
+== Adding a 5th node: how many keys move? ==
+  hash mod N, N 4 -> 5:               79.8% of keys move (almost everything)
+  64 fixed partitions, 4 -> 5 nodes:  18.9% of keys move (12 partition moves, layout {node-a=13, node-b=13, node-c=13, node-d=13, node-e=12})
+  consistent hashing, 150 vnodes:     21.2% of keys move (ideal 1/5 = 20.0%)
+```
+
+The rest of the output, including the migration trace, matches the Java run.
 
 ## Use It
 

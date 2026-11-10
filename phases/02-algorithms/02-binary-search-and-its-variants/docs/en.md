@@ -349,25 +349,133 @@ The test run prints `45 passed, 0 failed`.
 
 ### In Python
 
+The loop, the predicates, and the `CappedBatch` search are line-for-line the same; three things differ in `code/python/main.py`. **No midpoint overflow:** Python integers are arbitrary precision, so `(lo + hi) // 2` is safe and `>>` replaces `>>>` (there is no unsigned shift and none is needed for non-negative ranges). The code keeps `lo + ((hi - lo) >> 1)` so the shape matches the Java. To print the same wrapped value as the Java demo, `to_int32` masks the sum to 32-bit two's complement and `trunc_div` divides toward zero the way Java's `/` does (`-7 // 2` is `-4` in Python but `-7 / 2` is `-3` in Java); a test pins both. **`firstTrueLong` is the same function:** with one integer type, `first_true` and `first_true_long` are identical; both are kept so the names match. `integer_sqrt` keeps the `x > n // x` guard even though `x * x` cannot overflow, because the guard is the lesson. **Checked addition is explicit:** `CappedBatch.total_with_cap` calls `add_exact`, which raises `ArithmeticError` outside the signed 64-bit range, so a Python total fails exactly where `Math.addExact` would. Predicates are lambdas; `IllegalArgumentException` maps to `ValueError`.
+
+The standard library already has the primitive: `bisect.bisect_left(a, t)` is `lower_bound` and `bisect.bisect_right(a, t)` is `upper_bound` (both take `key=` since 3.10). The test suite checks the JDK-style negative encoding against `bisect_left`. Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v` (the Java's 45 checks plus 3 for the 32-bit wraparound helpers).
+
+#### Step 1: The classic search, done carefully
+
+The closed-range loop and the `-(lo + 1)` miss encoding are the Java ones. The midpoint is written in the overflow-safe form for symmetry even though a Python int cannot wrap.
+
 ```python
-@staticmethod
-def first_true(lo: int, hi: int, predicate: Callable[[int], bool]) -> int:
-    while lo < hi:
-        mid = lo + ((hi - lo) >> 1)
-        if predicate(mid):
-            hi = mid
-        else:
-            lo = mid + 1
-    return lo
+    @staticmethod
+    def index_of(a: list[int], target: int) -> int:
+        """Classic: index of `target` in a sorted list, or -(insertion_point + 1) if absent (the JDK convention)."""
+        lo, hi = 0, len(a) - 1  # closed range [lo, hi]
+        while lo <= hi:
+            mid = lo + ((hi - lo) >> 1)  # the Java-safe form; Python ints cannot overflow anyway
+            if a[mid] < target:
+                lo = mid + 1
+            elif a[mid] > target:
+                hi = mid - 1
+            else:
+                return mid
+        return -(lo + 1)
 ```
 
-The loop, the predicates, and the `CappedBatch` search are line-for-line the same; three things differ, all in `code/python/main.py`:
+#### Step 2: The primitive
 
-- **No midpoint overflow.** Python integers are arbitrary precision, so `(lo + hi) // 2` is safe and `>>` replaces `>>>` (there is no unsigned shift and none is needed for non-negative ranges). The code keeps `lo + ((hi - lo) >> 1)` so the shape matches the Java. To print the same wrapped value as the Java demo, `to_int32` masks the sum to 32-bit two's complement and `trunc_div` divides toward zero the way Java's `/` does (`-7 // 2` is `-4` in Python but `-7 / 2` is `-3` in Java); a test pins both.
-- **`firstTrueLong` is the same function.** With one integer type, `first_true` and `first_true_long` are identical; both are kept so the names match. `integer_sqrt` keeps the `x > n // x` guard even though `x * x` cannot overflow, because the guard is the lesson.
-- **Checked addition is explicit.** `CappedBatch.total_with_cap` calls `add_exact`, which raises `ArithmeticError` outside the signed 64-bit range, so a Python total fails exactly where `Math.addExact` would. Predicates are lambdas; `IllegalArgumentException` maps to `ValueError`.
+The predicate is any callable from index to bool. `first_true_long` has the same body because Python has one integer type; it exists so call sites read the same as the Java.
 
-The standard library already has the primitive: `bisect.bisect_left(a, t)` is `lower_bound` and `bisect.bisect_right(a, t)` is `upper_bound` (both take `key=` since 3.10). The test suite checks the JDK-style negative encoding against `bisect_left`.
+```python
+    @staticmethod
+    def first_true(lo: int, hi: int, predicate: Callable[[int], bool]) -> int:
+        """Smallest i in [lo, hi) with predicate(i) true, or hi if none. Predicate must be monotone."""
+        while lo < hi:
+            mid = lo + ((hi - lo) >> 1)
+            if predicate(mid):
+                hi = mid  # mid is a candidate: keep it in the range
+            else:
+                lo = mid + 1  # mid is false: the answer is strictly to the right
+        return lo  # invariant: everything < lo is false, everything >= hi is true
+```
+
+#### Step 3: Bounds and counts as one-liners
+
+Lambdas close over `a` and `target`. These are `bisect_left` and `bisect_right` written by hand; the test suite checks them against both a linear scan and the `bisect` module.
+
+```python
+    @staticmethod
+    def lower_bound(a: list[int], target: int) -> int:
+        """First index whose value is >= target."""
+        return BinarySearch.first_true(0, len(a), lambda i: a[i] >= target)
+
+    @staticmethod
+    def upper_bound(a: list[int], target: int) -> int:
+        """First index whose value is > target."""
+        return BinarySearch.first_true(0, len(a), lambda i: a[i] > target)
+
+    @staticmethod
+    def count(a: list[int], target: int) -> int:
+        return BinarySearch.upper_bound(a, target) - BinarySearch.lower_bound(a, target)
+
+    @staticmethod
+    def count_in_range(a: list[int], low: int, high: int) -> int:
+        """Number of elements in the closed value range [low, high]."""
+        return BinarySearch.upper_bound(a, high) - BinarySearch.lower_bound(a, low)
+```
+
+#### Step 4: Rotated arrays
+
+`a[-1]` is the last element. The second search reads through `(pivot + i) % n` and never builds the un-rotated list; an empty list raises `ValueError` from `rotation_point` and returns `-1` from `index_of_rotated`.
+
+```python
+    @staticmethod
+    def rotation_point(a: list[int]) -> int:
+        """Index of the minimum in a sorted-then-rotated list of distinct values."""
+        if not a:
+            raise ValueError("empty array")
+        last = a[-1]
+        # "a[i] <= last" is false on the rotated prefix and true from the minimum on
+        return BinarySearch.first_true(0, len(a), lambda i: a[i] <= last)
+
+    @staticmethod
+    def index_of_rotated(a: list[int], target: int) -> int:
+        """Search a rotated sorted list without un-rotating it."""
+        if not a:
+            return -1
+        pivot = BinarySearch.rotation_point(a)
+        n = len(a)
+        k = BinarySearch.first_true(0, n, lambda i: a[(pivot + i) % n] >= target)
+        if k == n or a[(pivot + k) % n] != target:
+            return -1
+        return (pivot + k) % n
+```
+
+#### Step 5: Answer-space search
+
+`integer_sqrt` keeps the `x > n // x` guard as a habit, not a necessity. In `largest_cap_within` the predicate calls `total_with_cap`, whose `add_exact` raises if a sum would leave the 64-bit range, so the search fails loudly where the Java would throw.
+
+```python
+    @staticmethod
+    def integer_sqrt(n: int) -> int:
+        """Largest x >= 0 with x * x <= n: search over the answer space."""
+        if n < 0:
+            raise ArithmeticError("negative")
+        # first x with x*x > n, minus one; the guard x > n // x mirrors the Java overflow-avoiding form
+        first = BinarySearch.first_true_long(0, 3_037_000_500, lambda x: x > 0 and x > n // x)
+        return first - 1
+```
+
+```python
+    @staticmethod
+    def largest_cap_within(items: list[Money], budget: Money) -> int:
+        """Largest cap (minor units) with total_with_cap <= budget; -1 if even a cap of 0 exceeds it."""
+        if not items:
+            raise ValueError("no items")
+        for m in items:
+            if m.currency != budget.currency:
+                raise ValueError("currency mismatch")
+        max_item = 0
+        for m in items:
+            max_item = max(max_item, m.minor_units)
+        # predicate: "a cap of c already exceeds the budget"; false for small c, true for large c
+        first_over = BinarySearch.first_true_long(
+            0, max_item + 1, lambda c: CappedBatch.total_with_cap(items, c).compare_to(budget) > 0)
+        return first_over - 1
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/02-algorithms/02-binary-search-and-its-variants/code/python
@@ -375,29 +483,191 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo output matches the Java run line for line; the suite runs the Java's 45 checks plus 3 for the 32-bit wraparound helpers.
+```console
+== Sorted fee schedule (cents): [30, 30, 30, 50, 75, 75, 100, 250, 250, 250, 250, 500] ==
+indexOf(75)       = 5   (some index of a 75; which one is unspecified)
+indexOf(60)       = -5   (negative: insertion point is 4)
+lowerBound(250)   = 7   (first 250)
+upperBound(250)   = 11  (one past the last 250)
+count(250)        = 4
+countInRange(30, 100) = 7
+
+== Overflow-safe midpoint ==
+(lo + hi) / 2            = -397483648   (wrapped negative)
+lo + ((hi - lo) >>> 1)   = 1750000000
+
+== Rotated sorted array ==
+rotationPoint   = 4 (index of the minimum)
+indexOfRotated(20) = 5
+
+== Search over the answer space ==
+integerSqrt(Long.MAX_VALUE) = 3037000499
+largest per-payout cap within budget = 204.62 USD -> total 599.99 USD; one cent more -> 600.01 USD
+```
+
+The output matches the Java run line for line. The wrapped midpoint is produced by `to_int32` and `trunc_div`; plain Python would print `1750000000` for both lines.
 
 ### In Go
 
+The loop, the predicates, and the `CappedBatch` search are line-for-line the same; three things differ in `code/go/main.go`. **Errors are values:** `RotationPoint`, `IntegerSqrt`, `TotalWithCap`, and `LargestCapWithin` return `(T, error)` where the Java throws; the sentinels `ErrEmpty`, `ErrNegative`, `ErrNoItems`, `ErrCurrencyMismatch`, and `ErrOverflow` support `errors.Is`. The predicate inside `LargestCapWithin` cannot return an error, so it records the first overflow and returns `true` to stop the search; the caller then reports the error. **Checked addition is a helper:** Go's `+` on `int64` wraps like Java's primitive `+`, and there is no `Math.addExact`; `addChecked` in `money.go` returns `ErrOverflow` instead of a wrapped total. `Money.Compare` panics on a currency mismatch because a comparison has no error channel, as in the Phase 10 `Money`. **The midpoint bug needs a 32-bit type to show:** Go's `int` is 64 bits on every platform the course targets, so `(lo + hi) / 2` on the demo's indices does not wrap; the demo declares `lo` and `hi` as `int32` to reproduce Java's `-397483648`, and Go's `>>` on a `uint32` plays the role of Java's `>>>`. The search functions still use `lo + (hi-lo)/2`, because the `int64` answer space of `IntegerSqrt` and 32-bit targets make the overflow real again.
+
+The standard library has the primitive: `sort.Search(n, f)` *is* `FirstTrue` over `[0, n)`, and `slices.BinarySearch` returns `(index, found)` instead of the JDK's encoded negative; one test checks the two agree. Run it from `code/go/` with `go run .`; test with `go test ./...` (the Java's 45 checks plus 6 for the int32 wraparound, the empty-slice error, the empty-batch error, and the overflow sentinel).
+
+#### Step 1: The classic search, done carefully
+
+Same closed range, same miss encoding. `(hi-lo)/2` on non-negative ints is the overflow-safe midpoint; a `>>>` is unnecessary because the difference is never negative.
+
 ```go
-func FirstTrue(lo, hi int, predicate func(int) bool) int {
-    for lo < hi {
-        mid := lo + (hi-lo)/2
-        if predicate(mid) {
-            hi = mid // mid is a candidate: keep it in the range
-        } else {
-            lo = mid + 1 // mid is false: the answer is strictly to the right
-        }
-    }
-    return lo
+// IndexOf is the classic search: index of `target` in a sorted slice, or -(insertionPoint + 1) if absent (the JDK convention).
+func IndexOf(a []int64, target int64) int {
+	lo, hi := 0, len(a)-1 // closed range [lo, hi]
+	for lo <= hi {
+		mid := lo + (hi-lo)/2 // never overflows; (lo + hi) / 2 does near the top of the int range
+		if a[mid] < target {
+			lo = mid + 1
+		} else if a[mid] > target {
+			hi = mid - 1
+		} else {
+			return mid
+		}
+	}
+	return -(lo + 1)
 }
 ```
 
-The loop, the predicates, and the `CappedBatch` search are line-for-line the same; three things differ, all in `code/go/main.go`:
+#### Step 2: The primitive
 
-- **Errors are values.** `RotationPoint`, `IntegerSqrt`, `TotalWithCap`, and `LargestCapWithin` return `(T, error)` where the Java throws; the sentinels `ErrEmpty`, `ErrNegative`, `ErrNoItems`, `ErrCurrencyMismatch`, and `ErrOverflow` support `errors.Is`. The predicate inside `LargestCapWithin` cannot return an error, so it records the first overflow and returns `true` to stop the search; the caller then reports the error.
-- **Checked addition is a helper.** Go's `+` on `int64` wraps like Java's primitive `+`, and there is no `Math.addExact`; `addChecked` in `money.go` returns `ErrOverflow` instead of a wrapped total. `Money.Compare` panics on a currency mismatch because a comparison has no error channel, as in the Phase 10 `Money`.
-- **The midpoint bug needs a 32-bit type to show.** Go's `int` is 64 bits on every platform the course targets, so `(lo + hi) / 2` on the demo's indices does not wrap; the demo declares `lo` and `hi` as `int32` to reproduce Java's `-397483648`, and Go's `>>` on a `uint32` plays the role of Java's `>>>`. The search functions still use `lo + (hi-lo)/2`, because the `int64` answer space of `IntegerSqrt` and 32-bit targets make the overflow real again.
+`FirstTrue` over `int` indices and `FirstTrueLong` over `int64` values are two functions because Go does not convert between them implicitly; the bodies are identical and both match `sort.Search`.
+
+```go
+// FirstTrue is the one primitive everything else is built from: the smallest index i in [lo, hi) such that
+// predicate(i) is true, or hi if none. Requires the predicate to be monotone: false...false true...true.
+func FirstTrue(lo, hi int, predicate func(int) bool) int {
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if predicate(mid) {
+			hi = mid // mid is a candidate: keep it in the range
+		} else {
+			lo = mid + 1 // mid is false: the answer is strictly to the right
+		}
+	}
+	return lo // invariant: everything < lo is false, everything >= hi is true
+}
+
+// FirstTrueLong is the same primitive over a range of int64 values rather than indices (for search over an answer space).
+func FirstTrueLong(lo, hi int64, predicate func(int64) bool) int64 {
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if predicate(mid) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+```
+
+#### Step 3: Bounds and counts as one-liners
+
+Function literals capture `a` and `target`. The oracle test in `main_test.go` compares both bounds against a linear scan on 200 random arrays, as the Java test does.
+
+```go
+// LowerBound is the first index whose value is >= target: the insertion point before any existing equal keys.
+func LowerBound(a []int64, target int64) int {
+	return FirstTrue(0, len(a), func(i int) bool { return a[i] >= target })
+}
+
+// UpperBound is the first index whose value is > target: one past the last equal key.
+func UpperBound(a []int64, target int64) int {
+	return FirstTrue(0, len(a), func(i int) bool { return a[i] > target })
+}
+
+// Count is the number of elements equal to target, in O(log n) via the two bounds.
+func Count(a []int64, target int64) int { return UpperBound(a, target) - LowerBound(a, target) }
+
+// CountInRange is the number of elements in the closed value range [low, high].
+func CountInRange(a []int64, low, high int64) int { return UpperBound(a, high) - LowerBound(a, low) }
+```
+
+#### Step 4: Rotated arrays
+
+`RotationPoint` returns `ErrEmpty` for an empty slice; `IndexOfRotated` checks emptiness first and so can discard that error. The index arithmetic is the same as in Java.
+
+```go
+// RotationPoint is the index of the minimum in a slice that was sorted ascending, then rotated; distinct values required.
+func RotationPoint(a []int64) (int, error) {
+	if len(a) == 0 {
+		return 0, ErrEmpty
+	}
+	last := a[len(a)-1]
+	// predicate "a[i] <= last" is false on the rotated prefix (all larger than last) and true from the minimum on
+	return FirstTrue(0, len(a), func(i int) bool { return a[i] <= last }), nil
+}
+
+// IndexOfRotated searches a rotated sorted slice without un-rotating it: locate the pivot, then search the correct half.
+func IndexOfRotated(a []int64, target int64) int {
+	if len(a) == 0 {
+		return -1
+	}
+	pivot, _ := RotationPoint(a) // non-empty: cannot fail
+	n := len(a)
+	// the slice is sorted when read as a[(pivot + k) % n] for k in [0, n)
+	k := FirstTrue(0, n, func(i int) bool { return a[(pivot+i)%n] >= target })
+	if k == n || a[(pivot+k)%n] != target {
+		return -1
+	}
+	return (pivot + k) % n
+}
+```
+
+#### Step 5: Answer-space search
+
+`IntegerSqrt` returns `ErrNegative` instead of throwing. In `LargestCapWithin` the predicate closure cannot return an error, so it stashes the first `ErrOverflow` from `TotalWithCap` in `firstErr` and returns `true` to end the search early; the function then returns that error rather than a bogus cap.
+
+```go
+// IntegerSqrt is the largest x >= 0 with x * x <= n: search over the answer space, not over a slice.
+func IntegerSqrt(n int64) (int64, error) {
+	if n < 0 {
+		return 0, ErrNegative
+	}
+	// first x such that x*x > n, minus one; the guard x > n / x avoids overflow of x*x
+	first := FirstTrueLong(0, 3_037_000_500, func(x int64) bool { return x > 0 && x > n/x })
+	return first - 1, nil
+}
+```
+
+```go
+// LargestCapWithin is the largest cap (in minor units) such that TotalWithCap <= budget; -1 if even a cap of 0 exceeds the budget.
+func LargestCapWithin(items []Money, budget Money) (int64, error) {
+	if len(items) == 0 {
+		return 0, ErrNoItems
+	}
+	var maxItem int64
+	for _, m := range items {
+		if m.Currency != budget.Currency {
+			return 0, ErrCurrencyMismatch
+		}
+		maxItem = max(maxItem, m.MinorUnits)
+	}
+	// predicate: "a cap of c already exceeds the budget"; false for small c, true for large c
+	var firstErr error
+	firstOver := FirstTrueLong(0, maxItem+1, func(c int64) bool {
+		total, err := TotalWithCap(items, c)
+		if err != nil {
+			firstErr = err
+			return true
+		}
+		return total.Compare(budget) > 0
+	})
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	return firstOver - 1, nil
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/02-algorithms/02-binary-search-and-its-variants/code/go
@@ -405,7 +675,29 @@ go run .
 go test ./...
 ```
 
-The demo output matches the Java run line for line. The standard library has the primitive: `sort.Search(n, f)` *is* `FirstTrue` over `[0, n)`, and `slices.BinarySearch` returns `(index, found)` instead of the JDK's encoded negative; one test checks the two agree. The suite runs the Java's 45 checks plus 6 for the int32 wraparound, the empty-slice error, the empty-batch error, and the overflow sentinel.
+```console
+== Sorted fee schedule (cents): [30, 30, 30, 50, 75, 75, 100, 250, 250, 250, 250, 500] ==
+indexOf(75)       = 5   (some index of a 75; which one is unspecified)
+indexOf(60)       = -5   (negative: insertion point is 4)
+lowerBound(250)   = 7   (first 250)
+upperBound(250)   = 11  (one past the last 250)
+count(250)        = 4
+countInRange(30, 100) = 7
+
+== Overflow-safe midpoint ==
+(lo + hi) / 2            = -397483648   (wrapped negative)
+lo + ((hi - lo) >>> 1)   = 1750000000
+
+== Rotated sorted array ==
+rotationPoint   = 4 (index of the minimum)
+indexOfRotated(20) = 5
+
+== Search over the answer space ==
+integerSqrt(Long.MAX_VALUE) = 3037000499
+largest per-payout cap within budget = 204.62 USD -> total 599.99 USD; one cent more -> 600.01 USD
+```
+
+The Go and Python outputs are byte-identical. The wrapped midpoint appears only because the demo declares `lo` and `hi` as `int32`; with Go's default 64-bit `int` the sum would not wrap.
 
 ## Use It
 

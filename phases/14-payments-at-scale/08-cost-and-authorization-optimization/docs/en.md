@@ -353,23 +353,195 @@ Seven arms over 100,000 transactions take about a second, so the experiment can 
 
 ### In Python
 
-`code/python/main.py` keeps `PriceList`, `Txn`, `TxnTrace`, `ArmResult`, `AuthExperiment`, and `Uplift`, and prints the same table: 83,737 control approvals, 7,823 extra under ALL, 10,941 as the sum of singles. What differs:
+The Python port (`code/python/main.py`, tests in `test_main.py`) keeps `PriceList`, `Txn`, `TxnTrace`, `ArmResult`, `AuthExperiment`, and `Uplift`, and prints the same table: 83,737 control approvals, 7,823 extra under ALL, 10,941 as the sum of singles. What differs: **The population comes from `java.util.Random`, reimplemented.** `random.Random(seed)` is a Mersenne Twister and would give different draws, so `AuthExperiment.population` uses a 20-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop); seed 2026 therefore builds the same 100,000 transactions, and every arm's totals match the Java demo to the cent, with a test pinning the sequence to values taken from the JDK. **Enums carry their data:** `ResponseCode` members are `("05", DeclineClass.GENERIC)` tuples unpacked in `__init__`, so `r.code` and `r.decline_class` read as in Java; lever sets are `frozenset`s of `Lever`, with `levers_str` reproducing `EnumSet.toString` in declaration order for the demo. **Integer arithmetic:** basis points and minor units are `int`; `//` replaces Java's truncating `/` wherever the operands are non-negative (approval rate, cost per approval), and `divide_rounded` works on magnitudes so `HALF_EVEN` agrees with Java for negative deltas such as the LEVEL3_DATA cost saving; `run` accumulates its six totals as ints over the 700,000 simulated attempts and wraps them in `Money` once, which keeps the seven arms under five seconds on CPython. **Exceptions:** a draw outside `[0, 10000)` raises `ValueError` where Java throws `IllegalArgumentException`; `TxnTrace` equality, which the "same txn, same levers, same trace" test relies on, comes from `@dataclass(frozen=True)`. The Python tests port every Java check (41 assertions).
 
-- **The population comes from `java.util.Random`, reimplemented.** `random.Random(seed)` is a Mersenne Twister and would give different draws, so `AuthExperiment.population` uses a 20-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop). Seed 2026 therefore builds the same 100,000 transactions, and every arm's totals match the Java demo to the cent. A test pins the sequence to values taken from the JDK.
-- **Enums carry their data.** `ResponseCode` members are `("05", DeclineClass.GENERIC)` tuples unpacked in `__init__`, so `r.code` and `r.decline_class` read as in Java; lever sets are `frozenset`s of `Lever`, with `levers_str` reproducing `EnumSet.toString` in declaration order for the demo.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Money, copied
+
+`times` multiplies the exact rational and rounds once through `divide_rounded`, which works on magnitudes because `//` floors; Python ints make `multiplyExact` unnecessary.
+
+```python
+def divide_rounded(dividend: int, divisor: int, rounding: Rounding) -> int:
+    """Integer division with an explicit rounding rule, on magnitudes so Python's floor division matches Java."""
+    sign = -1 if (dividend < 0) != (divisor < 0) else 1
+    quotient, remainder = divmod(abs(dividend), abs(divisor))
+    abs_divisor = abs(divisor)
+    if remainder == 0:
+        return sign * quotient
+    twice = remainder * 2
+    if rounding is Rounding.UP:
+        quotient += 1
+    elif rounding is Rounding.HALF_UP:
+        if twice >= abs_divisor:
+            quotient += 1
+    elif rounding is Rounding.HALF_EVEN:
+        if twice > abs_divisor or (twice == abs_divisor and quotient % 2 == 1):
+            quotient += 1
+    return sign * quotient
+
+
+@total_ordering
+
+    def times(self, numerator: int, denominator: int, rounding: Rounding) -> "Money":
+        return Money(divide_rounded(self.minor_units * numerator, denominator, rounding), self.currency)
+```
+
+#### Step 2: Response codes and their classes
+
+Each `ResponseCode` value is a `(code, decline_class)` tuple that `Enum.__init__` unpacks, so the class is attached to the code once, in the type.
 
 ```python
 class ResponseCode(Enum):
+    """ISO 8583 field 39 response codes used in this lesson."""
+
     APPROVED = ("00", DeclineClass.NONE)
     DO_NOT_HONOR = ("05", DeclineClass.GENERIC)
-    ...
+    LOST_OR_STOLEN = ("43", DeclineClass.NEVER_RETRY)
+    INSUFFICIENT_FUNDS = ("51", DeclineClass.RETRY_LATER)
+    EXPIRED_CARD = ("54", DeclineClass.FIX_DATA)
+    NOT_PERMITTED = ("57", DeclineClass.NEVER_RETRY)
+    ISSUER_UNAVAILABLE = ("91", DeclineClass.RETRY_LATER)
+    PROCESSOR_TIMEOUT = ("96", DeclineClass.RETRY_LATER)
+
     def __init__(self, code: str, decline_class: DeclineClass) -> None:
         self.code = code
         self.decline_class = decline_class
+
+    def approved(self) -> bool:
+        return self is ResponseCode.APPROVED
+
+    def __str__(self) -> str:
+        return self.name
 ```
 
-- **Integer arithmetic.** Basis points and minor units are `int`; `//` replaces Java's truncating `/` wherever the operands are non-negative (approval rate, cost per approval), and `divide_rounded` works on magnitudes so `HALF_EVEN` agrees with Java for negative deltas such as the LEVEL3_DATA cost saving. `run` accumulates its six totals as ints over the 700,000 simulated attempts and wraps them in `Money` once, which keeps the seven arms under five seconds on CPython.
-- **Exceptions.** A draw outside `[0, 10000)` raises `ValueError` where Java throws `IllegalArgumentException`; `TxnTrace` equality, which the "same txn, same levers, same trace" test relies on, comes from `@dataclass(frozen=True)`.
+#### Step 3: The transaction and its draws
+
+`Txn` is a frozen dataclass whose `__post_init__` checks the three draws are basis points in `[0, 10000)`; everything random about a transaction is fixed when the population is generated.
+
+```python
+class Txn:
+    """One transaction in the experiment. Its base outcome and three uniform draws in [0, 10000) are fixed when the
+    population is generated, so every arm of the experiment sees the same customer, the same card, and the same
+    luck. This is the common-random-numbers technique: differences between arms are caused by the levers only."""
+
+    id: str
+    amount: Money
+    card_type: CardType
+    token_eligible: bool
+    base_outcome: ResponseCode
+    draw_token: int
+    draw_retry: int
+    draw_updater: int
+
+    def __post_init__(self) -> None:
+        for d in (self.draw_token, self.draw_retry, self.draw_updater):
+            if d < 0 or d >= 10_000:
+                raise ValueError("draws are basis points in [0, 10000)")
+```
+
+#### Step 4: The path of one transaction
+
+`simulate` is pure. Credential levers run first, with the token taking precedence over the updater; then the first attempt is charged, with the token fee when a token is in use.
+
+```python
+    def simulate(self, t: Txn, levers: frozenset) -> TxnTrace:
+        """Decide one transaction's path under a set of levers. Pure: same txn, same levers, same trace."""
+        prices = self.prices
+        outcome = t.base_outcome
+        use_token = Lever.NETWORK_TOKEN in levers and t.token_eligible
+        updater_hit = False
+        fees = Money.zero(self.currency)
+
+        # 1. Credential levers run before the first attempt.
+        if outcome is ResponseCode.EXPIRED_CARD:
+            if use_token:
+                outcome = ResponseCode.APPROVED  # the token's lifecycle management already holds the new card
+            elif Lever.ACCOUNT_UPDATER in levers and t.draw_updater < prices.updater_match_bps:
+                outcome = ResponseCode.APPROVED
+                updater_hit = True
+                fees = fees.plus(prices.updater_hit_fee)
+        if use_token and outcome is ResponseCode.DO_NOT_HONOR and t.draw_token < prices.token_recover_do_not_honor_bps:
+            outcome = ResponseCode.APPROVED  # issuers approve more tokenized card-not-present traffic
+
+        # 2. First attempt.
+        attempts = 1
+        fees = fees.plus(prices.auth_fee)
+        if use_token:
+            fees = fees.plus(prices.token_fee)
+```
+
+#### Step 5: Failover and retry
+
+A timeout under `ROUTING` adds an attempt and resolves against `failover_timeout_bps`; the `not failed_over` guard caps a transaction at two attempts, and `retryable` admits only `RETRY_LATER` and `GENERIC`.
+
+```python
+        # 3. Timeout at the primary: fail over to the secondary processor.
+        failed_over = False
+        if outcome is ResponseCode.PROCESSOR_TIMEOUT and Lever.ROUTING in levers:
+            attempts += 1
+            failed_over = True
+            fees = fees.plus(prices.auth_fee)
+            if use_token:
+                fees = fees.plus(prices.token_fee)
+            outcome = ResponseCode.APPROVED if t.draw_retry < prices.failover_timeout_bps else ResponseCode.ISSUER_UNAVAILABLE
+
+        # 4. One retry for soft declines only. NEVER_RETRY and FIX_DATA are never re-sent unchanged.
+        retried = False
+        if not failed_over and Lever.SOFT_DECLINE_RETRY in levers and AuthExperiment.retryable(outcome):
+            attempts += 1
+            retried = True
+            fees = fees.plus(prices.auth_fee)
+            if use_token:
+                fees = fees.plus(prices.token_fee)
+            if t.draw_retry < self.retry_success_bps(outcome):
+                outcome = ResponseCode.APPROVED
+        return TxnTrace(outcome, attempts, use_token, updater_hit, failed_over, retried, fees)
+```
+
+#### Step 6: Running an arm
+
+`run` accumulates six minor-unit ints across the population and wraps them in `Money` once at the end; network fees and interchange are charged only on approvals, with `least_cost` and `level3` derived from the lever set.
+
+```python
+    def run(self, population: list, levers: frozenset) -> ArmResult:
+        c = self.currency
+        attempts = approvals = 0
+        # Accumulated as minor-unit ints inside the loop (700,000 simulate calls in the demo); wrapped as Money once.
+        volume = auth = token = updater = network = ic = 0
+        token_fee, auth_fee, updater_fee = self.prices.token_fee.minor_units, self.prices.auth_fee.minor_units, self.prices.updater_hit_fee.minor_units
+        level3, least_cost = Lever.LEVEL3_DATA in levers, Lever.ROUTING in levers
+        for t in population:
+            tr = self.simulate(t, levers)
+            attempts += tr.attempts
+            token_attempts = tr.attempts if tr.token_used else 0
+            token += token_fee * token_attempts
+            if tr.updater_hit:
+                updater += updater_fee
+            auth += auth_fee * tr.attempts
+            if tr.final_outcome.approved():
+                approvals += 1
+                volume += t.amount.minor_units
+                network += self.network_fee(t.amount, t.card_type, least_cost).minor_units
+                ic += self.interchange(t.amount, t.card_type, level3).minor_units
+        return ArmResult(frozenset(levers), len(population), attempts, approvals, Money.of_minor(volume, c), Money.of_minor(auth, c),
+                         Money.of_minor(token, c), Money.of_minor(updater, c), Money.of_minor(network, c), Money.of_minor(ic, c))
+```
+
+#### Step 7: Uplift and net value
+
+`Uplift.of` computes extra volume, extra cost, and net value as `extra_volume * margin - extra_cost` with `HALF_EVEN`; the rate delta is taken from each arm's own basis-point rate.
+
+```python
+    def of(arm: str, control: ArmResult, treatment: ArmResult, margin_bps: int) -> "Uplift":
+        extra_volume = treatment.approved_volume.minus(control.approved_volume)
+        extra_cost = treatment.total_cost().minus(control.total_cost())
+        value = extra_volume.times(margin_bps, 10_000, Rounding.HALF_EVEN).minus(extra_cost)
+        return Uplift(arm, treatment.approvals - control.approvals,
+                      treatment.approval_rate_bps() - control.approval_rate_bps(), extra_volume, extra_cost, value)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/14-payments-at-scale/08-cost-and-authorization-optimization/code/python
@@ -377,31 +549,231 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The Python tests port every Java check (41 assertions) and the demo output is identical to the Java run.
+The output is identical to the Java run:
+
+```console
+== Level 2/3 data on one 1,000.00 USD commercial card purchase ==
+level 1 interchange 26.60 USD, level 3 18.60 USD, saved 8.00 USD
+
+== One expired card, three ways ==
+  control                -> EXPIRED_CARD   attempts 1 fees 0.05 USD
+  [SOFT_DECLINE_RETRY]   -> EXPIRED_CARD   attempts 1 fees 0.05 USD
+  [ACCOUNT_UPDATER]      -> APPROVED       attempts 1 fees 0.20 USD
+  [NETWORK_TOKEN]        -> APPROVED       attempts 1 fees 0.06 USD
+```
 
 ### In Go
 
-`code/go/main.go` keeps `PriceList`, `Txn`, `TxnTrace`, `ArmResult`, `AuthExperiment`, and `Uplift`; `money.go` is the Phase 10 `Money` and `javarandom.go` the JDK generator. The demo prints the same table: 83,737 control approvals, 7,823 extra under ALL, 10,941 as the sum of singles. What differs:
+The Go port (`code/go/main.go`, `money.go`, `javarandom.go`, tests in `main_test.go`) keeps `PriceList`, `Txn`, `TxnTrace`, `ArmResult`, `AuthExperiment`, and `Uplift`; `money.go` is the Phase 10 `Money` and `javarandom.go` the JDK generator. The demo prints the same table: 83,737 control approvals, 7,823 extra under ALL, 10,941 as the sum of singles. What differs: **`EnumSet<Lever>` is a bitmask.** `LeverSet` is a `uint8` with `Of(levers...)`, `AllLevers()`, `Has`, and a `String` that walks `Levers` in declaration order, so it prints `[NETWORK_TOKEN, ROUTING]` exactly as `EnumSet.toString` does; enums with data (`ResponseCode`'s field 39 value and `DeclineClass`) are `iota` constants indexing a table, read through `Code()` and `DeclineClass()`. **Validation returns an error, arithmetic that cannot fail panics:** `NewTxn` returns `ErrBadDraw` for a draw outside `[0, 10000)` where Java's compact constructor throws, and the test checks it with `errors.Is`; `Money.Plus`, `Minus`, and `Times` return `(Money, error)` as in Phase 10, and inside `Simulate` and `Run` every amount is the same currency and far below `int64`, so the calls go through a `need` helper that panics on the error instead of threading `if err != nil` through the hot loop. **Equality is structural:** `TxnTrace` and `ArmResult` are plain structs of comparable fields, so "same txn, same levers, same trace" and "control is reproducible" are `==`; `Money.Compare` panics on a currency mismatch, as `compareTo` throws. **Integer arithmetic:** basis points and minor units are `int64`; Go's `/` truncates toward zero like Java's, so the approval rate, the cost per approval, and `DivideRounded` with `HalfEven` agree with the Java to the cent, including the negative LEVEL3_DATA cost delta. The Go tests port all 33 Java checks (40 assertions, plus a pin on the seed-2026 demo figures).
 
-- **`EnumSet<Lever>` is a bitmask.** `LeverSet` is a `uint8` with `Of(levers...)`, `AllLevers()`, `Has`, and a `String` that walks `Levers` in declaration order, so it prints `[NETWORK_TOKEN, ROUTING]` exactly as `EnumSet.toString` does. Enums with data (`ResponseCode`'s field 39 value and `DeclineClass`) are `iota` constants indexing a table, read through `Code()` and `DeclineClass()`.
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Money, copied
+
+`Times` in `money.go` rejects a non-positive denominator, multiplies through `mulChecked`, and rounds once with `DivideRounded`.
 
 ```go
-type LeverSet uint8
-
-func Of(levers ...Lever) LeverSet {
-    var s LeverSet
-    for _, l := range levers {
-        s |= 1 << l
-    }
-    return s
+func (m Money) Times(numerator, denominator int64, rounding Rounding) (Money, error) {
+	if denominator <= 0 {
+		return Money{}, errors.New("denominator must be positive")
+	}
+	product, err := mulChecked(m.MinorUnits, numerator)
+	if err != nil {
+		return Money{}, err
+	}
+	return Money{DivideRounded(product, denominator, rounding), m.Currency}, nil
 }
-
-func (s LeverSet) Has(l Lever) bool { return s&(1<<l) != 0 }
 ```
 
-- **Validation returns an error, arithmetic that cannot fail panics.** `NewTxn` returns `ErrBadDraw` for a draw outside `[0, 10000)` where Java's compact constructor throws, and the test checks it with `errors.Is`. `Money.Plus`, `Minus`, and `Times` return `(Money, error)` as in Phase 10; inside `Simulate` and `Run` every amount is the same currency and far below `int64`, so the calls go through a `need` helper that panics on the error instead of threading `if err != nil` through the hot loop.
-- **Equality is structural.** `TxnTrace` and `ArmResult` are plain structs of comparable fields, so "same txn, same levers, same trace" and "control is reproducible" are `==`. `Money.Compare` panics on a currency mismatch, as `compareTo` throws.
-- **Integer arithmetic.** Basis points and minor units are `int64`; Go's `/` truncates toward zero like Java's, so the approval rate, the cost per approval, and `DivideRounded` with `HalfEven` agree with the Java to the cent, including the negative LEVEL3_DATA cost delta. Seven arms over 100,000 transactions run in well under a second.
+#### Step 2: Response codes and their classes
+
+`ResponseCode` is an `iota` enum indexing the `responseCodes` table, which holds the name, the ISO 8583 code, and the decline class side by side; `Code()` and `DeclineClass()` read from it.
+
+```go
+type ResponseCode int
+
+const (
+	Approved ResponseCode = iota
+	DoNotHonor
+	LostOrStolen
+	InsufficientFunds
+	ExpiredCard
+	NotPermitted
+	IssuerUnavailable
+	ProcessorTimeout
+)
+
+var responseCodes = [...]struct {
+	name         string
+	code         string
+	declineClass DeclineClass
+}{
+	{"APPROVED", "00", None},
+	{"DO_NOT_HONOR", "05", Generic},
+	{"LOST_OR_STOLEN", "43", NeverRetry},
+	{"INSUFFICIENT_FUNDS", "51", RetryLater},
+	{"EXPIRED_CARD", "54", FixData},
+	{"NOT_PERMITTED", "57", NeverRetry},
+	{"ISSUER_UNAVAILABLE", "91", RetryLater},
+	{"PROCESSOR_TIMEOUT", "96", RetryLater},
+}
+
+func (r ResponseCode) String() string             { return responseCodes[r].name }
+func (r ResponseCode) Code() string               { return responseCodes[r].code }
+func (r ResponseCode) DeclineClass() DeclineClass { return responseCodes[r].declineClass }
+func (r ResponseCode) Approved() bool             { return r == Approved }
+```
+
+#### Step 3: The transaction and its draws
+
+`NewTxn` returns `ErrBadDraw` for a draw outside `[0, 10000)`; the struct carries the base outcome and the three draws so every arm sees the same luck.
+
+```go
+type Txn struct {
+	Id            string
+	Amount        Money
+	CardType      CardType
+	TokenEligible bool
+	BaseOutcome   ResponseCode
+	DrawToken     int
+	DrawRetry     int
+	DrawUpdater   int
+}
+
+// ErrBadDraw is returned for a draw outside [0, 10000).
+var ErrBadDraw = errors.New("draws are basis points in [0, 10000)")
+
+func NewTxn(id string, amount Money, cardType CardType, tokenEligible bool, baseOutcome ResponseCode,
+	drawToken, drawRetry, drawUpdater int) (Txn, error) {
+	for _, d := range []int{drawToken, drawRetry, drawUpdater} {
+		if d < 0 || d >= 10_000 {
+			return Txn{}, ErrBadDraw
+		}
+	}
+	return Txn{id, amount, cardType, tokenEligible, baseOutcome, drawToken, drawRetry, drawUpdater}, nil
+}
+```
+
+#### Step 4: The path of one transaction
+
+`Simulate` reads the lever bitmask with `Has`; credential levers come first, token before updater, then the first attempt is charged, with `need` unwrapping the checked `Plus`.
+
+```go
+func (e *AuthExperiment) Simulate(t Txn, levers LeverSet) TxnTrace {
+	outcome := t.BaseOutcome
+	useToken := levers.Has(NetworkToken) && t.TokenEligible
+	updaterHit := false
+	fees := Zero(e.Currency)
+
+	// 1. Credential levers run before the first attempt.
+	if outcome == ExpiredCard {
+		if useToken {
+			outcome = Approved // the token's lifecycle management already holds the new card
+		} else if levers.Has(AccountUpdater) && int64(t.DrawUpdater) < e.Prices.UpdaterMatchBps {
+			outcome = Approved
+			updaterHit = true
+			fees = need(fees.Plus(e.Prices.UpdaterHitFee))
+		}
+	}
+	if useToken && outcome == DoNotHonor && int64(t.DrawToken) < e.Prices.TokenRecoverDoNotHonorBps {
+		outcome = Approved // issuers approve more tokenized card-not-present traffic
+	}
+
+	// 2. First attempt.
+	attempts := 1
+	fees = need(fees.Plus(e.Prices.AuthFee))
+	if useToken {
+		fees = need(fees.Plus(e.Prices.TokenFee))
+	}
+```
+
+#### Step 5: Failover and retry
+
+The same two blocks: a timeout under `Routing` fails over and resolves against `FailoverTimeoutBps`; the `!failedOver` guard caps attempts at two and `Retryable` admits only the soft classes.
+
+```go
+	// 3. Timeout at the primary: fail over to the secondary processor.
+	failedOver := false
+	if outcome == ProcessorTimeout && levers.Has(Routing) {
+		attempts++
+		failedOver = true
+		fees = need(fees.Plus(e.Prices.AuthFee))
+		if useToken {
+			fees = need(fees.Plus(e.Prices.TokenFee))
+		}
+		if int64(t.DrawRetry) < e.Prices.FailoverTimeoutBps {
+			outcome = Approved
+		} else {
+			outcome = IssuerUnavailable
+		}
+	}
+
+	// 4. One retry for soft declines only. NeverRetry and FixData are never re-sent unchanged.
+	retried := false
+	if !failedOver && levers.Has(SoftDeclineRetry) && Retryable(outcome) {
+		attempts++
+		retried = true
+		fees = need(fees.Plus(e.Prices.AuthFee))
+		if useToken {
+			fees = need(fees.Plus(e.Prices.TokenFee))
+		}
+		if int64(t.DrawRetry) < e.RetrySuccessBps(outcome) {
+			outcome = Approved
+		}
+	}
+	return TxnTrace{outcome, attempts, useToken, updaterHit, failedOver, retried, fees}
+}
+```
+
+#### Step 6: Running an arm
+
+`Run` accumulates `Money` totals through `need(...Plus)` and `mulChecked` for the per-attempt fees; network fees and interchange are added only on approvals.
+
+```go
+func (e *AuthExperiment) Run(population []Txn, levers LeverSet) ArmResult {
+	attempts, approvals := 0, 0
+	volume, auth, token := Zero(e.Currency), Zero(e.Currency), Zero(e.Currency)
+	updater, network, ic := Zero(e.Currency), Zero(e.Currency), Zero(e.Currency)
+	level3, leastCost := levers.Has(Level3Data), levers.Has(Routing)
+	for _, t := range population {
+		tr := e.Simulate(t, levers)
+		attempts += tr.Attempts
+		tokenAttempts := 0
+		if tr.TokenUsed {
+			tokenAttempts = tr.Attempts
+		}
+		tokenCost := OfMinor(need(mulChecked(e.Prices.TokenFee.MinorUnits, int64(tokenAttempts))), e.Currency)
+		token = need(token.Plus(tokenCost))
+		if tr.UpdaterHit {
+			updater = need(updater.Plus(e.Prices.UpdaterHitFee))
+		}
+		auth = need(auth.Plus(OfMinor(need(mulChecked(e.Prices.AuthFee.MinorUnits, int64(tr.Attempts))), e.Currency)))
+		if tr.FinalOutcome.Approved() {
+			approvals++
+			volume = need(volume.Plus(t.Amount))
+			network = need(network.Plus(e.NetworkFee(t.Amount, t.CardType, leastCost)))
+			ic = need(ic.Plus(e.Interchange(t.Amount, t.CardType, level3)))
+		}
+	}
+	return ArmResult{levers, len(population), attempts, approvals, volume, auth, token, updater, network, ic}
+}
+```
+
+#### Step 7: Uplift and net value
+
+`UpliftOf` is the same three subtractions and one `Times` with `HalfEven`, unwrapped with `need`.
+
+```go
+func UpliftOf(arm string, control, treatment ArmResult, marginBps int64) Uplift {
+	extraVolume := need(treatment.ApprovedVolume.Minus(control.ApprovedVolume))
+	extraCost := need(treatment.TotalCost().Minus(control.TotalCost()))
+	value := need(need(extraVolume.Times(marginBps, 10_000, HalfEven)).Minus(extraCost))
+	return Uplift{arm, treatment.Approvals - control.Approvals,
+		treatment.ApprovalRateBps() - control.ApprovalRateBps(), extraVolume, extraCost, value}
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/14-payments-at-scale/08-cost-and-authorization-optimization/code/go
@@ -409,7 +781,14 @@ go run .
 go test ./...
 ```
 
-The Go tests port all 33 Java checks (40 assertions, plus a pin on the seed-2026 demo figures) and the demo output is identical to the Java run.
+The output is identical to the Java run, ending with:
+
+```console
+sum of single-lever uplifts 10941 vs all levers together 7823
+(token and updater recover the same expired cards; routing and retry the same timeouts)
+cost per approval: control 8.65 USD, all levers 6.57 USD
+hard declines re-sent under ALL: 0
+```
 
 ## Use It
 

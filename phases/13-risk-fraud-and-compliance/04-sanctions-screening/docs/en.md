@@ -394,11 +394,543 @@ The explanation lines are the deliverable. An analyst reading `initial 'theodora
 
 ### In Python
 
-`code/python/main.py` is the same design with `@dataclass(frozen=True)` for `MatchReason`, `MatchScore`, `WatchlistEntry`, `Hit`, and `LabelledPair`, and an `Enum` for `ReasonKind`. Two differences worth noticing. The diacritic table is a module-level `dict` built the same way, and it is deliberately not `unicodedata.normalize("NFKD", ...)`, which would handle `ø` and `ß` differently from the Java table. The pair sort uses a tuple key `(-score, i, j)` rather than a comparator, which is the idiomatic way to get the same deterministic tie-break. Errors are `ValueError` where Java throws `IllegalArgumentException`. Tests: 29 `unittest` methods.
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with `@dataclass(frozen=True)` for `MatchReason`, `MatchScore`, `WatchlistEntry`, `Hit`, and `LabelledPair`, and an `Enum` for `ReasonKind`. Two differences are worth noticing. **The diacritic table is a module-level `dict`** built the same way, and it is deliberately not `unicodedata.normalize("NFKD", ...)`, which would handle `ø` and `ß` differently from the Java table. **The pair sort uses a tuple key** `(-score, i, j)` rather than a comparator, which is the idiomatic way to get the same deterministic tie-break. Errors are `ValueError` where Java throws `IllegalArgumentException`. The test file has 29 `unittest` methods.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Normalize
+
+One pass over the characters, one over the tokens. `ch.isascii() and ch.isalnum()` is the Java `ch < 128 && isLetterOrDigit` test; `str.split()` with no argument collapses the runs of spaces, and the comprehension drops the honorifics in `STOPWORDS`. Particles survive, as in Java.
+
+```python
+def normalize(name: str) -> str:
+    """Lowercase ASCII letters and digits separated by single spaces; honorifics removed."""
+    out: list[str] = []
+    for ch in name:
+        if ch in DIACRITICS:
+            out.append(DIACRITICS[ch])
+        elif ch.isascii() and ch.isalnum():
+            out.append(ch.lower())
+        else:
+            out.append(" ")  # punctuation, hyphens, apostrophes, anything else
+    tokens = [t for t in "".join(out).split() if t not in STOPWORDS]
+    return " ".join(tokens)
+```
+
+#### Step 2: Jaro
+
+The two boolean lists enforce "each character matches at most once"; the window is `max(len) // 2 - 1`, and the transposition loop walks the matched characters of both strings in parallel. Integer division keeps `half` an `int`.
+
+```python
+def jaro(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    window = max(len(a), len(b)) // 2 - 1
+    if window < 0:
+        window = 0
+    a_matched = [False] * len(a)
+    b_matched = [False] * len(b)
+    matches = 0
+    for i, ca in enumerate(a):
+        lo = max(0, i - window)
+        hi = min(len(b), i + window + 1)
+        for j in range(lo, hi):
+            if not b_matched[j] and b[j] == ca:
+                a_matched[i] = True
+                b_matched[j] = True
+                matches += 1
+                break
+    if matches == 0:
+        return 0.0
+    # transpositions: matched characters in order, count positions that disagree
+    transpositions = 0
+    j = 0
+    for i, ca in enumerate(a):
+        if not a_matched[i]:
+            continue
+        while not b_matched[j]:
+            j += 1
+        if ca != b[j]:
+            transpositions += 1
+        j += 1
+    half = transpositions // 2
+    return (matches / len(a) + matches / len(b) + (matches - half) / matches) / 3.0
+```
+
+#### Step 3: Winkler and Soundex
+
+`jaro_winkler` counts the common prefix with `zip`, capped at `JW_MAX_PREFIX`. `soundex` keeps the two subtleties: `h`/`w` are skipped without resetting `last`, a vowel resets it, and the key is padded with zeros to four characters; `_SOUNDEX_CODES` is built with `dict.fromkeys`.
+
+```python
+def jaro_winkler(a: str, b: str) -> float:
+    base = jaro(a, b)
+    prefix = 0
+    for ca, cb in zip(a, b):
+        if ca != cb or prefix == JW_MAX_PREFIX:
+            break
+        prefix += 1
+    return base + prefix * JW_PREFIX_SCALE * (1.0 - base)
+
+def soundex(token: str) -> str:
+    t = [c for c in token.lower() if "a" <= c <= "z"]
+    if not t:
+        return ""
+    key = t[0].upper()
+    last = _SOUNDEX_CODES.get(t[0], "")
+    for c in t[1:]:
+        if c in "hw":
+            continue  # h and w are transparent: letters either side with the same code merge
+        code = _SOUNDEX_CODES.get(c, "")
+        if code == "":
+            last = ""  # a vowel separates: the same code may be emitted again
+            continue
+        if code != last:
+            key += code
+            last = code
+        if len(key) == 4:
+            break
+    return (key + "000")[:4]
+```
+
+#### Step 4: Scoring a token pair
+
+`_pair_score` returns a `(kind, score)` tuple instead of a `MatchReason`; the branches and floors are identical, with the initial match, the phonetic floor for a Soundex match below 0.85, and the 0.70 fuzzy floor.
+
+```python
+PHONETIC_FLOOR = 0.85
+INITIAL_SCORE = 0.85
+FUZZY_FLOOR = 0.70  # a token pair below this contributes nothing: it is noise, not evidence
+
+
+def _pair_score(q: str, c: str) -> tuple[ReasonKind, float]:
+    if q == c:
+        return ReasonKind.EXACT, 1.0
+    if len(q) == 1 and c.startswith(q) or len(c) == 1 and q.startswith(c):
+        return ReasonKind.INITIAL, INITIAL_SCORE
+    jw = jaro_winkler(q, c)
+    if soundex(q) == soundex(c) and jw < PHONETIC_FLOOR:
+        return ReasonKind.PHONETIC, PHONETIC_FLOOR
+    if jw >= FUZZY_FLOOR:
+        return ReasonKind.FUZZY, jw
+    return ReasonKind.UNMATCHED, 0.0
+```
+
+#### Step 5: Alignment
+
+`compare` builds every non-unmatched pair, sorts with the tuple key `(-score, i, j)`, and takes pairs greedily. Unmatched particles leave the denominator; unmatched real tokens stay in it; both are recorded as reasons so the explanation is complete.
+
+```python
+    def compare(self, query: str, candidate: str) -> MatchScore:
+        q = tokenize(normalize(query))
+        c = tokenize(normalize(candidate))
+        if not q or not c:
+            return MatchScore(0.0, [])
+        pairs: list[tuple[float, int, int, ReasonKind]] = []
+        for i, qt in enumerate(q):
+            for j, ct in enumerate(c):
+                kind, s = _pair_score(qt, ct)
+                if kind is not ReasonKind.UNMATCHED:
+                    pairs.append((s, i, j, kind))
+        pairs.sort(key=lambda p: (-p[0], p[1], p[2]))  # best first; ties by position: deterministic
+        used_q = [False] * len(q)
+        used_c = [False] * len(c)
+        reasons: list[MatchReason] = []
+        total = 0.0
+        reordered = False
+        for s, i, j, kind in pairs:
+            if used_q[i] or used_c[j]:
+                continue
+            used_q[i] = used_c[j] = True
+            total += s
+            if i != j:
+                reordered = True
+            reasons.append(MatchReason(kind, q[i], c[j], s))
+        q_count, c_count = len(q), len(c)
+        for i, qt in enumerate(q):
+            if not used_q[i]:
+                if qt in PARTICLES:
+                    q_count -= 1
+                    reasons.append(MatchReason(ReasonKind.PARTICLE, qt, "", 0.0))
+                else:
+                    reasons.append(MatchReason(ReasonKind.UNMATCHED, qt, "", 0.0))
+        for j, ct in enumerate(c):
+            if not used_c[j]:
+                if ct in PARTICLES:
+                    c_count -= 1
+                    reasons.append(MatchReason(ReasonKind.PARTICLE, "", ct, 0.0))
+                else:
+                    reasons.append(MatchReason(ReasonKind.UNMATCHED, "", ct, 0.0))
+        denominator = max(q_count, c_count, 1)
+        return MatchScore(total / denominator, reasons, reordered)
+```
+
+#### Step 6: The watchlist, best alias per entry
+
+`screen` validates the threshold with a chained comparison, keeps the best alias per entry so one listed person yields one hit, and sorts hits by `(-score, entry_id)`.
+
+```python
+    def screen(self, name: str, threshold: float) -> ScreeningResult:
+        if not 0.0 < threshold <= 1.0:
+            raise ValueError("threshold must be in (0, 1]")
+        hits: list[Hit] = []
+        for entry in self.entries:
+            best: Hit | None = None
+            for candidate in entry.all_names():  # best alias per entry: one hit per listed person
+                m = self.matcher.compare(name, candidate)
+                if best is None or m.score > best.match.score:
+                    best = Hit(entry.entry_id, candidate, entry.program, m)
+            if best is not None and best.match.score >= threshold:
+                hits.append(best)
+        hits.sort(key=lambda h: (-h.match.score, h.entry_id))
+        return ScreeningResult(name, normalize(name), threshold, hits)
+```
+
+#### Step 7: Precision and recall
+
+`evaluate` is the four-exit `if`/`elif` chain over the labelled pairs, returning an `Evaluation` dataclass whose `precision`, `recall`, and `f1` properties feed the threshold table.
+
+```python
+def evaluate(matcher: NameMatcher, pairs: list[LabelledPair], threshold: float) -> Evaluation:
+    tp = fp = fn = tn = 0
+    for pair in pairs:
+        predicted = matcher.compare(pair.query, pair.list_name).score >= threshold
+        if predicted and pair.is_match:
+            tp += 1
+        elif predicted:
+            fp += 1
+        elif pair.is_match:
+            fn += 1
+        else:
+            tn += 1
+    return Evaluation(threshold, tp, fp, fn, tn)
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/13-risk-fraud-and-compliance/04-sanctions-screening/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output is identical to the Java run:
+
+```console
+== Normalization ==
+  'GRIMBLEWOOD, Thaddeus'            -> 'grimblewood thaddeus'
+  'Dr. Ximena Fortaleza-Rúa'         -> 'ximena fortaleza rua'
+  'Hamid al-Qasrani'                 -> 'hamid al qasrani'
+  'Müller-Lüdenscheidt, Jörg'        -> 'muller ludenscheidt jorg'
+```
 
 ### In Go
 
-`code/go/main.go` returns `(ScreeningResult, error)` from `Screen` with sentinel errors `ErrBadThreshold` and `ErrDuplicateEntry` that tests check with `errors.Is`. Strings are iterated as runes, not bytes, in `Normalize`, because the diacritic table is keyed by `rune` and a byte-wise loop would split `ü` into two garbage bytes; after normalization everything is ASCII and `Jaro` and `Soundex` can index bytes directly. The alignment uses `sort.SliceStable` with an explicit `(score, i, j)` comparator; `sort.Slice` is not stable and would make the explanation order vary between runs. Tests: 9 `Test` functions with 39 assertions.
+The Go port (`code/go/main.go`, tests in `main_test.go`) returns `(ScreeningResult, error)` from `Screen` with sentinel errors `ErrBadThreshold` and `ErrDuplicateEntry` that tests check with `errors.Is`. **Strings are iterated as runes, not bytes, in `Normalize`**, because the diacritic table is keyed by `rune` and a byte-wise loop would split `ü` into two garbage bytes; after normalization everything is ASCII and `Jaro` and `Soundex` can index bytes directly. **The alignment uses `sort.SliceStable`** with an explicit `(score, i, j)` comparator; `sort.Slice` is not stable and would make the explanation order vary between runs. The test file has 9 `Test` functions with 39 assertions.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Normalize
+
+`for _, ch := range name` yields runes, so the `diacritics` lookup sees `ü` whole; `strings.Fields` splits on any run of whitespace and the stopword filter drops honorifics.
+
+```go
+func Normalize(name string) string {
+	var out strings.Builder
+	for _, ch := range name {
+		if folded, ok := diacritics[ch]; ok {
+			out.WriteString(folded)
+		} else if ch < 128 && (unicode.IsLetter(ch) || unicode.IsDigit(ch)) {
+			out.WriteRune(unicode.ToLower(ch))
+		} else {
+			out.WriteByte(' ') // punctuation, hyphens, apostrophes, anything else
+		}
+	}
+	var tokens []string
+	for _, t := range strings.Fields(out.String()) {
+		if !stopwords[t] {
+			tokens = append(tokens, t)
+		}
+	}
+	return strings.Join(tokens, " ")
+}
+```
+
+#### Step 2: Jaro
+
+After normalization the strings are ASCII, so `a[i]` and `b[j]` index bytes safely. The algorithm is the Java one line for line, using Go's built-in `max`/`min`.
+
+```go
+func Jaro(a, b string) float64 {
+	if a == b {
+		return 1.0
+	}
+	if a == "" || b == "" {
+		return 0.0
+	}
+	window := max(len(a), len(b))/2 - 1
+	if window < 0 {
+		window = 0
+	}
+	aMatched := make([]bool, len(a))
+	bMatched := make([]bool, len(b))
+	matches := 0
+	for i := 0; i < len(a); i++ {
+		lo := max(0, i-window)
+		hi := min(len(b), i+window+1)
+		for j := lo; j < hi; j++ {
+			if !bMatched[j] && b[j] == a[i] {
+				aMatched[i] = true
+				bMatched[j] = true
+				matches++
+				break
+			}
+		}
+	}
+	if matches == 0 {
+		return 0.0
+	}
+	transpositions := 0
+	j := 0
+	for i := 0; i < len(a); i++ {
+		if !aMatched[i] {
+			continue
+		}
+		for !bMatched[j] {
+			j++
+		}
+		if a[i] != b[j] {
+			transpositions++
+		}
+		j++
+	}
+	half := transpositions / 2
+	m := float64(matches)
+	return (m/float64(len(a)) + m/float64(len(b)) + (m-float64(half))/m) / 3.0
+}
+```
+
+#### Step 3: Winkler and Soundex
+
+`JaroWinkler` counts the common prefix up to `jwMaxPrefix`. `Soundex` works on a `[]byte` of letters; `soundexCode` returns `0` for a vowel, which resets `last`, while `h` and `w` are skipped without touching it.
+
+```go
+func JaroWinkler(a, b string) float64 {
+	base := Jaro(a, b)
+	prefix := 0
+	for i := 0; i < min(len(a), len(b)); i++ {
+		if a[i] != b[i] || prefix == jwMaxPrefix {
+			break
+		}
+		prefix++
+	}
+	return base + float64(prefix)*jwPrefixScale*(1.0-base)
+}
+
+func Soundex(token string) string {
+	var letters []byte
+	for _, c := range []byte(strings.ToLower(token)) {
+		if c >= 'a' && c <= 'z' {
+			letters = append(letters, c)
+		}
+	}
+	if len(letters) == 0 {
+		return ""
+	}
+	key := []byte{byte(unicode.ToUpper(rune(letters[0])))}
+	last := soundexCode(letters[0])
+	for i := 1; i < len(letters) && len(key) < 4; i++ {
+		c := letters[i]
+		if c == 'h' || c == 'w' {
+			continue
+		}
+		code := soundexCode(c)
+		if code == 0 {
+			last = 0 // a vowel separates: the same code may be emitted again
+			continue
+		}
+		if code != last {
+			key = append(key, code)
+			last = code
+		}
+	}
+	for len(key) < 4 {
+		key = append(key, '0')
+	}
+	return string(key)
+}
+```
+
+#### Step 4: Scoring a token pair
+
+`PairScore` returns a `MatchReason` value with the same four evidence kinds and the same floors.
+
+```go
+func PairScore(q, c string) MatchReason {
+	if q == c {
+		return MatchReason{Exact, q, c, 1.0}
+	}
+	if (len(q) == 1 && strings.HasPrefix(c, q)) || (len(c) == 1 && strings.HasPrefix(q, c)) {
+		return MatchReason{Initial, q, c, InitialScore}
+	}
+	jw := JaroWinkler(q, c)
+	if Soundex(q) == Soundex(c) && jw < PhoneticFloor {
+		return MatchReason{Phonetic, q, c, PhoneticFloor}
+	}
+	if jw >= FuzzyFloor {
+		return MatchReason{Fuzzy, q, c, jw}
+	}
+	return MatchReason{Unmatched, q, c, 0.0}
+}
+```
+
+#### Step 5: Alignment
+
+`Compare` collects the candidate pairs, sorts them stably by score descending then `(i, j)`, and takes them greedily; the particle and unmatched bookkeeping adjusts the denominator exactly as in Java.
+
+```go
+func (NameMatcher) Compare(query, candidate string) MatchScore {
+	q := Tokenize(Normalize(query))
+	c := Tokenize(Normalize(candidate))
+	if len(q) == 0 || len(c) == 0 {
+		return MatchScore{0.0, nil, false}
+	}
+	var pairs []pair
+	for i, qt := range q {
+		for j, ct := range c {
+			r := PairScore(qt, ct)
+			if r.Kind != Unmatched {
+				pairs = append(pairs, pair{r.Score, i, j, r.Kind})
+			}
+		}
+	}
+	// best first; ties broken by position so the alignment is deterministic
+	sort.SliceStable(pairs, func(x, y int) bool {
+		if pairs[x].score != pairs[y].score {
+			return pairs[x].score > pairs[y].score
+		}
+		if pairs[x].i != pairs[y].i {
+			return pairs[x].i < pairs[y].i
+		}
+		return pairs[x].j < pairs[y].j
+	})
+	usedQ := make([]bool, len(q))
+	usedC := make([]bool, len(c))
+	var reasons []MatchReason
+	total := 0.0
+	reordered := false
+	for _, p := range pairs {
+		if usedQ[p.i] || usedC[p.j] {
+			continue
+		}
+		usedQ[p.i], usedC[p.j] = true, true
+		total += p.score
+		if p.i != p.j {
+			reordered = true
+		}
+		reasons = append(reasons, MatchReason{p.kind, q[p.i], c[p.j], p.score})
+	}
+	qCount, cCount := len(q), len(c)
+	for i, qt := range q {
+		if usedQ[i] {
+			continue
+		}
+		if particles[qt] {
+			qCount--
+			reasons = append(reasons, MatchReason{Particle, qt, "", 0.0})
+		} else {
+			reasons = append(reasons, MatchReason{Unmatched, qt, "", 0.0})
+		}
+	}
+	for j, ct := range c {
+		if usedC[j] {
+			continue
+		}
+		if particles[ct] {
+			cCount--
+			reasons = append(reasons, MatchReason{Particle, "", ct, 0.0})
+		} else {
+			reasons = append(reasons, MatchReason{Unmatched, "", ct, 0.0})
+		}
+	}
+	denominator := max(qCount, cCount, 1)
+	return MatchScore{total / float64(denominator), reasons, reordered}
+}
+```
+
+#### Step 6: The watchlist, best alias per entry
+
+`Screen` returns `ErrBadThreshold` for a threshold outside `(0, 1]`, keeps a `*Hit` per entry so "none yet" is `nil`, and sorts hits stably by score then entry id.
+
+```go
+func (w *Watchlist) Screen(name string, threshold float64) (ScreeningResult, error) {
+	if !(threshold > 0.0 && threshold <= 1.0) {
+		return ScreeningResult{}, ErrBadThreshold
+	}
+	var hits []Hit
+	for _, entry := range w.Entries {
+		var best *Hit
+		for _, candidate := range entry.AllNames() { // best alias per entry: one hit per listed person
+			m := w.Matcher.Compare(name, candidate)
+			if best == nil || m.Score > best.Match.Score {
+				best = &Hit{entry.EntryID, candidate, entry.Program, m}
+			}
+		}
+		if best != nil && best.Match.Score >= threshold {
+			hits = append(hits, *best)
+		}
+	}
+	sort.SliceStable(hits, func(a, b int) bool {
+		if hits[a].Match.Score != hits[b].Match.Score {
+			return hits[a].Match.Score > hits[b].Match.Score
+		}
+		return hits[a].EntryID < hits[b].EntryID
+	})
+	return ScreeningResult{name, Normalize(name), threshold, hits}, nil
+}
+```
+
+#### Step 7: Precision and recall
+
+`Evaluate` is a tagless `switch` with the same four exits, accumulating directly into an `Evaluation` struct.
+
+```go
+func Evaluate(matcher NameMatcher, pairs []LabelledPair, threshold float64) Evaluation {
+	ev := Evaluation{Threshold: threshold}
+	for _, p := range pairs {
+		predicted := matcher.Compare(p.Query, p.ListName).Score >= threshold
+		switch {
+		case predicted && p.IsMatch:
+			ev.TP++
+		case predicted:
+			ev.FP++
+		case p.IsMatch:
+			ev.FN++
+		default:
+			ev.TN++
+		}
+	}
+	return ev
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/13-risk-fraud-and-compliance/04-sanctions-screening/code/go
+go run .
+go test ./...
+```
+
+The output is identical to the Java run; the threshold table ends:
+
+```console
+   0.85  12   6   0   6     0.667   1.000  0.800
+   0.90  12   4   0   8     0.750   1.000  0.857
+   0.95   9   1   3  11     0.900   0.750  0.818
+   1.00   4   0   8  12     1.000   0.333  0.500
+```
 
 ## Use It
 

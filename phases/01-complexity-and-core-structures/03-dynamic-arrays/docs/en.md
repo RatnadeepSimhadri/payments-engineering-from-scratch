@@ -346,22 +346,155 @@ The test harness prints `38 passed, 0 failed`.
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps `GrowthPolicy`, `ArrayStats`, `DynamicArray`, and the same thresholds. What differs: **the backing store is a fixed-length `list` of slots.** Python's own `list` is already a dynamic array that hides its capacity, so the port preallocates `[None] * capacity` and never calls `append` on it; `size` is tracked by hand, and the tail shifts in `insert` and `remove` are slice assignments of equal length, the Python spelling of `System.arraycopy`. **Bounds are checked by hand, and negative indexes are rejected:** a Python list would happily answer `a[-1]`; `_check_index` raises `IndexError` for anything outside `0..size-1`, which is what `Objects.checkIndex` does, and `NoSuchElementException` from `remove_last` on an empty array also becomes `IndexError`, matching `list.pop()`. **No overflow guard:** Python integers are arbitrary precision, so `size * 4L` becomes a plain `self._size * 4 < capacity`. **`GrowthPolicy` is an `Enum` with a `next` method** instead of constant-specific bodies; the arithmetic is identical, so the capacity sequences, copy counts, and slack percentages print the same numbers as Java.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The growth policy as a value
+
+An `Enum` whose single `next` method branches on `self`, because Python enums cannot give each member its own method body. The integer arithmetic is identical, including the `max(capacity + 1, ...)` guard that keeps a capacity-1 array growing. Iterating over `GrowthPolicy` yields the members in declaration order, which is what the demo and tests rely on.
+
 ```python
-def _resize(self, new_capacity: int) -> None:
-    if new_capacity < self._size:
-        raise RuntimeError("cannot shrink below size")
-    # Arrays.copyOf: a new backing list of new_capacity slots holding the live prefix.
-    self._elements = self._elements[:self._size] + [None] * (new_capacity - self._size)
-    self._stats.reallocations += 1
-    self._stats.elements_copied += self._size
+class GrowthPolicy(Enum):
+    """How capacity grows when the backing array is full. The factor is the whole trade-off."""
+
+    GROW_1_5X = "GROW_1_5X"
+    GROW_2X = "GROW_2X"
+
+    def next(self, capacity: int) -> int:
+        """The capacity after one reallocation from `capacity`."""
+        if self is GrowthPolicy.GROW_1_5X:
+            # capacity + capacity/2, but always at least +1 so tiny arrays still grow (1 -> 2, 2 -> 3).
+            return max(capacity + 1, capacity + (capacity >> 1))
+        return max(capacity + 1, capacity << 1)
 ```
 
-`code/python/main.py` keeps `GrowthPolicy`, `ArrayStats`, `DynamicArray`, and the same thresholds. What differs:
+#### Step 2: Counters, so the argument is measured
 
-- **The backing store is a fixed-length `list` of slots.** Python's own `list` is already a dynamic array that hides its capacity, so the port preallocates `[None] * capacity` and never calls `append` on it; `size` is tracked by hand, and the tail shifts in `insert` and `remove` are slice assignments of equal length, the Python spelling of `System.arraycopy`.
-- **Bounds are checked by hand, and negative indexes are rejected.** A Python list would happily answer `a[-1]`; `_check_index` raises `IndexError` for anything outside `0..size-1`, which is what `Objects.checkIndex` does. `NoSuchElementException` from `remove_last` on an empty array also becomes `IndexError`, matching `list.pop()`.
-- **No overflow guard.** Python integers are arbitrary precision, so `size * 4L` becomes a plain `self._size * 4 < capacity`.
-- **`GrowthPolicy` is an `Enum` with a `next` method** instead of constant-specific bodies; the arithmetic (`max(capacity + 1, capacity + (capacity >> 1))`) is identical, so the capacity sequences, copy counts, and slack percentages print the same numbers as Java.
+A plain class with four public attributes and a `__str__` that prints them in the same `key=value` layout as the Java `toString`, so the measured rows read the same in both languages.
+
+```python
+class ArrayStats:
+    """Counters that make the amortized argument measurable rather than believed."""
+
+    def __init__(self) -> None:
+        self.reallocations = 0     # how many times a new backing array was allocated
+        self.elements_copied = 0   # total elements moved between backing arrays (grow + shrink)
+        self.shrinks = 0           # how many of the reallocations were shrinks
+        self.peak_capacity = 0     # largest backing array ever held
+```
+
+#### Step 3: The structure and its invariant
+
+`DynamicArray(Generic[T])` holds a list of `Optional[T]` slots whose length is the capacity. The invariant is the same: `elements[0..size)` are live and the rest are `None`. Constructor checks raise `ValueError` where Java throws `IllegalArgumentException`; `shrink_enabled` defaults to `True` so the common call site needs two arguments.
+
+```python
+class DynamicArray(Generic[T]):
+    MIN_CAPACITY = 4
+
+    def __init__(self, initial_capacity: int, policy: GrowthPolicy, shrink_enabled: bool = True) -> None:
+        if initial_capacity < 1:
+            raise ValueError("initial_capacity must be >= 1")
+        if policy is None:
+            raise ValueError("policy must not be None")
+        self._elements: list[Optional[T]] = [None] * initial_capacity
+        self._size = 0
+        self._policy = policy
+        self._shrink_enabled = shrink_enabled
+        self._stats = ArrayStats()
+        self._stats.peak_capacity = initial_capacity
+```
+
+#### Step 4: Append and the grow path
+
+`add` is the Java method with the post-increment unrolled. `_resize` is where `Arrays.copyOf` becomes a slice of the live prefix concatenated with fresh `None` slots; the slots past `size` are `None` by construction. The counter is `elements_copied += self._size`: copies are the cost, empty slots are not touched.
+
+```python
+    def add(self, value: T) -> None:
+        """Append. O(1) amortized: a copy of all `size` elements happens only when size == capacity."""
+        if self._size == len(self._elements):
+            self._resize(self._policy.next(len(self._elements)))
+        self._elements[self._size] = value
+        self._size += 1
+
+    def _resize(self, new_capacity: int) -> None:
+        if new_capacity < self._size:
+            raise RuntimeError("cannot shrink below size")
+        # Arrays.copyOf: a new backing list of new_capacity slots holding the live prefix.
+        self._elements = self._elements[:self._size] + [None] * (new_capacity - self._size)
+        self._stats.reallocations += 1
+        self._stats.elements_copied += self._size
+        if new_capacity > self._stats.peak_capacity:
+            self._stats.peak_capacity = new_capacity
+```
+
+#### Step 5: Access bounded by size, not capacity
+
+`_check_index` is the hand-written `Objects.checkIndex`: it compares against `size`, not `len(self._elements)`, and it rejects negative indexes explicitly because a bare list index would wrap them around. The `type: ignore` comments stand in for Java's unchecked cast; the slot is typed `Optional[T]` but is known to be live.
+
+```python
+    def _check_index(self, index: int) -> None:
+        # size, not capacity: a slot past size is not an element. Negative indexes are rejected, not wrapped.
+        if index < 0 or index >= self._size:
+            raise IndexError(f"Index {index} out of bounds for length {self._size}")
+
+    def get(self, index: int) -> T:
+        self._check_index(index)
+        return self._elements[index]  # type: ignore[return-value]
+
+    def set(self, index: int, value: T) -> T:
+        self._check_index(index)
+        old = self._elements[index]
+        self._elements[index] = value
+        return old  # type: ignore[return-value]
+```
+
+#### Step 6: Insert and remove in the middle
+
+The tail shifts are slice assignments of equal length on both sides, which is how Python expresses an overlapping `arraycopy`; the interpreter copies the source slice first, so direction does not matter. `insert` accepts `index == size`, `remove` does not, and `remove` clears the vacated slot before calling `_maybe_shrink`.
+
+```python
+    def insert(self, index: int, value: T) -> None:
+        """Insert at index, shifting the tail right. O(n - index): the cost the ring buffer lesson avoids."""
+        if index < 0 or index > self._size:
+            raise IndexError(f"index {index} size {self._size}")
+        if self._size == len(self._elements):
+            self._resize(self._policy.next(len(self._elements)))
+        e = self._elements
+        e[index + 1:self._size + 1] = e[index:self._size]  # System.arraycopy, shifting right by one
+        e[index] = value
+        self._size += 1
+
+    def remove(self, index: int) -> T:
+        """Remove at index, shifting the tail left, clearing the vacated slot so the GC can reclaim it."""
+        self._check_index(index)
+        e = self._elements
+        old = e[index]
+        if self._size - index - 1 > 0:
+            e[index:self._size - 1] = e[index + 1:self._size]
+        self._size -= 1
+        e[self._size] = None
+        self._maybe_shrink()
+        return old  # type: ignore[return-value]
+```
+
+#### Step 7: Shrink with hysteresis
+
+The same quarter-full trigger and half-capacity target. `self._size * 4 < capacity` needs no `long` widening because Python ints cannot overflow; `capacity // 2` is the integer halving. At exactly one quarter full nothing happens, and `MIN_CAPACITY` is the floor.
+
+```python
+    def _maybe_shrink(self) -> None:
+        if not self._shrink_enabled:
+            return
+        capacity = len(self._elements)
+        if capacity > self.MIN_CAPACITY and self._size * 4 < capacity:  # Python ints cannot overflow
+            target = max(self.MIN_CAPACITY, capacity // 2)
+            if target < capacity:
+                self._stats.shrinks += 1
+                self._resize(target)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/03-dynamic-arrays/code/python
@@ -369,37 +502,244 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Measured copies for 1,000,000 appends (initial capacity 8) ==
+GROW_1_5X: reallocations=29 copied=2010617 shrinks=0 peakCapacity=1005310  copies/append=2.011  slack=0.5%
+GROW_2X: reallocations=17 copied=1048568 shrinks=0 peakCapacity=1048576  copies/append=1.049  slack=4.9%
+Both are O(1) amortized; the factor moves the constant between 'fewer copies' and 'less slack'.
+
+== Can freed blocks be reused? (sum of earlier capacities vs the next one) ==
+GROW_1_5X: 12(no) 18(fits) 27(fits) 40(fits) 60(fits) 90(fits) 135(fits) 202(fits)
+GROW_2X: 16(no) 32(no) 64(no) 128(no) 256(no)
+
+== Shrink with hysteresis: add/remove at the boundary does not thrash ==
+after 64 adds: size=64 capacity=64 reallocations=4 copied=60 shrinks=0 peakCapacity=64
+down to 16:    size=16 capacity=64 reallocations=4 copied=60 shrinks=0 peakCapacity=64
+down to 15:    size=15 capacity=32 (15*4 < 64 -> shrink to 32)
+1000 add/remove pairs at the boundary: reallocations added = 0
+```
+
+Every number matches the Java run, because the growth arithmetic is integer arithmetic in both languages.
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps `GrowthPolicy`, `ArrayStats`, `DynamicArray`, and the same thresholds. What differs: **the backing store is a `[]T` whose length is the capacity.** Go slices are already dynamic arrays with a hidden `cap`, so the port never calls `append` on the backing slice: `make([]T, capacity)` allocates it, `size` is tracked by hand, and the tail shifts in `Insert` and `Remove` are `copy` calls, the Go spelling of `System.arraycopy`; `copy` handles overlapping ranges correctly in both directions. **Errors are values:** `Get`, `Set`, `Remove`, and `RemoveLast` return `(T, error)`; `Insert` returns `error`; `ErrIndexOutOfBounds` and `ErrEmpty` are sentinels the tests match with `errors.Is`. The one panic is `resize` being asked to shrink below `size`, which is a bug in the array, not a caller mistake. **`DynamicArray[T any]` is a generic type:** the `[T any]` parameter replaces Java's `Object[]` plus unchecked casts; vacated slots are set to the zero value of `T` instead of `null`, which has the same effect on the garbage collector when `T` is a pointer type. **`GrowthPolicy` is an `int` enum with a `Next` method** instead of constant-specific bodies; the arithmetic is identical, so the capacity sequences, copy counts, and slack percentages print the same numbers as Java.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The growth policy as a value
+
+An integer type with two `iota` constants, a `Policies` slice that plays the role of `values()`, and a `Next` method. Go 1.21's built-in `max` keeps the `capacity+1` guard on one line.
+
 ```go
-func (a *DynamicArray[T]) Remove(index int) (T, error) {
-    var zero T
-    if err := a.checkIndex(index); err != nil {
-        return zero, err
-    }
-    old := a.elements[index]
-    if moved := a.size - index - 1; moved > 0 {
-        copy(a.elements[index:], a.elements[index+1:a.size])
-    }
-    a.size--
-    a.elements[a.size] = zero // the GC can reclaim a pointer-typed element
-    a.maybeShrink()
-    return old, nil
+type GrowthPolicy int
+
+const (
+	Grow1_5X GrowthPolicy = iota
+	Grow2X
+)
+
+// Policies lists every policy in declaration order, like GrowthPolicy.values().
+var Policies = []GrowthPolicy{Grow1_5X, Grow2X}
+
+// Next is the capacity after one reallocation from capacity.
+func (p GrowthPolicy) Next(capacity int) int {
+	if p == Grow1_5X {
+		// capacity + capacity/2, but always at least +1 so tiny arrays still grow (1 -> 2, 2 -> 3).
+		return max(capacity+1, capacity+(capacity>>1))
+	}
+	return max(capacity+1, capacity<<1)
 }
 ```
 
-`code/go/main.go` keeps `GrowthPolicy`, `ArrayStats`, `DynamicArray`, and the same thresholds. What differs:
+#### Step 2: Counters, so the argument is measured
 
-- **The backing store is a `[]T` whose length is the capacity.** Go slices are already dynamic arrays with a hidden `cap`, so the port never calls `append` on the backing slice: `make([]T, capacity)` allocates it, `size` is tracked by hand, and the tail shifts in `Insert` and `Remove` are `copy` calls, the Go spelling of `System.arraycopy`. `copy` handles overlapping ranges correctly in both directions.
-- **Errors are values.** `Get`, `Set`, `Remove`, and `RemoveLast` return `(T, error)`; `Insert` returns `error`. `ErrIndexOutOfBounds` and `ErrEmpty` are sentinels the tests match with `errors.Is`. The one panic is `resize` being asked to shrink below `size`, which is a bug in the array, not a caller mistake.
-- **`DynamicArray[T any]` is a generic type.** The `[T any]` parameter replaces Java's `Object[]` plus unchecked casts; vacated slots are set to the zero value of `T` instead of `null`, which has the same effect on the garbage collector when `T` is a pointer type.
-- **`GrowthPolicy` is an `int` enum with a `Next` method** instead of constant-specific bodies; the arithmetic (`max(capacity+1, capacity+(capacity>>1))`) is identical, so the capacity sequences, copy counts, and slack percentages print the same numbers as Java.
+A struct with exported fields; the three counts are `int64` so a long demo cannot wrap them, and `String()` renders the same `key=value` row as Java.
+
+```go
+// ArrayStats are counters that make the amortized argument measurable rather than believed.
+type ArrayStats struct {
+	Reallocations  int64 // how many times a new backing array was allocated
+	ElementsCopied int64 // total elements moved between backing arrays (grow + shrink)
+	Shrinks        int64 // how many of the reallocations were shrinks
+	PeakCapacity   int   // largest backing array ever held
+}
+```
+
+#### Step 3: The structure and its invariant
+
+The generic struct holds a `[]T` whose `len` is the capacity. There are two constructors because Go has no default arguments: `NewDynamicArray` enables shrinking, `NewDynamicArrayShrink` lets the caller choose. Both return `(*DynamicArray[T], error)` so the capacity check is an error rather than a panic; `mustArray` wraps it for the demo.
+
+```go
+type DynamicArray[T any] struct {
+	elements      []T // len(elements) is the capacity
+	size          int
+	policy        GrowthPolicy
+	shrinkEnabled bool
+	stats         ArrayStats
+}
+
+// NewDynamicArray creates an array with shrinking enabled.
+func NewDynamicArray[T any](initialCapacity int, policy GrowthPolicy) (*DynamicArray[T], error) {
+	return NewDynamicArrayShrink[T](initialCapacity, policy, true)
+}
+
+// NewDynamicArrayShrink creates an array and chooses whether it shrinks.
+func NewDynamicArrayShrink[T any](initialCapacity int, policy GrowthPolicy, shrinkEnabled bool) (*DynamicArray[T], error) {
+	if initialCapacity < 1 {
+		return nil, errors.New("initialCapacity must be >= 1")
+	}
+	a := &DynamicArray[T]{elements: make([]T, initialCapacity), policy: policy, shrinkEnabled: shrinkEnabled}
+	a.stats.PeakCapacity = initialCapacity
+	return a, nil
+}
+```
+
+#### Step 4: Append and the grow path
+
+`Add` is identical in shape. `resize` allocates a fresh slice with `make` and copies the live prefix with `copy`, which is `Arrays.copyOf` in two lines; the new slots hold the zero value by construction. The shrink-below-size check panics because no caller can reach it legitimately.
+
+```go
+// Add appends. O(1) amortized: a copy of all size elements happens only when size == capacity.
+func (a *DynamicArray[T]) Add(value T) {
+	if a.size == len(a.elements) {
+		a.resize(a.policy.Next(len(a.elements)))
+	}
+	a.elements[a.size] = value
+	a.size++
+}
+
+func (a *DynamicArray[T]) resize(newCapacity int) {
+	if newCapacity < a.size {
+		panic("cannot shrink below size")
+	}
+	fresh := make([]T, newCapacity)
+	copy(fresh, a.elements[:a.size])
+	a.elements = fresh
+	a.stats.Reallocations++
+	a.stats.ElementsCopied += int64(a.size)
+	if newCapacity > a.stats.PeakCapacity {
+		a.stats.PeakCapacity = newCapacity
+	}
+}
+```
+
+#### Step 5: Access bounded by size, not capacity
+
+`checkIndex` returns a wrapped `ErrIndexOutOfBounds`, and `Get` and `Set` return the zero value alongside it. The comparison is against `a.size`; a slice index against `len(a.elements)` would compile and return zero values for slots past the end.
+
+```go
+func (a *DynamicArray[T]) checkIndex(index int) error {
+	if index < 0 || index >= a.size { // size, not capacity: a slot past size is not an element
+		return fmt.Errorf("%w: index %d size %d", ErrIndexOutOfBounds, index, a.size)
+	}
+	return nil
+}
+
+// Get reads the element at index.
+func (a *DynamicArray[T]) Get(index int) (T, error) {
+	var zero T
+	if err := a.checkIndex(index); err != nil {
+		return zero, err
+	}
+	return a.elements[index], nil
+}
+
+// Set replaces the element at index and returns the old one.
+func (a *DynamicArray[T]) Set(index int, value T) (T, error) {
+	var zero T
+	if err := a.checkIndex(index); err != nil {
+		return zero, err
+	}
+	old := a.elements[index]
+	a.elements[index] = value
+	return old, nil
+}
+```
+
+#### Step 6: Insert and remove in the middle
+
+The built-in `copy` is memmove-safe, so the right shift in `Insert` and the left shift in `Remove` are each one call. `Insert` accepts `index == size` and returns only an `error`; `Remove` zeroes the vacated slot (the Go equivalent of `= null`) before `maybeShrink`.
+
+```go
+// Insert at index, shifting the tail right. O(n - index): the cost the ring buffer lesson avoids.
+func (a *DynamicArray[T]) Insert(index int, value T) error {
+	if index < 0 || index > a.size {
+		return fmt.Errorf("%w: index %d size %d", ErrIndexOutOfBounds, index, a.size)
+	}
+	if a.size == len(a.elements) {
+		a.resize(a.policy.Next(len(a.elements)))
+	}
+	copy(a.elements[index+1:a.size+1], a.elements[index:a.size])
+	a.elements[index] = value
+	a.size++
+	return nil
+}
+
+// Remove at index, shifting the tail left, zeroing the vacated slot so the GC can reclaim it.
+func (a *DynamicArray[T]) Remove(index int) (T, error) {
+	var zero T
+	if err := a.checkIndex(index); err != nil {
+		return zero, err
+	}
+	old := a.elements[index]
+	moved := a.size - index - 1
+	if moved > 0 {
+		copy(a.elements[index:], a.elements[index+1:a.size])
+	}
+	a.size--
+	a.elements[a.size] = zero
+	a.maybeShrink()
+	return old, nil
+}
+```
+
+#### Step 7: Shrink with hysteresis
+
+The condition widens both sides to `int64` for the same reason the Java uses `4L`: `int` is 64 bits on most Go targets but not all, and a spurious negative product would trigger a bogus shrink. `MinCapacity` is a package constant and `max` is the built-in.
+
+```go
+func (a *DynamicArray[T]) maybeShrink() {
+	if !a.shrinkEnabled {
+		return
+	}
+	capacity := len(a.elements)
+	if capacity > MinCapacity && int64(a.size)*4 < int64(capacity) {
+		target := max(MinCapacity, capacity/2)
+		if target < capacity {
+			a.stats.Shrinks++
+			a.resize(target)
+		}
+	}
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/03-dynamic-arrays/code/go
 go run .
 go test ./...
 ```
+
+```console
+== Measured copies for 1,000,000 appends (initial capacity 8) ==
+GROW_1_5X: reallocations=29 copied=2010617 shrinks=0 peakCapacity=1005310  copies/append=2.011  slack=0.5%
+GROW_2X: reallocations=17 copied=1048568 shrinks=0 peakCapacity=1048576  copies/append=1.049  slack=4.9%
+Both are O(1) amortized; the factor moves the constant between 'fewer copies' and 'less slack'.
+
+== Can freed blocks be reused? (sum of earlier capacities vs the next one) ==
+GROW_1_5X: 12(no) 18(fits) 27(fits) 40(fits) 60(fits) 90(fits) 135(fits) 202(fits)
+GROW_2X: 16(no) 32(no) 64(no) 128(no) 256(no)
+
+== Shrink with hysteresis: add/remove at the boundary does not thrash ==
+after 64 adds: size=64 capacity=64 reallocations=4 copied=60 shrinks=0 peakCapacity=64
+down to 16:    size=16 capacity=64 reallocations=4 copied=60 shrinks=0 peakCapacity=64
+down to 15:    size=15 capacity=32 (15*4 < 64 -> shrink to 32)
+1000 add/remove pairs at the boundary: reallocations added = 0
+```
+
+The output is identical to the Java and Python runs.
 
 ## Use It
 

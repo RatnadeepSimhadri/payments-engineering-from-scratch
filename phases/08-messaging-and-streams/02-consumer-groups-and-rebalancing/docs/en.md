@@ -344,57 +344,427 @@ Expected output, abbreviated:
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Ordered maps are plain `dict`s:** Java uses `LinkedHashMap` for the assignment (insertion order = member order) and `TreeMap` for membership and owners; Python's `dict` keeps insertion order, so the assignment needs nothing extra, `members()` returns `sorted(self._last_heartbeat)`, and `Assignor.owners` sorts its items before returning, which keeps the demo and history lines byte-identical to Java's. **`TreeSet<Integer> unassigned` is a `set` iterated with `sorted(...)`:** the sticky assignor hands orphans out in ascending partition order; a bare `set` iteration would be unordered and could give partition 7 a different owner than the Java run. **`pop()` is `remove(size - 1)`:** the levelling loop moves the *last* partition of the heaviest member, before the final sort. Keep it as `pop()`, not `pop(0)`; the two choices produce different but equally balanced assignments, and the tests pin the Java one (`moved == 2`). **Exceptions are `UnknownMemberError`, `IllegalGenerationError`, `NotOwnerError`** (plain `Exception` subclasses) and `ValueError` where Java throws `IllegalArgumentException`; `HeartbeatResult` is an `Enum` whose `__str__` prints the bare name so the demo reads `-> REBALANCE_IN_PROGRESS`, and `Assignment.partitions` is a tuple, the frozen-dataclass equivalent of `List.copyOf`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: An injected clock and the result types
+
+`ManualClock` is the whole reason the session-timeout test takes no time: "c2 has been silent for ten seconds" is `clock.advance(10_000)`. `Assignment` is a frozen dataclass holding the generation and a tuple of partitions, and `HeartbeatResult` is an `Enum` with the three Java constants.
+
 ```python
-# 2. orphans go to whoever has the fewest (ties: lowest member id, because members are sorted)
-for p in sorted(unassigned):
-    out[self._least_loaded(members, out)].append(p)
-# 3. level: move one partition at a time from the heaviest to the lightest while the spread exceeds one
-while True:
-    most, least = self._most_loaded(members, out), self._least_loaded(members, out)
-    if len(out[most]) - len(out[least]) <= 1:
-        break
-    out[least].append(out[most].pop())
+class ManualClock:
+    def __init__(self, start_millis: int) -> None:
+        self._now = start_millis
+
+    def now(self) -> int:
+        return self._now
+
+    def advance(self, millis: int) -> None:
+        if millis < 0:
+            raise ValueError("clock only moves forward")
+        self._now += millis
+
+
+@dataclass(frozen=True)
+class Assignment:
+    generation: int
+    partitions: Tuple[int, ...]
+
+
+class HeartbeatResult(Enum):
+    OK = "OK"
+    REBALANCE_IN_PROGRESS = "REBALANCE_IN_PROGRESS"
+    UNKNOWN_MEMBER = "UNKNOWN_MEMBER"
+
+    def __str__(self) -> str:
+        return self.name
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The assignor contract and the movement metric
 
-- **Ordered maps are plain `dict`s.** Java uses `LinkedHashMap` for the assignment (insertion order = member order) and `TreeMap` for membership and owners. Python's `dict` keeps insertion order, so the assignment needs nothing extra; `members()` returns `sorted(self._last_heartbeat)` and `Assignor.owners` sorts its items before returning, which keeps the demo and history lines byte-identical to Java's.
-- **`TreeSet<Integer> unassigned` is a `set` iterated with `sorted(...)`.** The sticky assignor hands orphans out in ascending partition order; a bare `set` iteration would be unordered and could give partition 7 a different owner than the Java run.
-- **`pop()` is `remove(size - 1)`.** The levelling loop moves the *last* partition of the heaviest member, before the final sort. Keep it as `pop()`, not `pop(0)`; the two choices produce different but equally balanced assignments, and the tests pin the Java one (`moved == 2`).
-- **Exceptions are `UnknownMemberError`, `IllegalGenerationError`, `NotOwnerError`** (plain `Exception` subclasses) and `ValueError` where Java throws `IllegalArgumentException`. `HeartbeatResult` is an `Enum` whose `__str__` prints the bare name so the demo reads `-> REBALANCE_IN_PROGRESS`.
-- **`Assignment.partitions` is a tuple**, the frozen-dataclass equivalent of `List.copyOf`.
+`Assignor` is a base class with `name` and `assign` raising `NotImplementedError`; the two static helpers are `@staticmethod`s on it. `owners` inverts the assignment and enforces the invariant (`RuntimeError` for a partition under two members), then returns a sorted `dict` to stand in for Java's `TreeMap`. `moved` is a one-line generator sum over the before-owners.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The output, including the rebalance history, matches the Java run line for line.
+```python
+class Assignor:
+    def name(self) -> str:
+        raise NotImplementedError
+
+    def assign(self, members: List[str], partition_count: int, previous: AssignmentMap) -> AssignmentMap:
+        raise NotImplementedError
+
+    @staticmethod
+    def moved(before: AssignmentMap, after: AssignmentMap) -> int:
+        owner_before = Assignor.owners(before)
+        owner_after = Assignor.owners(after)
+        return sum(1 for p, m in owner_before.items() if owner_after.get(p) != m)
+
+    @staticmethod
+    def owners(assignment: AssignmentMap) -> Dict[int, str]:
+        owners: Dict[int, str] = {}
+        for m, ps in assignment.items():
+            for p in ps:
+                if p in owners:
+                    raise RuntimeError(f"partition {p} assigned twice")
+                owners[p] = m
+        return dict(sorted(owners.items()))
+```
+
+#### Step 3: Range and round-robin
+
+Range computes `per_member` and `extra` with `//` and `%` and hands each member a `range` slice; the first `extra` members get one more. Round-robin (in `RoundRobinAssignor`, just below it) is `out[members[p % len(members)]].append(p)` for each `p`. Both ignore `previous`.
+
+```python
+    def assign(self, members: List[str], partition_count: int, previous: AssignmentMap) -> AssignmentMap:
+        out: AssignmentMap = {}
+        if not members:
+            return out
+        per_member = partition_count // len(members)
+        extra = partition_count % len(members)
+        nxt = 0
+        for i, m in enumerate(members):
+            count = per_member + (1 if i < extra else 0)
+            out[m] = list(range(nxt, nxt + count))
+            nxt += count
+        return out
+```
+
+#### Step 4: Sticky
+
+The same three passes. `unassigned` is a `set`, so pass 2 iterates `sorted(unassigned)` to get the ascending order a `TreeSet` gives for free. Pass 3 uses `pop()` (the last element) and then every list is sorted at the end; `_least_loaded` and `_most_loaded` scan `members` in sorted order and keep the first winner, so ties are deterministic.
+
+```python
+        unassigned = set(range(partition_count))
+        # 1. survivors keep their partitions
+        for m in members:
+            for p in previous.get(m, []):
+                if p < partition_count and p in unassigned:
+                    unassigned.remove(p)
+                    out[m].append(p)
+        # 2. orphans go to whoever has the fewest (ties: lowest member id, because members are sorted)
+        for p in sorted(unassigned):
+            out[self._least_loaded(members, out)].append(p)
+        # 3. level: move one partition at a time from the heaviest to the lightest while the spread exceeds one
+        while True:
+            most, least = self._most_loaded(members, out), self._least_loaded(members, out)
+            if len(out[most]) - len(out[least]) <= 1:
+                break
+            p = out[most].pop()
+            out[least].append(p)
+        for l in out.values():
+            l.sort()
+        return out
+```
+
+#### Step 5: Membership and heartbeats
+
+`_last_heartbeat` is an ordinary dict; `members()` sorts its keys on every call, which is what gives the assignor a stable order. `join` only rebalances for a new member id; a re-join refreshes the heartbeat and returns the current assignment. `expire_sessions` collects every member at or past the deadline (note the `<=`) in one comprehension and triggers exactly one rebalance for all of them.
+
+```python
+    def join(self, member_id: str) -> Assignment:
+        is_new = member_id not in self._last_heartbeat
+        self._last_heartbeat[member_id] = self._clock.now()
+        if is_new:
+            self._rebalance(f"join of {member_id}")
+        return Assignment(self._generation, tuple(self._assignment.get(member_id, [])))
+
+    def heartbeat(self, member_id: str, member_generation: int) -> HeartbeatResult:
+        if member_id not in self._last_heartbeat:
+            return HeartbeatResult.UNKNOWN_MEMBER
+        self._last_heartbeat[member_id] = self._clock.now()
+        return HeartbeatResult.OK if member_generation == self._generation else HeartbeatResult.REBALANCE_IN_PROGRESS
+
+    def expire_sessions(self) -> List[str]:
+        deadline = self._clock.now() - self._session_timeout_ms
+        dead = [m for m in self.members() if self._last_heartbeat[m] <= deadline]
+        if dead:
+            for m in dead:
+                del self._last_heartbeat[m]
+            self._rebalance(f"session timeout of {format_members(dead)}")
+        return dead
+```
+
+#### Step 6: Rebalance and the fenced commit
+
+`_rebalance` is the only place the generation and the assignment change, and they change together; `format_assignment` prints the dict in Java's `Map.toString` shape so the history lines match. `commit_offset` applies the three fences in order, each raising its own exception class, and stores the offset keyed by partition alone, because the offset belongs to the group.
+
+```python
+    def _rebalance(self, reason: str) -> None:
+        previous = self._assignment
+        self._assignment = self._assignor.assign(self.members(), self._partition_count, previous)
+        self._generation += 1
+        self._history.append(f"generation {self._generation} ({reason}): {format_assignment(self._assignment)} "
+                             f"moved={Assignor.moved(previous, self._assignment)}")
+
+    def commit_offset(self, member_id: str, member_generation: int, partition: int, next_offset: int) -> None:
+        if member_id not in self._last_heartbeat:
+            raise UnknownMemberError(member_id)
+        if member_generation != self._generation:
+            raise IllegalGenerationError(member_id, member_generation, self._generation)
+        owner = self.owner_of(partition)
+        if member_id != owner:
+            raise NotOwnerError(member_id, partition, owner)
+        if next_offset < 0:
+            raise ValueError("offset must be non-negative")
+        self._committed[partition] = next_offset
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/08-messaging-and-streams/02-consumer-groups-and-rebalancing/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output, including the rebalance history and the `moved=` counts, matches the Java run line for line:
+
+```console
+== The zombie: c2 comes back from its GC pause and tries to commit partition 3 ==
+  rejected: unknown member c2
+  new owner committed next offset 1040 for partition 3
+  c2 re-joins -> generation 5, owns [3, 4, 5]
+  stale generation rejected: member c2 sent generation 4 but the group is at 5
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Errors are values:** `Leave`, `OwnerOf`, and `CommitOffset` return `error`; the three fences wrap the sentinels `ErrUnknownMember`, `ErrIllegalGeneration`, and `ErrNotOwner`, so the demo and the tests match them with `errors.Is` where Java catches by exception class. `NewGroupCoordinator` returns an error for a non-positive partition count or session timeout; `Join` and `Heartbeat` cannot fail and return plain values, as in Java. **Go maps have no order, so every ordered view sorts:** `Members()` returns sorted ids, `ExpireSessions` walks `Members()` so the evicted list and the rebalance reason are deterministic, `FormatAssignment` prints members in sorted order so the history lines are byte-identical to Java's, and the sticky assignor collects `unassigned` into a slice and `sort.Ints` it before handing orphans out, the stand-in for `TreeSet`. **Static interface methods become package functions:** Java's `Assignor.moved` and `Assignor.owners` are `Moved` and `Owners`, and `Owners` panics on a partition assigned twice because that is a bug in an assignor, not a condition a caller can handle. **Enums are typed constants:** `HeartbeatResult` is an `int` type with `OK`, `RebalanceInProgress`, `UnknownMember` and a `String()` method that prints the Java names.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: An injected clock and the result types
+
+`ManualClock.Advance` panics on a negative step, because that is a programming error in a test, not a runtime condition. `Assignment` is a value struct with a slice copy of the partitions, and `HeartbeatResult` is an `int` with `iota` constants and a `String()` that prints the Java spelling.
+
 ```go
-func (g *GroupCoordinator) CommitOffset(memberID string, memberGeneration, partition int, nextOffset int64) error {
-    if _, known := g.lastHeartbeat[memberID]; !known {
-        return unknownMember(memberID)
-    }
-    if memberGeneration != g.generation {
-        return illegalGeneration(memberID, memberGeneration, g.generation)
-    }
-    owner, err := g.OwnerOf(partition)
-    if err != nil {
-        return err
-    }
-    if memberID != owner {
-        return notOwner(memberID, partition, owner)
-    }
-    ...
+type ManualClock struct {
+	now int64
+}
+
+func NewManualClock(startMillis int64) *ManualClock { return &ManualClock{now: startMillis} }
+
+func (c *ManualClock) Now() int64 { return c.now }
+
+func (c *ManualClock) Advance(millis int64) {
+	if millis < 0 {
+		panic("clock only moves forward")
+	}
+	c.now += millis
+}
+
+type Assignment struct {
+	Generation int
+	Partitions []int
+}
+
+type HeartbeatResult int
+
+const (
+	OK HeartbeatResult = iota
+	RebalanceInProgress
+	UnknownMember
+)
+```
+
+#### Step 2: The assignor contract and the movement metric
+
+The interface carries only the two instance methods; `Moved` and `Owners` are package-level functions because Go interfaces cannot have static members. `Owners` returns a plain map (callers sort when they print) and panics on a double assignment; `Moved` ranges over the before-owners and counts the ones whose owner changed.
+
+```go
+type Assignor interface {
+	Name() string
+	Assign(members []string, partitionCount int, previous map[string][]int) map[string][]int
+}
+
+func Moved(before, after map[string][]int) int {
+	ownerBefore := Owners(before)
+	ownerAfter := Owners(after)
+	moved := 0
+	for p, owner := range ownerBefore {
+		if ownerAfter[p] != owner {
+			moved++
+		}
+	}
+	return moved
+}
+
+func Owners(assignment map[string][]int) map[int]string {
+	owners := map[int]string{}
+	for member, ps := range assignment {
+		for _, p := range ps {
+			if _, dup := owners[p]; dup {
+				panic(fmt.Sprintf("partition %d assigned twice", p))
+			}
+			owners[p] = member
+		}
+	}
+	return owners
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: Range and round-robin
 
-- **Errors are values.** `Leave`, `OwnerOf`, and `CommitOffset` return `error`; the three fences wrap the sentinels `ErrUnknownMember`, `ErrIllegalGeneration`, and `ErrNotOwner`, so the demo and the tests match them with `errors.Is` where Java catches by exception class. `NewGroupCoordinator` returns an error for a non-positive partition count or session timeout. `Join` and `Heartbeat` cannot fail and return plain values, as in Java.
-- **Go maps have no order, so every ordered view sorts.** Java leans on `TreeMap` (members, owners) and `LinkedHashMap` (assignment). The Go coordinator stores plain maps and sorts where order is observable: `Members()` returns sorted ids, `ExpireSessions` walks `Members()` so the evicted list and the rebalance reason are deterministic, and `FormatAssignment` prints members in sorted order so the history lines are byte-identical to Java's. The sticky assignor collects `unassigned` into a slice and `sort.Ints` it before handing orphans out, the stand-in for `TreeSet`.
-- **Static interface methods become package functions.** Java's `Assignor.moved` and `Assignor.owners` are `Moved` and `Owners`; Go interfaces cannot carry static members. `Owners` panics on a partition assigned twice, because that is a bug in an assignor, not a condition a caller can handle.
-- **Enums are typed constants.** `HeartbeatResult` is an `int` type with `OK`, `RebalanceInProgress`, `UnknownMember` and a `String()` method that prints the Java names, so the demo still reads `-> REBALANCE_IN_PROGRESS`.
+`RangeAssignor` is an empty struct with value-receiver methods. The arithmetic is the Java one; the only Go-specific detail is initialising `mine` as `[]int{}` rather than `nil` so a member with zero partitions still prints `[]`. `RoundRobinAssignor` (just below) appends `p` to `out[members[p%len(members)]]`.
 
-Run it from `code/go/` with `go run .`; test with `go test ./...`. The output, including the rebalance history and `moved=` counts, matches the Java run.
+```go
+func (RangeAssignor) Assign(members []string, partitionCount int, previous map[string][]int) map[string][]int {
+	out := map[string][]int{}
+	if len(members) == 0 {
+		return out
+	}
+	perMember := partitionCount / len(members)
+	extra := partitionCount % len(members)
+	next := 0
+	for i, m := range members {
+		count := perMember
+		if i < extra {
+			count++
+		}
+		mine := []int{}
+		for k := 0; k < count; k++ {
+			mine = append(mine, next)
+			next++
+		}
+		out[m] = mine
+	}
+	return out
+}
+```
+
+#### Step 4: Sticky
+
+`unassigned` is a `map[int]bool`, so pass 2 first copies its keys into `orphans` and sorts them: without that the orphans would be handed out in map iteration order, which is randomised in Go, and partition 7 could land on a different member each run. Pass 3 pops the last element by reslicing; `leastLoaded` and `mostLoaded` scan `members` in order and keep the first winner.
+
+```go
+	// 1. survivors keep their partitions
+	for _, m := range members {
+		for _, p := range previous[m] {
+			if p < partitionCount && unassigned[p] {
+				delete(unassigned, p)
+				out[m] = append(out[m], p)
+			}
+		}
+	}
+	// 2. orphans go to whoever has the fewest (ties: lowest member id, because members are sorted); ascending order
+	orphans := make([]int, 0, len(unassigned))
+	for p := range unassigned {
+		orphans = append(orphans, p)
+	}
+	sort.Ints(orphans)
+	for _, p := range orphans {
+		least := leastLoaded(members, out)
+		out[least] = append(out[least], p)
+	}
+	// 3. level: move one partition at a time from the heaviest to the lightest while the spread exceeds one
+	for {
+		most, least := mostLoaded(members, out), leastLoaded(members, out)
+		if len(out[most])-len(out[least]) <= 1 {
+			break
+		}
+		from := out[most]
+		p := from[len(from)-1]
+		out[most] = from[:len(from)-1]
+		out[least] = append(out[least], p)
+	}
+```
+
+#### Step 5: Membership and heartbeats
+
+The comma-ok lookup on `lastHeartbeat` is Go's `containsKey`. `Join` copies the partition slice into the returned `Assignment` so a caller cannot mutate the coordinator's state. `ExpireSessions` iterates `g.Members()`, the sorted view, so the `dead` list and therefore the rebalance reason string come out in the same order as Java's `TreeMap` walk.
+
+```go
+func (g *GroupCoordinator) Join(memberID string) Assignment {
+	_, known := g.lastHeartbeat[memberID]
+	g.lastHeartbeat[memberID] = g.clock.Now()
+	if !known {
+		g.rebalance("join of " + memberID)
+	}
+	return Assignment{g.generation, append([]int{}, g.assignment[memberID]...)}
+}
+
+func (g *GroupCoordinator) Heartbeat(memberID string, memberGeneration int) HeartbeatResult {
+	if _, known := g.lastHeartbeat[memberID]; !known {
+		return UnknownMember
+	}
+	g.lastHeartbeat[memberID] = g.clock.Now()
+	if memberGeneration == g.generation {
+		return OK
+	}
+	return RebalanceInProgress
+}
+
+func (g *GroupCoordinator) ExpireSessions() []string {
+	dead := []string{}
+	deadline := g.clock.Now() - g.sessionTimeoutMs
+	for _, m := range g.Members() {
+		if g.lastHeartbeat[m] <= deadline {
+			dead = append(dead, m)
+		}
+	}
+	if len(dead) > 0 {
+		for _, m := range dead {
+			delete(g.lastHeartbeat, m)
+		}
+		g.rebalance("session timeout of " + formatStrings(dead))
+	}
+	return dead
+}
+```
+
+#### Step 6: Rebalance and the fenced commit
+
+`rebalance` is unchanged in shape; `FormatAssignment` sorts the members before printing so the history line matches. `CommitOffset` returns the first fence that fails as a wrapped sentinel error. `OwnerOf` returns `""` for an unowned partition (Go's zero string stands in for Java's `null`), and its own error for a partition number outside the topic.
+
+```go
+func (g *GroupCoordinator) rebalance(reason string) {
+	previous := g.assignment
+	g.assignment = g.assignor.Assign(g.Members(), g.partitionCount, previous)
+	g.generation++
+	g.history = append(g.history, fmt.Sprintf("generation %d (%s): %s moved=%d",
+		g.generation, reason, FormatAssignment(g.assignment), Moved(previous, g.assignment)))
+}
+
+func (g *GroupCoordinator) CommitOffset(memberID string, memberGeneration, partition int, nextOffset int64) error {
+	if _, known := g.lastHeartbeat[memberID]; !known {
+		return unknownMember(memberID)
+	}
+	if memberGeneration != g.generation {
+		return illegalGeneration(memberID, memberGeneration, g.generation)
+	}
+	owner, err := g.OwnerOf(partition)
+	if err != nil {
+		return err
+	}
+	if memberID != owner {
+		return notOwner(memberID, partition, owner)
+	}
+	if nextOffset < 0 {
+		return errors.New("offset must be non-negative")
+	}
+	g.committed[partition] = nextOffset
+	return nil
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/08-messaging-and-streams/02-consumer-groups-and-rebalancing/code/go
+go run .
+go test ./...
+```
+
+The output, including the rebalance history and `moved=` counts, matches the Java run:
+
+```console
+== Rebalance history (range group) ==
+  generation 1 (join of c1): {c1=[0, 1, 2, 3, 4, 5, 6, 7]} moved=0
+  generation 2 (join of c2): {c1=[0, 1, 2, 3], c2=[4, 5, 6, 7]} moved=4
+  generation 3 (join of c3): {c1=[0, 1, 2], c2=[3, 4, 5], c3=[6, 7]} moved=3
+  generation 4 (session timeout of [c2]): {c1=[0, 1, 2, 3], c3=[4, 5, 6, 7]} moved=3
+  generation 5 (join of c2): {c1=[0, 1, 2], c2=[3, 4, 5], c3=[6, 7]} moved=3
+```
 
 ## Use It
 

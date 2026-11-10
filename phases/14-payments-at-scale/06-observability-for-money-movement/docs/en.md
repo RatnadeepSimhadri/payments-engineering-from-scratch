@@ -356,25 +356,250 @@ ALERT PAGE auth-rate-drop:proc_b: proc_b approves 74.00% vs fleet 83.50% over 15
 
 ### In Python
 
-`code/python/main.py` keeps `ManualClock`, `MinuteCounter`, `Ratio`, `Slo`, `BurnRule`, `MoneyMovementMonitor`, and `Simulation`, and prints the same three dashboards. What differs:
+The Python port (`code/python/main.py`, tests in `test_main.py`) keeps `ManualClock`, `MinuteCounter`, `Ratio`, `Slo`, `BurnRule`, `MoneyMovementMonitor`, and `Simulation`, and prints the same three dashboards. What differs: **Time is `datetime` with `timezone.utc` and `timedelta`.** The clock hands out aware datetimes; `MinuteCounter.minute` buckets by `int(at.timestamp()) // 60`, which is `Math.floorDiv(epochSecond, 60)`; `minutes_of` reproduces `Duration.toMinutes` (truncation toward zero), and `iso_z` prints the `2026-03-31T13:10:00Z` form `Instant.toString` uses. A naive `datetime` compared with the clock raises `TypeError`, which is the right failure. **Dicts replace `TreeMap` and `EnumMap`:** the counter keeps a plain dict of minute buckets and filters by range (a few hundred buckets, so a scan beats a sorted structure); `processors()` returns `sorted(...)` so alerts and the dashboard list processors in the same order as Java; the exposure and histogram maps iterate `PaymentState` in declaration order, which is what `EnumMap` did. **Integer arithmetic is exact and unbounded:** `burn_rate_x100` and `Ratio.bps` use `//`; the inputs are non-negative, so floor division equals Java's truncation, and there is no `multiplyExact` to port because Python integers do not overflow. **The simulation's randomness is `java.util.Random`, reimplemented:** `Simulation` draws from a `JavaRandom` with the JDK's 48-bit LCG (`next_int` with its rejection loop, `next_double` from 53 bits), so seed 42 produces the same amounts, outcomes, first-fired minutes, and dashboards as the Java demo; the scheduled callbacks are closures created inside `_attempt`, one scope per call, so they capture the right payment id without the `final` dance Java needs. The Python tests port every Java check (54 assertions).
 
-- **Time is `datetime` with `timezone.utc` and `timedelta`.** The clock hands out aware datetimes; `MinuteCounter.minute` buckets by `int(at.timestamp()) // 60`, which is `Math.floorDiv(epochSecond, 60)`. `minutes_of` reproduces `Duration.toMinutes` (truncation toward zero), and `iso_z` prints the `2026-03-31T13:10:00Z` form `Instant.toString` uses. A naive `datetime` compared with the clock raises `TypeError`, which is the right failure.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Injected time
+
+`ManualClock.advance` adds a `timedelta` and refuses a negative one with `ValueError`; every age, window, and alert below reads `clock.now()`.
 
 ```python
-def sum(self, now: datetime, window: timedelta) -> list[int]:
-    now_minute = self.minute(now)
-    start = now_minute - minutes_of(window) + 1
-    total = [0] * self.width
-    for minute, counts in self.buckets.items():
-        if start <= minute <= now_minute:
-            for i in range(self.width):
-                total[i] += counts[i]
-    return total
+class Clock:
+    def now(self) -> datetime:
+        raise NotImplementedError
+
+
+class ManualClock(Clock):
+    def __init__(self, start: datetime) -> None:
+        self._now = start
+
+    def now(self) -> datetime:
+        return self._now
+
+    def advance(self, d: timedelta) -> None:
+        if d < timedelta(0):
+            raise ValueError("time does not go backwards")
+        self._now = self._now + d
 ```
 
-- **Dicts replace `TreeMap` and `EnumMap`.** The counter keeps a plain dict of minute buckets and filters by range (a few hundred buckets, so a scan beats a sorted structure); `processors()` returns `sorted(...)` so alerts and the dashboard list processors in the same order as Java; the exposure and histogram maps iterate `PaymentState` in declaration order, which is what `EnumMap` did.
-- **Integer arithmetic is exact and unbounded.** `burn_rate_x100` and `Ratio.bps` use `//`; the inputs are non-negative, so floor division equals Java's truncation, and there is no `multiplyExact` to port because Python integers do not overflow.
-- **The simulation's randomness is `java.util.Random`, reimplemented.** `Simulation` draws from a `JavaRandom` with the JDK's 48-bit LCG (`next_int` with its rejection loop, `next_double` from 53 bits), so seed 42 produces the same amounts, outcomes, first-fired minutes, and dashboards as the Java demo. The scheduled callbacks are closures created inside `_attempt`, one scope per call, so they capture the right payment id without the `final` dance Java needs.
+#### Step 2: Tracking state entry
+
+`transition` rejects a foreign currency, pops the payment on a terminal state, and otherwise stores a fresh `Tracked` record with the current time, so the tracked dict is exactly the in-flight set.
+
+```python
+    def transition(self, payment_id: str, processor: str, amount: Money, to: PaymentState) -> None:
+        """Record that a payment entered a state now. Terminal states stop tracking the payment."""
+        if amount.currency != self.currency:
+            raise CurrencyMismatchError(self.currency, amount.currency)
+        if to.terminal():
+            self.payments.pop(payment_id, None)
+        else:
+            self.payments[payment_id] = Tracked(processor, amount, to, self.clock.now())
+```
+
+#### Step 3: Stuck detection
+
+`stuck` computes each age as a `timedelta`, compares with the state's limit, and sorts by `(-age.total_seconds(), payment_id)` so the oldest comes first with a deterministic tie-break. `stuck_exposure` sums the amounts.
+
+```python
+    def stuck(self) -> list[StuckPayment]:
+        """Payments whose time in their current state exceeds that state's limit, oldest first."""
+        out = []
+        for payment_id, t in self.payments.items():
+            age = self.clock.now() - t.entered_at
+            limit = self.stuck_after.get(t.state)
+            if limit is not None and age > limit:
+                out.append(StuckPayment(payment_id, t.processor, t.state, age, t.amount))
+        out.sort(key=lambda s: (-s.age.total_seconds(), s.payment_id))
+        return out
+
+    def stuck_exposure(self) -> Money:
+        total = Money.zero(self.currency)
+        for s in self.stuck():
+            total = total.plus(s.amount)
+        return total
+```
+
+#### Step 4: Minute buckets and windows
+
+`minute` is `int(timestamp) // 60`; `sum` scans the dict and keeps buckets in `[now - w + 1, now]`; `covers` checks that the oldest bucket reaches back the whole window.
+
+```python
+class MinuteCounter:
+    """Counts per minute bucket, keyed by epoch minute. A window query sums the buckets whose minute is in
+    (now - window, now]. Old buckets are dropped once they fall outside the longest window we query."""
+
+    def __init__(self, width: int) -> None:
+        self.buckets: dict[int, list[int]] = {}
+        self.width = width
+
+    @staticmethod
+    def minute(at: datetime) -> int:
+        return int(at.timestamp()) // 60  # Math.floorDiv(epochSecond, 60)
+
+    def add(self, at: datetime, slot: int, n: int) -> None:
+        counts = self.buckets.get(self.minute(at))
+        if counts is None:
+            counts = self.buckets[self.minute(at)] = [0] * self.width
+        counts[slot] += n
+
+    def sum(self, now: datetime, window: timedelta) -> list[int]:
+        now_minute = self.minute(now)
+        start = now_minute - minutes_of(window) + 1
+        total = [0] * self.width
+        for minute, counts in self.buckets.items():
+            if start <= minute <= now_minute:
+                for i in range(self.width):
+                    total[i] += counts[i]
+        return total
+
+    def covers(self, now: datetime, window: timedelta) -> bool:
+        """True when the counter has data reaching back at least the whole window."""
+        if not self.buckets:
+            return False
+        return min(self.buckets) <= self.minute(now) - minutes_of(window) + 1
+```
+
+#### Step 5: Auth rate and burn rate
+
+`auth_rate_bps` returns -1 below the minimum sample; `burn_rate_x100` feeds only `PROCESSOR_ERROR` as bad into `Slo.burn_rate_x100`, which is exact integer arithmetic with `//`.
+
+```python
+class Slo:
+    """Burn rate for an SLO with error budget given in parts per million (99.9% SLO = 1,000 ppm budget).
+    Returned x100 so that 14.4 is 1440 and every comparison is an exact integer comparison."""
+
+    name: str
+    budget_ppm: int
+
+    def burn_rate_x100(self, bad: int, total: int) -> int:
+        if total == 0:
+            return 0
+        # (bad / total) / (budgetPpm / 1e6) * 100 = bad * 1e8 / (total * budgetPpm)
+        return bad * 100_000_000 // (total * self.budget_ppm)
+
+    def auth_rate_bps(self, processor: Optional[str], window: timedelta) -> int:
+        """Approvals over all attempts, in basis points; -1 if fewer than min_attempts_for_rate attempts."""
+        c = self._counts(processor, window)
+        total = c[0] + c[1] + c[2]
+        return -1 if total < self.min_attempts_for_rate else Ratio.bps(c[AuthOutcome.APPROVED.value], total)
+
+    def attempts(self, processor: Optional[str], window: timedelta) -> int:
+        c = self._counts(processor, window)
+        return c[0] + c[1] + c[2]
+
+    def _counts(self, processor: Optional[str], window: timedelta) -> list[int]:
+        if processor is None:
+            return self.auth_all.sum(self.clock.now(), window)
+        mc = self.auth_by_processor.get(processor)
+        return [0, 0, 0] if mc is None else mc.sum(self.clock.now(), window)
+
+    def burn_rate_x100(self, window: timedelta) -> int:
+        """Availability SLI burn rate: processor errors are bad, issuer declines are good events."""
+        c = self.auth_all.sum(self.clock.now(), window)
+        return self.slo.burn_rate_x100(c[AuthOutcome.PROCESSOR_ERROR.value], c[0] + c[1] + c[2])
+```
+
+#### Step 6: Alert rules
+
+`evaluate_alerts` is stateless: burn rules gated by `covers`, stuck payments with severity by exposure, per-processor auth-rate drop against the fleet, and the reconciliation break rate, in that order.
+
+```python
+    def evaluate_alerts(self) -> list[Alert]:
+        out: list[Alert] = []
+        for r in self.burn_rules:
+            if not self.auth_all.covers(self.clock.now(), r.long_window):
+                continue  # a half-empty long window is a short window
+            lng, shrt = self.burn_rate_x100(r.long_window), self.burn_rate_x100(r.short_window)
+            if lng >= r.threshold_x100 and shrt >= r.threshold_x100:
+                out.append(Alert(r.severity, f"slo-burn-{minutes_of(r.long_window)}m",
+                                 f"{self.slo.name} burning {x100(lng)} over {minutes_of(r.long_window)}m and {x100(shrt)} over "
+                                 f"{minutes_of(r.short_window)}m (threshold {x100(r.threshold_x100)})"))
+        stuck = self.stuck()
+        if stuck:
+            exposure = self.stuck_exposure()
+            sev = Severity.PAGE if exposure >= self.stuck_page_threshold else Severity.TICKET
+            oldest = stuck[0]
+            out.append(Alert(sev, "stuck-payments", f"{len(stuck)} stuck, {exposure}; oldest {oldest.payment_id} in {oldest.state} "
+                                                    f"for {minutes_of(oldest.age)}m"))
+        fleet = self.auth_rate_bps(None, timedelta(minutes=15))
+        for p in self.processors():
+            rate = self.auth_rate_bps(p, timedelta(minutes=15))
+            if rate >= 0 and fleet >= 0 and fleet - rate >= self.auth_drop_bps:
+                out.append(Alert(Severity.PAGE, f"auth-rate-drop:{p}", f"{p} approves {Ratio.pct(rate)} vs fleet {Ratio.pct(fleet)} over 15m"))
+        recon = self.recon_break_rate_bps(4)
+        if recon >= self.recon_break_ticket_bps:
+            out.append(Alert(Severity.TICKET, "recon-break-rate", f"break rate {Ratio.pct(recon)} over last 4 runs"))
+        return out
+```
+
+#### Step 7: The dashboard
+
+`dashboard` renders the same screen with f-string alignment: exposure and age histogram per non-terminal state, auth rates per processor, burn rates, break rate, and the firing alerts.
+
+```python
+    def dashboard(self) -> str:
+        lines = [f"MONEY MOVEMENT  {iso_z(self.clock.now())}\n", f"in flight {self.total_in_flight()}\n"]
+        hist = self.state_age_histogram()
+        lines.append(f"  {'state':<16} {'amount':<14} {'<1m':>6} {'1-5m':>6} {'5-15m':>6} {'15-60m':>6} {'1-24h':>6} {'>24h':>6}\n")
+        for state, amount in self.in_flight_exposure().items():
+            h = hist[state]
+            lines.append(f"  {state.name:<16} {str(amount):<14} {h[0]:>6} {h[1]:>6} {h[2]:>6} {h[3]:>6} {h[4]:>6} {h[5]:>6}\n")
+        lines.append(f"auth rate        {'5m':<10} {'1h':<10} {'attempts 1h':<10}\n")
+        for p in self.processors():
+            lines.append(f"  {p:<14} {Ratio.pct(self.auth_rate_bps(p, timedelta(minutes=5))):<10} "
+                         f"{Ratio.pct(self.auth_rate_bps(p, timedelta(hours=1))):<10} {self.attempts(p, timedelta(hours=1))}\n")
+        lines.append(f"slo burn         5m {x100(self.burn_rate_x100(timedelta(minutes=5)))}  1h {x100(self.burn_rate_x100(timedelta(hours=1)))}"
+                     f"  6h {x100(self.burn_rate_x100(timedelta(hours=6)))}\n")
+        lines.append(f"recon breaks     {Ratio.pct(self.recon_break_rate_bps(4))} (last 4 runs)\n")
+        alerts = self.evaluate_alerts()
+        if not alerts:
+            lines.append("alerts           none\n")
+        for a in alerts:
+            lines.append(f"ALERT {a.severity} {a.name}: {a.detail}\n")
+        return "".join(lines)
+```
+
+#### Step 8: The simulation
+
+`_attempt` draws the amount and outcome from `JavaRandom`, transitions the payment, schedules the capture steps as closures (one scope per call), and turns one in five processor errors into a reconciliation break.
+
+```python
+    def _attempt(self, minute: int, processor: str) -> None:
+        payment_id = f"pay_{self._seq:06d}"
+        self._seq += 1
+        amount = Money.of_minor(500 + self.rnd.next_int(49_500), USD)
+        u = self.rnd.next_double()
+        degraded = processor == "proc_b" and minute >= self.OUTAGE_MINUTE
+        error_p = 0.25 if degraded else 0.0005
+        outcome = (AuthOutcome.PROCESSOR_ERROR if u < error_p
+                   else AuthOutcome.ISSUER_DECLINE if u < error_p + 0.08
+                   else AuthOutcome.APPROVED)
+        monitor = self.monitor
+        monitor.transition(payment_id, processor, amount, PaymentState.CREATED)
+        monitor.auth_result(processor, outcome)
+        if outcome is AuthOutcome.APPROVED:
+            monitor.transition(payment_id, processor, amount, PaymentState.AUTHORIZED)
+            self._at(minute + 1, lambda: monitor.transition(payment_id, processor, amount, PaymentState.CAPTURE_PENDING))
+
+            def capture() -> None:
+                monitor.transition(payment_id, processor, amount, PaymentState.CAPTURED)
+                self._captured[payment_id] = amount
+                self._recon_matched += 1
+
+            self._at(minute + 2, capture)
+        elif outcome is AuthOutcome.ISSUER_DECLINE:
+            monitor.transition(payment_id, processor, amount, PaymentState.FAILED)
+        else:
+            monitor.transition(payment_id, processor, amount, PaymentState.FAILED)
+            # A timeout is not a decline: one in five was actually approved at the processor,
+            # which reconciliation later reports as a capture we do not have.
+            if self.rnd.next_int(5) == 0:
+                self._recon_breaks += 1
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/14-payments-at-scale/06-observability-for-money-movement/code/python
@@ -382,33 +607,337 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The Python tests port every Java check (54 assertions) and the demo output is identical to the Java run.
+The output is identical to the Java run:
+
+```console
+== Eight hours of traffic, seed 42 ==
+lost capture webhooks injected at minute 360; proc_b outage starts at minute 420
+  first fired stuck-payments         minute 376 (12:16)
+  first fired auth-rate-drop:proc_b  minute 423 (13:03)
+  first fired slo-burn-60m           minute 425 (13:05)
+  first fired slo-burn-360m          minute 436 (13:16)
+  first fired recon-break-rate       minute 449 (13:29)
+```
 
 ### In Go
 
-`code/go/main.go` keeps `Clock`/`ManualClock`, `MinuteCounter`, `Ratio`, `Slo`, `BurnRule`, `MoneyMovementMonitor`, and `Simulation`; `javarandom.go` carries the JDK generator so seed 42 prints the same first-fired minutes and the same three dashboards. What differs:
+The Go port (`code/go/main.go`, tests in `main_test.go`) keeps `Clock`/`ManualClock`, `MinuteCounter`, `Ratio`, `Slo`, `BurnRule`, `MoneyMovementMonitor`, and `Simulation`; `javarandom.go` carries the JDK generator so seed 42 prints the same first-fired minutes and the same three dashboards. What differs: **Time is `time.Time` and `time.Duration`.** The clock hands out UTC times; `epochMinute` reproduces `Math.floorDiv(epochSecond, 60)` with an explicit floor, `minutesOf` is `Duration.toMinutes`, and the dashboard header prints `Format(time.RFC3339)`, which is the `2026-03-31T13:10:00Z` form `Instant.toString` uses; `Advance` returns `ErrTimeBackwards` instead of throwing. **Maps replace `TreeMap` and `EnumMap`:** the counter keeps a plain map of minute buckets and filters by range; `Processors()` sorts its keys so alerts and the dashboard list processors in Java's `TreeMap` order; `nonTerminalStates` fixes the `EnumMap` iteration order for exposure and the histogram; `Simulation.FiredOrder` records the `LinkedHashMap` insertion order next to the `FirstFired` map. **Overflow is checked, not thrown:** `Money.Plus` and `Ratio.Bps` go through `addChecked`/`mulChecked`, which return `ErrOverflow` where Java's `addExact`/`multiplyExact` throw; a `need` helper panics on the error, since no sum of minor units in this lesson can overflow; `Transition` returns a wrapped `ErrCurrencyMismatch` and the test checks it with `errors.Is`; `AgeOf` returns `(time.Duration, bool)` where Java returned `null` for an untracked payment. **Single-goroutine by design:** nothing in the monitor is shared across goroutines; if ingestion and evaluation ran concurrently, a `sync.Mutex` around the monitor would be the first change, and `go test -race` would catch the omission. The Go tests port all 42 Java checks (53 assertions).
 
-- **Time is `time.Time` and `time.Duration`.** The clock hands out UTC times; `epochMinute` reproduces `Math.floorDiv(epochSecond, 60)` with an explicit floor, `minutesOf` is `Duration.toMinutes`, and the dashboard header prints `Format(time.RFC3339)`, which is the `2026-03-31T13:10:00Z` form `Instant.toString` uses. `Advance` returns `ErrTimeBackwards` instead of throwing.
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Injected time
+
+`Clock` is a one-method interface; `ManualClock.Advance` returns `ErrTimeBackwards` for a negative duration.
 
 ```go
-func (c *MinuteCounter) Sum(now time.Time, window time.Duration) []int64 {
-    nowMinute := epochMinute(now)
-    from := nowMinute - minutesOf(window) + 1
-    total := make([]int64, c.width)
-    for minute, counts := range c.buckets {
-        if minute >= from && minute <= nowMinute {
-            for i := 0; i < c.width; i++ {
-                total[i] += counts[i]
-            }
-        }
-    }
-    return total
+type Clock interface{ Now() time.Time }
+
+type ManualClock struct{ now time.Time }
+
+func NewManualClock(start time.Time) *ManualClock { return &ManualClock{start} }
+
+func (c *ManualClock) Now() time.Time { return c.now }
+
+// ErrTimeBackwards is returned when a test tries to advance the clock by a negative duration.
+var ErrTimeBackwards = errors.New("time does not go backwards")
+
+func (c *ManualClock) Advance(d time.Duration) error {
+	if d < 0 {
+		return ErrTimeBackwards
+	}
+	c.now = c.now.Add(d)
+	return nil
 }
 ```
 
-- **Maps replace `TreeMap` and `EnumMap`.** The counter keeps a plain map of minute buckets and filters by range; `Processors()` sorts its keys so alerts and the dashboard list processors in Java's `TreeMap` order; `nonTerminalStates` fixes the `EnumMap` iteration order for exposure and the histogram; `Simulation.FiredOrder` records the `LinkedHashMap` insertion order next to the `FirstFired` map.
-- **Overflow is checked, not thrown.** `Money.Plus` and `Ratio.Bps` go through `addChecked`/`mulChecked`, which return `ErrOverflow` where Java's `addExact`/`multiplyExact` throw; a `need` helper panics on the error, since no sum of minor units in this lesson can overflow. `Transition` returns a wrapped `ErrCurrencyMismatch` and the test checks it with `errors.Is`. `AgeOf` returns `(time.Duration, bool)` where Java returned `null` for an untracked payment.
-- **Single-goroutine by design.** Nothing in the monitor is shared across goroutines; if ingestion and evaluation ran concurrently, a `sync.Mutex` around the monitor would be the first change, and `go test -race` would catch the omission.
+#### Step 2: Tracking state entry
+
+`Transition` returns a wrapped `ErrCurrencyMismatch`, deletes on a terminal state, and otherwise stores a `tracked` value with `clock.Now()`.
+
+```go
+func (m *MoneyMovementMonitor) Transition(paymentId, processor string, amount Money, to PaymentState) error {
+	if amount.Currency != m.currency {
+		return fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, m.currency.Code, amount.Currency.Code)
+	}
+	if to.Terminal() {
+		delete(m.payments, paymentId)
+	} else {
+		m.payments[paymentId] = tracked{processor, amount, to, m.clock.Now()}
+	}
+	return nil
+}
+```
+
+#### Step 3: Stuck detection
+
+`Stuck` iterates the (unordered) map, so the `sort.Slice` by age descending then id is what makes the result deterministic; `StuckExposure` sums with `need(...Plus)`.
+
+```go
+func (m *MoneyMovementMonitor) Stuck() []StuckPayment {
+	out := []StuckPayment{}
+	for id, t := range m.payments {
+		age := m.clock.Now().Sub(t.enteredAt)
+		if limit, ok := m.stuckAfter[t.state]; ok && age > limit {
+			out = append(out, StuckPayment{id, t.processor, t.state, age, t.amount})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Age != out[j].Age {
+			return out[i].Age > out[j].Age
+		}
+		return out[i].PaymentId < out[j].PaymentId
+	})
+	return out
+}
+
+func (m *MoneyMovementMonitor) StuckExposure() Money {
+	total := Zero(m.currency)
+	for _, s := range m.Stuck() {
+		total = need(total.Plus(s.Amount))
+	}
+	return total
+}
+```
+
+#### Step 4: Minute buckets and windows
+
+`epochMinute` floors with a double-modulo so negative seconds would round the right way; `Sum` filters the map by range; `Covers` finds the oldest bucket by scanning, since a Go map has no `firstKey`.
+
+```go
+func minutesOf(d time.Duration) int64 { return int64(d / time.Minute) }
+
+func epochMinute(at time.Time) int64 {
+	s := at.Unix()
+	return (s - ((s%60)+60)%60) / 60 // Math.floorDiv(epochSecond, 60)
+}
+
+// MinuteCounter counts per minute bucket, keyed by epoch minute. A window query sums the buckets whose minute is
+// in (now - window, now]. Old buckets are dropped once they fall outside the longest window we query.
+type MinuteCounter struct {
+	buckets map[int64][]int64
+	width   int
+}
+
+func NewMinuteCounter(width int) *MinuteCounter { return &MinuteCounter{map[int64][]int64{}, width} }
+
+func (c *MinuteCounter) Add(at time.Time, slot int, n int64) {
+	minute := epochMinute(at)
+	counts, ok := c.buckets[minute]
+	if !ok {
+		counts = make([]int64, c.width)
+		c.buckets[minute] = counts
+	}
+	counts[slot] += n
+}
+
+func (c *MinuteCounter) Sum(now time.Time, window time.Duration) []int64 {
+	nowMinute := epochMinute(now)
+	from := nowMinute - minutesOf(window) + 1
+	total := make([]int64, c.width)
+	for minute, counts := range c.buckets {
+		if minute >= from && minute <= nowMinute {
+			for i := 0; i < c.width; i++ {
+				total[i] += counts[i]
+			}
+		}
+	}
+	return total
+}
+
+// Covers is true when the counter has data reaching back at least the whole window.
+func (c *MinuteCounter) Covers(now time.Time, window time.Duration) bool {
+	if len(c.buckets) == 0 {
+		return false
+	}
+	first := int64(0)
+	started := false
+	for minute := range c.buckets {
+		if !started || minute < first {
+			first, started = minute, true
+		}
+	}
+	return first <= epochMinute(now)-minutesOf(window)+1
+}
+```
+
+#### Step 5: Auth rate and burn rate
+
+`AuthRateBps` uses `""` for "all processors" where Java used `null`; `Slo.BurnRateX100` does the exact arithmetic through `mulChecked`.
+
+```go
+type Slo struct {
+	Name      string
+	BudgetPpm int64
+}
+
+func (s Slo) BurnRateX100(bad, total int64) int64 {
+	if total == 0 {
+		return 0
+	}
+	// (bad / total) / (budgetPpm / 1e6) * 100 = bad * 1e8 / (total * budgetPpm)
+	return need(mulChecked(bad, 100_000_000)) / need(mulChecked(total, s.BudgetPpm))
+}
+
+func (m *MoneyMovementMonitor) AuthRateBps(processor string, window time.Duration) int64 {
+	c := m.counts(processor, window)
+	total := c[0] + c[1] + c[2]
+	if total < m.minAttemptsForRate {
+		return -1
+	}
+	return Ratio.Bps(c[Approved], total)
+}
+
+func (m *MoneyMovementMonitor) Attempts(processor string, window time.Duration) int64 {
+	c := m.counts(processor, window)
+	return c[0] + c[1] + c[2]
+}
+
+func (m *MoneyMovementMonitor) counts(processor string, window time.Duration) []int64 {
+	if processor == "" {
+		return m.authAll.Sum(m.clock.Now(), window)
+	}
+	mc, ok := m.authByProcessor[processor]
+	if !ok {
+		return make([]int64, authOutcomes)
+	}
+	return mc.Sum(m.clock.Now(), window)
+}
+
+// BurnRateX100 is the availability SLI burn rate: processor errors are bad, issuer declines are good events.
+func (m *MoneyMovementMonitor) BurnRateX100(window time.Duration) int64 {
+	c := m.authAll.Sum(m.clock.Now(), window)
+	return m.slo.BurnRateX100(c[ProcessorError], c[0]+c[1]+c[2])
+}
+```
+
+#### Step 6: Alert rules
+
+`EvaluateAlerts` evaluates the four families in the same order; `Processors()` is sorted so the per-processor alerts appear in `TreeMap` order.
+
+```go
+func (m *MoneyMovementMonitor) EvaluateAlerts() []Alert {
+	out := []Alert{}
+	for _, r := range m.burnRules {
+		if !m.authAll.Covers(m.clock.Now(), r.LongWindow) {
+			continue // a half-empty long window is a short window
+		}
+		lng, shrt := m.BurnRateX100(r.LongWindow), m.BurnRateX100(r.ShortWindow)
+		if lng >= r.ThresholdX100 && shrt >= r.ThresholdX100 {
+			out = append(out, Alert{r.Severity, fmt.Sprintf("slo-burn-%dm", minutesOf(r.LongWindow)),
+				fmt.Sprintf("%s burning %s over %dm and %s over %dm (threshold %s)", m.slo.Name, X100(lng),
+					minutesOf(r.LongWindow), X100(shrt), minutesOf(r.ShortWindow), X100(r.ThresholdX100))})
+		}
+	}
+	if stuck := m.Stuck(); len(stuck) > 0 {
+		exposure := m.StuckExposure()
+		sev := Ticket
+		if exposure.Compare(m.stuckPageThreshold) >= 0 {
+			sev = Page
+		}
+		oldest := stuck[0]
+		out = append(out, Alert{sev, "stuck-payments", fmt.Sprintf("%d stuck, %v; oldest %s in %v for %dm",
+			len(stuck), exposure, oldest.PaymentId, oldest.State, minutesOf(oldest.Age))})
+	}
+	fleet := m.AuthRateBps("", 15*time.Minute)
+	for _, p := range m.Processors() {
+		rate := m.AuthRateBps(p, 15*time.Minute)
+		if rate >= 0 && fleet >= 0 && fleet-rate >= m.authDropBps {
+			out = append(out, Alert{Page, "auth-rate-drop:" + p,
+				fmt.Sprintf("%s approves %s vs fleet %s over 15m", p, Ratio.Pct(rate), Ratio.Pct(fleet))})
+		}
+	}
+	if recon := m.ReconBreakRateBps(4); recon >= m.reconBreakTicketBps {
+		out = append(out, Alert{Ticket, "recon-break-rate", fmt.Sprintf("break rate %s over last 4 runs", Ratio.Pct(recon))})
+	}
+	return out
+}
+```
+
+#### Step 7: The dashboard
+
+`Dashboard` writes into a `strings.Builder` with `%-16s`/`%6d` widths matching the Java format, iterating `nonTerminalStates` for the `EnumMap` order.
+
+```go
+func (m *MoneyMovementMonitor) Dashboard() string {
+	var sb strings.Builder
+	sb.WriteString("MONEY MOVEMENT  " + m.clock.Now().UTC().Format(time.RFC3339) + "\n")
+	fmt.Fprintf(&sb, "in flight %v\n", m.TotalInFlight())
+	hist := m.StateAgeHistogram()
+	exposure := m.InFlightExposure()
+	fmt.Fprintf(&sb, "  %-16s %-14s %6s %6s %6s %6s %6s %6s\n", "state", "amount", "<1m", "1-5m", "5-15m", "15-60m", "1-24h", ">24h")
+	for _, s := range nonTerminalStates {
+		h := hist[s]
+		fmt.Fprintf(&sb, "  %-16s %-14s %6d %6d %6d %6d %6d %6d\n", s, exposure[s], h[0], h[1], h[2], h[3], h[4], h[5])
+	}
+	fmt.Fprintf(&sb, "auth rate        %-10s %-10s %-10s\n", "5m", "1h", "attempts 1h")
+	for _, p := range m.Processors() {
+		fmt.Fprintf(&sb, "  %-14s %-10s %-10s %d\n", p, Ratio.Pct(m.AuthRateBps(p, 5*time.Minute)),
+			Ratio.Pct(m.AuthRateBps(p, time.Hour)), m.Attempts(p, time.Hour))
+	}
+	fmt.Fprintf(&sb, "slo burn         5m %s  1h %s  6h %s\n", X100(m.BurnRateX100(5*time.Minute)),
+		X100(m.BurnRateX100(time.Hour)), X100(m.BurnRateX100(6*time.Hour)))
+	sb.WriteString("recon breaks     " + Ratio.Pct(m.ReconBreakRateBps(4)) + " (last 4 runs)\n")
+	alerts := m.EvaluateAlerts()
+	if len(alerts) == 0 {
+		sb.WriteString("alerts           none\n")
+	}
+	for _, a := range alerts {
+		fmt.Fprintf(&sb, "ALERT %v %s: %s\n", a.Severity, a.Name, a.Detail)
+	}
+	return sb.String()
+}
+```
+
+#### Step 8: The simulation
+
+`attempt` draws from `JavaRandom`, wraps `Transition` in `need(0, ...)` because a currency mismatch here would be a bug, and schedules the capture closures; Go closures capture `id` per call, so no re-binding is needed.
+
+```go
+func (s *Simulation) attempt(minute int, processor string) {
+	id := fmt.Sprintf("pay_%06d", s.seq)
+	s.seq++
+	amount := OfMinor(500+int64(s.rnd.NextIntBound(49_500)), USD)
+	u := s.rnd.NextDouble()
+	degraded := processor == "proc_b" && minute >= OutageMinute
+	errorP := 0.0005
+	if degraded {
+		errorP = 0.25
+	}
+	outcome := Approved
+	switch {
+	case u < errorP:
+		outcome = ProcessorError
+	case u < errorP+0.08:
+		outcome = IssuerDecline
+	}
+	need(0, s.Monitor.Transition(id, processor, amount, Created))
+	s.Monitor.AuthResult(processor, outcome)
+	switch outcome {
+	case Approved:
+		need(0, s.Monitor.Transition(id, processor, amount, Authorized))
+		s.at(minute+1, func() { need(0, s.Monitor.Transition(id, processor, amount, CapturePending)) })
+		s.at(minute+2, func() {
+			need(0, s.Monitor.Transition(id, processor, amount, Captured))
+			if _, dup := s.captured[id]; !dup {
+				s.capturedIds = append(s.capturedIds, id)
+			}
+			s.captured[id] = amount
+			s.reconMatched++
+		})
+	case IssuerDecline:
+		need(0, s.Monitor.Transition(id, processor, amount, Failed))
+	case ProcessorError:
+		need(0, s.Monitor.Transition(id, processor, amount, Failed))
+		// A timeout is not a decline: one in five was actually approved at the processor,
+		// which reconciliation later reports as a capture we do not have.
+		if s.rnd.NextIntBound(5) == 0 {
+			s.reconBreaks++
+		}
+	}
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/14-payments-at-scale/06-observability-for-money-movement/code/go
@@ -416,7 +945,14 @@ go run .
 go test ./...
 ```
 
-The Go tests port all 42 Java checks (53 assertions) and the demo output is identical to the Java run.
+The output is identical to the Java run; the minute-430 dashboard opens:
+
+```console
+-- dashboard at minute 430 --
+MONEY MOVEMENT  2026-03-31T13:10:00Z
+in flight 101752.68 USD
+  state            amount            <1m   1-5m  5-15m 15-60m  1-24h   >24h
+```
 
 ## Use It
 

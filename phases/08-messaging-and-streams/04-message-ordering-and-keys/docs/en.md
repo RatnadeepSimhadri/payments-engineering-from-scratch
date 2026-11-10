@@ -341,59 +341,409 @@ Ninety retries produced fifty-nine visible reorderings; the rest happened to be 
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **The seeded run reproduces `java.util.Random`:** `random.Random(42)` is a Mersenne Twister and would pick a different 5% of sends to fail, so the "90 retries, 59 gaps, 151 rejected" line would not match. `JavaRandom` is the JDK's 48-bit linear congruential generator in eight lines; `FaultInjector.random` uses it, and the test file checks its first two doubles against the JDK. **`CommitTracker.done_ahead` is a `heapq` plus a `set`**, not a `TreeSet`: the heap gives the smallest finished offset in O(log n) (`[0]` to peek, `heappop` while it equals the mark); the set is what detects "completed twice", which `TreeSet.add` reported for free. **FNV-1a masks every multiply** with `& 0xFFFFFFFF` because Python integers do not wrap; `for b in data` already yields `0..255`, so no `& 0xFF`. **`Money` is `int` minor units** and rejects a `float` in `__post_init__`; `Verdict` is an `Enum` whose `__str__` prints the bare name; `ValueError` replaces `IllegalArgumentException`, `RuntimeError` replaces `IllegalStateException`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Messages carry the producer's sequence number
+
+`Message` is a frozen dataclass with the validation in `__post_init__`; `seq` is assigned by the producer per key before the first send and never changes on retry, while `StoredMessage.offset` is assigned by the log. `produced_at` and `cost_millis` exist only for the simulation.
+
 ```python
-class JavaRandom:
-    """java.util.Random: the 48-bit LCG, so a seed yields the same sequence as the Java demo."""
-    _MASK = (1 << 48) - 1
+@dataclass(frozen=True)
+class Message:
+    key: str
+    seq: int
+    type: str
+    amount: Money
+    produced_at: int
+    cost_millis: int
 
-    def __init__(self, seed: int) -> None:
-        self._seed = (seed ^ 0x5DEECE66D) & self._MASK
+    def __post_init__(self) -> None:
+        if self.key is None:
+            raise TypeError("key")
+        if self.seq < 0:
+            raise ValueError("seq must be non-negative")
+        if self.cost_millis < 0:
+            raise ValueError("costMillis must be non-negative")
 
-    def next(self, bits: int) -> int:
-        self._seed = (self._seed * 0x5DEECE66D + 0xB) & self._MASK
-        value = (self._seed >> (48 - bits)) & 0xFFFFFFFF
-        return value - (1 << 32) if value >= 1 << 31 else value
 
-    def next_double(self) -> float:
-        return ((self.next(26) << 27) + self.next(27)) * (1.0 / (1 << 53))
+@dataclass(frozen=True)
+class StoredMessage:
+    offset: int
+    message: Message
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The partitioner, unchanged from Lesson 01
 
-- **The seeded run reproduces `java.util.Random`.** `random.Random(42)` is a Mersenne Twister and would pick a different 5% of sends to fail, so the "90 retries, 59 gaps, 151 rejected" line would not match. `JavaRandom` is the JDK's 48-bit linear congruential generator in eight lines; `FaultInjector.random` uses it, and the test file checks its first two doubles against the JDK.
-- **`CommitTracker.done_ahead` is a `heapq` plus a `set`**, not a `TreeSet`. The heap gives the smallest finished offset in O(log n) (`[0]` to peek, `heappop` while it equals the mark); the set is what detects "completed twice", which `TreeSet.add` reported for free.
-- **FNV-1a masks every multiply** with `& 0xFFFFFFFF` because Python integers do not wrap; `for b in data` already yields `0..255`, so no `& 0xFF`.
-- **`Money` is `int` minor units** and rejects a `float` in `__post_init__`. `Verdict` is an `Enum` whose `__str__` prints the bare name; `ValueError` replaces `IllegalArgumentException`, `RuntimeError` replaces `IllegalStateException`.
+Both functions are static methods on `Partitioner`. The hash masks after each multiply so it wraps like a Java `int`, and `partition_for` masks the sign bit before the modulo even though the Python hash is already non-negative, so the same key lands in the same partition in all three languages.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. Every number in the demo, including section 6, matches the Java output.
+```python
+class Partitioner:
+    @staticmethod
+    def fnv1a32(data: bytes) -> int:
+        h = 0x811C9DC5
+        for b in data:
+            h ^= b
+            h = (h * 0x01000193) & 0xFFFFFFFF
+        return h
+
+    @staticmethod
+    def partition_for(key: str, partition_count: int) -> int:
+        if partition_count <= 0:
+            raise ValueError("partitionCount must be positive")
+        h = Partitioner.fnv1a32(key.encode("utf-8"))
+        return (h & 0x7FFFFFFF) % partition_count
+```
+
+#### Step 3: The sequential scheduler reproduces head-of-line blocking
+
+One worker is one `busy_until`. The builtin `max` is the whole head-of-line mechanism: a record starts when it has arrived and the worker is free, whichever is later, so the wait behind a 40 ms record is inherited by the next one.
+
+```python
+class SequentialScheduler(Scheduler):
+    def run(self, partition: Partition) -> List[Completion]:
+        out: List[Completion] = []
+        busy_until = 0
+        for s in partition.read_all():
+            m = s.message
+            start = max(busy_until, m.produced_at)
+            end = start + m.cost_millis
+            busy_until = end
+            out.append(Completion(s.offset, m.key, start, end, end - m.produced_at))
+        return out
+```
+
+#### Step 4: Per-key lanes
+
+`busy_until` becomes a list of length `lanes`, indexed by `lane_for(key)`, which is just `Partitioner.partition_for(key, lanes)`. Because the dispatcher walks offsets in order and each lane is FIFO, same-key records are processed in offset order; different lanes never wait for each other. The rest of `run` (shown in Step 5) replays the completions through a `CommitTracker`.
+
+```python
+    def lane_for(self, key: str) -> int:
+        return Partitioner.partition_for(key, self._lanes)
+
+    def run(self, partition: Partition) -> List[Completion]:
+        lane_busy_until = [0] * self._lanes
+        out: List[Completion] = []
+        for s in partition.read_all():
+            m = s.message
+            lane = self.lane_for(m.key)
+            start = max(lane_busy_until[lane], m.produced_at)
+            end = start + m.cost_millis
+            lane_busy_until[lane] = end
+            out.append(Completion(s.offset, m.key, start, end, end - m.produced_at))
+```
+
+#### Step 5: Commit the low-water mark
+
+`_done_ahead` is a min-heap and `_done_set` a parallel set: the heap's `[0]` is the smallest finished offset, popped while it equals `_committable`; the set catches an offset completed twice, which Java's `TreeSet.add` returning `false` caught for free. `KeyedLaneScheduler.run` replays its completions sorted by `(completed_at, offset)` through a tracker and records the deepest `completed_ahead()` it ever saw.
+
+```python
+    def complete(self, offset: int) -> int:
+        if offset < self._committable:
+            raise RuntimeError(f"offset {offset} already committed")
+        if offset in self._done_set:
+            raise RuntimeError(f"offset {offset} completed twice")
+        self._done_set.add(offset)
+        heapq.heappush(self._done_ahead, offset)
+        while self._done_ahead and self._done_ahead[0] == self._committable:
+            self._done_set.discard(heapq.heappop(self._done_ahead))
+            self._committable += 1
+        return self._committable
+```
+
+```python
+        by_time = sorted(out, key=lambda c: (c.completed_at, c.offset))
+        tracker = CommitTracker(0)
+        self._max_completed_ahead = 0
+        for c in by_time:
+            tracker.complete(c.offset)
+            self._max_completed_ahead = max(self._max_completed_ahead, tracker.completed_ahead())
+        self._final_committable = tracker.committable()
+        return out
+```
+
+#### Step 6: Simulating a producer with sends in flight
+
+`pending` is a `collections.deque`, so taking a window from the front (`popleft`) and pushing re-sends back to the front (`appendleft`, in reverse so the smallest index ends up first) are both O(1). A send that fails its first attempt is re-sent in the next window, after the rest of this window has been appended: that is the reordering. With `sequence_guard`, the broker also bounces any send whose `seq` is not `last + 1`.
+
+```python
+        while pending:
+            window: List[_Send] = []
+            while pending and len(window) < max_in_flight:
+                window.append(pending.popleft())
+            resend: List[_Send] = []
+            for send in window:
+                if not send.attempted and faults.fails_first_attempt(send.index):
+                    send.attempted = True
+                    retries += 1
+                    resend.append(send)
+                    continue
+                send.attempted = True
+                key = send.message.key
+                expected = last_seq.get(key, -1) + 1
+                if sequence_guard and send.message.seq != expected:
+                    rejected += 1
+                    resend.append(send)
+                    continue
+                last_seq[key] = send.message.seq
+                appended.append(send.message)
+            resend.sort(key=lambda s: s.index)
+            for s in reversed(resend):
+                pending.appendleft(s)
+        return SendOutcome(appended, retries, rejected)
+```
+
+#### Step 7: Detecting the damage at the consumer
+
+Three verdicts and nothing else. `dict.get(key, -1) + 1` is the `getOrDefault` idiom; `GAP` moves the expectation forward because the consumer cannot wait, `DUPLICATE` leaves it alone, so a reordered retry shows as one of each.
+
+```python
+    def observe(self, m: Message) -> Verdict:
+        expected = self._last_seq.get(m.key, -1) + 1
+        if m.seq == expected:
+            self._last_seq[m.key] = m.seq
+            return Verdict.IN_ORDER
+        if m.seq < expected:
+            self._duplicates += 1
+            return Verdict.DUPLICATE
+        self._gaps += 1
+        self._last_seq[m.key] = m.seq
+        return Verdict.GAP
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/08-messaging-and-streams/04-message-ordering-and-keys/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Every number in the demo, including the seeded section 6, matches the Java output:
+
+```console
+== 5. Retries reorder when more than one send is in flight ==
+maxInFlight=1, sends 2 and 5 fail once: log seqs=[0, 1, 2, 3, 4, 5, 6, 7] retries=2 ordered=true
+maxInFlight=5, sends 2 and 5 fail once: log seqs=[0, 1, 3, 4, 2, 6, 7, 5] retries=2 ordered=false
+consumer-side SequenceTracker on the reordered log: 0:IN_ORDER 1:IN_ORDER 3:GAP 4:IN_ORDER 2:DUPLICATE 6:GAP 7:IN_ORDER 5:DUPLICATE
+maxInFlight=5 with broker sequence guard: log seqs=[0, 1, 2, 3, 4, 5, 6, 7] retries=2 rejected=3 ordered=true
+
+== 6. The same thing at scale, seeded ==
+2000 sends, 5% fail once, maxInFlight=5: unguarded retries=90 gaps seen by consumer=59; guarded rejected=151 ordered=true
+```
 
 ### In Go
 
+The Go port (`code/go/main.go` and `code/go/javarandom.go`) keeps the design with four differences. **`CommitTracker` is a `map[int64]bool`, not a `TreeSet`:** it only ever needs the minimum finished offset when that minimum equals the mark, so a membership map plus the `for c.doneAhead[c.committable]` loop replaces the ordered set; the same map detects "completed twice". `Complete` returns `(mark, error)` with the sentinels `ErrAlreadyCommitted` and `ErrCompletedTwice` where Java throws `IllegalStateException`. **The seeded run reproduces `java.util.Random`:** `math/rand` would pick a different 5% of sends to fail, so section 6 would not match; `JavaRandom` in `javarandom.go` is the JDK's 48-bit LCG (`next(bits)` and `NextDouble`), and the test checks its first two doubles against the JDK. **Errors are values; programming errors panic:** `Deliver`, `NewKeyedLaneScheduler`, and `NewMessage` return `error` for bad arguments, while `PartitionFor` with a non-positive count and `Partition.Get` outside the log `panic`, matching the Java `IllegalArgumentException` / `IndexOutOfBoundsException` for conditions no caller can handle (the test uses `recover`). **Unsigned hashing:** `Fnv1a32` returns `uint32`, so the multiply wraps the way Java's `int` does, and `PartitionFor` masks with `0x7FFFFFFF` before the modulo. `Verdict` is a typed `int` with a `String()` that prints `IN_ORDER`, `DUPLICATE`, `GAP`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Messages carry the producer's sequence number
+
+A struct literal has no constructor, so `NewMessage` is the validating path and returns an error where Java's compact constructor throws. The key cannot be `null` in Go (a string is always a value), so that check disappears.
+
 ```go
-func (c *CommitTracker) Complete(offset int64) (int64, error) {
-    if offset < c.committable {
-        return c.committable, fmt.Errorf("%w: %d", ErrAlreadyCommitted, offset)
-    }
-    if c.doneAhead[offset] {
-        return c.committable, fmt.Errorf("%w: %d", ErrCompletedTwice, offset)
-    }
-    c.doneAhead[offset] = true
-    for c.doneAhead[c.committable] {
-        delete(c.doneAhead, c.committable)
-        c.committable++
-    }
-    return c.committable, nil
+type Message struct {
+	Key        string
+	Seq        int64
+	Type       string
+	Amount     Money
+	ProducedAt int64
+	CostMillis int64
+}
+
+func NewMessage(key string, seq int64, typ string, amount Money, producedAt, costMillis int64) (Message, error) {
+	if seq < 0 {
+		return Message{}, errors.New("seq must be non-negative")
+	}
+	if costMillis < 0 {
+		return Message{}, errors.New("costMillis must be non-negative")
+	}
+	return Message{key, seq, typ, amount, producedAt, costMillis}, nil
+}
+
+type StoredMessage struct {
+	Offset  int64
+	Message Message
 }
 ```
 
-Differences, all in `code/go/main.go` and `code/go/javarandom.go`:
+#### Step 2: The partitioner, unchanged from Lesson 01
 
-- **`CommitTracker` is a `map[int64]bool`, not a `TreeSet`.** It only ever needs the minimum finished offset when that minimum equals the mark, so a membership map plus the `for c.doneAhead[c.committable]` loop replaces the ordered set; the same map detects "completed twice". `Complete` returns `(mark, error)` with the sentinels `ErrAlreadyCommitted` and `ErrCompletedTwice` where Java throws `IllegalStateException`.
-- **The seeded run reproduces `java.util.Random`.** `math/rand` would pick a different 5% of sends to fail, so section 6 would not match. `JavaRandom` in `javarandom.go` is the JDK's 48-bit LCG: `next(bits)` and `NextDouble`; the test checks its first two doubles against the JDK.
-- **Errors are values; programming errors panic.** `Deliver`, `NewKeyedLaneScheduler`, and `NewMessage` return `error` for bad arguments. `PartitionFor` with a non-positive count and `Partition.Get` outside the log `panic`, matching the Java `IllegalArgumentException` / `IndexOutOfBoundsException` for conditions no caller can handle; the test uses `recover`.
-- **Unsigned hashing.** `Fnv1a32` returns `uint32`, so the multiply wraps the way Java's `int` does; `PartitionFor` masks with `0x7FFFFFFF` before the modulo, exactly as the Java does. `Verdict` is a typed `int` with a `String()` that prints `IN_ORDER`, `DUPLICATE`, `GAP`.
+`uint32` arithmetic wraps by definition, so no mask is needed inside the hash. `[]byte(key)` is the UTF-8 encoding. A non-positive partition count panics rather than returning an error, because every caller passes a constant.
 
-Run it from `code/go/` with `go run .`; test with `go test ./...`. Every number in the demo, including section 6, matches the Java output.
+```go
+func Fnv1a32(bytes []byte) uint32 {
+	hash := uint32(0x811C9DC5)
+	for _, b := range bytes {
+		hash ^= uint32(b)
+		hash *= 0x01000193
+	}
+	return hash
+}
+
+func PartitionFor(key string, partitionCount int) int {
+	if partitionCount <= 0 {
+		panic("partitionCount must be positive")
+	}
+	return int(Fnv1a32([]byte(key))&0x7FFFFFFF) % partitionCount
+}
+```
+
+#### Step 3: The sequential scheduler reproduces head-of-line blocking
+
+`SequentialScheduler` is an empty struct satisfying the `Scheduler` interface. The builtin `max` (Go 1.21+) is the head-of-line mechanism; everything else is the integer arithmetic of the Java version.
+
+```go
+func (SequentialScheduler) Run(partition *Partition) []Completion {
+	out := []Completion{}
+	var busyUntil int64
+	for _, s := range partition.ReadAll() {
+		m := s.Message
+		start := max(busyUntil, m.ProducedAt)
+		end := start + m.CostMillis
+		busyUntil = end
+		out = append(out, Completion{s.Offset, m.Key, start, end, end - m.ProducedAt})
+	}
+	return out
+}
+```
+
+#### Step 4: Per-key lanes
+
+`laneBusyUntil` is a `[]int64` of length `lanes`, indexed by `LaneFor`, which delegates to `PartitionFor`. The lane count is validated once in `NewKeyedLaneScheduler`, which returns an error. The replay through the `CommitTracker` follows in Step 5.
+
+```go
+func (k *KeyedLaneScheduler) LaneFor(key string) int { return PartitionFor(key, k.lanes) }
+
+func (k *KeyedLaneScheduler) Run(partition *Partition) []Completion {
+	laneBusyUntil := make([]int64, k.lanes)
+	out := []Completion{}
+	for _, s := range partition.ReadAll() {
+		m := s.Message
+		lane := k.LaneFor(m.Key)
+		start := max(laneBusyUntil[lane], m.ProducedAt)
+		end := start + m.CostMillis
+		laneBusyUntil[lane] = end
+		out = append(out, Completion{s.Offset, m.Key, start, end, end - m.ProducedAt})
+	}
+```
+
+#### Step 5: Commit the low-water mark
+
+The map replaces the ordered set: after marking `offset` done, the loop advances `committable` as long as the next offset is in the map, deleting as it goes, so `len(doneAhead)` is always the finished-but-uncommittable count. The replay in `Run` sorts a copy of the completions by `(CompletedAt, Offset)` and panics if `Complete` ever errors, because a replay completes every offset exactly once.
+
+```go
+func (c *CommitTracker) Complete(offset int64) (int64, error) {
+	if offset < c.committable {
+		return c.committable, fmt.Errorf("%w: %d", ErrAlreadyCommitted, offset)
+	}
+	if c.doneAhead[offset] {
+		return c.committable, fmt.Errorf("%w: %d", ErrCompletedTwice, offset)
+	}
+	c.doneAhead[offset] = true
+	for c.doneAhead[c.committable] {
+		delete(c.doneAhead, c.committable)
+		c.committable++
+	}
+	return c.committable, nil
+}
+```
+
+```go
+	tracker := NewCommitTracker(0)
+	k.maxCompletedAhead = 0
+	for _, c := range byTime {
+		if _, err := tracker.Complete(c.Offset); err != nil {
+			panic(err) // every offset completes exactly once in a replay
+		}
+		k.maxCompletedAhead = max(k.maxCompletedAhead, tracker.CompletedAhead())
+	}
+	k.finalCommittable = tracker.Committable()
+	return out
+}
+```
+
+#### Step 6: Simulating a producer with sends in flight
+
+`pending` is a slice of `*send`; the window is `pending[:n]` and re-sends go back to the front with `append(resend, pending...)`, which copies but keeps the code to one line. The comma-ok lookup on `lastSeq` replaces `getOrDefault(key, -1L) + 1`: a missing key means `expected = 0`. The reordering and the sequence guard work exactly as in Java.
+
+```go
+	for len(pending) > 0 {
+		n := min(maxInFlight, len(pending))
+		window := pending[:n]
+		pending = pending[n:]
+		resend := []*send{}
+		for _, s := range window {
+			if !s.attempted && faults.FailsFirstAttempt(s.index) {
+				s.attempted = true
+				retries++
+				resend = append(resend, s)
+				continue
+			}
+			s.attempted = true
+			key := s.message.Key
+			expected := int64(0)
+			if last, ok := lastSeq[key]; ok {
+				expected = last + 1
+			}
+			if sequenceGuard && s.message.Seq != expected {
+				rejected++
+				resend = append(resend, s)
+				continue
+			}
+			lastSeq[key] = s.message.Seq
+			appended = append(appended, s.message)
+		}
+		sort.Slice(resend, func(i, j int) bool { return resend[i].index < resend[j].index })
+		pending = append(resend, pending...)
+	}
+	return SendOutcome{appended, retries, rejected}, nil
+```
+
+#### Step 7: Detecting the damage at the consumer
+
+Same three verdicts, with the comma-ok lookup for the expected sequence. `Gap` advances `lastSeq`; `Duplicate` does not; the typed constants print as the Java names through `Verdict.String()`.
+
+```go
+func (t *SequenceTracker) Observe(m Message) Verdict {
+	expected := int64(0)
+	if last, ok := t.lastSeq[m.Key]; ok {
+		expected = last + 1
+	}
+	if m.Seq == expected {
+		t.lastSeq[m.Key] = m.Seq
+		return InOrder
+	}
+	if m.Seq < expected {
+		t.duplicates++
+		return Duplicate
+	}
+	t.gaps++
+	t.lastSeq[m.Key] = m.Seq
+	return Gap
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/08-messaging-and-streams/04-message-ordering-and-keys/code/go
+go run .
+go test ./...
+```
+
+Every number in the demo, including the seeded section 6, matches the Java output:
+
+```console
+consumer-side SequenceTracker on the reordered log: 0:IN_ORDER 1:IN_ORDER 3:GAP 4:IN_ORDER 2:DUPLICATE 6:GAP 7:IN_ORDER 5:DUPLICATE
+  gaps=2 duplicates=2 (a GAP followed by a lower seq is the signature of a reordered retry)
+maxInFlight=5 with broker sequence guard: log seqs=[0, 1, 2, 3, 4, 5, 6, 7] retries=2 rejected=3 ordered=true
+
+== 6. The same thing at scale, seeded ==
+2000 sends, 5% fail once, maxInFlight=5: unguarded retries=90 gaps seen by consumer=59; guarded rejected=151 ordered=true
+```
 
 ## Use It
 

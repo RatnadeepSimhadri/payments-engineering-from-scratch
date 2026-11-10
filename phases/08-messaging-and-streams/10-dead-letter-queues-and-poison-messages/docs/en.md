@@ -333,66 +333,414 @@ dead letters remaining: 1 (offset 6, acct-D, awaiting a currency-code fix)
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`HandlerError` carries `kind`** as a `FailureKind` enum attribute, and the consumer checks `ex.kind is FailureKind.PERMANENT`. The multi-catch becomes `except (ValueError, ArithmeticError)`: `Money.parse` raises `ValueError` for garbage (Java's `NumberFormatException`) and `ArithmeticError` for excess precision, and `Currency.of` raises `ValueError` for an unknown code, so the same three poison cases are classified PERMANENT. **The seeded fault injector reproduces `java.util.Random`:** `random.Random(11)` would time out on different ledger calls and the demo would park a different offset. `JavaRandom.next_double()` is the 48-bit LCG, so the second run retries exactly twice and parks offset 5, as in Java; the test file pins the first twelve draws. **`TreeMap` becomes `dict(sorted(...))`** in `LedgerPostingHandler.balances()`, and `LinkedHashMap quarantinedKeys` is a plain `dict` (insertion-ordered); `DeadLetterQueue.clear` rebuilds the list with a comprehension where Java uses `removeIf`, and `replay` sorts the letters with `sorted(..., key=lambda d: d.event.offset)`. **`Money` is `int` minor units** and raises `TypeError` on a `float`; `ConsumerStats` is a frozen dataclass with a `__str__` that prints the Java record shape so the final `stats:` line matches.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Events, failures, and the clock
+
+`Event` (a frozen dataclass, fields shown) carries the payload as strings, because parsing must happen inside the handler where it can fail and be classified. `HandlerError` is a plain `Exception` subclass with a `kind` attribute, and `SimClock.advance` raises `ValueError` on a negative step.
+
 ```python
-def handle(self, e: Event) -> None:
-    try:
-        currency = Currency.of(e.currency_code)
-        amount = Money.parse(e.amount_text, currency)
-    except (ValueError, ArithmeticError) as ex:   # NumberFormatException / IllegalArgumentException / ArithmeticException
-        raise HandlerError(FailureKind.PERMANENT, str(ex)) from None
-    if self._faults.should_fail():
-        raise HandlerError(FailureKind.TRANSIENT, "ledger db timeout")
-    if e.offset in self._applied:                  # idempotent replay
-        return
+    offset: int
+    account_key: str
+    amount_text: str
+    currency_code: str
+
+
+class FailureKind(Enum):
+    TRANSIENT = "TRANSIENT"
+    PERMANENT = "PERMANENT"
+
+
+class HandlerError(Exception):
+    def __init__(self, kind: FailureKind, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class SimClock:
+    def __init__(self) -> None:
+        self._now = 0
+
+    def now(self) -> int:
+        return self._now
+
+    def advance(self, millis: int) -> None:
+        if millis < 0:
+            raise ValueError("cannot advance backwards")
+        self._now += millis
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: An idempotent handler that classifies its failures
 
-- **`HandlerError` carries `kind`** as a `FailureKind` enum attribute, and the consumer checks `ex.kind is FailureKind.PERMANENT`. The multi-catch becomes `except (ValueError, ArithmeticError)`: `Money.parse` raises `ValueError` for garbage (Java's `NumberFormatException`) and `ArithmeticError` for excess precision, and `Currency.of` raises `ValueError` for an unknown code, so the same three poison cases are classified PERMANENT.
-- **The seeded fault injector reproduces `java.util.Random`.** `random.Random(11)` would time out on different ledger calls and the demo would park a different offset. `JavaRandom.next_double()` is the 48-bit LCG, so the second run retries exactly twice and parks offset 5, as in Java; the test file pins the first twelve draws.
-- **`TreeMap` becomes `dict(sorted(...))`** in `LedgerPostingHandler.balances()`, and `LinkedHashMap quarantinedKeys` is a plain `dict` (insertion-ordered). `DeadLetterQueue.clear` rebuilds the list with a comprehension where Java uses `removeIf`; `replay` sorts the letters with `sorted(..., key=lambda d: d.event.offset)`.
-- **`Money` is `int` minor units** and raises `TypeError` on a `float`; `ConsumerStats` is a frozen dataclass with a `__str__` that prints the Java record shape so the final `stats:` line matches.
+One `except` tuple covers the unknown currency, the garbage amount, and the excess-precision case, re-raising as PERMANENT; `from None` keeps the traceback clean. The fault injector runs before the `_applied` check on purpose, so a retry of an already-posted offset is a no-op. The `merge` becomes a conditional assignment.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The dead-letter table and both replays match the Java run line for line.
+```python
+    def handle(self, e: Event) -> None:
+        try:
+            currency = Currency.of(e.currency_code)
+            amount = Money.parse(e.amount_text, currency)
+        except (ValueError, ArithmeticError) as ex:  # ValueError plays NumberFormatException / IllegalArgumentException
+            raise HandlerError(FailureKind.PERMANENT, str(ex)) from None
+        if self._faults.should_fail():
+            raise HandlerError(FailureKind.TRANSIENT, "ledger db timeout")
+        if e.offset in self._applied:  # idempotent replay
+            return
+        current = self._balances.get(e.account_key)
+        self._balances[e.account_key] = amount if current is None else current.plus(amount)
+        self._applied[e.offset] = True
+```
+
+#### Step 3: The dead letter and its queue
+
+`DeadLetter` is a frozen dataclass with the five operator questions. The queue is a list; `for_key` is a filtering comprehension that preserves offset order, and `clear` rebuilds the list without the key's entries, which is Python's `removeIf`.
+
+```python
+@dataclass(frozen=True)
+class DeadLetter:
+    event: Event
+    reason: ParkReason
+    attempts: int
+    last_error: str
+    parked_at: int
+
+
+class DeadLetterQueue:
+    def __init__(self) -> None:
+        self._entries: List[DeadLetter] = []
+
+    def park(self, letter: DeadLetter) -> None:
+        self._entries.append(letter)
+
+    def for_key(self, key: str) -> List[DeadLetter]:
+        return [d for d in self._entries if d.event.account_key == key]
+
+    def clear(self, key: str) -> None:
+        self._entries = [d for d in self._entries if d.event.account_key != key]
+```
+
+#### Step 4: The consumer loop with quarantine
+
+The quarantine check uses `in` on the `_quarantined_keys` dict before the handler is called, and the dead letter names the offset that caused the quarantine. The last line commits the offset whether the event was processed or parked.
+
+```python
+    def consume(self, partition: List[Event]) -> None:
+        for e in partition:
+            if e.account_key in self._quarantined_keys:
+                self._dlq.park(DeadLetter(e, ParkReason.KEY_QUARANTINED, 0,
+                                          f"earlier offset {self._quarantined_keys[e.account_key]} for this key is parked",
+                                          self._clock.now()))
+                self._parked += 1
+                self._quarantined += 1
+            else:
+                self._attempt(e)
+            self._committed_offset = e.offset + 1
+```
+
+#### Step 5: Bounded retries with backoff
+
+`except HandlerError as ex` is the one catch; `ex.kind` decides between parking immediately and retrying. Backoff is `base << (attempts - 1)` on the simulated clock, so 100, 200 ms for three attempts and never a `sleep`.
+
+```python
+    def _attempt(self, e: Event) -> bool:
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                self._handler.handle(e)
+                self._processed += 1
+                return True
+            except HandlerError as ex:
+                if ex.kind is FailureKind.PERMANENT:
+                    self._park(e, ParkReason.PERMANENT_FAILURE, attempts, str(ex))
+                    return False
+                if attempts >= self._max_attempts:
+                    self._park(e, ParkReason.MAX_ATTEMPTS_EXCEEDED, attempts, str(ex))
+                    return False
+                self._retries += 1
+                self._clock.advance(self._base_backoff_millis << (attempts - 1))  # exponential backoff: base, 2x, 4x, ...
+```
+
+#### Step 6: Replay in offset order
+
+`sorted(..., key=...)` orders the letters, `dict.pop(key, None)` lifts the quarantine, and `corrections.get(offset, event)` substitutes a repaired event where the operator supplied one. Because `_attempt` is reused, a replay that fails again re-parks the event, and the slice `letters[i + 1:]` re-parks every follower in order.
+
+```python
+    def replay(self, key: str, corrections: Dict[int, Event]) -> int:
+        letters = sorted(self._dlq.for_key(key), key=lambda d: d.event.offset)
+        self._dlq.clear(key)
+        self._quarantined_keys.pop(key, None)
+        replayed = 0
+        for i, letter in enumerate(letters):
+            e = corrections.get(letter.event.offset, letter.event)
+            self._parked -= 1  # leaving the DLQ, one way or the other
+            if self._attempt(e):
+                replayed += 1
+            else:
+                # Re-park the rest in order, preserving per-key ordering behind the failure.
+                for rest_letter in letters[i + 1:]:
+                    self._dlq.park(DeadLetter(rest_letter.event, ParkReason.KEY_QUARANTINED, 0,
+                                              f"replay of offset {e.offset} failed again", self._clock.now()))
+                    self._quarantined += 1
+                break
+        return replayed
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/08-messaging-and-streams/10-dead-letter-queues-and-poison-messages/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The dead-letter table and both replays match the Java run line for line, and `ConsumerStats.__str__` prints the Java record shape:
+
+```console
+== Replay acct-A after correcting offset 2 (12.345 -> 12.34, approved by finance) ==
+replayed 3 events in offset order; acct-A quarantined=false
+acct-A balance = 77.34 USD  (100.00 + 12.34 - 40.00 + 5.00)
+
+== Replay acct-B after the ledger database recovered: no correction needed ==
+replayed 2 events; acct-B balance = 39.75 USD  (25.50 + 10.00 + 4.25)
+dead letters remaining: 1 (offset 6, acct-D, awaiting a currency-code fix)
+stats: ConsumerStats[processed=9, parked=1, quarantined=3, retries=2, committedOffset=10]
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`, `code/go/money.go`, and `code/go/javarandom.go`) keeps the design with four differences. **Failures are error values, not exceptions:** `Handler.Handle` returns `error`; the consumer does `var he *HandlerError; errors.As(err, &he)` and branches on `he.Kind`. Anything that is not a `*HandlerError` is a programming error and panics, which is what an uncaught non-`HandlerException` does to the Java consumer. `CurrencyOf` and `ParseMoney` return `(T, error)` with sentinels (`ErrUnknownCurrency`, `ErrNotDecimal`, `ErrExcessPrecision`, `ErrCurrencyMismatch`, `ErrOverflow`) that still answer `errors.Is`, while `Error()` prints the Java message verbatim so the dead-letter table reads `12.345 has more decimals than USD allows (2)` in both languages. `NewResilientConsumer` returns `ErrMaxAttempts` and `SimClock.Advance` returns `ErrNegativeAdvance` where Java throws `IllegalArgumentException`. **Overflow is checked by hand:** `ParseMoney` uses `mulChecked` and `addChecked` in place of `Math.multiplyExact` / `Math.addExact`, because `int64` wraps silently like Java's `long` would without them; amounts stay integer minor units, there is no `float64` anywhere. **The seeded fault injector reproduces `java.util.Random`:** `math/rand` would time out on different ledger calls and the demo would park a different offset. `JavaRandom.NextDouble` is the 48-bit LCG, so the second run retries exactly twice and parks offset 5 as in Java; the test pins the first twelve draws and the whole run's `ConsumerStats{4, 6, 3, 2, 10}`. **`TreeMap`, `LinkedHashMap`, and `null` have no direct equivalent:** `Balances()` returns the keys sorted plus the map, and `formatBalances` prints the Java `{acct-A=100.00 USD, ...}` shape; `quarantinedKeys` is a plain `map[string]int64` (the demo never iterates it, so insertion order is not needed); `Balance` returns `(Money, bool)` and `StuckOn` returns `*Event`, nil when the partition finished. `DeadLetterQueue.Clear` filters the slice in place where Java uses `removeIf`, and `Replay` sorts with `sort.SliceStable` on the offset.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...` (the tests also pass under `go test -race ./...`).
+
+#### Step 1: Events, failures, and the clock
+
+`HandlerError` is a struct implementing `error` through `Error()`; `newHandlerError` returns it as a pointer so `errors.As` can recover it. `FailureKind` is a typed constant with a `String()` that prints the Java names, and `SimClock.Advance` returns the `ErrNegativeAdvance` sentinel instead of throwing.
+
 ```go
-// HandlerError is the handler's one way to say no; the consumer recovers it with errors.As.
+type Event struct {
+	Offset       int64
+	AccountKey   string
+	AmountText   string
+	CurrencyCode string
+}
+
+type FailureKind int
+
+const (
+	Transient FailureKind = iota
+	Permanent
+)
+
 type HandlerError struct {
-    Kind FailureKind
-    Msg  string
+	Kind FailureKind
+	Msg  string
 }
 
 func (e *HandlerError) Error() string { return e.Msg }
 
-func (h *LedgerPostingHandler) Handle(e Event) error {
-    currency, err := CurrencyOf(e.CurrencyCode)
-    if err != nil {
-        return newHandlerError(Permanent, err.Error())
-    }
-    amount, err := ParseMoney(e.AmountText, currency)
-    if err != nil {
-        return newHandlerError(Permanent, err.Error())
-    }
-    if h.faults.ShouldFail() {
-        return newHandlerError(Transient, "ledger db timeout")
-    }
-    if h.applied[e.Offset] { // idempotent replay
-        return nil
-    }
-    ...
+func newHandlerError(kind FailureKind, msg string) error { return &HandlerError{Kind: kind, Msg: msg} }
+
+type SimClock struct {
+	now int64
+}
+
+func (c *SimClock) Now() int64 { return c.now }
+
+func (c *SimClock) Advance(millis int64) error {
+	if millis < 0 {
+		return ErrNegativeAdvance
+	}
+	c.now += millis
+	return nil
 }
 ```
 
-Differences, all in `code/go/main.go`, `code/go/money.go`, and `code/go/javarandom.go`:
+#### Step 2: An idempotent handler that classifies its failures
 
-- **Failures are error values, not exceptions.** `Handler.Handle` returns `error`; the consumer does `var he *HandlerError; errors.As(err, &he)` and branches on `he.Kind`. Anything that is not a `*HandlerError` is a programming error and panics, which is what an uncaught non-`HandlerException` does to the Java consumer. `CurrencyOf` and `ParseMoney` return `(T, error)` with sentinels (`ErrUnknownCurrency`, `ErrNotDecimal`, `ErrExcessPrecision`, `ErrCurrencyMismatch`, `ErrOverflow`) that still answer `errors.Is`, while `Error()` prints the Java message verbatim so the dead-letter table reads `12.345 has more decimals than USD allows (2)` in both languages. `NewResilientConsumer` returns `ErrMaxAttempts` and `SimClock.Advance` returns `ErrNegativeAdvance` where Java throws `IllegalArgumentException`.
-- **Overflow is checked by hand.** `ParseMoney` uses `mulChecked` and `addChecked` in place of `Math.multiplyExact` / `Math.addExact`, because `int64` wraps silently like Java's `long` would without them. Amounts stay integer minor units; there is no `float64` anywhere.
-- **The seeded fault injector reproduces `java.util.Random`.** `math/rand` would time out on different ledger calls and the demo would park a different offset. `JavaRandom.NextDouble` is the 48-bit LCG, so the second run retries exactly twice and parks offset 5 as in Java; the test pins the first twelve draws and the whole run's `ConsumerStats{4, 6, 3, 2, 10}`.
-- **`TreeMap`, `LinkedHashMap`, and `null` have no direct equivalent.** `Balances()` returns the keys sorted plus the map, and `formatBalances` prints the Java `{acct-A=100.00 USD, ...}` shape; `quarantinedKeys` is a plain `map[string]int64` (the demo never iterates it, so insertion order is not needed); `Balance` returns `(Money, bool)` and `StuckOn` returns `*Event`, nil when the partition finished. `DeadLetterQueue.Clear` filters the slice in place where Java uses `removeIf`, and `Replay` sorts with `sort.SliceStable` on the offset.
+Each parse step returns an error that is wrapped as `Permanent`; there is no multi-catch, just two `if err != nil` checks. The fault injector still runs before the `applied` check, and the balance update does the `merge` by hand with a comma-ok lookup; a currency mismatch on `Plus` is also classified `Permanent`.
 
-Run it from `code/go/` with `go run .`; test with `go test ./...` (the tests also pass under `go test -race ./...`). The dead-letter table, both replays, and the final `stats:` line are identical to the Java run.
+```go
+func (h *LedgerPostingHandler) Handle(e Event) error {
+	currency, err := CurrencyOf(e.CurrencyCode)
+	if err != nil {
+		return newHandlerError(Permanent, err.Error())
+	}
+	amount, err := ParseMoney(e.AmountText, currency)
+	if err != nil {
+		return newHandlerError(Permanent, err.Error())
+	}
+	if h.faults.ShouldFail() {
+		return newHandlerError(Transient, "ledger db timeout")
+	}
+	if h.applied[e.Offset] { // idempotent replay
+		return nil
+	}
+	if current, ok := h.balances[e.AccountKey]; ok {
+		sum, err := current.Plus(amount)
+		if err != nil {
+			return newHandlerError(Permanent, err.Error())
+		}
+		h.balances[e.AccountKey] = sum
+	} else {
+		h.balances[e.AccountKey] = amount
+	}
+	h.applied[e.Offset] = true
+	return nil
+}
+```
+
+#### Step 3: The dead letter and its queue
+
+`DeadLetter` is a value struct with the five fields; `ParkReason` is a typed constant whose `String()` prints the Java names. `Clear` reuses the slice's backing array (`q.entries[:0]`) to filter in place, the Go idiom for `removeIf`.
+
+```go
+type DeadLetter struct {
+	Event     Event
+	Reason    ParkReason
+	Attempts  int
+	LastError string
+	ParkedAt  int64
+}
+
+type DeadLetterQueue struct {
+	entries []DeadLetter
+}
+
+func (q *DeadLetterQueue) Park(letter DeadLetter) { q.entries = append(q.entries, letter) }
+
+func (q *DeadLetterQueue) ForKey(key string) []DeadLetter {
+	var out []DeadLetter
+	for _, d := range q.entries {
+		if d.Event.AccountKey == key {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func (q *DeadLetterQueue) Clear(key string) {
+	kept := q.entries[:0]
+	for _, d := range q.entries {
+		if d.Event.AccountKey != key {
+			kept = append(kept, d)
+		}
+	}
+	q.entries = kept
+}
+```
+
+#### Step 4: The consumer loop with quarantine
+
+The comma-ok lookup on `quarantinedKeys` gives both the quarantine decision and the causing offset in one line. The offset commits on every iteration, processed or parked.
+
+```go
+func (c *ResilientConsumer) Consume(partition []Event) {
+	for _, e := range partition {
+		if cause, quarantined := c.quarantinedKeys[e.AccountKey]; quarantined {
+			c.dlq.Park(DeadLetter{Event: e, Reason: KeyQuarantined, Attempts: 0,
+				LastError: fmt.Sprintf("earlier offset %d for this key is parked", cause), ParkedAt: c.clock.Now()})
+			c.parked++
+			c.quarantined++
+		} else {
+			c.attempt(e)
+		}
+		c.committedOffset = e.Offset + 1
+	}
+}
+```
+
+#### Step 5: Bounded retries with backoff
+
+`errors.As` recovers the `*HandlerError`; a different error type panics, because the handler contract says every failure is classified. The backoff shift is the same, and the `Advance` error is impossible here (the shift is non-negative), so it panics rather than being handled.
+
+```go
+func (c *ResilientConsumer) attempt(e Event) bool {
+	attempts := 0
+	for {
+		attempts++
+		err := c.handler.Handle(e)
+		if err == nil {
+			c.processed++
+			return true
+		}
+		var he *HandlerError
+		if !errors.As(err, &he) {
+			panic(fmt.Sprintf("handler returned a non-HandlerError for offset %d: %v", e.Offset, err)) // Java: uncaught
+		}
+		if he.Kind == Permanent {
+			c.park(e, PermanentFailure, attempts, he.Msg)
+			return false
+		}
+		if attempts >= c.maxAttempts {
+			c.park(e, MaxAttemptsExceeded, attempts, he.Msg)
+			return false
+		}
+		c.retries++
+		if err := c.clock.Advance(c.baseBackoffMillis << (attempts - 1)); err != nil { // exponential backoff: base, 2x, 4x, ...
+			panic(err)
+		}
+	}
+}
+```
+
+#### Step 6: Replay in offset order
+
+`sort.SliceStable` on the offset, `delete` to lift the quarantine, and a comma-ok lookup in `corrections` to swap in a repaired event. The `continue` on success and the trailing `break` after re-parking the followers give the same control flow as the Java loop.
+
+```go
+func (c *ResilientConsumer) Replay(key string, corrections map[int64]Event) int {
+	letters := c.dlq.ForKey(key)
+	sort.SliceStable(letters, func(i, j int) bool { return letters[i].Event.Offset < letters[j].Event.Offset })
+	c.dlq.Clear(key)
+	delete(c.quarantinedKeys, key)
+	replayed := 0
+	for i := 0; i < len(letters); i++ {
+		e := letters[i].Event
+		if fixed, ok := corrections[e.Offset]; ok {
+			e = fixed
+		}
+		c.parked-- // leaving the DLQ, one way or the other
+		if c.attempt(e) {
+			replayed++
+			continue
+		}
+		// Re-park the rest in order, preserving per-key ordering behind the failure.
+		for j := i + 1; j < len(letters); j++ {
+			rest := letters[j].Event
+			c.dlq.Park(DeadLetter{Event: rest, Reason: KeyQuarantined, Attempts: 0,
+				LastError: fmt.Sprintf("replay of offset %d failed again", e.Offset), ParkedAt: c.clock.Now()})
+			c.quarantined++
+		}
+		break
+	}
+	return replayed
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/08-messaging-and-streams/10-dead-letter-queues-and-poison-messages/code/go
+go run .
+go test ./...
+```
+
+The dead-letter table, both replays, and the final `stats:` line are identical to the Java run:
+
+```console
+== Resilient consumer: park the poison, quarantine its key, keep every other account moving ==
+processed=4 parked=6 (of which quarantined followers=3) transient retries=2 committed offset=10 simulated clock=300ms
+balances: {acct-A=100.00 USD, acct-B=25.50 USD, acct-C=1500 JPY}
+dead letters:
+  offset 2 acct-A 12.345   USD  reason=PERMANENT_FAILURE      attempts=1 error=12.345 has more decimals than USD allows (2)
+  offset 4 acct-A -40.00   USD  reason=KEY_QUARANTINED        attempts=0 error=earlier offset 2 for this key is parked
+  offset 5 acct-B 10.00    USD  reason=MAX_ATTEMPTS_EXCEEDED  attempts=3 error=ledger db timeout
+  offset 6 acct-D 7.00     US$  reason=PERMANENT_FAILURE      attempts=1 error=unknown currency: US$
+  offset 8 acct-B 4.25     USD  reason=KEY_QUARANTINED        attempts=0 error=earlier offset 5 for this key is parked
+  offset 9 acct-A 5.00     USD  reason=KEY_QUARANTINED        attempts=0 error=earlier offset 2 for this key is parked
+```
 
 ## Use It
 

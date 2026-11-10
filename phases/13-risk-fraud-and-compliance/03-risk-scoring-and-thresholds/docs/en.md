@@ -489,60 +489,659 @@ everything wrong at once -> DECLINE (score 861, p=0.862)
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) prints the same dataset counts, weights, sweep table, band, calibration bins, and explanations as the Java version, digit for digit. Getting there took four deliberate choices. **`java.util.Random` is ported, not replaced:** `random.Random(42)` is a Mersenne Twister and would generate a different dataset; `JavaRandom` reproduces the 48-bit LCG, `next_double`, and the polar-method `next_gaussian` with its cached second value, and `java_shuffle` is `Collections.shuffle`, so same seed, same 20,000 rows, same 14,000/6,000 split. **Floats are summed the Java way:** Python 3.12+ `sum()` uses compensated summation, which is more accurate and therefore not bit-identical to a Java `+=` loop, so every float accumulation (gradients, ECE) uses `reduce(operator.add, ...)`; `Scorecard.train` works column by column with `map` so 400 epochs take about two seconds, its docstring lists the three rewrites that keep it exact, and a test asserts two runs give identical weights. **Java's rounding rules are explicit:** `Math.round` rounds half up (`java_round`), and `String.format("%.2f")` rounds the shortest decimal half up where Python's f-strings round the exact binary value half to even (`0.125` prints `0.13` in Java, `0.12` in Python), so `jf` reproduces the Java output; `math.exp` raises `OverflowError` where Java returns `Infinity`, so `sigmoid(-1000)` is caught and returns `0.0` like the Java. **Money stays integer:** costs are `Money` with `int` minor units; `times` reapplies the sign after `divmod` because Python's `//` floors where Java truncates, and `_check_long` keeps `Math.addExact`'s 64-bit bound.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Features with fixed meaning and range
+
+`Features` is a frozen dataclass over a tuple of floats, with `NAMES` and `COUNT` as class attributes; `__post_init__` coerces and checks the length. The `of` factory is the single transform shared by training and serving, with the same clamps and divisions as Java.
+
 ```python
-def jf(x: float, digits: int, plus: bool = False) -> str:
-    d = Decimal(repr(float(x))).quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP)
-    s = f"{d:f}"
-    return "+" + s if plus and not s.startswith("-") else s
+class Features:
+    """The feature vector a transaction is scored on. Every value is already transformed to a small range."""
+
+    values: tuple
+
+    NAMES = (
+        "amount_log_ratio",   # ln(amount / account's trailing average amount); 0 means typical
+        "new_device",         # 1 if the device fingerprint has never been seen on this account
+        "geo_mismatch",       # 1 if the IP country differs from the card's issuing country
+        "velocity_1h",        # attempts on this account in the last hour, capped at 10, divided by 10
+        "account_young",      # max(0, 1 - account_age_days / 90)
+        "failed_cvv_24h",     # CVV failures in the last 24 hours, capped at 5, divided by 5
+    )
+    COUNT = 6
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "values", tuple(float(v) for v in self.values))
+        if len(self.values) != Features.COUNT:
+            raise ValueError(f"expected {Features.COUNT} features, got {len(self.values)}")
+
+    @staticmethod
+    def of(amount_log_ratio: float, new_device: bool, geo_mismatch: bool, attempts_1h: int, account_age_days: int,
+           failed_cvv_24h: int) -> "Features":
+        return Features((
+            amount_log_ratio,
+            1.0 if new_device else 0.0,
+            1.0 if geo_mismatch else 0.0,
+            min(10, max(0, attempts_1h)) / 10.0,
+            max(0.0, 1.0 - max(0, account_age_days) / 90.0),
+            min(5, max(0, failed_cvv_24h)) / 5.0,
+        ))
+
+    def get(self, i: int) -> float:
+        return self.values[i]
 ```
 
-`code/python/main.py` prints the same dataset counts, weights, sweep table, band, calibration bins, and explanations as the Java version, digit for digit. Getting there took four deliberate choices:
+#### Step 2: A seeded synthetic dataset
 
-- **`java.util.Random` is ported, not replaced.** `random.Random(42)` is a Mersenne Twister and would generate a different dataset. `JavaRandom` reproduces the 48-bit LCG, `next_double`, and the polar-method `next_gaussian` with its cached second value; `java_shuffle` is `Collections.shuffle`. Same seed, same 20,000 rows, same 14,000/6,000 split.
-- **Floats are summed the Java way.** Python 3.12+ `sum()` uses compensated summation, which is more accurate and therefore not bit-identical to a Java `+=` loop. Every float accumulation (gradients, ECE) uses `reduce(operator.add, ...)` instead. `Scorecard.train` works column by column with `map` so 400 epochs take about two seconds; its docstring lists the three rewrites that keep it exact, and a test asserts two runs give identical weights.
-- **Java's rounding rules are explicit.** `Math.round` rounds half up (`java_round`), and `String.format("%.2f")` rounds the shortest decimal half up, where Python's f-strings round the exact binary value half to even (`0.125` prints `0.13` in Java, `0.12` in Python). `jf` reproduces the Java output. `math.exp` raises `OverflowError` where Java returns `Infinity`, so `sigmoid(-1000)` is caught and returns `0.0` like the Java.
-- **Money stays integer.** Costs are `Money` with `int` minor units; `times` reapplies the sign after `divmod` because Python's `//` floors where Java truncates, and `_check_long` keeps `Math.addExact`'s 64-bit bound.
+`generate` draws the label first and then the features from the two overlapping distributions, using `JavaRandom` so the rows match the Java dataset exactly; the amount is `java_round(4000 * exp(ratio)) + 100` cents.
 
-Run it from `code/python/`:
+```python
+    def generate(seed: int, n: int, fraud_rate: float) -> list[Example]:
+        rng = JavaRandom(seed)
+        rows: list[Example] = []
+        for _ in range(n):
+            fraud = rng.next_double() < fraud_rate
+            if fraud:
+                amount_log_ratio = 0.9 + 0.8 * rng.next_gaussian()
+                new_device = rng.next_double() < 0.70
+                geo_mismatch = rng.next_double() < 0.40
+                attempts = 1 + SyntheticDataset.poisson(rng, 3.0)
+                age_days = rng.next_int(30) if rng.next_double() < 0.5 else rng.next_int(1000)
+                failed_cvv = SyntheticDataset.poisson(rng, 1.2)
+            else:
+                amount_log_ratio = 0.0 + 0.6 * rng.next_gaussian()
+                new_device = rng.next_double() < 0.10
+                geo_mismatch = rng.next_double() < 0.03
+                attempts = 1 + SyntheticDataset.poisson(rng, 0.3)
+                age_days = rng.next_int(1000)
+                failed_cvv = 1 if rng.next_double() < 0.05 else 0
+            cents = java_round(4000 * math.exp(amount_log_ratio)) + 100   # typical ticket 40.00 USD
+            rows.append(Example(Features.of(amount_log_ratio, new_device, geo_mismatch, attempts, age_days, failed_cvv),
+                                fraud, Money.of_minor(cents, USD)))
+        return rows
+```
+
+#### Step 3: The scorecard and its gradient
+
+`train` is the same batch gradient descent, restructured column by column with `map`/`reduce` for speed while staying bit-identical: left-to-right sums, `-z` built as a sum of negations, and sparse columns that skip the zeros. The docstring records why each rewrite is exact.
+
+```python
+    def train(rows: list[Example], epochs: int, learning_rate: float) -> "Scorecard":
+        """Batch gradient descent on log loss, bit-identical to the Java loop but column by column with map/reduce, so
+        400 epochs over 14,000 rows take about two seconds instead of minutes. Three exact rewrites make that possible:
+        - every element still goes through ((b + w0*x0) + w1*x1) + ..., and every gradient is a left-to-right sum;
+        - -z is built as (-b) + (-w0)*x0 + ...: IEEE negation commutes with round-to-nearest, so it equals -(z) exactly;
+        - a column that is mostly zero keeps only its non-zero (index, value) pairs: adding w*0.0 never changes a sum."""
+        add, mul, sub, truediv = operator.add, operator.mul, operator.sub, operator.truediv
+        cols = [[r.features.get(i) for r in rows] for i in range(Features.COUNT)]
+        labels = [1.0 if r.fraud else 0.0 for r in rows]
+        n = len(rows)
+        sparse: list = []
+        for i in range(Features.COUNT):
+            idx = [j for j, v in enumerate(cols[i]) if v != 0.0]
+            sparse.append((idx, [cols[i][j] for j in idx]) if len(idx) < n // 4 else None)
+        w = [0.0] * Features.COUNT
+        b = 0.0
+        for _ in range(epochs):
+            neg_z = [-b] * n
+            for i in range(Features.COUNT):
+                nw = -w[i]
+                if sparse[i] is None:
+                    neg_z = list(map(add, neg_z, map(mul, repeat(nw), cols[i])))
+                else:
+                    for j, v in zip(*sparse[i]):
+                        neg_z[j] = neg_z[j] + nw * v
+            try:
+                e = list(map(math.exp, neg_z))
+            except OverflowError:
+                e = [_exp_neg(-v) for v in neg_z]
+            p = map(truediv, repeat(1.0), map(add, repeat(1.0), e))   # sigmoid(z) = 1 / (1 + exp(-z))
+            error = list(map(sub, p, labels))
+            grad_w = []
+            for i in range(Features.COUNT):
+                if sparse[i] is None:
+                    grad_w.append(reduce(add, map(mul, error, cols[i]), 0.0))
+                else:
+                    idx, vals = sparse[i]
+                    grad_w.append(reduce(add, map(mul, map(error.__getitem__, idx), vals), 0.0))
+            grad_b = reduce(add, error, 0.0)
+            for i in range(Features.COUNT):
+                w[i] -= learning_rate * grad_w[i] / n
+            b -= learning_rate * grad_b / n
+        return Scorecard(w, b)
+```
+
+#### Step 4: Integer scores and explanations
+
+`score` is `java_round(p * 999.0)`. `explain` sorts contributions by `(-abs(contribution), feature)`, the tuple key giving the same deterministic tie-break as the chained Java comparator.
+
+```python
+    def score(self, f: Features) -> int:
+        """Integer 0..999 for storage, comparison, and thresholds in rules; never compare raw doubles across services."""
+        return java_round(self.probability(f) * 999.0)
+
+    def explain(self, f: Features, k: int) -> Explanation:
+        """The k features with the largest absolute contribution, most influential first (ties by name)."""
+        contributions = [Contribution(Features.NAMES[i], f.get(i), self.weights[i], self.weights[i] * f.get(i))
+                         for i in range(len(self.weights))]
+        contributions.sort(key=lambda c: (-abs(c.contribution), c.feature))
+        return Explanation(self.score(f), self.probability(f), tuple(contributions[:min(k, len(contributions))]))
+```
+
+#### Step 5: The confusion matrix and AUC
+
+`confusion` is the four-exit `if`/`elif` chain. `auc` sorts by probability, groups ties with the inner `while`, and awards each member the average rank; the Mann-Whitney formula closes it.
+
+```python
+    def confusion(scored: list[Scored], threshold: float) -> ConfusionMatrix:
+        """Declare fraud when probability >= threshold."""
+        tp = fp = tn = fn = 0
+        for s in scored:
+            flagged = s.probability >= threshold
+            if s.fraud and flagged:
+                tp += 1
+            elif not s.fraud and flagged:
+                fp += 1
+            elif not s.fraud:
+                tn += 1
+            else:
+                fn += 1
+        return ConfusionMatrix(tp, fp, tn, fn)
+
+    @staticmethod
+    def auc(scored: list[Scored]) -> float:
+        """Area under the ROC curve by the rank-sum (Mann-Whitney) formula."""
+        srt = sorted(scored, key=lambda s: s.probability)
+        positives = sum(1 for s in srt if s.fraud)
+        negatives = len(srt) - positives
+        if positives == 0 or negatives == 0:
+            return 0.5
+        rank_sum = 0.0
+        i = 0
+        while i < len(srt):
+            j = i
+            while j < len(srt) and srt[j].probability == srt[i].probability:
+                j += 1
+            avg_rank = (i + 1 + j) / 2.0   # ranks are 1-based; ties share the average rank
+            for k in range(i, j):
+                if srt[k].fraud:
+                    rank_sum += avg_rank
+            i = j
+        return (rank_sum - positives * (positives + 1) / 2.0) / (float(positives) * negatives)
+```
+
+#### Step 6: Thresholds chosen in money
+
+`CostModel.cost` multiplies the two `Money` costs by the counts with `times(..., HALF_EVEN)`. `best_by_cost` sweeps the 99 thresholds and keeps the first strictly cheaper one, so ties resolve to the lowest threshold.
+
+```python
+class CostModel:
+    """Money consequences of each cell. Costs are per case."""
+
+    fraud_loss: Money
+    insult_cost: Money
+    review_cost: Money
+    review_miss_rate: float
+    review_insult_rate: float
+
+    def cost(self, cm: ConfusionMatrix) -> Money:
+        """Every fraud we miss costs fraud_loss, every good customer we block costs insult_cost."""
+        return self.fraud_loss.times(cm.fn, 1, Rounding.HALF_EVEN).plus(self.insult_cost.times(cm.fp, 1, Rounding.HALF_EVEN))
+
+    def best_by_cost(scored: list[Scored], costs: CostModel) -> Threshold:
+        best: Optional[Threshold] = None
+        for i in range(1, ThresholdSelector.STEPS):
+            t = i / ThresholdSelector.STEPS
+            cm = Evaluator.confusion(scored, t)
+            c = costs.cost(cm)
+            if best is None or c.compare_to(best.expected_cost) < 0:
+                best = Threshold(t, cm, c)
+        return best
+```
+
+#### Step 7: The review band
+
+`best_band` builds the two histograms, turns them into prefix sums with `cumulative`, and evaluates each `(lo, hi)` pair in O(1); the expected slips and insults inside the band go through `java_round` before becoming whole-transaction costs.
+
+```python
+    def best_band(scored: list[Scored], costs: CostModel) -> ReviewBand:
+        """Sweep every (low, high) pair on a 100-bin histogram. A reviewed fraud is caught with probability
+        (1 - review_miss_rate); a reviewed good customer is wrongly declined with probability review_insult_rate;
+        every review costs review_cost regardless of outcome."""
+        steps = ThresholdSelector.STEPS
+        fraud_bins, legit_bins = [0] * (steps + 1), [0] * (steps + 1)
+        for s in scored:
+            b = min(steps, math.floor(s.probability * steps))
+            if s.fraud:
+                fraud_bins[b] += 1
+            else:
+                legit_bins[b] += 1
+        fraud_cum, legit_cum = ThresholdSelector.cumulative(fraud_bins), ThresholdSelector.cumulative(legit_bins)
+        best: Optional[ReviewBand] = None
+        for lo in range(1, steps):
+            for hi in range(lo, steps):
+                fraud_below, legit_below = fraud_cum[lo], legit_cum[lo]
+                fraud_mid, legit_mid = fraud_cum[hi] - fraud_cum[lo], legit_cum[hi] - legit_cum[lo]
+                fraud_above, legit_above = fraud_cum[steps + 1] - fraud_cum[hi], legit_cum[steps + 1] - legit_cum[hi]
+                reviewed = fraud_mid + legit_mid
+                missed_in_review = java_round(fraud_mid * costs.review_miss_rate)
+                insulted_in_review = java_round(legit_mid * costs.review_insult_rate)
+                cost = (costs.fraud_loss.times(fraud_below + missed_in_review, 1, Rounding.HALF_EVEN)
+                        .plus(costs.insult_cost.times(legit_above + insulted_in_review, 1, Rounding.HALF_EVEN))
+                        .plus(costs.review_cost.times(reviewed, 1, Rounding.HALF_EVEN)))
+                if best is None or cost.compare_to(best.expected_cost) < 0:
+                    best = ReviewBand(lo / steps, hi / steps, fraud_below + legit_below, reviewed, fraud_above + legit_above, cost)
+        return best
+```
+
+#### Step 8: Calibration and the decision engine
+
+`expected_calibration_error` sums with `fsum_seq` (a left-to-right `reduce`, not the compensated built-in). `DecisionEngine` rejects an inverted band in its constructor and `decide` maps the probability onto `APPROVE`/`REVIEW`/`DECLINE` with a top-three explanation.
+
+```python
+    def expected_calibration_error(bins: list[Bin]) -> float:
+        """Count-weighted mean of |predicted - observed| over the bins."""
+        total = sum(b.count for b in bins)
+        if total == 0:
+            return 0.0
+        return fsum_seq(b.count / total * abs(b.mean_predicted - b.observed_rate) for b in bins)
+
+class DecisionEngine:
+    """The production object: a frozen scorecard, a review band, and an explanation on every call."""
+
+    def __init__(self, model: Scorecard, band: ReviewBand) -> None:
+        if band.low > band.high:
+            raise ValueError("low must not exceed high")
+        self._model = model
+        self._band = band
+
+    def decide(self, f: Features) -> Decision:
+        p = self._model.probability(f)
+        outcome = Outcome.DECLINE if p >= self._band.high else Outcome.REVIEW if p >= self._band.low else Outcome.APPROVE
+        return Decision(outcome, self._model.explain(f, 3))
+```
+
+#### Step 9: Run it
 
 ```bash
+cd phases/13-risk-fraud-and-compliance/03-risk-scoring-and-thresholds/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+The run takes about three seconds and prints the same numbers as the Java run:
+
+```console
+== Dataset ==
+20000 rows, 14000 train (286 fraud), 6000 test (136 fraud), base rate 2.11%
+
+== Scorecard ==
+bias -4.511
+  amount_log_ratio   +1.294
+  new_device         +1.238
+  geo_mismatch       +0.999
+  velocity_1h        +0.344
+  account_young      +0.864
+  failed_cvv_24h     +0.776
+train log loss 0.0574, test log loss 0.0566
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`, tests in `main_test.go`) prints the same dataset counts, weights, sweep table, band, calibration bins, and explanations as the Java version, digit for digit. What it took: **`java.util.Random` is ported, not replaced:** `math/rand` would generate a different dataset; `JavaRandom` is the 48-bit LCG with `next(bits)`, `NextInt(bound)`, `NextDouble`, and the polar-method `NextGaussian` with its cached second value, and `Shuffle` is `Collections.shuffle`. **Floating point is kept un-fused:** Go may fuse `a*b + c` into one rounding on some CPUs, which would make the 400-epoch gradient descent drift from Java's two roundings; the hot loops write `z += float64(w[i] * x)`, and the explicit conversion forbids fusion, so the weights match to the last bit. **Java's rounding rules are explicit:** `javaRound` is `Math.round` (`floor(x + 0.5)`, so -2.5 gives -2 where `math.Round` gives -3), and `jf` reproduces `String.format("%.Nf")`, which rounds the shortest decimal representation half up; Go's `%f` rounds the binary value half to even, so `0.125` would print `0.12`, and a test pins both. **Errors are values; money stays integer:** `NewFeatures`, `NewScorecard`, and `NewDecisionEngine` return sentinel errors (`ErrFeatureCount`, `ErrInvertedBand`) checked with `errors.Is`; `Money.Plus`, `Minus`, and `Times` return `(Money, error)` with `ErrOverflow`/`ErrCurrencyMismatch`, `Compare` panics on a mismatch because it has no error slot, and the cost model unwraps with `must`, since no overflow is reachable from the demo's amounts.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Features with fixed meaning and range
+
+`FeatureNames` and `FeatureCount` are package variables; `NewFeatures` copies and length-checks, returning `ErrFeatureCount`. `FeaturesOf` is the shared transform, with `clampInt` for the two capped counts and `math.Max` for the age decay.
+
 ```go
-func (r *JavaRandom) NextGaussian() float64 {
-    if r.haveNextNextGaussian {
-        r.haveNextNextGaussian = false
-        return r.nextNextGaussian
-    }
-    for {
-        v1 := 2*r.NextDouble() - 1
-        v2 := 2*r.NextDouble() - 1
-        s := v1*v1 + v2*v2
-        if s >= 1 || s == 0 { continue }
-        multiplier := math.Sqrt(-2 * math.Log(s) / s)
-        r.nextNextGaussian = v2 * multiplier
-        r.haveNextNextGaussian = true
-        return v1 * multiplier
-    }
+type Features struct{ Values []float64 }
+
+var FeatureNames = []string{
+	"amount_log_ratio", // ln(amount / account's trailing average amount); 0 means typical
+	"new_device",       // 1 if the device fingerprint has never been seen on this account
+	"geo_mismatch",     // 1 if the IP country differs from the card's issuing country
+	"velocity_1h",      // attempts on this account in the last hour, capped at 10, divided by 10
+	"account_young",    // max(0, 1 - account_age_days / 90)
+	"failed_cvv_24h",   // CVV failures in the last 24 hours, capped at 5, divided by 5
+}
+
+var FeatureCount = len(FeatureNames)
+
+// ErrFeatureCount is returned when a vector does not have exactly FeatureCount values.
+var ErrFeatureCount = errors.New("wrong feature count")
+
+func NewFeatures(values []float64) (Features, error) {
+	if len(values) != FeatureCount {
+		return Features{}, fmt.Errorf("%w: expected %d features, got %d", ErrFeatureCount, FeatureCount, len(values))
+	}
+	return Features{append([]float64(nil), values...)}, nil
+}
+
+func clampInt(x, lo, hi int) int {
+	if x < lo {
+		return lo
+	}
+	if x > hi {
+		return hi
+	}
+	return x
+}
+
+func FeaturesOf(amountLogRatio float64, newDevice, geoMismatch bool, attempts1h, accountAgeDays, failedCvv24h int) Features {
+	b2f := func(b bool) float64 {
+		if b {
+			return 1.0
+		}
+		return 0.0
+	}
+	age := accountAgeDays
+	if age < 0 {
+		age = 0
+	}
+	return Features{[]float64{
+		amountLogRatio,
+		b2f(newDevice),
+		b2f(geoMismatch),
+		float64(clampInt(attempts1h, 0, 10)) / 10.0,
+		math.Max(0.0, 1.0-float64(age)/90.0),
+		float64(clampInt(failedCvv24h, 0, 5)) / 5.0,
+	}}
 }
 ```
 
-`code/go/main.go` prints the same dataset counts, weights, sweep table, band, calibration bins, and explanations as the Java version, digit for digit. What it took:
+#### Step 2: A seeded synthetic dataset
 
-- **`java.util.Random` is ported, not replaced.** `math/rand` would generate a different dataset. `JavaRandom` is the 48-bit LCG with `next(bits)`, `NextInt(bound)`, `NextDouble`, and the polar-method `NextGaussian` with its cached second value; `Shuffle` is `Collections.shuffle`. Same seed, same 20,000 rows, same 14,000/6,000 split.
-- **Floating point is kept un-fused.** Go may fuse `a*b + c` into one rounding on some CPUs, which would make the 400-epoch gradient descent drift from Java's two roundings. The hot loops write `z += float64(w[i] * x)`: the explicit conversion forbids fusion, so the weights match to the last bit.
-- **Java's rounding rules are explicit.** `javaRound` is `Math.round` (`floor(x + 0.5)`, so -2.5 gives -2 where `math.Round` gives -3), and `jf` reproduces `String.format("%.Nf")`, which rounds the shortest decimal representation half up; Go's `%f` rounds the binary value half to even, so `0.125` would print `0.12`. A test pins both.
-- **Errors are values; money stays integer.** `NewFeatures`, `NewScorecard`, and `NewDecisionEngine` return sentinel errors (`ErrFeatureCount`, `ErrInvertedBand`) checked with `errors.Is`. `Money.Plus`, `Minus`, and `Times` return `(Money, error)` with `ErrOverflow`/`ErrCurrencyMismatch`; `Compare` panics on a mismatch because it has no error slot. The cost model unwraps with `must`, since no overflow is reachable from the demo's amounts.
+`Generate` is the Java loop with the same draw order on `JavaRandom`; the amount is `javaRound(4000*math.Exp(ratio)) + 100` cents.
 
-Run it from `code/go/`:
+```go
+func Generate(seed int64, n int, fraudRate float64) []Example {
+	rng := NewJavaRandom(seed)
+	rows := make([]Example, 0, n)
+	for i := 0; i < n; i++ {
+		fraud := rng.NextDouble() < fraudRate
+		var amountLogRatio float64
+		var newDevice, geoMismatch bool
+		var attempts, ageDays, failedCvv int
+		if fraud {
+			amountLogRatio = 0.9 + 0.8*rng.NextGaussian()
+			newDevice = rng.NextDouble() < 0.70
+			geoMismatch = rng.NextDouble() < 0.40
+			attempts = 1 + Poisson(rng, 3.0)
+			if rng.NextDouble() < 0.5 {
+				ageDays = rng.NextInt(30)
+			} else {
+				ageDays = rng.NextInt(1000)
+			}
+			failedCvv = Poisson(rng, 1.2)
+		} else {
+			amountLogRatio = 0.0 + 0.6*rng.NextGaussian()
+			newDevice = rng.NextDouble() < 0.10
+			geoMismatch = rng.NextDouble() < 0.03
+			attempts = 1 + Poisson(rng, 0.3)
+			ageDays = rng.NextInt(1000)
+			if rng.NextDouble() < 0.05 {
+				failedCvv = 1
+			}
+		}
+		cents := javaRound(4000*math.Exp(amountLogRatio)) + 100 // typical ticket 40.00 USD
+		rows = append(rows, Example{FeaturesOf(amountLogRatio, newDevice, geoMismatch, attempts, ageDays, failedCvv), fraud, OfMinor(cents, USD)})
+	}
+	return rows
+}
+```
+
+#### Step 3: The scorecard and its gradient
+
+`Train` is the Java loop line for line with one addition: every multiply-add is wrapped in `float64(...)` so the compiler may not fuse it, which keeps the 400 epochs bit-identical to Java.
+
+```go
+func Train(rows []Example, epochs int, learningRate float64) *Scorecard {
+	w := make([]float64, FeatureCount)
+	b := 0.0
+	n := float64(len(rows))
+	for epoch := 0; epoch < epochs; epoch++ {
+		gradW := make([]float64, FeatureCount)
+		gradB := 0.0
+		for _, row := range rows {
+			z := b
+			for i := range w {
+				z += float64(w[i] * row.Features.Get(i))
+			}
+			target := 0.0
+			if row.Fraud {
+				target = 1.0
+			}
+			err := Sigmoid(z) - target
+			for i := range w {
+				gradW[i] += float64(err * row.Features.Get(i))
+			}
+			gradB += err
+		}
+		for i := range w {
+			w[i] -= float64(learningRate*gradW[i]) / n
+		}
+		b -= float64(learningRate*gradB) / n
+	}
+	return &Scorecard{w, b}
+}
+```
+
+#### Step 4: Integer scores and explanations
+
+`Score` is `javaRound(p * 999.0)`; `Explain` sorts with `sort.Slice` on absolute contribution descending, then feature name, and copies the top `k`.
+
+```go
+func (s *Scorecard) Score(f Features) int { return int(javaRound(s.Probability(f) * 999.0)) }
+
+func ScoreFromProbability(p float64) int { return int(javaRound(p * 999.0)) }
+
+func (s *Scorecard) Explain(f Features, k int) Explanation {
+	all := make([]Contribution, 0, len(s.Weights))
+	for i := range s.Weights {
+		all = append(all, Contribution{FeatureNames[i], f.Get(i), s.Weights[i], s.Weights[i] * f.Get(i)})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		ai, aj := math.Abs(all[i].Contribution), math.Abs(all[j].Contribution)
+		if ai != aj {
+			return ai > aj
+		}
+		return all[i].Feature < all[j].Feature
+	})
+	if k > len(all) {
+		k = len(all)
+	}
+	return Explanation{s.Score(f), s.Probability(f), append([]Contribution(nil), all[:k]...)}
+}
+```
+
+#### Step 5: The confusion matrix and AUC
+
+`Confusion` is a tagless `switch` with the same four exits. `AUC` uses `sort.SliceStable`, groups ties, and awards the average rank before the Mann-Whitney formula.
+
+```go
+func Confusion(scored []Scored, threshold float64) ConfusionMatrix {
+	var cm ConfusionMatrix
+	for _, s := range scored {
+		flagged := s.Probability >= threshold
+		switch {
+		case s.Fraud && flagged:
+			cm.TP++
+		case !s.Fraud && flagged:
+			cm.FP++
+		case !s.Fraud:
+			cm.TN++
+		default:
+			cm.FN++
+		}
+	}
+	return cm
+}
+
+// AUC is the area under the ROC curve by the rank-sum (Mann-Whitney) formula: the probability a random fraud outscores a random legit.
+func AUC(scored []Scored) float64 {
+	sorted := append([]Scored(nil), scored...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Probability < sorted[j].Probability })
+	var positives, negatives int64
+	for _, s := range sorted {
+		if s.Fraud {
+			positives++
+		} else {
+			negatives++
+		}
+	}
+	if positives == 0 || negatives == 0 {
+		return 0.5
+	}
+	rankSum := 0.0
+	i := 0
+	for i < len(sorted) {
+		j := i
+		for j < len(sorted) && sorted[j].Probability == sorted[i].Probability {
+			j++
+		}
+		avgRank := float64(i+1+j) / 2.0 // ranks are 1-based; ties share the average rank
+		for k := i; k < j; k++ {
+			if sorted[k].Fraud {
+				rankSum += avgRank
+			}
+		}
+		i = j
+	}
+	return (rankSum - float64(positives)*float64(positives+1)/2.0) / (float64(positives) * float64(negatives))
+}
+```
+
+#### Step 6: Thresholds chosen in money
+
+`CostModel.Cost` unwraps `Times` and `Plus` with `must` because the demo's amounts cannot overflow. `BestByCost` keeps a pointer to the best threshold so "none yet" is `nil`, and uses strict `<` on `Compare`.
+
+```go
+type CostModel struct {
+	FraudLoss, InsultCost, ReviewCost Money
+	ReviewMissRate, ReviewInsultRate  float64
+}
+
+// Cost is the expected cost of a hard threshold: every fraud we miss costs FraudLoss, every good customer we block costs InsultCost.
+func (c CostModel) Cost(cm ConfusionMatrix) Money {
+	return must(must(c.FraudLoss.Times(cm.FN, 1, HalfEven)).Plus(must(c.InsultCost.Times(cm.FP, 1, HalfEven))))
+}
+
+func BestByCost(scored []Scored, costs CostModel) Threshold {
+	var best *Threshold
+	for i := 1; i < Steps; i++ {
+		t := float64(i) / float64(Steps)
+		cm := Confusion(scored, t)
+		c := costs.Cost(cm)
+		if best == nil || c.Compare(best.ExpectedCost) < 0 {
+			best = &Threshold{t, cm, c}
+		}
+	}
+	return *best
+}
+```
+
+#### Step 7: The review band
+
+`BestBand` builds the histograms, prefix-sums them with `Cumulative`, and evaluates each `(lo, hi)` in O(1); `javaRound` rounds the expected slips and insults to whole transactions before the `Money` multiplication.
+
+```go
+func BestBand(scored []Scored, costs CostModel) ReviewBand {
+	fraudBins, legitBins := make([]int64, Steps+1), make([]int64, Steps+1)
+	for _, s := range scored {
+		bin := int(math.Floor(s.Probability * Steps))
+		if bin > Steps {
+			bin = Steps
+		}
+		if s.Fraud {
+			fraudBins[bin]++
+		} else {
+			legitBins[bin]++
+		}
+	}
+	fraudCum, legitCum := Cumulative(fraudBins), Cumulative(legitBins)
+	var best *ReviewBand
+	for lo := 1; lo < Steps; lo++ {
+		for hi := lo; hi < Steps; hi++ {
+			fraudBelow, legitBelow := fraudCum[lo], legitCum[lo]
+			fraudMid, legitMid := fraudCum[hi]-fraudCum[lo], legitCum[hi]-legitCum[lo]
+			fraudAbove, legitAbove := fraudCum[Steps+1]-fraudCum[hi], legitCum[Steps+1]-legitCum[hi]
+			// approvals: missed fraud. reviews: review fee on all, a share of fraud slips, a share of legit insulted. declines: insults.
+			reviewed := fraudMid + legitMid
+			missedInReview := javaRound(float64(fraudMid) * costs.ReviewMissRate)
+			insultedInReview := javaRound(float64(legitMid) * costs.ReviewInsultRate)
+			cost := must(costs.FraudLoss.Times(fraudBelow+missedInReview, 1, HalfEven))
+			cost = must(cost.Plus(must(costs.InsultCost.Times(legitAbove+insultedInReview, 1, HalfEven))))
+			cost = must(cost.Plus(must(costs.ReviewCost.Times(reviewed, 1, HalfEven))))
+			if best == nil || cost.Compare(best.ExpectedCost) < 0 {
+				best = &ReviewBand{float64(lo) / float64(Steps), float64(hi) / float64(Steps),
+					fraudBelow + legitBelow, reviewed, fraudAbove + legitAbove, cost}
+			}
+		}
+	}
+	return *best
+}
+```
+
+#### Step 8: Calibration and the decision engine
+
+`ExpectedCalibrationError` is a plain `+=` loop, which matches Java's accumulation. `NewDecisionEngine` returns `ErrInvertedBand` for `Low > High`; `Decide` maps the probability onto the three outcomes.
+
+```go
+func ExpectedCalibrationError(bins []Bin) float64 {
+	var total int64
+	for _, b := range bins {
+		total += b.Count
+	}
+	if total == 0 {
+		return 0.0
+	}
+	ece := 0.0
+	for _, b := range bins {
+		ece += float64(b.Count) / float64(total) * math.Abs(b.MeanPredicted-b.ObservedRate)
+	}
+	return ece
+}
+
+func NewDecisionEngine(model *Scorecard, band ReviewBand) (*DecisionEngine, error) {
+	if band.Low > band.High {
+		return nil, ErrInvertedBand
+	}
+	return &DecisionEngine{model, band}, nil
+}
+
+func (e *DecisionEngine) Decide(f Features) Decision {
+	p := e.model.Probability(f)
+	outcome := Approve
+	if p >= e.band.High {
+		outcome = Decline
+	} else if p >= e.band.Low {
+		outcome = Review
+	}
+	return Decision{outcome, e.model.Explain(f, 3)}
+}
+```
+
+#### Step 9: Run it
 
 ```bash
+cd phases/13-risk-fraud-and-compliance/03-risk-scoring-and-thresholds/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run, ending with the explained decisions:
+
+```console
+everything wrong at once -> DECLINE (score 861, p=0.862)
+    amount_log_ratio   value 2.00 x weight +1.29 = +2.59
+    new_device         value 1.00 x weight +1.24 = +1.24
+    geo_mismatch       value 1.00 x weight +1.00 = +1.00
 ```
 
 ## Use It

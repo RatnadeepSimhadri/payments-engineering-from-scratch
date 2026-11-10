@@ -308,42 +308,394 @@ The tests in all three languages assert this table row by row. If a reimplementa
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **Ceiling division is `-(-a // b)`:** Python's `//` floors, so the negate-floor-negate idiom gives the ceiling for positive operands; Java and Go use `(a + b - 1) / b`. Both are exact integer arithmetic. **`collections.deque`** is the sliding log, with `popleft` for expiry and `[0]` for the oldest entry. **A frozen dataclass** for `Decision`, with `allow` and `deny` as static methods; the Java record and Go struct carry the same three fields. The `RateLimiter` base class raises `NotImplementedError`, the lightweight interface, and constructors raise `ValueError` for bad parameters.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The decision and the clock
+
+`Decision` is a frozen dataclass with defaults so `allow()` and `allow(delay)` are one static method; `deny` clamps to at least one millisecond and `retry_after_header` rounds up with `-(-x // 1000)`. `ManualClock.set` refuses to move backwards, which catches an unsorted trace.
+
 ```python
-def try_acquire(self) -> Decision:
-    self._refill()
-    if self._tokens >= SCALE:
-        self._tokens -= SCALE
-        return Decision.allow()
-    deficit = SCALE - self._tokens
-    return Decision.deny(-(-deficit // self.refill_per_second))  # ceil(deficit / rate) ms
+    def set(self, millis: int) -> None:
+        if millis < self._now:
+            raise ValueError("clock cannot go backwards")
+        self._now = millis
 ```
 
-Differences, all in `code/python/main.py`:
+```python
+@dataclass(frozen=True)
+class Decision:
+    allowed: bool
+    retry_after_millis: int = 0
+    delay_millis: int = 0
 
-- **Ceiling division is `-(-a // b)`.** Python's `//` floors, so the negate-floor-negate idiom gives the ceiling for positive operands; Java and Go use `(a + b - 1) / b`. Both are exact integer arithmetic.
-- **`collections.deque`** is the sliding log, with `popleft` for expiry and `[0]` for the oldest entry.
-- **A frozen dataclass** for `Decision`, with `allow` and `deny` as static methods; the Java record and Go struct carry the same three fields.
+    @staticmethod
+    def allow(delay_millis: int = 0) -> "Decision":
+        return Decision(True, 0, delay_millis)
+
+    @staticmethod
+    def deny(retry_after_millis: int) -> "Decision":
+        return Decision(False, max(1, retry_after_millis), 0)
+
+    def retry_after_header(self) -> int:
+        """Retry-After is delta-seconds; always round up so the client never retries early."""
+        return -(-self.retry_after_millis // 1000)
+
+
+class RateLimiter:
+    name = "base"
+
+    def try_acquire(self) -> Decision:
+        raise NotImplementedError
+```
+
+#### Step 2: Token bucket with integer refill
+
+Tokens are kept in thousandths (`SCALE = 1000`) so `elapsed * refill_per_second` is the exact refill. The denial's wait is the deficit divided by the rate, rounded up with the floor-division idiom.
+
+```python
+    def _refill(self) -> None:
+        now = self.clock.now_millis()
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            # refill_per_second tokens/s == refill_per_second thousandths per ms: exact integer math
+            self._tokens = min(self.capacity * SCALE, self._tokens + elapsed * self.refill_per_second)
+            self._last_refill = now
+
+    def try_acquire(self) -> Decision:
+        self._refill()
+        if self._tokens >= SCALE:
+            self._tokens -= SCALE
+            return Decision.allow()
+        deficit = SCALE - self._tokens
+        return Decision.deny(-(-deficit // self.refill_per_second))  # ceil(deficit / rate) ms
+```
+
+#### Step 3: Leaky bucket by virtual scheduling
+
+`_next_slot` is the only state; the built-in `max` picks the later of now and the next free slot, and `Decision.allow(delay)` carries the wait the caller must observe.
+
+```python
+    def try_acquire(self) -> Decision:
+        now = self.clock.now_millis()
+        slot = max(now, self._next_slot)
+        delay = slot - now
+        if delay >= self.queue_capacity * self.interval_millis:
+            # the queue is full: the request would wait longer than queue_capacity slots
+            return Decision.deny(delay - self.queue_capacity * self.interval_millis + self.interval_millis)
+        self._next_slot = slot + self.interval_millis
+        return Decision.allow(delay)
+```
+
+#### Step 4: Fixed window and sliding log
+
+The fixed window aligns to multiples of `window_millis` with `%`. The log is a `deque`: `popleft` expires the front while it is at or before the cutoff (`<=`, so the window is half-open), and `_log[0]` is the oldest live admission that decides Retry-After.
+
+```python
+    def try_acquire(self) -> Decision:
+        now = self.clock.now_millis()
+        start = now - now % self.window_millis
+        if start != self._window_start:
+            self._window_start = start
+            self._count = 0
+        if self._count < self.limit:
+            self._count += 1
+            return Decision.allow()
+        return Decision.deny(start + self.window_millis - now)
+```
+
+```python
+    def try_acquire(self) -> Decision:
+        now = self.clock.now_millis()
+        cutoff = now - self.window_millis
+        while self._log and self._log[0] <= cutoff:
+            self._log.popleft()
+        if len(self._log) < self.limit:
+            self._log.append(now)
+            return Decision.allow()
+        return Decision.deny(self._log[0] + self.window_millis - now)
+```
+
+#### Step 5: Sliding window counter in integers
+
+`_roll` handles the gap case, and the weighted comparison is kept multiplied by `w` so no division happens on the admit path. The Retry-After branch uses `//`, which agrees with Java's `/` here because every operand is non-negative.
+
+```python
+    def _roll(self, now: int) -> int:
+        start = now - now % self.window_millis
+        if start != self._window_start:
+            if start == self._window_start + self.window_millis:
+                self._previous = self._current       # the window just before this one
+            else:
+                self._previous = 0                   # a gap: nothing overlaps
+            self._current = 0
+            self._window_start = start
+        return now - start
+
+    def try_acquire(self) -> Decision:
+        now = self.clock.now_millis()
+        elapsed = self._roll(now)
+        w = self.window_millis
+        scaled = self._previous * (w - elapsed) + self._current * w
+        if scaled + w <= self.limit * w:
+            self._current += 1
+            return Decision.allow()
+        if self._current >= self.limit or self._previous == 0:
+            return Decision.deny(w - elapsed)
+        # smallest e' with previous*(w - e') + current*w + w <= limit*w
+        needed = w - ((self.limit - 1 - self._current) * w) // self._previous
+        return Decision.deny(max(1, needed - elapsed))
+```
+
+#### Step 6: Replay the storm
+
+The replay drives each limiter's own `ManualClock` through the trace with `set`, records processing times (`t + delay`), and tallies the columns of the table; `burst_start <= t < burst_end` is the chained in-burst test.
+
+```python
+def replay(limiter: RateLimiter, clock: ManualClock, trace: list[int], burst_start: int, burst_end: int) -> ReplaySummary:
+    """Drive the injected clock through the trace and tally what the limiter did."""
+    allowed_times: list[int] = []
+    denied = 0
+    in_burst = 0
+    max_retry = 0
+    max_delay = 0
+    for t in trace:
+        clock.set(t)
+        d = limiter.try_acquire()
+        if d.allowed:
+            allowed_times.append(t + d.delay_millis)
+            max_delay = max(max_delay, d.delay_millis)
+            if burst_start <= t < burst_end:
+                in_burst += 1
+        else:
+            denied += 1
+            max_retry = max(max_retry, d.retry_after_millis)
+    return ReplaySummary(limiter.name, len(allowed_times), denied, in_burst, max_in_window(allowed_times, 1000), max_retry, max_delay)
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/03-systems-data-structures/11-rate-limiter-algorithms/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== Token bucket: burst now, steady later ==
+7 requests at t=0 against capacity 5: [True, True, True, True, True, False, False]
+denied: retry after 500 ms -> Retry-After: 1
+```
+
+The five-row storm table is identical to the Java run; the tests assert it row by row.
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design with three differences. **Built-in `min` and `max`** (Go 1.21+) replace `Math.min` and `Math.max`. **Constructors return `(limiter, error)`** with `ErrBadParameter` as the sentinel, in place of `IllegalArgumentException` and `ValueError`. `ManualClock` panics on a backwards move, because a trace that is not sorted is a programming error in the test, not a runtime condition. **The sliding log is a slice** re-sliced from the front on expiry (`l.log = l.log[drop:]`); Go has no deque in the standard library, and for a bounded log the slice is the idiomatic answer. A long-running production version would copy to a fresh slice periodically so the backing array does not grow without bound.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The decision and the clock
+
+`Decision` is a struct with three constructor functions (`Allow`, `AllowAfter`, `Deny`) because Go has no overloading; `Deny` clamps the wait and `RetryAfterHeader` uses the `(x + 999) / 1000` idiom. `ceilDiv` is the helper the token bucket uses, and `Set` panics on a backwards move.
+
 ```go
-func (b *LeakyBucket) TryAcquire() Decision {
-    now := b.clock.NowMillis()
-    slot := max(now, b.nextSlot)
-    delay := slot - now
-    if delay >= b.QueueCapacity*b.IntervalMillis {
-        return Deny(delay - b.QueueCapacity*b.IntervalMillis + b.IntervalMillis)
-    }
-    b.nextSlot = slot + b.IntervalMillis
-    return AllowAfter(delay)
+func (c *ManualClock) Set(millis int64) {
+	if millis < c.now {
+		panic("clock cannot go backwards")
+	}
+	c.now = millis
+}
+
+type Decision struct {
+	Allowed          bool
+	RetryAfterMillis int64
+	DelayMillis      int64
+}
+
+// Allow is an immediate admission.
+func Allow() Decision { return Decision{Allowed: true} }
+
+// AllowAfter is an admission that is processed delayMillis from now.
+func AllowAfter(delayMillis int64) Decision { return Decision{Allowed: true, DelayMillis: delayMillis} }
+
+// Deny is a rejection; the wait is never reported as zero.
+func Deny(retryAfterMillis int64) Decision {
+	if retryAfterMillis < 1 {
+		retryAfterMillis = 1
+	}
+	return Decision{RetryAfterMillis: retryAfterMillis}
+}
+
+// RetryAfterHeader is delta-seconds; always round up so the client never retries early.
+func (d Decision) RetryAfterHeader() int64 { return (d.RetryAfterMillis + 999) / 1000 }
+
+func ceilDiv(a, b int64) int64 { return (a + b - 1) / b }
+```
+
+#### Step 2: Token bucket with integer refill
+
+The `if elapsed := ...; elapsed > 0` form scopes the elapsed time to the refill branch, and the built-in `min` caps the bucket. The denial goes through `ceilDiv`.
+
+```go
+func (b *TokenBucket) refill() {
+	now := b.clock.NowMillis()
+	if elapsed := now - b.lastRefill; elapsed > 0 {
+		// refillPerSecond tokens/s == refillPerSecond thousandths per ms: exact integer math
+		b.tokens = min(b.Capacity*Scale, b.tokens+elapsed*b.RefillPerSecond)
+		b.lastRefill = now
+	}
+}
+
+func (b *TokenBucket) TryAcquire() Decision {
+	b.refill()
+	if b.tokens >= Scale {
+		b.tokens -= Scale
+		return Allow()
+	}
+	return Deny(ceilDiv(Scale-b.tokens, b.RefillPerSecond))
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: Leaky bucket by virtual scheduling
 
-- **Built-in `min` and `max`** (Go 1.21+) replace `Math.min` and `Math.max`.
-- **Constructors return `(limiter, error)`** with `ErrBadParameter` as the sentinel, in place of `IllegalArgumentException` and `ValueError`. `ManualClock` panics on a backwards move, because a trace that is not sorted is a programming error in the test, not a runtime condition.
-- **The sliding log is a slice** re-sliced from the front on expiry (`l.log = l.log[drop:]`); Go has no deque in the standard library, and for a bounded log the slice is the idiomatic answer. A long-running production version would copy to a fresh slice periodically so the backing array does not grow without bound.
+The Java method with the built-in `max` and `AllowAfter(delay)` for an admission that carries a wait.
+
+```go
+func (b *LeakyBucket) TryAcquire() Decision {
+	now := b.clock.NowMillis()
+	slot := max(now, b.nextSlot)
+	delay := slot - now
+	if delay >= b.QueueCapacity*b.IntervalMillis {
+		// the queue is full: the request would wait longer than queueCapacity slots
+		return Deny(delay - b.QueueCapacity*b.IntervalMillis + b.IntervalMillis)
+	}
+	b.nextSlot = slot + b.IntervalMillis
+	return AllowAfter(delay)
+}
+```
+
+#### Step 4: Fixed window and sliding log
+
+The fixed window is unchanged. The log counts how many leading entries are at or before the cutoff and re-slices them away in one step; `l.log[0]` is then the oldest live admission.
+
+```go
+func (w *FixedWindow) TryAcquire() Decision {
+	now := w.clock.NowMillis()
+	start := now - now%w.WindowMillis
+	if start != w.windowStart {
+		w.windowStart = start
+		w.count = 0
+	}
+	if w.count < w.Limit {
+		w.count++
+		return Allow()
+	}
+	return Deny(start + w.WindowMillis - now)
+}
+```
+
+```go
+func (l *SlidingWindowLog) TryAcquire() Decision {
+	now := l.clock.NowMillis()
+	cutoff := now - l.WindowMillis
+	drop := 0
+	for drop < len(l.log) && l.log[drop] <= cutoff {
+		drop++
+	}
+	l.log = l.log[drop:]
+	if int64(len(l.log)) < l.Limit {
+		l.log = append(l.log, now)
+		return Allow()
+	}
+	return Deny(l.log[0] + l.WindowMillis - now)
+}
+```
+
+#### Step 5: Sliding window counter in integers
+
+`roll` and `TryAcquire` are the Java lines; Go's `/` truncates like Java's, and every operand in the Retry-After formula is non-negative so the result is identical. The built-in `max` clamps the wait to one millisecond.
+
+```go
+func (c *SlidingWindowCounter) roll(now int64) int64 {
+	start := now - now%c.WindowMillis
+	if start != c.windowStart {
+		if start == c.windowStart+c.WindowMillis {
+			c.previous = c.current // the window just before this one
+		} else {
+			c.previous = 0 // a gap: nothing overlaps
+		}
+		c.current = 0
+		c.windowStart = start
+	}
+	return now - start
+}
+
+func (c *SlidingWindowCounter) TryAcquire() Decision {
+	now := c.clock.NowMillis()
+	elapsed := c.roll(now)
+	w := c.WindowMillis
+	scaled := c.previous*(w-elapsed) + c.current*w
+	if scaled+w <= c.Limit*w {
+		c.current++
+		return Allow()
+	}
+	if c.current >= c.Limit || c.previous == 0 {
+		return Deny(w - elapsed)
+	}
+	// smallest e' with previous*(w - e') + current*w + w <= limit*w
+	needed := w - ((c.Limit-1-c.current)*w)/c.previous
+	return Deny(max(1, needed-elapsed))
+}
+```
+
+#### Step 6: Replay the storm
+
+`Replay` fills the `ReplaySummary` fields in place as it walks the trace and computes `MaxInAnySecond` at the end from the recorded processing times.
+
+```go
+func Replay(limiter RateLimiter, clock *ManualClock, trace []int64, burstStart, burstEnd int64) ReplaySummary {
+	var allowedTimes []int64
+	s := ReplaySummary{Name: limiter.Name()}
+	for _, t := range trace {
+		clock.Set(t)
+		d := limiter.TryAcquire()
+		if d.Allowed {
+			allowedTimes = append(allowedTimes, t+d.DelayMillis)
+			s.MaxDelayMillis = max(s.MaxDelayMillis, d.DelayMillis)
+			if t >= burstStart && t < burstEnd {
+				s.AllowedInBurst++
+			}
+		} else {
+			s.Denied++
+			s.MaxRetryAfterMillis = max(s.MaxRetryAfterMillis, d.RetryAfterMillis)
+		}
+	}
+	s.Allowed = len(allowedTimes)
+	s.MaxInAnySecond = MaxInWindow(allowedTimes, 1000)
+	return s
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/03-systems-data-structures/11-rate-limiter-algorithms/code/go
+go run .
+go test ./...
+```
+
+```console
+limiter          allowed denied in burst max/1s max Retry-After max delay
+token bucket          69     30       10     19           95 ms      0 ms
+leaky bucket          69     30       11     10          195 ms    995 ms
+fixed window          60     39       10     19          995 ms      0 ms
+sliding log           60     39        1     10          100 ms      0 ms
+sliding counter       55     44        1     10          112 ms      0 ms
+```
+
+Every row matches the Java table, and the earlier sections print the same decisions.
 
 ## Use It
 

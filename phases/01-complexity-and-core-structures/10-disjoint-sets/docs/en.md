@@ -318,30 +318,126 @@ The tests cross-check 2,000 random unions against a brute-force label array (mer
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps `DisjointSet` (three `list[int]`s), `EntityLinker`, and both switchable heuristics. What differs: **the loop is mandatory.** A recursive `find` raises `RecursionError` on the naive chain, because CPython's default limit is 1,000 frames and the chain is 1,999 deep. The two-pass loop also binds `self._parent` to a local and accumulates hops locally, which roughly halves the cost of each hop in the interpreter. **The heuristics demo runs at one tenth the size.** The naive variant is O(n^2) pointer hops by design: about 200 million on Java's 20,000-element chain and tens of millions more on the random workload. CPython follows roughly 10-30 million pointers a second, so `demo_heuristics` runs n = 2,000 with 3,000 random unions. The table has the same shape (naive depth n-1 and n/2 hops per find; rank-only depth 1; compression repairs the chain after one find), and `test_demo_table_matches_java_at_n_2000` pins the exact numbers the Java algorithm prints at that size. Every other section, including the 100,000 unions over 50,000 elements, prints the same numbers as Java. **Same random workloads:** `JavaRandom` reproduces `java.util.Random(seed).nextInt(bound)`, so seeds 3, 11, and 99 drive identical unions. **Exceptions:** an out-of-range element raises `IndexError`, a negative `n` raises `ValueError`, and exceeding the linker's capacity raises `RuntimeError` where Java throws `IllegalStateException`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Arrays, not nodes
+
+Three parallel lists: `list(range(n))` makes every element its own root, `[0] * n` and `[1] * n` initialise rank and size. Both heuristics default to on, so `DisjointSet(n)` is the production shape and the demo passes explicit flags.
+
 ```python
-def find(self, x: int) -> int:
-    self._check_index(x)
-    parent = self._parent
-    root = x
-    hops = 0
-    while parent[root] != root:
-        root = parent[root]
-        hops += 1
-    self._hops += hops
-    if self._path_compression:
-        while parent[x] != root:
-            nxt = parent[x]
-            parent[x] = root
-            x = nxt
-    return root
+class DisjointSet:
+    def __init__(self, n: int, union_by_rank: bool = True, path_compression: bool = True) -> None:
+        if n < 0:
+            raise ValueError("n must be >= 0")
+        self._parent = list(range(n))
+        self._rank = [0] * n
+        self._size = [1] * n
+        self._components = n
+        self._union_by_rank = union_by_rank
+        self._path_compression = path_compression
+        self._hops = 0  # instrumentation: parent pointers followed inside find
+
+    def _check_index(self, x: int) -> None:
+        if x < 0 or x >= len(self._parent):
+            raise IndexError(f"element {x} not in 0..{len(self._parent) - 1}")
 ```
 
-`code/python/main.py` keeps `DisjointSet` (three `list[int]`s), `EntityLinker`, and both switchable heuristics. What differs:
+#### Step 2: Find with two-pass compression
 
-- **The loop is mandatory.** A recursive `find` raises `RecursionError` on the naive chain, because CPython's default limit is 1,000 frames and the chain is 1,999 deep. The two-pass loop above also binds `self._parent` to a local and accumulates hops locally, which roughly halves the cost of each hop in the interpreter.
-- **The heuristics demo runs at one tenth the size.** The naive variant is O(n^2) pointer hops by design: about 200 million on Java's 20,000-element chain and tens of millions more on the random workload. CPython follows roughly 10-30 million pointers a second, so `demo_heuristics` runs n = 2,000 with 3,000 random unions. The table has the same shape (naive depth n-1 and n/2 hops per find; rank-only depth 1; compression repairs the chain after one find), and `test_demo_table_matches_java_at_n_2000` pins the exact numbers the Java algorithm prints at that size. Every other section, including the 100,000 unions over 50,000 elements, prints the same numbers as Java.
-- **Same random workloads.** `JavaRandom` reproduces `java.util.Random(seed).nextInt(bound)`, so seeds 3, 11, and 99 drive identical unions.
-- **Exceptions.** An out-of-range element raises `IndexError`, a negative `n` raises `ValueError`, and exceeding the linker's capacity raises `RuntimeError` where Java throws `IllegalStateException`.
+Same two passes. The local `parent` alias and the local `hops` counter are interpreter optimisations: an attribute lookup per hop would roughly double the time on the naive chain. `nxt` is used as a name because `next` is a builtin.
+
+```python
+    def find(self, x: int) -> int:
+        self._check_index(x)
+        parent = self._parent
+        root = x
+        hops = 0
+        while parent[root] != root:
+            root = parent[root]
+            hops += 1
+        self._hops += hops
+        if self._path_compression:
+            while parent[x] != root:
+                nxt = parent[x]
+                parent[x] = root
+                x = nxt
+        return root
+```
+
+#### Step 3: Union by rank
+
+The swap is a tuple assignment. Otherwise the method is the Java one: hang the shorter root under the taller, bump the rank on a tie, update `size` on the survivor, decrement `components`, and return whether anything merged.
+
+```python
+    def union(self, a: int, b: int) -> bool:
+        """Merge the sets containing a and b. Returns False if they were already the same set."""
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        if self._union_by_rank:
+            if self._rank[ra] < self._rank[rb]:
+                ra, rb = rb, ra  # ra is now the taller (or equal) root
+            self._parent[rb] = ra
+            if self._rank[ra] == self._rank[rb]:
+                self._rank[ra] += 1
+        else:
+            self._parent[rb] = ra  # naive: always hang b's root under a's root
+        self._size[ra] += self._size[rb]
+        self._components -= 1
+        return True
+```
+
+#### Step 4: Queries and the invariant checker
+
+`connected` is two finds; `component_size` reads `size` at the root. `depth` walks without compressing so tests can observe the shape. `check_invariant` (in the file) does the cycle-guarded walk from every element and reconciles roots against `components` and `size`.
+
+```python
+    def connected(self, a: int, b: int) -> bool:
+        return self.find(a) == self.find(b)
+
+    def component_size(self, x: int) -> int:
+        """Number of elements in x's set."""
+        return self._size[self.find(x)]
+
+    def depth(self, x: int) -> int:
+        """How many parent pointers separate x from its root. Does not compress."""
+        self._check_index(x)
+        parent = self._parent
+        d = 0
+        while parent[x] != x:
+            x = parent[x]
+            d += 1
+        return d
+```
+
+#### Step 5: Names on top of integers
+
+A `dict` assigns integers and a list maps back. `_id` raises `RuntimeError` when the fixed capacity is exhausted. `same_ring` uses `dict.get` so an unknown identifier yields `None` and the query never creates an element.
+
+```python
+    def _id(self, name: str) -> int:
+        existing = self._index.get(name)
+        if existing is not None:
+            return existing
+        if self._next >= self._capacity:
+            raise RuntimeError(f"linker capacity exceeded: {self._capacity}")  # Java: IllegalStateException
+        self._index[name] = self._next
+        self._names.append(name)
+        self._next += 1
+        return self._next - 1
+
+    def link(self, a: str, b: str) -> bool:
+        """Record that two identifiers were seen together. Returns True if this observation merged two rings."""
+        return self._sets.union(self._id(a), self._id(b))
+
+    def same_ring(self, a: str, b: str) -> bool:
+        ia, ib = self._index.get(a), self._index.get(b)
+        return ia is not None and ib is not None and self._sets.connected(ia, ib)
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/10-disjoint-sets/code/python
@@ -349,40 +445,219 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== What union by rank and path compression buy ==
+naive (neither)          max depth before finds   1999, pointers followed per find   999, max depth after 1999
+union by rank only       max depth before finds      1, pointers followed per find     0, max depth after   1
+path compression only    max depth before finds   1999, pointers followed per find     1, max depth after   1
+both                     max depth before finds      1, pointers followed per find     0, max depth after   1
+
+random workload: 2,000 elements, 3,000 random unions, then one find per element
+naive (neither)          max depth before finds    328, pointers followed per find 213.19, max depth after 328
+union by rank only       max depth before finds      5, pointers followed per find  1.98, max depth after   5
+path compression only    max depth before finds      6, pointers followed per find  1.88, max depth after   1
+both                     max depth before finds      3, pointers followed per find  1.06, max depth after   1
+
+== Entity linking: accounts that share devices, cards, or emails ==
+acct:1001 and acct:1004 share a ring: true (no direct link between them; three hops through device, card, email)
+ring of 7 flagged for review: [acct:1001, acct:1002, acct:1003, acct:1004, card:4111-xx-0001, device:A, email:x@example.com]
+
+== 100,000 random unions over 50,000 elements ==
+effective merges 49036, components left 964, largest set 49000, max depth 1, avg pointers per find 2.01
+```
+
+The heuristics table is at n = 2,000, so its absolute numbers differ from the Java run; the shape is the same, and the test pins these exact values. The fraud and 50,000-element sections match Java digit for digit.
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps `DisjointSet` (three `[]int32` slices), `EntityLinker`, and both switchable heuristics. What differs: **panics for programming errors, errors for runtime conditions.** `Find`, `Union`, `Depth`, and friends panic on an out-of-range element, exactly as indexing a Go slice would; there is no honest `(int, error)` shape for a function every other method calls in a tight loop. Conditions a caller can hit at runtime are errors: `NewDisjointSetWith` returns `ErrNegativeSize`, and `EntityLinker.Link` returns `(bool, error)` with `ErrCapacityExceeded` when the identifier slots run out. **`int32` arrays:** `parent`, `rank`, and `size` are `[]int32`, matching Java's `int[]` byte for byte; `rank` never exceeds 64, and the hop counter is `int64` because the naive chain follows 200 million pointers in the demo. **Sorting by hand:** `Ring` and `RingsOfAtLeast` use `sort.Strings` and `sort.Slice` with the same comparator (size descending, then smallest member) instead of `TreeMap` and `Comparator.comparingInt`, so the flagged rings print in the same order as Java. **Same random workloads:** `JavaRandom` reproduces `java.util.Random(seed).nextInt(bound)`, so seeds 3, 11, and 99 drive identical unions and every section prints the same numbers as Java. The test suite pins the heuristics table at n = 2,000, the same size the Python test uses, so `go test -race` stays fast.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Arrays, not nodes
+
+Three `[]int32` slices, `components` as an `int`, and an `int64` hop counter. `NewDisjointSetWith` returns an error for a negative `n`; `NewDisjointSet` is the both-heuristics-on convenience that panics on that error because its argument is always a literal in this lesson.
+
 ```go
-func (d *DisjointSet) Find(x int) int {
-    d.checkIndex(x) // panics, like a slice index: an out-of-range element is a programming error
-    root := int32(x)
-    for d.parent[root] != root {
-        root = d.parent[root]
-        d.hops++
-    }
-    if d.pathCompression {
-        cur := int32(x)
-        for d.parent[cur] != root {
-            next := d.parent[cur]
-            d.parent[cur] = root
-            cur = next
-        }
-    }
-    return int(root)
+type DisjointSet struct {
+	parent          []int32
+	rank            []int32
+	size            []int32
+	components      int
+	unionByRank     bool
+	pathCompression bool
+	hops            int64 // instrumentation: parent pointers followed inside Find
+}
+
+// NewDisjointSetWith builds a forest with each heuristic chosen explicitly.
+func NewDisjointSetWith(n int, unionByRank, pathCompression bool) (*DisjointSet, error) {
+	if n < 0 {
+		return nil, ErrNegativeSize
+	}
+	ds := &DisjointSet{
+		parent: make([]int32, n), rank: make([]int32, n), size: make([]int32, n),
+		components: n, unionByRank: unionByRank, pathCompression: pathCompression,
+	}
+	for i := range ds.parent {
+		ds.parent[i] = int32(i)
+		ds.size[i] = 1
+	}
+	return ds, nil
+}
+
+// checkIndex panics like a slice index would: an out-of-range element is a programming error, not a runtime condition.
+func (d *DisjointSet) checkIndex(x int) {
+	if x < 0 || x >= len(d.parent) {
+		panic(fmt.Sprintf("element %d not in 0..%d", x, len(d.parent)-1))
+	}
 }
 ```
 
-`code/go/main.go` keeps `DisjointSet` (three `[]int32` slices), `EntityLinker`, and both switchable heuristics. What differs:
+#### Step 2: Find with two-pass compression
 
-- **Panics for programming errors, errors for runtime conditions.** `Find`, `Union`, `Depth`, and friends panic on an out-of-range element, exactly as indexing a Go slice would; there is no honest `(int, error)` shape for a function every other method calls in a tight loop. Conditions a caller can hit at runtime are errors: `NewDisjointSetWith` returns `ErrNegativeSize`, and `EntityLinker.Link` returns `(bool, error)` with `ErrCapacityExceeded` when the identifier slots run out.
-- **`int32` arrays.** `parent`, `rank`, and `size` are `[]int32`, matching Java's `int[]` byte for byte; `rank` never exceeds 64, and the hop counter is `int64` because the naive chain follows 200 million pointers in the demo.
-- **Sorting by hand.** `Ring` and `RingsOfAtLeast` use `sort.Strings` and `sort.Slice` with the same comparator (size descending, then smallest member) instead of `TreeMap` and `Comparator.comparingInt`, so the flagged rings print in the same order as Java.
-- **Same random workloads.** `JavaRandom` reproduces `java.util.Random(seed).nextInt(bound)`, so seeds 3, 11, and 99 drive identical unions and every section prints the same numbers as Java. The test suite pins the heuristics table at n = 2,000, the same size the Python test uses, so `go test -race` stays fast.
+The walk is done on `int32` values to avoid a conversion per hop; the result is widened back to `int` for callers. Two loops, no recursion, hops counted on the first pass.
+
+```go
+func (d *DisjointSet) Find(x int) int {
+	d.checkIndex(x)
+	root := int32(x)
+	for d.parent[root] != root {
+		root = d.parent[root]
+		d.hops++
+	}
+	if d.pathCompression {
+		cur := int32(x)
+		for d.parent[cur] != root {
+			next := d.parent[cur]
+			d.parent[cur] = root
+			cur = next
+		}
+	}
+	return int(root)
+}
+```
+
+#### Step 3: Union by rank
+
+Identical to the Java, with a parallel assignment for the swap and `int32` roots throughout.
+
+```go
+// Union merges the sets containing a and b. Returns false if they were already the same set.
+func (d *DisjointSet) Union(a, b int) bool {
+	ra, rb := int32(d.Find(a)), int32(d.Find(b))
+	if ra == rb {
+		return false
+	}
+	if d.unionByRank {
+		if d.rank[ra] < d.rank[rb] {
+			ra, rb = rb, ra // ra is now the taller (or equal) root
+		}
+		d.parent[rb] = ra
+		if d.rank[ra] == d.rank[rb] {
+			d.rank[ra]++
+		}
+	} else {
+		d.parent[rb] = ra // naive: always hang b's root under a's root
+	}
+	d.size[ra] += d.size[rb]
+	d.components--
+	return true
+}
+```
+
+#### Step 4: Queries and the invariant checker
+
+One-line methods for `Connected` and `ComponentSize`; `Depth` walks without compressing. `CheckInvariant` (in the file) is the same cycle-guarded reconciliation as Java and runs after every mutation in the tests.
+
+```go
+// Connected reports whether a and b share a root.
+func (d *DisjointSet) Connected(a, b int) bool { return d.Find(a) == d.Find(b) }
+
+// ComponentSize is the number of elements in x's set.
+func (d *DisjointSet) ComponentSize(x int) int { return int(d.size[d.Find(x)]) }
+
+// Depth is the actual depth of x: how many parent pointers separate it from its root. Does not compress.
+func (d *DisjointSet) Depth(x int) int {
+	d.checkIndex(x)
+	cur := int32(x)
+	depth := 0
+	for d.parent[cur] != cur {
+		cur = d.parent[cur]
+		depth++
+	}
+	return depth
+}
+```
+
+#### Step 5: Names on top of integers
+
+`id` returns `(int, error)` so `Link` can surface `ErrCapacityExceeded` instead of panicking in the middle of a fraud batch. `SameRing` uses the two-value map lookup to treat unknown identifiers as connected to nothing.
+
+```go
+func (l *EntityLinker) id(name string) (int, error) {
+	if existing, ok := l.index[name]; ok {
+		return existing, nil
+	}
+	if l.next >= l.capacity {
+		return 0, fmt.Errorf("%w: %d", ErrCapacityExceeded, l.capacity)
+	}
+	l.index[name] = l.next
+	l.names = append(l.names, name)
+	l.next++
+	return l.next - 1, nil
+}
+
+// Link records that two identifiers were seen together. Returns true if this observation merged two rings.
+func (l *EntityLinker) Link(a, b string) (bool, error) {
+	ia, err := l.id(a)
+	if err != nil {
+		return false, err
+	}
+	ib, err := l.id(b)
+	if err != nil {
+		return false, err
+	}
+	return l.sets.Union(ia, ib), nil
+}
+
+// SameRing reports whether both identifiers are known and connected.
+func (l *EntityLinker) SameRing(a, b string) bool {
+	ia, okA := l.index[a]
+	ib, okB := l.index[b]
+	return okA && okB && l.sets.Connected(ia, ib)
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/10-disjoint-sets/code/go
 go run .
 go test ./...
 ```
+
+```console
+== What union by rank and path compression buy ==
+naive (neither)          max depth before finds  19999, pointers followed per find  9999, max depth after 19999
+union by rank only       max depth before finds      1, pointers followed per find     0, max depth after   1
+path compression only    max depth before finds  19999, pointers followed per find     1, max depth after   1
+both                     max depth before finds      1, pointers followed per find     0, max depth after   1
+
+random workload: 20,000 elements, 30,000 random unions, then one find per element
+naive (neither)          max depth before finds   2948, pointers followed per find 1950.96, max depth after 2948
+union by rank only       max depth before finds      6, pointers followed per find  2.05, max depth after   6
+path compression only    max depth before finds      8, pointers followed per find  1.88, max depth after   1
+both                     max depth before finds      3, pointers followed per find  1.06, max depth after   1
+
+== Entity linking: accounts that share devices, cards, or emails ==
+acct:1001 and acct:1004 share a ring: true (no direct link between them; three hops through device, card, email)
+ring of 7 flagged for review: [acct:1001, acct:1002, acct:1003, acct:1004, card:4111-xx-0001, device:A, email:x@example.com]
+
+== 100,000 random unions over 50,000 elements ==
+effective merges 49036, components left 964, largest set 49000, max depth 1, avg pointers per find 2.01
+```
+
+Every number matches the Java run, including the full-size heuristics table: Go follows the naive chain's 200 million pointers in well under a second.
 
 ## Use It
 

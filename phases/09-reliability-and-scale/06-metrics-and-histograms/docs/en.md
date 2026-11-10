@@ -353,22 +353,154 @@ Every exact percentile sits inside the histogram's bracket and every bracket is 
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`floor(log2 v)` is `v.bit_length() - 1`:** Python has no `numberOfLeadingZeros`, but on a non-negative int `bit_length` gives the same exponent and `>>` behaves identically, so `index_of`, `lower_bound`, and `upper_bound` are line-for-line the Java shifts with no casts. **No fixed-width integers:** the `Math.*Exact` checks on counts and sums vanish, and `_min`/`_max` start at `LONG_MAX`/`LONG_MIN` constants only to keep the sentinels the same. `Rng` masks every SplitMix64 step with `& MASK64`, converts to a signed value in `next_long` so the seed-42 assertion matches `-4767286540954276203`, and `next_double` shifts the unsigned form by 11 as `>>>` does. **`Math.round` is `java_round`, not `round`:** Python's `round` is banker's rounding; `java_round` is round-half-up computed exactly, which is what turns the log-normal draws into the same microsecond samples (so the histogram sum `3529462222` matches) and renders `_sum` the same way. **Exposition:** `LinkedHashMap` is a plain `dict` (insertion-ordered), `StringBuilder` is a list of strings joined once, and `String.indent(2)` is a three-line helper.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Counter and gauge
+
+`inc` rejects a negative increment with `ValueError` and needs no `addExact`. `rate` is a static method with the reset-aware delta: a counter that went down restarted from zero, so the delta is the current value.
+
 ```python
-def index_of(self, v: int) -> int:
-    """Which bucket holds ``v``. Exact below 2^precision_bits; log-linear above."""
-    if v < self._linear:
-        return v
-    e = v.bit_length() - 1  # floor(log2 v), e >= precision_bits
-    sub = (v - (1 << e)) >> (e - self.precision_bits)
-    return (e - self.precision_bits + 1) * self._linear + sub
+class Counter:
+    def __init__(self) -> None:
+        self._value = 0
+
+    def inc(self, n: int = 1) -> None:
+        if n < 0:
+            raise ValueError(f"counter can only go up: {n}")
+        self._value += n
+
+    def value(self) -> int:
+        return self._value
+
+    @staticmethod
+    def rate(previous: int, current: int, seconds: float) -> float:
+        if seconds <= 0:
+            raise ValueError("interval must be positive")
+        delta = current - previous if current >= previous else current
+        return delta / seconds
+
+
+class Gauge:
+    def __init__(self) -> None:
+        self._value = 0
+
+    def set(self, v: int) -> None:
+        self._value = v
+
+    def inc(self) -> None:
+        self._value += 1
+
+    def dec(self) -> None:
+        self._value -= 1
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: Bucket indexing
 
-- **`floor(log2 v)` is `v.bit_length() - 1`.** Python has no `numberOfLeadingZeros`, but on a non-negative int `bit_length` gives the same exponent and `>>` behaves identically, so `index_of`, `lower_bound`, and `upper_bound` are line-for-line the Java shifts with no casts.
-- **No fixed-width integers.** The `Math.*Exact` checks on counts and sums vanish, and `_min`/`_max` start at `LONG_MAX`/`LONG_MIN` constants only to keep the sentinels the same. `Rng` masks every SplitMix64 step with `& MASK64`, converts to a signed value in `next_long` so the seed-42 assertion matches `-4767286540954276203`, and `next_double` shifts the unsigned form by 11 as `>>>` does.
-- **`Math.round` is `java_round`, not `round`.** Python's `round` is banker's rounding; `java_round` is round-half-up computed exactly, which is what turns the log-normal draws into the same microsecond samples (so the histogram sum `3529462222` matches) and renders `_sum` the same way.
-- **Exposition.** `LinkedHashMap` is a plain `dict` (insertion-ordered), `StringBuilder` is a list of strings joined once, and `String.indent(2)` is a three-line helper.
+`v.bit_length() - 1` is `floor(log2 v)`; the rest of the arithmetic is the Java shift-and-add with `//` and `%` for the inverse. No casts, because there is only one integer type.
+
+```python
+    def index_of(self, v: int) -> int:
+        if v < self._linear:
+            return v
+        e = v.bit_length() - 1  # floor(log2 v), e >= precision_bits
+        sub = (v - (1 << e)) >> (e - self.precision_bits)  # which of the 2^precision_bits slices of [2^e, 2^(e+1))
+        return (e - self.precision_bits + 1) * self._linear + sub
+
+    def lower_bound(self, index: int) -> int:
+        if index < self._linear:
+            return index
+        k = index // self._linear
+        e = k + self.precision_bits - 1
+        sub = index % self._linear
+        return (1 << e) + (sub << (e - self.precision_bits))
+
+    def upper_bound(self, index: int) -> int:
+        return self.lower_bound(index + 1) - 1
+```
+
+#### Step 3: Recording and percentiles
+
+`record_many` keeps `_sum` exact with plain `+=` and `*`. `percentile` walks the counts with `enumerate` until the nearest rank is reached and clamps the bracket to the observed `_min` and `_max`; a `p` outside 0..100 is a `ValueError`.
+
+```python
+    def record_many(self, v: int, n: int) -> None:
+        if v < 0 or v > self.highest_trackable:
+            raise ValueError(f"value out of range: {v}")
+        if n <= 0:
+            raise ValueError("count must be positive")
+        self._counts[self.index_of(v)] += n
+        self._total += n
+        self._sum += v * n
+        if v < self._min:
+            self._min = v
+        if v > self._max:
+            self._max = v
+
+    def percentile(self, p: float) -> Estimate:
+        if p < 0 or p > 100:
+            raise ValueError("percentile must be 0..100")
+        if self._total == 0:
+            return Estimate(p, 0, 0)
+        rank = max(1, math.ceil(p / 100.0 * self._total))
+        seen = 0
+        for i, c in enumerate(self._counts):
+            seen += c
+            if seen >= rank:
+                return Estimate(p, max(self.lower_bound(i), self._min), min(self.upper_bound(i), self._max))
+        return Estimate(p, self._max, self._max)
+```
+
+#### Step 4: Merge and cumulative export
+
+Merge is element-wise addition over the two count lists; `cumulative` sums a slice prefix per boundary, which is the Prometheus `le` shape.
+
+```python
+    def merge(self, other: "LogLinearHistogram") -> None:
+        if other.precision_bits != self.precision_bits or other.highest_trackable != self.highest_trackable:
+            raise ValueError("cannot merge histograms with different layouts")
+        for i in range(len(self._counts)):
+            self._counts[i] += other._counts[i]
+        self._total += other._total
+        self._sum += other._sum
+        if other._total > 0:
+            self._min = min(self._min, other._min)
+            self._max = max(self._max, other._max)
+
+    def cumulative(self, boundaries: list[int]) -> list[int]:
+        out = []
+        for b in boundaries:
+            idx = self.index_of(min(b, self.highest_trackable))
+            out.append(sum(self._counts[: idx + 1]))
+        return out
+```
+
+#### Step 5: The registry and exposition
+
+The three dicts iterate in registration order. Each line is an f-string appended to a list and joined once; `_sum` goes through `java_round` so it rounds half-up like `Math.round`.
+
+```python
+    def render(self, histogram_boundaries: list[int]) -> str:
+        out: list[str] = []
+        for name, c in self._counters.items():
+            out.append(f"# TYPE {name}_total counter\n")
+            out.append(f"{name}_total {c.value()}\n")
+        for name, g in self._gauges.items():
+            out.append(f"# TYPE {name} gauge\n")
+            out.append(f"{name} {g.value()}\n")
+        for name, h in self._histograms.items():
+            out.append(f"# TYPE {name} histogram\n")
+            cum = h.cumulative(histogram_boundaries)
+            for b, n in zip(histogram_boundaries, cum):
+                out.append(f'{name}_bucket{{le="{b}"}} {n}\n')
+            out.append(f'{name}_bucket{{le="+Inf"}} {h.count()}\n')
+            out.append(f"{name}_sum {java_round(h.mean() * h.count())}\n")
+            out.append(f"{name}_count {h.count()}\n")
+        return "".join(out)
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/06-metrics-and-histograms/code/python
@@ -376,31 +508,220 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Because the generator, the rounding, and the bucket math are bit-identical, every percentile and bracket matches the Java run:
+
+```console
+== 2. Averages lie: 100,000 authorizations, 1% hit a slow issuer path ==
+  mean   = 35.3 ms   <- under a 100 ms SLO, this looks healthy
+  p50    = 12.2 ms      histogram says [12.1 ms, 12.2 ms], exact = 12.1 ms, bound 0.52%
+  p90    = 23.6 ms      histogram says [23.4 ms, 23.6 ms], exact = 23.5 ms, bound 0.54%
+  p99    = 1155.1 ms    histogram says [1146.9 ms, 1155.1 ms], exact = 1151.3 ms, bound 0.71%
+  p99.9  = 2916.4 ms    histogram says [2900.0 ms, 2916.4 ms], exact = 2909.9 ms, bound 0.56%
+  fraction of requests at or below 100 ms = 98.956%  (the SLI, answered from the buckets)
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design with four differences. **`floor(log2 v)` is `bits.Len64(uint64(v)) - 1`:** `math/bits` replaces `Long.numberOfLeadingZeros`; the shifts in `IndexOf`, `LowerBound`, and `UpperBound` are otherwise the Java lines with explicit `int64` casts, because Go will not mix `int` and `int64` silently. **Errors are values:** `NewLogLinearHistogram`, `Record`, `RecordMany`, `Merge`, `Counter.IncBy`, `Rate`, and `Percentile` return `error` where Java throws `IllegalArgumentException`. `Value(p)` panics on a `p` outside 0..100 because the Java `value` has no error channel either and the bad argument is a caller bug. `Counter.IncBy` returns `ErrOverflow` instead of wrapping at `math.MaxInt64`, which `Math.addExact` would have thrown; inside `RecordMany` and `Merge` the same `addChecked`/`mulChecked` helpers panic, since a histogram that has counted 2^63 observations has no sensible caller to inform. **The generator uses `uint64` state:** SplitMix64's multiplications must wrap, so `Rng.state` is unsigned and `NextLong` converts the result to `int64` at the end; the seed-42 assertion `-4767286540954276203` then holds exactly, and `NextDouble` shifts the unsigned form by 11 as `>>>` does. `Math.round` is `javaRound` (`math.Floor(x + 0.5)`), which is what makes the 100,000 log-normal draws land on the same microsecond values and the histogram `_sum` print `3529462222` in both languages. **Formatting and ordering:** `fmt` has no `%,d`, so a nine-line `commas` helper renders thousands separators; `String.indent(2)` is `indent`; `Double.toString` for the percentile label is `Trim` with `strconv.FormatFloat(p, 'f', -1, 64)`. `LinkedHashMap` becomes a `map` plus a `[]string` of names per metric type so the exposition keeps registration order.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Counter and gauge
+
+`IncBy` returns an error for a negative increment and for an `int64` overflow detected by `addChecked`; `Rate` is a package function returning `(float64, error)`. `Gauge` is three one-liners.
+
 ```go
-// IndexOf is which bucket holds v. Exact below 2^precisionBits; log-linear above.
+type Counter struct{ value int64 }
+
+func (c *Counter) Inc() { c.IncBy(1) }
+
+func (c *Counter) IncBy(n int64) error {
+	if n < 0 {
+		return fmt.Errorf("counter can only go up: %d", n)
+	}
+	v, err := addChecked(c.value, n)
+	if err != nil {
+		return err
+	}
+	c.value = v
+	return nil
+}
+
+func Rate(previous, current int64, seconds float64) (float64, error) {
+	if seconds <= 0 {
+		return 0, errors.New("interval must be positive")
+	}
+	delta := current
+	if current >= previous {
+		delta = current - previous
+	}
+	return float64(delta) / seconds, nil
+}
+
+type Gauge struct{ value int64 }
+
+func (g *Gauge) Set(v int64)  { g.value = v }
+func (g *Gauge) Inc()         { g.value++ }
+func (g *Gauge) Dec()         { g.value-- }
+func (g *Gauge) Value() int64 { return g.value }
+```
+
+#### Step 2: Bucket indexing
+
+`bits.Len64` on the value cast to `uint64` gives the bit length; the subtraction yields `floor(log2 v)`. The explicit `int64(...)` conversions are the only difference from the Java shifts.
+
+```go
 func (h *LogLinearHistogram) IndexOf(v int64) int {
-    if v < int64(h.linear) {
-        return int(v)
-    }
-    e := bits.Len64(uint64(v)) - 1                    // floor(log2 v), e >= precisionBits
-    sub := (v - int64(1)<<e) >> (e - h.PrecisionBits) // which of the 2^precisionBits slices of [2^e, 2^(e+1))
-    return int(int64(e-h.PrecisionBits+1)*int64(h.linear) + sub)
+	if v < int64(h.linear) {
+		return int(v)
+	}
+	e := bits.Len64(uint64(v)) - 1                    // floor(log2 v), e >= precisionBits
+	sub := (v - int64(1)<<e) >> (e - h.PrecisionBits) // which of the 2^precisionBits slices of [2^e, 2^(e+1))
+	return int(int64(e-h.PrecisionBits+1)*int64(h.linear) + sub)
+}
+
+func (h *LogLinearHistogram) LowerBound(index int) int64 {
+	if index < h.linear {
+		return int64(index)
+	}
+	k := index / h.linear
+	e := k + h.PrecisionBits - 1
+	sub := int64(index % h.linear)
+	return int64(1)<<e + sub<<(e-h.PrecisionBits)
+}
+
+func (h *LogLinearHistogram) UpperBound(index int) int64 { return h.LowerBound(index+1) - 1 }
+```
+
+#### Step 3: Recording and percentiles
+
+`RecordMany` validates with errors and then uses `mustInt(addChecked(...))` for the running totals, panicking on overflow. `Percentile` returns `(Estimate, error)`; the builtins `min` and `max` (Go 1.21+) clamp the bracket.
+
+```go
+func (h *LogLinearHistogram) RecordMany(v, n int64) error {
+	if v < 0 || v > h.HighestTrackable {
+		return fmt.Errorf("value out of range: %d", v)
+	}
+	if n <= 0 {
+		return errors.New("count must be positive")
+	}
+	h.counts[h.IndexOf(v)] += n
+	h.total = mustInt(addChecked(h.total, n))
+	h.sum = mustInt(addChecked(h.sum, mustInt(mulChecked(v, n))))
+	if v < h.min {
+		h.min = v
+	}
+	if v > h.max {
+		h.max = v
+	}
+	return nil
+}
+
+func (h *LogLinearHistogram) Percentile(p float64) (Estimate, error) {
+	if p < 0 || p > 100 {
+		return Estimate{}, errors.New("percentile must be 0..100")
+	}
+	if h.total == 0 {
+		return Estimate{p, 0, 0}, nil
+	}
+	rank := max(1, int64(math.Ceil(p/100.0*float64(h.total))))
+	var seen int64
+	for i := range h.counts {
+		seen += h.counts[i]
+		if seen >= rank {
+			return Estimate{p, max(h.LowerBound(i), h.min), min(h.UpperBound(i), h.max)}, nil
+		}
+	}
+	return Estimate{p, h.max, h.max}, nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 4: Merge and cumulative export
 
-- **`floor(log2 v)` is `bits.Len64(uint64(v)) - 1`.** `math/bits` replaces `Long.numberOfLeadingZeros`; the shifts in `IndexOf`, `LowerBound`, and `UpperBound` are otherwise the Java lines with explicit `int64` casts, because Go will not mix `int` and `int64` silently.
-- **Errors are values.** `NewLogLinearHistogram`, `Record`, `RecordMany`, `Merge`, `Counter.IncBy`, `Rate`, and `Percentile` return `error` where Java throws `IllegalArgumentException`. `Value(p)` panics on a `p` outside 0..100 because the Java `value` has no error channel either and the bad argument is a caller bug. `Counter.IncBy` returns `ErrOverflow` instead of wrapping at `math.MaxInt64`, which `Math.addExact` would have thrown; inside `RecordMany` and `Merge` the same `addChecked`/`mulChecked` helpers panic, since a histogram that has counted 2^63 observations has no sensible caller to inform.
-- **The generator uses `uint64` state.** SplitMix64's multiplications must wrap, so `Rng.state` is unsigned and `NextLong` converts the result to `int64` at the end; the seed-42 assertion `-4767286540954276203` then holds exactly, and `NextDouble` shifts the unsigned form by 11 as `>>>` does. `Math.round` is `javaRound` (`math.Floor(x + 0.5)`), which is what makes the 100,000 log-normal draws land on the same microsecond values and the histogram `_sum` print `3529462222` in both languages.
-- **Formatting and ordering.** `fmt` has no `%,d`, so a nine-line `commas` helper renders thousands separators; `String.indent(2)` is `indent`; `Double.toString` for the percentile label is `Trim` with `strconv.FormatFloat(p, 'f', -1, 64)`. `LinkedHashMap` becomes a `map` plus a `[]string` of names per metric type so the exposition keeps registration order.
+Element-wise addition through `addChecked`; a layout mismatch is an error. `Cumulative` is the same prefix sum per boundary.
+
+```go
+func (h *LogLinearHistogram) Merge(other *LogLinearHistogram) error {
+	if other.PrecisionBits != h.PrecisionBits || other.HighestTrackable != h.HighestTrackable {
+		return errors.New("cannot merge histograms with different layouts")
+	}
+	for i := range h.counts {
+		h.counts[i] = mustInt(addChecked(h.counts[i], other.counts[i]))
+	}
+	h.total = mustInt(addChecked(h.total, other.total))
+	h.sum = mustInt(addChecked(h.sum, other.sum))
+	if other.total > 0 {
+		h.min = min(h.min, other.min)
+		h.max = max(h.max, other.max)
+	}
+	return nil
+}
+
+func (h *LogLinearHistogram) Cumulative(boundaries []int64) []int64 {
+	out := make([]int64, len(boundaries))
+	for b, bound := range boundaries {
+		idx := h.IndexOf(min(bound, h.HighestTrackable))
+		var seen int64
+		for i := 0; i <= idx; i++ {
+			seen += h.counts[i]
+		}
+		out[b] = seen
+	}
+	return out
+}
+```
+
+#### Step 5: The registry and exposition
+
+`strings.Builder` with `fmt.Fprintf` replaces `StringBuilder.append`. The `counterNames`, `gaugeNames`, and `histogramNames` slices give the registration order a Go map cannot; `javaRound` renders `_sum`.
+
+```go
+func (r *MetricsRegistry) Render(histogramBoundaries []int64) string {
+	var sb strings.Builder
+	for _, name := range r.counterNames {
+		fmt.Fprintf(&sb, "# TYPE %s_total counter\n", name)
+		fmt.Fprintf(&sb, "%s_total %d\n", name, r.counters[name].Value())
+	}
+	for _, name := range r.gaugeNames {
+		fmt.Fprintf(&sb, "# TYPE %s gauge\n", name)
+		fmt.Fprintf(&sb, "%s %d\n", name, r.gauges[name].Value())
+	}
+	for _, name := range r.histogramNames {
+		h := r.histograms[name]
+		fmt.Fprintf(&sb, "# TYPE %s histogram\n", name)
+		cum := h.Cumulative(histogramBoundaries)
+		for i, bound := range histogramBoundaries {
+			fmt.Fprintf(&sb, "%s_bucket{le=\"%d\"} %d\n", name, bound, cum[i])
+		}
+		fmt.Fprintf(&sb, "%s_bucket{le=\"+Inf\"} %d\n", name, h.Count())
+		fmt.Fprintf(&sb, "%s_sum %d\n", name, javaRound(h.Mean()*float64(h.Count())))
+		fmt.Fprintf(&sb, "%s_count %d\n", name, h.Count())
+	}
+	return sb.String()
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/06-metrics-and-histograms/code/go
 go run .
 go test ./...
+```
+
+Every number matches the Java run, including the merged-histogram section:
+
+```console
+== 1. Bucket layout: precisionBits=7 means at most 1/128 = 0.78% relative error ==
+  value        255 -> bucket   255 covering [255, 255]  width 1
+  value        256 -> bucket   256 covering [256, 257]  width 2
+  value      1,000 -> bucket   506 covering [1,000, 1,003]  width 4
+
+== 3. Averaging percentiles is wrong; merging histograms is right ==
+  host A (90,000 requests): p99 = 38.4 ms   host B (10,000 requests, 10% slow): p99 = 2916.4 ms
+  average of the two p99s      = 1477.4 ms   <- meaningless
+  max of the two p99s          = 2916.4 ms   <- pessimistic
+  p99 of the merged histogram  = 892.9 ms   <- the fleet p99, computed correctly
 ```
 
 ## Use It

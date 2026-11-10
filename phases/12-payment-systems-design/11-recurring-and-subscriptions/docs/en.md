@@ -367,22 +367,243 @@ The demo calls `runDay()` twice per simulated day for 75 days; the gateway sees 
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **`datetime.date` has no `plusMonths`:** `add_months` reproduces the clamping rule with `calendar.monthrange`, and a test pins it against the same table (Jan 31 to Feb 28, Mar 31 minus one month, Feb 29 yearly); everything else about dates is `timedelta` arithmetic and `(b - a).days` for `ChronoUnit.DAYS.between`. **`allocate` is pure `int` arithmetic:** `//` and `%` on the non-negative magnitude, then a stable `sorted(range(n), key=lambda i: -remainders[i])` hands the leftover minor units to the largest remainders with ties to the lower index, exactly as the Java comparator sort did; it returns a `list[Money]`. **The transition table is `dict[SubscriptionStatus, frozenset[SubscriptionStatus]]`**, `DunningPolicy.retry_offsets_days` is a tuple validated in `__post_init__`, and `Interval.months` is a property over the enum value. **Optionals and exceptions:** `CardUpdater.refresh` returns `Optional[str]` (`None` for no replacement) and `BillingEngine.invoice` returns `None` for an unknown id; `IllegalTransitionError` is a `RuntimeError`, bad arguments raise `ValueError`, and a duplicate subscription or a plan change outside `ACTIVE` raises `RuntimeError`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Anchored billing dates
+
+`add_months` is the month-clamping arithmetic `LocalDate.plusMonths` provides for free. `period_start` multiplies the index by `interval.months` (no overflow to check), `period_end` is `period_start(n + 1)`, and `chained_starts` is the bug kept on purpose.
+
 ```python
 def add_months(d: date, months: int) -> date:
-    # java.time's plusMonths: the day of month clamps to the target month's last day (Jan 31 + 1 = Feb 28).
+    """java.time's plusMonths: the day of month clamps to the target month's last day (Jan 31 + 1 = Feb 28)."""
     month_index = d.year * 12 + (d.month - 1) + months
     year, month = divmod(month_index, 12)
     month += 1
     last = calendar.monthrange(year, month)[1]
     return date(year, month, min(d.day, last))
+
+
+# ---------------------------------------------------------------------------------------------
+# Billing cycles: every period boundary is computed from the anchor, never from the previous boundary.
+# ---------------------------------------------------------------------------------------------
+
+class BillingCycle:
+    @staticmethod
+    def period_start(anchor: date, interval: Interval, n: int) -> date:
+        """Start of period n (n = 0 is the anchor). add_months clamps to month end, e.g. Jan 31 + 1 month = Feb 28."""
+        if n < 0:
+            raise ValueError("period index must be >= 0")
+        return add_months(anchor, n * interval.months)
+
+    @staticmethod
+    def period_end(anchor: date, interval: Interval, n: int) -> date:
+        return BillingCycle.period_start(anchor, interval, n + 1)
+
+    @staticmethod
+    def chained_starts(anchor: date, interval: Interval, count: int) -> list[date]:
+        """The bug this lesson warns about: each boundary computed from the previous one drifts after a short month."""
+        out: list[date] = []
+        d = anchor
+        for _ in range(count):
+            out.append(d)
+            d = add_months(d, interval.months)
+        return out
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: Proration
 
-- **`datetime.date` has no `plusMonths`.** `add_months` reproduces the clamping rule with `calendar.monthrange`, and a test pins it against the same table (Jan 31 to Feb 28, Mar 31 minus one month, Feb 29 yearly). Everything else about dates is `timedelta` arithmetic and `(b - a).days` for `ChronoUnit.DAYS.between`.
-- **`allocate` is pure `int` arithmetic**: `//` and `%` on the non-negative magnitude, then a stable `sorted(range(n), key=lambda i: -remainders[i])` hands the leftover minor units to the largest remainders with ties to the lower index, exactly as the Java comparator sort did. It returns a `list[Money]`.
-- **The transition table is `dict[SubscriptionStatus, frozenset[SubscriptionStatus]]`**, `DunningPolicy.retry_offsets_days` is a tuple validated in `__post_init__`, and `Interval.months` is a property over the enum value.
-- **Optionals and exceptions:** `CardUpdater.refresh` returns `Optional[str]` (`None` for no replacement) and `BillingEngine.invoice` returns `None` for an unknown id; `IllegalTransitionError` is a `RuntimeError`, bad arguments raise `ValueError`, and a duplicate subscription or a plan change outside ACTIVE raises `RuntimeError`.
+The half-open guard reads `change_date < period_start or not change_date < period_end`; day counts are `(b - a).days`; `allocate(used, remaining)[1]` is the unused share of each price.
+
+```python
+class Proration:
+    @staticmethod
+    def compute(old_plan: Plan, new_plan: Plan, period_start: date, period_end: date, change_date: date) -> ProrationResult:
+        """Day-based proration with exact allocation. The old price is split used:remaining with
+        largest-remainder allocation, so used_portion + credit == old price to the minor unit."""
+        if change_date < period_start or not change_date < period_end:
+            raise ValueError(f"change date {change_date} outside period [{period_start}, {period_end})")
+        if old_plan.price.currency != new_plan.price.currency:
+            raise CurrencyMismatchError(old_plan.price.currency, new_plan.price.currency)
+        period = (period_end - period_start).days
+        used = (change_date - period_start).days
+        remaining = period - used
+        credit = old_plan.price.allocate(used, remaining)[1]
+        charge = new_plan.price.allocate(used, remaining)[1]
+        return ProrationResult(used, remaining, period, credit, charge)
+```
+
+#### Step 3: The state machine
+
+`ALLOWED` is a class-level dict of `frozenset`s and `allowed` a membership test. `transition` treats a self-transition as a no-op and otherwise raises `IllegalTransitionError`.
+
+```python
+class SubscriptionTransitions:
+    ALLOWED: dict[SubscriptionStatus, frozenset[SubscriptionStatus]] = {
+        SubscriptionStatus.TRIALING: frozenset({SubscriptionStatus.ACTIVE, SubscriptionStatus.PAST_DUE, SubscriptionStatus.CANCELED}),
+        SubscriptionStatus.ACTIVE: frozenset({SubscriptionStatus.PAST_DUE, SubscriptionStatus.CANCELED}),
+        SubscriptionStatus.PAST_DUE: frozenset({SubscriptionStatus.ACTIVE, SubscriptionStatus.UNPAID, SubscriptionStatus.CANCELED}),
+        SubscriptionStatus.UNPAID: frozenset({SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELED}),
+        SubscriptionStatus.CANCELED: frozenset(),
+    }
+
+    @staticmethod
+    def allowed(from_state: SubscriptionStatus, to_state: SubscriptionStatus) -> bool:
+        return to_state in SubscriptionTransitions.ALLOWED[from_state]
+
+    def transition(self, to: SubscriptionStatus) -> None:
+        if self.status is to:
+            return
+        if not SubscriptionTransitions.allowed(self.status, to):
+            raise IllegalTransitionError(self.status, to)
+        self.status = to
+```
+
+#### Step 4: The dunning policy and the gateway contracts
+
+`ChargeOutcome.retryable` is the one place that decides which outcomes enter the schedule. The two gateways are `Protocol`s, with `refresh` returning `Optional[str]`. `DunningPolicy.__post_init__` validates the offsets (positive, strictly increasing) and the exhaustion status.
+
+```python
+class ChargeOutcome(Enum):
+    APPROVED = "approved"
+    INSUFFICIENT_FUNDS = "insufficient_funds"
+    DO_NOT_HONOR = "do_not_honor"
+    EXPIRED_CARD = "expired_card"
+    DO_NOT_RETRY = "do_not_retry"
+
+    def retryable(self) -> bool:
+        return self in (ChargeOutcome.INSUFFICIENT_FUNDS, ChargeOutcome.DO_NOT_HONOR)
+
+class ChargeGateway(Protocol):
+    """Merchant-initiated charge on a stored credential; the reference is the gateway's idempotency key."""
+
+    def charge(self, reference: str, card_token: str, amount: Money) -> ChargeOutcome: ...
+
+
+class CardUpdater(Protocol):
+    """Visa Account Updater / Mastercard ABU style: given an old credential, maybe a replacement."""
+
+    def refresh(self, customer_id: str, old_card_token: str) -> Optional[str]: ...
+
+
+@dataclass(frozen=True)
+class DunningPolicy:
+    retry_offsets_days: tuple[int, ...]
+    when_exhausted: SubscriptionStatus
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "retry_offsets_days", tuple(self.retry_offsets_days))
+        offsets = self.retry_offsets_days
+        for i, off in enumerate(offsets):
+            if off <= 0 or (i > 0 and off <= offsets[i - 1]):
+                raise ValueError(f"retry offsets must be positive and strictly increasing: {list(offsets)}")
+        if self.when_exhausted not in (SubscriptionStatus.CANCELED, SubscriptionStatus.UNPAID):
+            raise ValueError("exhausted dunning ends CANCELED or UNPAID")
+
+    @staticmethod
+    def standard() -> "DunningPolicy":
+        return DunningPolicy((1, 3, 7, 14), SubscriptionStatus.CANCELED)
+
+    def max_attempts(self) -> int:
+        return 1 + len(self.retry_offsets_days)
+```
+
+#### Step 5: Rolling a period
+
+`_roll_period` recomputes both boundaries from the anchor and the new index, applies credit capped at the invoice amount, and uses the deterministic `f"{s.id}:{start}"` invoice id; `_open_invoice` returns the existing invoice for that id rather than creating a second one.
+
+```python
+    def _roll_period(self, s: Subscription) -> None:
+        s.period_index += 1
+        s.current_period_start = BillingCycle.period_start(s.anchor, s.plan.interval, s.period_index)
+        s.current_period_end = BillingCycle.period_end(s.anchor, s.plan.interval, s.period_index)
+        due = s.plan.price
+        applied = due if due.compare_to(s.credit_balance) < 0 else s.credit_balance
+        s.credit_balance = s.credit_balance.minus(applied)
+        amount = due.minus(applied)
+        inv_id = f"{s.id}:{s.current_period_start}"
+        inv = self._open_invoice(inv_id, s, s.current_period_start, s.current_period_end, amount, s.plan.id, s.current_period_start)
+        if amount.is_zero():
+            inv.status = InvoiceStatus.PAID
+            inv.next_attempt = None
+            self._note(f"{inv_id} covered by credit")
+
+    def _open_invoice(self, id: str, s: Subscription, start: date, end: date, amount: Money, description: str, due: date) -> Invoice:
+        existing = self._invoices.get(id)
+        if existing is not None:
+            return existing
+        inv = Invoice(id, s.id, start, end, amount, description, due)
+        self._invoices[id] = inv
+        self._note(f"invoice {id} {amount} for [{start}, {end})")
+        return inv
+```
+
+#### Step 6: One attempt, and what follows it
+
+The reference changes on every attempt, including the immediate retry after the card updater returns a fresh token. Failure records `first_failure`, moves the subscription to `PAST_DUE`, and either exhausts (non-retryable outcome or schedule used up) or schedules the next offset from `first_failure` with `timedelta`.
+
+```python
+    def _attempt(self, inv: Invoice, s: Subscription, today: date) -> None:
+        inv.attempts += 1
+        reference = f"{inv.id}#{inv.attempts}"
+        outcome = self._gateway.charge(reference, s.card_token, inv.amount)
+        if outcome is ChargeOutcome.EXPIRED_CARD:
+            fresh = self._updater.refresh(s.customer_id, s.card_token)
+            if fresh is not None and fresh != s.card_token:
+                self._note(f"{reference} EXPIRED_CARD; card updater {s.card_token} -> {fresh}")
+                s.card_token = fresh
+                inv.attempts += 1
+                reference = f"{inv.id}#{inv.attempts}"
+                outcome = self._gateway.charge(reference, s.card_token, inv.amount)
+        inv.last_outcome = outcome
+        if outcome is ChargeOutcome.APPROVED:
+            inv.status = InvoiceStatus.PAID
+            inv.next_attempt = None
+            if s.status is not SubscriptionStatus.ACTIVE:
+                s.transition(SubscriptionStatus.ACTIVE)
+            self._note(f"{reference} APPROVED {inv.amount} -> {s.id} {s.status.name}")
+            return
+        if inv.first_failure is None:
+            inv.first_failure = today
+        if s.status in (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING):
+            s.transition(SubscriptionStatus.PAST_DUE)
+        retries_used = self._retries_used(inv)
+        exhausted = not outcome.retryable() or retries_used >= len(self._policy.retry_offsets_days)
+        if exhausted:
+            inv.status = InvoiceStatus.UNCOLLECTIBLE
+            inv.next_attempt = None
+            s.transition(self._policy.when_exhausted)
+            self._note(f"{reference} {outcome.name}; dunning exhausted -> invoice UNCOLLECTIBLE, {s.id} {s.status.name}")
+            return
+        inv.next_attempt = inv.first_failure + timedelta(days=self._policy.retry_offsets_days[retries_used])
+        self._note(f"{reference} {outcome.name} -> {s.id} {s.status.name}, next attempt {inv.next_attempt}")
+```
+
+#### Step 7: The daily run
+
+Two passes: roll every subscription forward as many periods as are due (or cancel at period end), then attempt every open invoice whose `next_attempt` has arrived, skipping canceled subscriptions. The invoice list is copied with `list(...)` so attempts can mutate the dict safely.
+
+```python
+    def run_day(self) -> None:
+        """Run everything due today. Idempotent: a second call on the same day changes nothing."""
+        today = self._clock.today()
+        for s in self._subscriptions.values():
+            while s.bills() and not today < s.current_period_end:
+                if s.cancel_at_period_end:
+                    s.transition(SubscriptionStatus.CANCELED)
+                    self._note(f"{s.id} canceled at period end")
+                    break
+                self._roll_period(s)
+        for inv in list(self._invoices.values()):
+            if inv.status is InvoiceStatus.OPEN and inv.next_attempt is not None and not today < inv.next_attempt:
+                s = self._subscriptions[inv.subscription_id]
+                if s.status is SubscriptionStatus.CANCELED:
+                    continue
+                self._attempt(inv, s, today)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/11-recurring-and-subscriptions/code/python
@@ -390,38 +611,310 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run:
+
+```console
+== Anchored billing dates vs chained dates (anchor 2026-01-31) ==
+anchored: [2026-01-31, 2026-02-28, 2026-03-31, 2026-04-30, 2026-05-31, 2026-06-30]
+chained:  [2026-01-31, 2026-02-28, 2026-03-28, 2026-04-28, 2026-05-28, 2026-06-28]  <- drifted to the 28th forever
+
+== Proration: basic 30.00 -> pro 50.00 on 2026-03-11, period [2026-03-01, 2026-04-01) ==
+used 10 / remaining 21 / period 31 days
+basic split used:unused = 9.68 USD + 20.32 USD = 30.00 USD
+credit 20.32 USD, charge 33.87 USD, net due now 13.55 USD
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`, `money.go`, tests in `main_test.go`) keeps the design with four differences. **Go has no `LocalDate`, and `AddDate` does not clamp:** dates are `time.Time` values at midnight UTC; `plusMonths` does what `LocalDate.plusMonths` does, and `ChainedStarts` calls it too, so the drift it demonstrates is the real month-end drift, not Go's normalization; `daysBetween` is `ChronoUnit.DAYS.between` for midnight dates, and the invariant test walks every day of four month lengths through `plusMonths`. **Errors are values:** `PeriodStart`, `ComputeProration`, `NewPlan`, `NewDunningPolicy`, `Subscribe`, and `ChangePlan` return `(T, error)` wrapping `ErrInvalidArgument`, `ErrIllegalState`, or `ErrCurrencyMismatch`; `Subscription.Transition` returns `ErrIllegalTransition`, which wraps `ErrIllegalState` so either sentinel works with `errors.Is`; inside the engine, transitions the state table guarantees are legal are unwrapped with `mustOK`, because a failure there is a bug in the engine, not a runtime condition. **`null` becomes the zero value:** `Invoice.NextAttempt` and `FirstFailure` are the zero `time.Time` while unset (`IsZero()`); `CardUpdater.Refresh` returns `(string, bool)` for Java's `Optional<String>`; `BillingEngine.Invoice(id)` returns a nil pointer for an unknown id. **Insertion order is explicit:** Java's `LinkedHashMap` for subscriptions and invoices becomes a map plus an order slice, so `RunDay` visits subscriptions and invoices in creation order and the log lines come out in the same order as the Java demo.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Anchored billing dates
+
+`plusMonths` computes the target month in integer arithmetic and clamps the day with the "day 0 of next month" trick. `PeriodStart` returns an error for a negative index or an overflowing multiplication; `ChainedStarts` uses the same `plusMonths` so its drift is genuine.
+
 ```go
-// plusMonths is LocalDate.plusMonths: the day-of-month is clamped to the target month's length.
-// time.Time.AddDate normalizes instead (Jan 31 + 1 month = Mar 3), which is exactly the drift bug.
 func plusMonths(d time.Time, months int64) time.Time {
-    y, m, day := d.Date()
-    total := int64(y)*12 + int64(m-1) + months
-    ny, nm := total/12, total%12
-    if nm < 0 {
-        nm += 12
-        ny--
-    }
-    last := time.Date(int(ny), time.Month(nm+2), 0, 0, 0, 0, 0, time.UTC).Day() // day 0 of next month
-    if day > last {
-        day = last
-    }
-    return Date(int(ny), time.Month(nm+1), day)
+	y, m, day := d.Date()
+	total := int64(y)*12 + int64(m-1) + months
+	ny, nm := total/12, total%12
+	if nm < 0 { // floor division, so dates before year 0 would still land in the right month
+		nm += 12
+		ny--
+	}
+	last := time.Date(int(ny), time.Month(nm+2), 0, 0, 0, 0, 0, time.UTC).Day() // day 0 of next month = last day
+	if day > last {
+		day = last
+	}
+	return Date(int(ny), time.Month(nm+1), day)
+}
+
+func PeriodStart(anchor time.Time, interval Interval, n int64) (time.Time, error) {
+	if n < 0 {
+		return time.Time{}, fmt.Errorf("%w: period index must be >= 0", ErrInvalidArgument)
+	}
+	months, err := mulChecked(n, interval.Months())
+	if err != nil {
+		return time.Time{}, err
+	}
+	return plusMonths(anchor, months), nil
+}
+
+func PeriodEnd(anchor time.Time, interval Interval, n int64) (time.Time, error) {
+	return PeriodStart(anchor, interval, n+1)
+}
+
+// ChainedStarts is the bug this lesson warns about: each boundary computed from the previous one drifts after a short month.
+func ChainedStarts(anchor time.Time, interval Interval, count int) []time.Time {
+	out := make([]time.Time, 0, count)
+	d := anchor
+	for i := 0; i < count; i++ {
+		out = append(out, d)
+		d = plusMonths(d, interval.Months())
+	}
+	return out
 }
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+#### Step 2: Proration
 
-- **Go has no `LocalDate`, and `AddDate` does not clamp.** Dates are `time.Time` values at midnight UTC; `plusMonths` above does what `LocalDate.plusMonths` does, and `ChainedStarts` calls it too, so the drift it demonstrates is the real month-end drift, not Go's normalization. `daysBetween` is `ChronoUnit.DAYS.between` for midnight dates. The invariant test walks every day of four month lengths through `plusMonths`.
-- **Errors are values.** `PeriodStart`, `ComputeProration`, `NewPlan`, `NewDunningPolicy`, `Subscribe`, and `ChangePlan` return `(T, error)` wrapping `ErrInvalidArgument`, `ErrIllegalState`, or `ErrCurrencyMismatch`; `Subscription.Transition` returns `ErrIllegalTransition`, which wraps `ErrIllegalState` so either sentinel works with `errors.Is`. Inside the engine, transitions the state table guarantees are legal are unwrapped with `mustOK`, because a failure there is a bug in the engine, not a runtime condition.
-- **`null` becomes the zero value.** `Invoice.NextAttempt` and `FirstFailure` are the zero `time.Time` while unset (`IsZero()`); `CardUpdater.Refresh` returns `(string, bool)` for Java's `Optional<String>`; `BillingEngine.Invoice(id)` returns a nil pointer for an unknown id.
-- **Insertion order is explicit.** Java's `LinkedHashMap` for subscriptions and invoices becomes a map plus an order slice, so `RunDay` visits subscriptions and invoices in creation order and the log lines come out in the same order as the Java demo.
+`ComputeProration` returns `(ProrationResult, error)`: the half-open guard with `Before`, the currency check, `daysBetween` for the day counts, and `Allocate` (which can fail) for both prices, taking index 1 as the unused share.
+
+```go
+func ComputeProration(oldPlan, newPlan Plan, periodStart, periodEnd, changeDate time.Time) (ProrationResult, error) {
+	if changeDate.Before(periodStart) || !changeDate.Before(periodEnd) {
+		return ProrationResult{}, fmt.Errorf("%w: change date %s outside period [%s, %s)", ErrInvalidArgument,
+			fmtDate(changeDate), fmtDate(periodStart), fmtDate(periodEnd))
+	}
+	if oldPlan.Price.Currency != newPlan.Price.Currency {
+		return ProrationResult{}, fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch,
+			oldPlan.Price.Currency.Code, newPlan.Price.Currency.Code)
+	}
+	period := daysBetween(periodStart, periodEnd)
+	used := daysBetween(periodStart, changeDate)
+	remaining := period - used
+	credit, err := oldPlan.Price.Allocate(used, remaining)
+	if err != nil {
+		return ProrationResult{}, err
+	}
+	charge, err := newPlan.Price.Allocate(used, remaining)
+	if err != nil {
+		return ProrationResult{}, err
+	}
+	return ProrationResult{used, remaining, period, credit[1], charge[1]}, nil
+}
+```
+
+#### Step 3: The state machine
+
+`AllowedTransitions` is a map from status to a slice of statuses; `TransitionAllowed` is a linear scan. `Transition` returns `nil` for a self-transition and an error wrapping `ErrIllegalTransition` otherwise.
+
+```go
+var AllowedTransitions = map[SubscriptionStatus][]SubscriptionStatus{
+	TRIALING: {ACTIVE, PAST_DUE, CANCELED},
+	ACTIVE:   {PAST_DUE, CANCELED},
+	PAST_DUE: {ACTIVE, UNPAID, CANCELED},
+	UNPAID:   {ACTIVE, CANCELED},
+	CANCELED: {},
+}
+
+func TransitionAllowed(from, to SubscriptionStatus) bool {
+	for _, s := range AllowedTransitions[from] {
+		if s == to {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Subscription) Transition(to SubscriptionStatus) error {
+	if s.Status == to {
+		return nil
+	}
+	if !TransitionAllowed(s.Status, to) {
+		return fmt.Errorf("%w %v -> %v", ErrIllegalTransition, s.Status, to)
+	}
+	s.Status = to
+	return nil
+}
+```
+
+#### Step 4: The dunning policy and the gateway contracts
+
+`ChargeOutcome.Retryable` picks the two retryable outcomes. `ChargeGateway` and `CardUpdater` are interfaces, `Refresh` returning `(string, bool)`. `NewDunningPolicy` copies the offsets, validates them, and checks the exhaustion status; `StandardDunningPolicy` unwraps with `must`.
+
+```go
+type ChargeOutcome int
+
+const (
+	APPROVED ChargeOutcome = iota
+	INSUFFICIENT_FUNDS
+	DO_NOT_HONOR
+	EXPIRED_CARD
+	DO_NOT_RETRY
+)
+
+func (o ChargeOutcome) String() string {
+	return [...]string{"APPROVED", "INSUFFICIENT_FUNDS", "DO_NOT_HONOR", "EXPIRED_CARD", "DO_NOT_RETRY"}[o]
+}
+
+func (o ChargeOutcome) Retryable() bool { return o == INSUFFICIENT_FUNDS || o == DO_NOT_HONOR }
+
+// ChargeGateway is a merchant-initiated charge on a stored credential; the reference is the gateway's idempotency key.
+type ChargeGateway interface {
+	Charge(reference, cardToken string, amount Money) ChargeOutcome
+}
+
+// CardUpdater is Visa Account Updater / Mastercard ABU style: given an old credential, maybe a replacement.
+type CardUpdater interface {
+	Refresh(customerID, oldCardToken string) (string, bool)
+}
+
+type DunningPolicy struct {
+	RetryOffsetsDays []int
+	WhenExhausted    SubscriptionStatus
+}
+
+func NewDunningPolicy(retryOffsetsDays []int, whenExhausted SubscriptionStatus) (DunningPolicy, error) {
+	offsets := append([]int{}, retryOffsetsDays...)
+	for i, o := range offsets {
+		if o <= 0 || (i > 0 && o <= offsets[i-1]) {
+			return DunningPolicy{}, fmt.Errorf("%w: retry offsets must be positive and strictly increasing: %v", ErrInvalidArgument, offsets)
+		}
+	}
+	if whenExhausted != CANCELED && whenExhausted != UNPAID {
+		return DunningPolicy{}, fmt.Errorf("%w: exhausted dunning ends CANCELED or UNPAID", ErrInvalidArgument)
+	}
+	return DunningPolicy{offsets, whenExhausted}, nil
+}
+
+func StandardDunningPolicy() DunningPolicy {
+	return must(NewDunningPolicy([]int{1, 3, 7, 14}, CANCELED))
+}
+
+func (p DunningPolicy) MaxAttempts() int { return 1 + len(p.RetryOffsetsDays) }
+```
+
+#### Step 5: Rolling a period
+
+`rollPeriod` uses `must` on `PeriodStart`/`PeriodEnd` because the index is known-valid, applies the capped credit, and clears `NextAttempt` to the zero `time.Time` when the invoice is covered by credit.
+
+```go
+func (e *BillingEngine) rollPeriod(s *Subscription) {
+	s.PeriodIndex++
+	s.CurrentPeriodStart = must(PeriodStart(s.Anchor, s.Plan.Interval, s.PeriodIndex))
+	s.CurrentPeriodEnd = must(PeriodEnd(s.Anchor, s.Plan.Interval, s.PeriodIndex))
+	due := s.Plan.Price
+	applied := s.CreditBalance
+	if due.Compare(s.CreditBalance) < 0 {
+		applied = due
+	}
+	s.CreditBalance = mustMinus(s.CreditBalance, applied)
+	amount := mustMinus(due, applied)
+	id := s.ID + ":" + fmtDate(s.CurrentPeriodStart)
+	inv := e.openInvoice(id, s, s.CurrentPeriodStart, s.CurrentPeriodEnd, amount, s.Plan.ID, s.CurrentPeriodStart)
+	if amount.IsZero() {
+		inv.Status = PAID
+		inv.NextAttempt = time.Time{}
+		e.note(id + " covered by credit")
+	}
+}
+```
+
+#### Step 6: One attempt, and what follows it
+
+The same flow with `(fresh, ok)` from `Refresh`, `IsZero()` for an unset `FirstFailure`, and `mustOK` around transitions the table guarantees. The next attempt is `FirstFailure.AddDate(0, 0, offset)`.
+
+```go
+func (e *BillingEngine) attempt(inv *Invoice, s *Subscription, today time.Time) {
+	inv.Attempts++
+	reference := fmt.Sprintf("%s#%d", inv.ID, inv.Attempts)
+	outcome := e.gateway.Charge(reference, s.CardToken, inv.Amount)
+	if outcome == EXPIRED_CARD {
+		if fresh, ok := e.updater.Refresh(s.CustomerID, s.CardToken); ok && fresh != s.CardToken {
+			e.note(fmt.Sprintf("%s EXPIRED_CARD; card updater %s -> %s", reference, s.CardToken, fresh))
+			s.CardToken = fresh
+			inv.Attempts++
+			reference = fmt.Sprintf("%s#%d", inv.ID, inv.Attempts)
+			outcome = e.gateway.Charge(reference, s.CardToken, inv.Amount)
+		}
+	}
+	inv.LastOutcome = outcome
+	if outcome == APPROVED {
+		inv.Status = PAID
+		inv.NextAttempt = time.Time{}
+		if s.Status != ACTIVE {
+			mustOK(s.Transition(ACTIVE))
+		}
+		e.note(fmt.Sprintf("%s APPROVED %v -> %s %v", reference, inv.Amount, s.ID, s.Status))
+		return
+	}
+	if inv.FirstFailure.IsZero() {
+		inv.FirstFailure = today
+	}
+	if s.Status == ACTIVE || s.Status == TRIALING {
+		mustOK(s.Transition(PAST_DUE))
+	}
+	retriesUsed := e.retriesUsed(inv)
+	exhausted := !outcome.Retryable() || retriesUsed >= len(e.policy.RetryOffsetsDays)
+	if exhausted {
+		inv.Status = UNCOLLECTIBLE
+		inv.NextAttempt = time.Time{}
+		mustOK(s.Transition(e.policy.WhenExhausted))
+		e.note(fmt.Sprintf("%s %v; dunning exhausted -> invoice UNCOLLECTIBLE, %s %v", reference, outcome, s.ID, s.Status))
+		return
+	}
+	inv.NextAttempt = inv.FirstFailure.AddDate(0, 0, e.policy.RetryOffsetsDays[retriesUsed])
+	e.note(fmt.Sprintf("%s %v -> %s %v, next attempt %s", reference, outcome, s.ID, s.Status, fmtDate(inv.NextAttempt)))
+}
+```
+
+#### Step 7: The daily run
+
+`RunDay` walks `subOrder` for the rolling pass and `Invoices()` (creation order) for the attempt pass; `!inv.NextAttempt.IsZero()` is the Go spelling of `nextAttempt != null`.
+
+```go
+func (e *BillingEngine) RunDay() {
+	today := e.clock.Today()
+	for _, id := range e.subOrder {
+		s := e.subscriptions[id]
+		for s.Bills() && !today.Before(s.CurrentPeriodEnd) {
+			if s.CancelAtPeriodEnd {
+				mustOK(s.Transition(CANCELED))
+				e.note(s.ID + " canceled at period end")
+				break
+			}
+			e.rollPeriod(s)
+		}
+	}
+	for _, inv := range e.Invoices() {
+		if inv.Status == OPEN && !inv.NextAttempt.IsZero() && !today.Before(inv.NextAttempt) {
+			s := e.subscriptions[inv.SubscriptionID]
+			if s.Status == CANCELED {
+				continue
+			}
+			e.attempt(inv, s, today)
+		}
+	}
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/11-recurring-and-subscriptions/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run, ending with:
+
+```console
+sub_flaky    ACTIVE    card=tok_flaky     next bill 2026-04-30
+sub_updater  ACTIVE    card=tok_reissued  next bill 2026-04-30
+sub_trial    CANCELED  card=tok_broke     next bill 2026-03-14
+gateway calls = 14, approved = 6
 ```
 
 ## Use It

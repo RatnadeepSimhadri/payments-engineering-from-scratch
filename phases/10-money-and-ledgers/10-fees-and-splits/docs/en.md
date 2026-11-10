@@ -348,26 +348,162 @@ Expected output, abbreviated:
 
 ### In Python
 
-The full port is `code/python/main.py` (same `FeeSchedule`, `Splitter`, `OrderSplit`, `PayoutCalculator`, `Ledger.capture_entry`; tests in `code/python/test_main.py`). Three things differ:
+The Python port has the same `FeeSchedule`, `Splitter`, `OrderSplit`, `PayoutCalculator`, and `Ledger.capture_entry`, with three differences. **Allocation ties are broken by a stable sort:** `Money.allocate` sorts the line indices by descending remainder with `sorted(..., key=...)`, which is stable like Java's `Arrays.sort` on objects, so equal remainders still go to the lower index and the discount shares come out `3.26, 0.27, 6.47` in both languages. `int` cannot overflow, so the `multiplyExact` in the Java version disappears; `fractions.Fraction` is tempting for the fee math, but the single explicit rounding in `fee_for` is the lesson, so it stays an integer `times(bps, 10_000, rounding)`. **Optional bounds and per-party totals:** `minimum` and `maximum` are `Optional[Money]` (`None` where Java has `null`), and `OrderSplit.total` takes any callable, so `s.total(lambda l: l.tax)` replaces `s.total(LineSplit::tax)`; `seller_nets()` and `referral_fees()` return insertion-ordered `dict`s, which gives `capture_entry` the same posting order as Java's `LinkedHashMap`. Money comparisons use the operators (`fee < self.minimum`) that `@total_ordering` derives from `__lt__`, which raise `CurrencyMismatchError` like `compareTo`. **The property test replays Java's randomness:** `MainTest.java` draws 2,000 orders from `Random(23)`, including `nextLong(bound)`; the Python test ships a `JavaRandom` with the same LCG, `nextBoolean`, and the `boundedNextLong` rejection loop, so it exercises exactly the same orders rather than a different seeded stream.
 
-- **Allocation ties are broken by a stable sort.** `Money.allocate` sorts the line indices by descending remainder with `sorted(..., key=...)`, which is stable like Java's `Arrays.sort` on objects, so equal remainders still go to the lower index and the discount shares come out `3.26, 0.27, 6.47` in both languages. `int` cannot overflow, so the `multiplyExact` in the Java version disappears; `fractions.Fraction` is tempting for the fee math, but the single explicit rounding in `fee_for` is the lesson, so it stays an integer `times(bps, 10_000, rounding)`:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The fee schedule
+
+`__post_init__` carries the compact constructor's checks (bps range, non-negative fixed fee, minimum not above maximum). `fee_for` is one rounded `times`, one `plus`, and three clamps written with comparison operators; `None` bounds are skipped.
 
 ```python
-def fee_for(self, amount: Money) -> Money:
-    if amount.is_negative():
-        raise ValueError(f"fee base must not be negative: {amount}")
-    fee = amount.times(self.bps, 10_000, self.rounding).plus(self.fixed)
-    if self.minimum is not None and fee < self.minimum:
-        fee = self.minimum
-    if self.maximum is not None and fee > self.maximum:
-        fee = self.maximum
-    if fee > amount:  # a fee never exceeds what it is charged on
-        fee = amount
-    return fee
+    def __post_init__(self) -> None:
+        if self.bps < 0 or self.bps > 10_000:
+            raise ValueError(f"bps must be 0..10000: {self.bps}")
+        if self.fixed.is_negative():
+            raise ValueError("fixed fee must not be negative")
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError(f"minimum {self.minimum} exceeds maximum {self.maximum}")
+
+    def fee_for(self, amount: Money) -> Money:
+        if amount.is_negative():
+            raise ValueError(f"fee base must not be negative: {amount}")
+        fee = amount.times(self.bps, 10_000, self.rounding).plus(self.fixed)
+        if self.minimum is not None and fee < self.minimum:
+            fee = self.minimum
+        if self.maximum is not None and fee > self.maximum:
+            fee = self.maximum
+        if fee > amount:  # a fee never exceeds what it is charged on
+            fee = amount
+        return fee
 ```
 
-- **Optional bounds and per-party totals.** `minimum` and `maximum` are `Optional[Money]` (`None` where Java has `null`), and `OrderSplit.total` takes any callable, so `s.total(lambda l: l.tax)` replaces `s.total(LineSplit::tax)`. `seller_nets()` and `referral_fees()` return insertion-ordered `dict`s, which gives `capture_entry` the same posting order as Java's `LinkedHashMap`. Money comparisons use the operators (`fee < self.minimum`) that `@total_ordering` derives from `__lt__`, which raise `CurrencyMismatchError` like `compareTo`.
-- **The property test replays Java's randomness.** `MainTest.java` draws 2,000 orders from `Random(23)`, including `nextLong(bound)`; the Python test ships a `JavaRandom` with the same LCG, `nextBoolean`, and the `boundedNextLong` rejection loop, so it exercises exactly the same orders rather than a different seeded stream.
+#### Step 2: Allocate the discount across lines
+
+The opening of `Splitter.split`: a discount above the subtotal is rejected, the weights are the line prices in minor units (each must be positive), and a zero discount short-circuits to a list of zeros instead of allocating. `allocate(*weights)` unpacks the list into the varargs the Lesson 01 method expects.
+
+```python
+        policy = self._policy
+        cur = order.discount.currency
+        if order.discount > order.subtotal():
+            raise ValueError("discount exceeds subtotal")
+        weights = []
+        for line in order.lines:
+            if not line.price.is_positive():
+                raise ValueError(f"line price must be positive: {line.price}")
+            weights.append(line.price.minor_units)
+        discount_shares = _zeros(cur, len(weights)) if order.discount.is_zero() else order.discount.allocate(*weights)
+```
+
+#### Step 3: Split one line
+
+The per-line body: VAT by ratio `10000 : tax_bps`, commission from the schedule on the tax-exclusive amount, an optional referral split, and `seller_net` as the remainder. `dict.get` returns `None` for a seller without a referrer, which is the Java `null` check.
+
+```python
+        for i, line in enumerate(order.lines):
+            charged = line.price.minus(discount_shares[i])
+            tax_parts = _zeros(cur, 2) if charged.is_zero() else charged.allocate(10_000, policy.tax_bps)
+            net_of_tax, tax = tax_parts[0], tax_parts[1]
+            commission = policy.commission.fee_for(net_of_tax)
+            referrer = policy.referrer_by_seller.get(line.seller_id)
+            platform, referral = commission, Money.zero(cur)
+            if referrer is not None and not commission.is_zero():
+                parts = commission.allocate(10_000 - policy.referral_share_bps, policy.referral_share_bps)
+                platform, referral = parts[0], parts[1]
+            seller_net = net_of_tax.minus(commission)
+            out.append(LineSplit(line, discount_shares[i], charged, tax, platform, referral, referrer, seller_net))
+        processor_fee = policy.processor_fee.fee_for(order.charged())
+        return OrderSplit(order, tuple(out), processor_fee)
+```
+
+#### Step 4: Post the split as one entry
+
+Lambdas replace the method references, and `.items()` on the two insertion-ordered dicts replaces `forEach`. `_add_credit` drops zero amounts; the `JournalEntry` constructor checks the balance.
+
+```python
+    @staticmethod
+    def capture_entry(s: OrderSplit) -> JournalEntry:
+        """Build the capture entry for a split: one debit to the receivable, one credit per party, nothing dropped."""
+        ps: List[Posting] = [Posting.debit("1200 Receivable", s.order.charged())]
+        _add_credit(ps, "2300 VAT Payable", s.total(lambda l: l.tax))
+        _add_credit(ps, "4100 Commission Revenue", s.total(lambda l: l.platform_fee))
+        for partner, fee in s.referral_fees().items():
+            _add_credit(ps, f"2400 Referral Payable {partner}", fee)
+        for seller, net in s.seller_nets().items():
+            _add_credit(ps, f"2100 Seller Payable {seller}", net)
+        if s.processor_fee.is_positive():
+            ps.append(Posting.debit("5100 Processing Expense", s.processor_fee))
+            ps.append(Posting.credit("1200 Receivable", s.processor_fee))
+        return JournalEntry(f"cap-{s.order.id}", ps)
+
+
+def _add_credit(ps: List[Posting], account: str, amount: Money) -> None:
+    if amount.is_positive():
+        ps.append(Posting.credit(account, amount))
+```
+
+#### Step 5: Payouts
+
+Identical structure: reserve rounded `UP`, fee from the schedule, net as the remainder, and two early returns that carry the whole balance over so `available == reserve + fee + net + carried_over` holds in every branch.
+
+```python
+class PayoutCalculator:
+    @staticmethod
+    def compute(seller_id: str, available: Money, policy: PayoutPolicy) -> Payout:
+        zero = Money.zero(available.currency)
+        if not available.is_positive():
+            return Payout(seller_id, available, zero, zero, zero, available)
+        reserve = available.times(policy.reserve_bps, 10_000, Rounding.UP)  # round the hold in the platform's favour
+        after_reserve = available.minus(reserve)
+        fee = policy.payout_fee.fee_for(after_reserve)
+        net = after_reserve.minus(fee)
+        if net < policy.minimum_payout:
+            return Payout(seller_id, available, zero, zero, zero, available)  # nothing moves; try again next cycle
+        return Payout(seller_id, available, reserve, fee, net, zero)
+```
+
+#### Step 6: Aggregate per party
+
+A plain `dict` with a conditional expression stands in for `merge(..., Money::plus)`; `plus` still raises on a currency mismatch between two lines. Insertion order is preserved, so the capture entry's credits come out in first-seen order.
+
+```python
+    def seller_nets(self) -> Dict[str, Money]:
+        out: Dict[str, Money] = {}
+        for l in self.lines:
+            out[l.line.seller_id] = out[l.line.seller_id].plus(l.seller_net) if l.line.seller_id in out else l.seller_net
+        return out
+
+    def referral_fees(self) -> Dict[str, Money]:
+        out: Dict[str, Money] = {}
+        for l in self.lines:
+            if l.referrer is not None and not l.referral_fee.is_zero():
+                out[l.referrer] = out[l.referrer].plus(l.referral_fee) if l.referrer in out else l.referral_fee
+        return out
+```
+
+#### Step 7: The property test
+
+From `test_main.py`: `JavaRandom(23)` reproduces the JDK's `nextInt`, `nextBoolean`, and bounded `nextLong`, so the 2,000 orders are the same ones `MainTest.java` sees. The four flags check conservation, non-negativity, the commission cap, and that every capture entry balances.
+
+```python
+        r = JavaRandom(23)
+        conserve = non_negative = bounded = balanced = True
+        for i in range(2_000):
+            n = 1 + r.next_int(5)
+            lines = []
+            subtotal = 0
+            for k in range(n):
+                price = 1 + r.next_int(500 if r.next_boolean() else 50_000)
+                subtotal += price
+                lines.append(LineItem(f"s{k}", "seller-A" if r.next_boolean() else "seller-B", Money.of_minor(price, EUR)))
+            discount = Money.of_minor(r.next_long_bounded(subtotal + 1) if r.next_int(4) == 0 else 0, EUR)
+            os_ = Splitter(policy()).split(Order(f"o{i}", lines, discount))
+            total = (os_.total(lambda l: l.tax).plus(os_.total(lambda l: l.platform_fee))
+                     .plus(os_.total(lambda l: l.referral_fee)).plus(os_.total(lambda l: l.seller_net)))
+            conserve = conserve and total == os_.order.charged() and os_.total(lambda l: l.discount_share) == discount
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/10-fees-and-splits/code/python
@@ -375,26 +511,275 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output matches the Java run, down to the closing demonstration:
+
+```console
+== Why allocate, not round each part: 0.10 split three ways ==
+  rounding each third: 0.03 EUR x 3 = 0.09 EUR (a cent lost)
+  allocate(1,1,1): [0.04 EUR, 0.03 EUR, 0.03 EUR] sum 0.10 EUR
+```
+
 ### In Go
 
-The full port is `code/go/main.go` (same `FeeSchedule`, `Splitter`, `OrderSplit`, `PayoutCalculator` as `ComputePayout`, `CaptureEntry`, `PayoutEntry`) with `money.go` (the Lesson 01 `Money`, whose `Allocate` does every split) and `javarandom.go` so the 2,000-order property test generates the same orders as Java (including `Random.nextLong(bound)`, pinned against JDK values). Tests are in `code/go/main_test.go`. Three things differ:
+The Go port is `code/go/main.go` (same `FeeSchedule`, `Splitter`, `OrderSplit`, `PayoutCalculator` as `ComputePayout`, `CaptureEntry`, `PayoutEntry`) with `money.go` (the Lesson 01 `Money`, whose `Allocate` does every split) and `javarandom.go` so the 2,000-order property test generates the same orders as Java (including `Random.nextLong(bound)`, pinned against JDK values). Three things differ. **Optional bounds are pointers:** `FeeSchedule.Minimum` and `Maximum` are `*Money`, nil meaning "no bound" (Java's `null`), and `WithBounds` sets both; `LineSplit.Referrer` is `""` for a seller without a partner. Every constructor that validates (`NewFeeSchedule`, `NewOrder`, `NewSplitPolicy`, `NewJournalEntry`) returns `(T, error)`; `FeeFor` and `Split` return errors too, because `Money.Times`/`Plus` can overflow. **Party aggregation keeps first-seen order by hand:** Java's `LinkedHashMap` makes `sellerNets()` and the capture entry's credits deterministic for free; Go's map does not, so `MoneyByParty` is a key slice plus a map, and `CaptureEntry` walks `Keys`. Its `String()` renders `{seller-A=44.84 EUR, seller-B=82.91 EUR}` exactly as Java prints a map, so the demo output matches. **`Total` takes a function:** `OrderSplit.Total(func(l LineSplit) Money { return l.Tax })` replaces Java's method references (`LineSplit::tax`); Go has no implicit getter functions, so the field accessor is written out. `Compare` is used for the clamps exactly as `compareTo` is, and it panics on a currency mismatch for the same reason the Java throws.
 
-- **Optional bounds are pointers.** `FeeSchedule.Minimum` and `Maximum` are `*Money`, nil meaning "no bound" (Java's `null`), and `WithBounds` sets both. `LineSplit.Referrer` is `""` for a seller without a partner. Every constructor that validates (`NewFeeSchedule`, `NewOrder`, `NewSplitPolicy`, `NewJournalEntry`) returns `(T, error)`; `FeeFor` and `Split` return errors too, because `Money.Times`/`Plus` can overflow.
-- **Party aggregation keeps first-seen order by hand.** Java's `LinkedHashMap` makes `sellerNets()` and the capture entry's credits deterministic for free; Go's map does not, so `MoneyByParty` is a key slice plus a map, and `CaptureEntry` walks `Keys`. Its `String()` renders `{seller-A=44.84 EUR, seller-B=82.91 EUR}` exactly as Java prints a map, so the demo output matches:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The fee schedule
+
+`FeeFor` returns `(Money, error)` because `Times` and `Plus` are checked. The three clamps use `Compare`, dereferencing the pointer bounds only when they are set.
 
 ```go
-sellers := s.SellerNets()
-for _, seller := range sellers.Keys {               // insertion order, never map order
-    ps = addCredit(ps, "2100 Seller Payable "+seller, sellers.Values[seller])
+func (f FeeSchedule) FeeFor(amount Money) (Money, error) {
+	if amount.IsNegative() {
+		return Money{}, fmt.Errorf("fee base must not be negative: %v", amount)
+	}
+	percent, err := amount.Times(f.Bps, 10_000, f.Rounding)
+	if err != nil {
+		return Money{}, err
+	}
+	fee, err := percent.Plus(f.Fixed)
+	if err != nil {
+		return Money{}, err
+	}
+	if f.Minimum != nil && fee.Compare(*f.Minimum) < 0 {
+		fee = *f.Minimum
+	}
+	if f.Maximum != nil && fee.Compare(*f.Maximum) > 0 {
+		fee = *f.Maximum
+	}
+	if fee.Compare(amount) > 0 { // a fee never exceeds what it is charged on
+		fee = amount
+	}
+	return fee, nil
 }
 ```
 
-- **`Total` takes a function.** `OrderSplit.Total(func(l LineSplit) Money { return l.Tax })` replaces Java's method references (`LineSplit::tax`); Go has no implicit getter functions, so the field accessor is written out. `Compare` is used for the clamps exactly as `compareTo` is, and it panics on a currency mismatch for the same reason the Java throws.
+#### Step 2: Allocate the discount across lines
+
+The start of `Split`: subtotal and discount are compared with `Compare`, the weights are collected with a positivity check, and `Allocate(weights...)` is called only for a non-zero discount (it can return an overflow error, so the result is checked).
+
+```go
+	cur := order.Discount.Currency
+	subtotal, err := order.Subtotal()
+	if err != nil {
+		return OrderSplit{}, err
+	}
+	if order.Discount.Compare(subtotal) > 0 {
+		return OrderSplit{}, errors.New("discount exceeds subtotal")
+	}
+	weights := make([]int64, len(order.Lines))
+	for i, l := range order.Lines {
+		if !l.Price.IsPositive() {
+			return OrderSplit{}, fmt.Errorf("line price must be positive: %v", l.Price)
+		}
+		weights[i] = l.Price.MinorUnits
+	}
+	discountShares := zeros(cur, len(weights))
+	if !order.Discount.IsZero() {
+		if discountShares, err = order.Discount.Allocate(weights...); err != nil {
+			return OrderSplit{}, err
+		}
+	}
+```
+
+#### Step 3: Split one line
+
+The same four moves, each checked for error. A missing map key yields `""`, so `referrer != ""` is the null test; `LineSplit` is built with a positional literal.
+
+```go
+	for i, line := range order.Lines {
+		charged, err := line.Price.Minus(discountShares[i])
+		if err != nil {
+			return OrderSplit{}, err
+		}
+		taxParts := zeros(cur, 2)
+		if !charged.IsZero() {
+			if taxParts, err = charged.Allocate(10_000, sp.policy.TaxBps); err != nil {
+				return OrderSplit{}, err
+			}
+		}
+		netOfTax, tax := taxParts[0], taxParts[1]
+		commission, err := sp.policy.Commission.FeeFor(netOfTax)
+		if err != nil {
+			return OrderSplit{}, err
+		}
+		referrer := sp.policy.ReferrerBySeller[line.SellerID]
+		platform, referral := commission, Zero(cur)
+		if referrer != "" && !commission.IsZero() {
+			parts, err := commission.Allocate(10_000-sp.policy.ReferralShareBps, sp.policy.ReferralShareBps)
+			if err != nil {
+				return OrderSplit{}, err
+			}
+			platform, referral = parts[0], parts[1]
+		}
+		sellerNet, err := netOfTax.Minus(commission)
+		if err != nil {
+			return OrderSplit{}, err
+		}
+		out = append(out, LineSplit{line, discountShares[i], charged, tax, platform, referral, referrer, sellerNet})
+	}
+```
+
+#### Step 4: Post the split as one entry
+
+`CaptureEntry` walks `referrals.Keys` and `sellers.Keys` rather than ranging over a map, so the posting order is first-seen and deterministic. `addCredit` returns the grown slice and skips zero amounts; `NewJournalEntry` checks the balance and returns an error.
+
+```go
+func CaptureEntry(s OrderSplit) (JournalEntry, error) {
+	charged, err := s.Order.Charged()
+	if err != nil {
+		return JournalEntry{}, err
+	}
+	receivable, err := NewPosting("1200 Receivable", Debit, charged)
+	if err != nil {
+		return JournalEntry{}, err
+	}
+	ps := []Posting{receivable}
+	ps = addCredit(ps, "2300 VAT Payable", s.Total(func(l LineSplit) Money { return l.Tax }))
+	ps = addCredit(ps, "4100 Commission Revenue", s.Total(func(l LineSplit) Money { return l.PlatformFee }))
+	referrals := s.ReferralFees()
+	for _, partner := range referrals.Keys {
+		ps = addCredit(ps, "2400 Referral Payable "+partner, referrals.Values[partner])
+	}
+	sellers := s.SellerNets()
+	for _, seller := range sellers.Keys {
+		ps = addCredit(ps, "2100 Seller Payable "+seller, sellers.Values[seller])
+	}
+	if s.ProcessorFee.IsPositive() {
+		ps = append(ps, Posting{"5100 Processing Expense", Debit, s.ProcessorFee}, Posting{"1200 Receivable", Credit, s.ProcessorFee})
+	}
+	return NewJournalEntry("cap-"+s.Order.ID, ps)
+}
+```
+
+#### Step 5: Payouts
+
+A package-level `ComputePayout` with the same two early returns; each arithmetic step is checked because `Times` and `Minus` return errors.
+
+```go
+func ComputePayout(sellerID string, available Money, policy PayoutPolicy) (Payout, error) {
+	zero := Zero(available.Currency)
+	if !available.IsPositive() {
+		return Payout{sellerID, available, zero, zero, zero, available}, nil
+	}
+	reserve, err := available.Times(policy.ReserveBps, 10_000, Up) // round the hold in the platform's favour
+	if err != nil {
+		return Payout{}, err
+	}
+	afterReserve, err := available.Minus(reserve)
+	if err != nil {
+		return Payout{}, err
+	}
+	fee, err := policy.PayoutFee.FeeFor(afterReserve)
+	if err != nil {
+		return Payout{}, err
+	}
+	net, err := afterReserve.Minus(fee)
+	if err != nil {
+		return Payout{}, err
+	}
+	if net.Compare(policy.MinimumPayout) < 0 {
+		return Payout{sellerID, available, zero, zero, zero, available}, nil // nothing moves; try again next cycle
+	}
+	return Payout{sellerID, available, reserve, fee, net, zero}, nil
+}
+```
+
+#### Step 6: Aggregate per party
+
+`MoneyByParty.add` appends a key the first time it is seen and `Plus`-merges afterwards; a currency mismatch inside one order is a bug, so the methods panic rather than return an error. `Total` takes the accessor function.
+
+```go
+func (s OrderSplit) Total(part func(LineSplit) Money) Money {
+	acc := Zero(s.Order.Discount.Currency)
+	for _, l := range s.Lines {
+		var err error
+		if acc, err = acc.Plus(part(l)); err != nil {
+			panic(err)
+		}
+	}
+	return acc
+}
+
+func (s OrderSplit) SellerNets() *MoneyByParty {
+	out := newMoneyByParty()
+	for _, l := range s.Lines {
+		if err := out.add(l.Line.SellerID, l.SellerNet); err != nil {
+			panic(err)
+		}
+	}
+	return out
+}
+
+func (s OrderSplit) ReferralFees() *MoneyByParty {
+	out := newMoneyByParty()
+	for _, l := range s.Lines {
+		if l.Referrer != "" && !l.ReferralFee.IsZero() {
+			if err := out.add(l.Referrer, l.ReferralFee); err != nil {
+				panic(err)
+			}
+		}
+	}
+	return out
+}
+```
+
+#### Step 7: The property test
+
+From `main_test.go`: the test first pins three `NextLongBounded` values against the JDK so a divergence in `javarandom.go` fails loudly, then generates the same 2,000 orders as Java and checks conservation, non-negativity, the cap, and the balanced capture entry.
+
+```go
+	r := NewJavaRandom(23)
+	// java.util.Random(23).nextLong(bound) reference values from the JDK, so the property test sees the same orders
+	ref := NewJavaRandom(23)
+	if a, b, c := ref.NextLongBounded(1000), ref.NextLongBounded(1<<20), ref.NextLongBounded(123456789); a != 988 || b != 949759 || c != 104581275 {
+		t.Fatalf("NextLongBounded diverges from the JDK: %d %d %d", a, b, c)
+	}
+	sp := NewSplitter(policy(t))
+	for i := range 2_000 {
+		n := 1 + int(r.NextInt(5))
+		var lines []LineItem
+		var subtotal int64
+		for k := range n {
+			bound := int32(50_000)
+			if r.NextBoolean() {
+				bound = 500
+			}
+			price := int64(1 + r.NextInt(bound))
+			subtotal += price
+			seller := "seller-B"
+			if r.NextBoolean() {
+				seller = "seller-A"
+			}
+			lines = append(lines, LineItem{fmt.Sprintf("s%d", k), seller, OfMinor(price, EUR)})
+		}
+		var discountMinor int64
+		if r.NextInt(4) == 0 {
+			discountMinor = r.NextLongBounded(subtotal + 1)
+		}
+		discount := OfMinor(discountMinor, EUR)
+		os := ok[OrderSplit](t)(sp.Split(ok[Order](t)(NewOrder(fmt.Sprintf("o%d", i), lines, discount))))
+		charged := ok[Money](t)(os.Order.Charged())
+		if partsTotal(os) != charged || os.Total(func(l LineSplit) Money { return l.DiscountShare }) != discount {
+			t.Fatalf("order %d: parts do not conserve", i)
+		}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/10-fees-and-splits/code/go
 go run .
 go test ./...
+```
+
+The numbers match the Java run; the only cosmetic difference is Go's slice formatting (no commas) in the last line:
+
+```console
+== Why allocate, not round each part: 0.10 split three ways ==
+  rounding each third: 0.03 EUR x 3 = 0.09 EUR (a cent lost)
+  allocate(1,1,1): [0.04 EUR 0.03 EUR 0.03 EUR] sum 0.10 EUR
 ```
 
 ## Use It

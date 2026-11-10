@@ -398,22 +398,239 @@ rejected: DOCTYPE (XXE guard)
 
 ### In Python
 
-The port in `code/python/main.py` keeps every class and method (`Iban.is_valid`, `SepaRules.violations`, `Pain001.write`, `Pacs008.from_pain001`) and produces byte-identical XML. Four things differ:
+The Python port keeps every class and method (`Iban.is_valid`, `SepaRules.violations`, `Pain001.write`, `Pacs008.from_pain001`) and produces byte-identical XML. Four things differ. **The XXE guard is a string check, not a parser feature:** `xml.etree.ElementTree` never fetches external entities, but it still expands internal ones, and it has no `disallow-doctype-decl` switch. The parser therefore refuses any input that contains `<!DOCTYPE` before `ET.fromstring` sees it, which closes both the file-read and the billion-laughs case with one line. **Namespaces live in the tag:** ElementTree spells a namespaced element `{urn:iso:std:iso:20022:tech:xsd:pain.001.001.09}Document`, so `Xml.local_name` and `Xml.namespace_uri` split the tag at `}` where the Java called `getLocalName()` and `getNamespaceURI()`; the `child`/`children` walk is otherwise the same loop over direct children. **Serialization needs a registered default namespace:** `ET.tostring(..., default_namespace=NS)` refuses the unqualified `Ccy` attribute, so `Xml.serialize` calls `ET.register_namespace("", NS)` and `ET.indent(root, space="  ")` to get the same `xmlns="urn:..."` root and two-space layout the Java `Transformer` prints. **Records are frozen dataclasses with tuples:** `PaymentInitiation.transfers` is normalized to a `tuple` in `__post_init__` (the equivalent of `List.copyOf`) so the round-trip equality `Pain001.parse(pain) == p` compares by value. Dates are naive `datetime`/`date`, formatted with `"%Y-%m-%dT%H:%M:%S"` and `isoformat()`; amounts go through the same integer `Money.parse`, and the exception hierarchy is one class, `Iso20022Exception`, raised `from` the underlying `ParseError` or `ArithmeticError`.
 
-- **The XXE guard is a string check, not a parser feature.** `xml.etree.ElementTree` never fetches external entities, but it still expands internal ones, and it has no `disallow-doctype-decl` switch. The parser therefore refuses any input that contains `<!DOCTYPE` before `ET.fromstring` sees it, which closes both the file-read and the billion-laughs case with one line:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The Python tests port all 42 checks (43 assertions).
+
+#### Step 1: Identifiers before XML
+
+The same length table and mod-97 loop; `all(...)` over the characters replaces `chars().allMatch`, and lowercase input is rejected on purpose. `Bic.is_valid` is one regular expression.
 
 ```python
-if Xml.DOCTYPE.search(xml):
-    raise Iso20022Exception("malformed XML: DOCTYPE is disallowed when processing a payment file")
-try:
-    root = ET.fromstring(xml)
-except ET.ParseError as e:
-    raise Iso20022Exception(f"malformed XML: {e}") from e
+    @staticmethod
+    def is_valid(iban: Optional[str]) -> bool:
+        if iban is None or len(iban) < 15 or len(iban) > 34:
+            return False
+        if not all(("A" <= c <= "Z") or ("0" <= c <= "9") for c in iban):
+            return False
+        expected = Iban.LENGTHS.get(iban[:2])
+        if expected is None or expected != len(iban):
+            return False
+        rearranged = iban[4:] + iban[:4]
+        remainder = 0
+        for c in rearranged:
+            value = ord(c) - ord("0") if c.isdigit() else ord(c) - ord("A") + 10
+            remainder = (remainder * 10 + value if value < 10 else remainder * 100 + value) % 97
+        return remainder == 1
 ```
 
-- **Namespaces live in the tag.** ElementTree spells a namespaced element `{urn:iso:std:iso:20022:tech:xsd:pain.001.001.09}Document`, so `Xml.local_name` and `Xml.namespace_uri` split the tag at `}` where the Java called `getLocalName()` and `getNamespaceURI()`. The `child`/`children` walk is otherwise the same loop over direct children.
-- **Serialization needs a registered default namespace.** `ET.tostring(..., default_namespace=NS)` refuses the unqualified `Ccy` attribute, so `Xml.serialize` calls `ET.register_namespace("", NS)` and `ET.indent(root, space="  ")` to get the same `xmlns="urn:..."` root and two-space layout the Java `Transformer` prints.
-- **Records are frozen dataclasses with tuples.** `PaymentInitiation.transfers` is normalized to a `tuple` in `__post_init__` (the equivalent of `List.copyOf`) so the round-trip equality `Pain001.parse(pain) == p` compares by value. Dates are naive `datetime`/`date`, formatted with `"%Y-%m-%dT%H:%M:%S"` and `isoformat()`; amounts go through the same integer `Money.parse`, and the exception hierarchy is one class, `Iso20022Exception`, raised `from` the underlying `ParseError` or `ArithmeticError`.
+#### Step 2: The domain model
+
+Frozen dataclasses; `Party.bic` and `CreditTransfer.remittance` are `Optional`. `PaymentInitiation.__post_init__` freezes the transfers into a tuple, and `number_of_transactions` and `control_sum` are derived, never stored.
+
+```python
+@dataclass(frozen=True)
+class Party:
+    name: str
+    iban: str
+    bic: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CreditTransfer:
+    """One payment inside a pain.001: CdtTrfTxInf."""
+
+    end_to_end_id: str
+    amount: Money
+    creditor: Party
+    remittance: Optional[str]
+
+
+@dataclass(frozen=True)
+class PaymentInitiation:
+    message_id: str
+    created_at: datetime
+    initiating_party: str
+    payment_info_id: str
+    requested_execution_date: date
+    debtor: Party
+    transfers: tuple
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "transfers", tuple(self.transfers))
+
+    def number_of_transactions(self) -> int:
+        return len(self.transfers)
+
+    def control_sum(self) -> Money:
+        total = Money.of_minor(0, EUR)
+        for t in self.transfers:
+            total = total.plus(t.amount)
+        return total
+```
+
+#### Step 3: SEPA rules as a list of violations
+
+Every rule appends to `v` and names its XML path; nothing raises. The duplicate check uses a `set`, the date comparison uses `created_at.date()`, and the helper methods (`_id`, `_text`, `_party`) are static.
+
+```python
+    def violations(p: PaymentInitiation) -> list[str]:
+        v: list[str] = []
+        SepaRules._id(v, "MsgId", p.message_id)
+        SepaRules._id(v, "PmtInfId", p.payment_info_id)
+        SepaRules._text(v, "InitgPty/Nm", p.initiating_party, 70)
+        SepaRules._party(v, "Dbtr", p.debtor)
+        if p.requested_execution_date < p.created_at.date():
+            v.append(f"ReqdExctnDt {p.requested_execution_date} is before CreDtTm {p.created_at.date()}")
+        if not p.transfers:
+            v.append("at least one CdtTrfTxInf is required")
+        seen: set[str] = set()
+        for t in p.transfers:
+            where = f"CdtTrfTxInf[{t.end_to_end_id}]"
+            SepaRules._id(v, where + "/EndToEndId", t.end_to_end_id)
+            if t.end_to_end_id in seen:
+                v.append(where + ": duplicate EndToEndId in message")
+            seen.add(t.end_to_end_id)
+            if t.amount.currency != EUR:
+                v.append(f"{where}: SEPA amounts must be EUR, got {t.amount.currency.code}")
+            if t.amount.minor_units < 1 or t.amount.minor_units > SepaRules.MAX_AMOUNT_MINOR:
+                v.append(f"{where}: amount out of range 0.01..999999999.99: {t.amount}")
+            SepaRules._party(v, where + "/Cdtr", t.creditor)
+            if t.remittance is not None:
+                SepaRules._text(v, where + "/RmtInf/Ustrd", t.remittance, 140)
+        return v
+```
+
+#### Step 4: Writing with DOM
+
+`Xml.el` is `ET.SubElement` with the parent's namespace prepended in Clark notation, so the tree inherits the pain.001 namespace from the root. `write` validates first, then emits the elements in schema order; the serializer escapes text content.
+
+```python
+    @staticmethod
+    def el(parent: ET.Element, name: str, text: Optional[str] = None) -> ET.Element:
+        e = ET.SubElement(parent, f"{{{Xml.namespace_uri(parent)}}}{name}")
+        if text is not None:
+            e.text = text
+        return e
+```
+
+```python
+    @staticmethod
+    def write(p: PaymentInitiation) -> str:
+        violations = SepaRules.violations(p)
+        if violations:
+            raise Iso20022Exception(f"SEPA rule violations: {violations}")
+        root = Xml.new_document(Pain001.NS)
+        init = Xml.el(root, "CstmrCdtTrfInitn")
+
+        grp = Xml.el(init, "GrpHdr")
+        Xml.el(grp, "MsgId", p.message_id)
+        Xml.el(grp, "CreDtTm", p.created_at.strftime(Xml.DATE_TIME))
+        Xml.el(grp, "NbOfTxs", str(p.number_of_transactions()))
+        Xml.el(grp, "CtrlSum", Xml.decimal(p.control_sum()))
+        Xml.el(Xml.el(grp, "InitgPty"), "Nm", p.initiating_party)
+
+        pmt = Xml.el(init, "PmtInf")
+        Xml.el(pmt, "PmtInfId", p.payment_info_id)
+        Xml.el(pmt, "PmtMtd", "TRF")
+        Xml.el(pmt, "NbOfTxs", str(p.number_of_transactions()))
+        Xml.el(pmt, "CtrlSum", Xml.decimal(p.control_sum()))
+        Xml.el(Xml.el(Xml.el(pmt, "PmtTpInf"), "SvcLvl"), "Cd", "SEPA")
+        Xml.el(Xml.el(pmt, "ReqdExctnDt"), "Dt", p.requested_execution_date.isoformat())
+        Xml.el(Xml.el(pmt, "Dbtr"), "Nm", p.debtor.name)
+        Xml.account(pmt, "DbtrAcct", p.debtor.iban)
+        if p.debtor.bic is not None:
+            Xml.agent(pmt, "DbtrAgt", p.debtor.bic)
+        Xml.el(pmt, "ChrgBr", "SLEV")
+```
+
+#### Step 5: Parsing with namespace checks and totals
+
+`parse_root` checks the root first; the path-walking helpers (`Xml.text(tx, "PmtId", "EndToEndId")`) read like the implementation guidelines. Dates come back through `fromisoformat`, and both totals blocks are checked with `_check_totals`, which compares the declared `CtrlSum` through `Money.parse`.
+
+```python
+    @staticmethod
+    def parse(xml: str) -> PaymentInitiation:
+        init = Xml.parse_root(xml, Pain001.NS, "CstmrCdtTrfInitn")
+        grp = Xml.child(init, "GrpHdr")
+        pmts = Xml.children(init, "PmtInf")
+        if len(pmts) != 1:
+            raise Iso20022Exception(f"this parser handles exactly one PmtInf, found {len(pmts)}")
+        pmt = pmts[0]
+        if Xml.text(pmt, "PmtMtd") != "TRF":
+            raise Iso20022Exception("PmtMtd must be TRF")
+        debtor = Party(Xml.text(pmt, "Dbtr", "Nm"), Xml.text(pmt, "DbtrAcct", "Id", "IBAN"),
+                       Xml.opt_text(pmt, "DbtrAgt", "FinInstnId", "BICFI"))
+        transfers = []
+        for tx in Xml.children(pmt, "CdtTrfTxInf"):
+            creditor = Party(Xml.text(tx, "Cdtr", "Nm"), Xml.text(tx, "CdtrAcct", "Id", "IBAN"),
+                             Xml.opt_text(tx, "CdtrAgt", "FinInstnId", "BICFI"))
+            transfers.append(CreditTransfer(Xml.text(tx, "PmtId", "EndToEndId"), Xml.amount(Xml.child(tx, "Amt", "InstdAmt")),
+                                            creditor, Xml.opt_text(tx, "RmtInf", "Ustrd")))
+        p = PaymentInitiation(Xml.text(grp, "MsgId"), datetime.fromisoformat(Xml.text(grp, "CreDtTm")),
+                              Xml.text(grp, "InitgPty", "Nm"), Xml.text(pmt, "PmtInfId"),
+                              date.fromisoformat(Xml.text(pmt, "ReqdExctnDt", "Dt")), debtor, tuple(transfers))
+        Pain001._check_totals("GrpHdr", grp, p)
+        Pain001._check_totals("PmtInf", pmt, p)
+        return p
+
+    @staticmethod
+    def _check_totals(where: str, header: ET.Element, p: PaymentInitiation) -> None:
+        """The declared NbOfTxs and CtrlSum must equal what the message actually contains."""
+        declared_count = int(Xml.text(header, "NbOfTxs"))
+        if declared_count != p.number_of_transactions():
+            raise Iso20022Exception(f"{where} NbOfTxs {declared_count} != {p.number_of_transactions()} transactions")
+        ctrl = Xml.opt_text(header, "CtrlSum")
+        if ctrl is not None and Money.parse(ctrl, EUR) != p.control_sum():
+            raise Iso20022Exception(f"{where} CtrlSum {ctrl} != computed {Xml.decimal(p.control_sum())}")
+```
+
+#### Step 6: The secure parser
+
+There is no factory to configure. `parse_root` rejects any `<!DOCTYPE` with a regular expression before the parser runs, converts `ParseError` into `Iso20022Exception`, and then checks the root element's local name and namespace.
+
+```python
+    DOCTYPE = re.compile(r"<!DOCTYPE", re.IGNORECASE)
+
+    @staticmethod
+    def parse_root(xml: str, expected_namespace: str, expected_child: str) -> ET.Element:
+        """XXE-safe: ElementTree never fetches external entities, but it would still expand internal ones,
+        so any DOCTYPE is rejected before the parser sees it. A payment file is never trusted input."""
+        if Xml.DOCTYPE.search(xml):
+            raise Iso20022Exception("malformed XML: DOCTYPE is disallowed when processing a payment file")
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError as e:
+            raise Iso20022Exception(f"malformed XML: {e}") from e
+        if Xml.local_name(root) != "Document" or Xml.namespace_uri(root) != expected_namespace:
+            raise Iso20022Exception(f"expected Document in {expected_namespace}, got {Xml.namespace_uri(root)}")
+        return Xml.child(root, expected_child)
+```
+
+#### Step 7: Mapping to pacs.008
+
+The BIC directory is any callable from IBAN to `Optional[str]`. `EndToEndId` is copied, `TxId` is minted with `f"{message_id}-{seq:04d}"`, the debtor is pushed down to every transaction, and a missing BIC fails the mapping.
+
+```python
+    @staticmethod
+    def from_pain001(p: PaymentInitiation, message_id: str, created_at: datetime,
+                     bic_directory: Callable[[str], Optional[str]]) -> InterbankMessage:
+        out = []
+        seq = 1
+        for t in p.transfers:
+            creditor = t.creditor
+            if creditor.bic is None:
+                bic = bic_directory(creditor.iban)
+                if bic is None:
+                    raise Iso20022Exception(f"no BIC for IBAN {creditor.iban} in directory")
+                creditor = Party(creditor.name, creditor.iban, bic)
+            tx_id = f"{message_id}-{seq:04d}"
+            seq += 1
+            out.append(InterbankTransfer(t.end_to_end_id, tx_id, t.amount, p.debtor, creditor, t.remittance))
+        return InterbankMessage(message_id, created_at, p.requested_execution_date, tuple(out))
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/09-sepa-and-iso-20022/code/python
@@ -421,25 +638,332 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The Python tests port all 42 checks (43 assertions) and the demo output is identical to the Java run, XML included.
+The demo output is identical to the Java run, XML included:
+
+```console
+== Rejections ==
+rule: MsgId must not start or end with '/' or contain '//'
+rule: DbtrAcct/IBAN invalid: DE89370400440532013001
+rule: ReqdExctnDt 2026-10-12 is before CreDtTm 2026-10-13
+rule: CdtTrfTxInf[INV-1]: SEPA amounts must be EUR, got USD
+rule: CdtTrfTxInf[INV-1]/Cdtr/Nm has characters outside the SEPA set: U+00FC at index 1
+rejected: GrpHdr CtrlSum 13600.50 != computed 13600.49
+rejected: bad amount 349.999: 349.999 has more decimals than EUR allows (2)
+rejected: expected Document in urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08, got urn:iso:std:iso:20022:tech:xsd:pain.001.001.09
+rejected: DOCTYPE (XXE guard)
+```
 
 ### In Go
 
-The port in `code/go/main.go` (with `money.go`, the Phase 10 `Money` copied unchanged) keeps every type and method: `Iban.IsValid`, `SepaRules.Violations`, `Pain001.Write`, `Pacs008.FromPain001`, and the same `Xml` helpers, and it prints byte-identical XML. Four things differ:
+The Go port (`main.go` plus `money.go`, the Phase 10 `Money` copied unchanged) keeps every type and method: `Iban.IsValid`, `SepaRules.Violations`, `Pain001.Write`, `Pacs008.FromPain001`, and the same `Xml` helpers, and it prints byte-identical XML. Four things differ. **The DOM is a struct you write yourself:** `encoding/xml` is a token stream, not a tree, so `Xml.decode` builds a small `Element{Namespace, Name, Attrs, Text, Children}` from `StartElement`/`EndElement`/`CharData` tokens and `Xml.Serialize` prints it with the two-space indent the Java `Transformer` uses; the decoder resolves `xmlns`, so `Name.Space` is the namespace URI the root check compares against. **The XXE guard is a prescan plus Strict mode:** Go's decoder never fetches external entities, but it has no `disallow-doctype-decl`, so `ParseRoot` refuses any input containing `<!DOCTYPE` before decoding, and `Strict = true` makes an undefined `&x;` a parse error instead of literal text. **One error type, matched with `errors.Is`:** `Iso20022Error` carries the message and wraps the cause; `errors.Is(err, ErrIso20022)` is what the tests check. `Write`, `Parse`, `FromPain001`, `ControlSum`, and `Xml.Child` all return `(T, error)`. Inside the two `Parse` functions a `need(...)` helper panics with that error and a deferred `catch` converts it back into the return value, so forty field reads do not each need an `if err != nil`; nothing escapes the function. **Optional fields are empty strings, records are structs with `Equals`:** `Party.Bic` and `Remittance` use `""` where Java used `null`, dates are `time.Time` in UTC formatted with `"2006-01-02T15:04:05"`, and `PaymentInitiation.Equals` compares the transfer slices element by element because a struct holding a slice is not comparable with `==`.
 
-- **The DOM is a struct you write yourself.** `encoding/xml` is a token stream, not a tree, so `Xml.decode` builds a small `Element{Namespace, Name, Attrs, Text, Children}` from `StartElement`/`EndElement`/`CharData` tokens and `Xml.Serialize` prints it with the two-space indent the Java `Transformer` uses. The decoder resolves `xmlns`, so `Name.Space` is the namespace URI the root check compares against.
-- **The XXE guard is a prescan plus Strict mode.** Go's decoder never fetches external entities, but it has no `disallow-doctype-decl`, so `ParseRoot` refuses any input containing `<!DOCTYPE` before decoding, and `Strict = true` makes an undefined `&x;` a parse error instead of literal text:
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The Go tests port all 42 checks (44 assertions, including an undefined-entity case).
+
+#### Step 1: Identifiers before XML
+
+`Iban` is a package-level value of a method-only struct so the call reads `Iban.IsValid(...)`. The byte loop and the mod-97 fold are the same; `IbanLengths` is the SEPA length table.
 
 ```go
-if doctype.MatchString(doc) {
-    return nil, isoErr("malformed XML: DOCTYPE is disallowed when processing a payment file")
+func (ibanRules) IsValid(iban string) bool {
+	if len(iban) < 15 || len(iban) > 34 {
+		return false
+	}
+	for i := 0; i < len(iban); i++ {
+		c := iban[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	expected, ok := IbanLengths[iban[:2]]
+	if !ok || expected != len(iban) {
+		return false
+	}
+	rearranged := iban[4:] + iban[:4]
+	remainder := 0
+	for i := 0; i < len(rearranged); i++ {
+		c := rearranged[i]
+		var value int
+		if c >= '0' && c <= '9' {
+			value = int(c - '0')
+			remainder = (remainder*10 + value) % 97
+		} else {
+			value = int(c-'A') + 10
+			remainder = (remainder*100 + value) % 97
+		}
+	}
+	return remainder == 1
 }
-d := xml.NewDecoder(strings.NewReader(doc))
-d.Strict = true
 ```
 
-- **One error type, matched with `errors.Is`.** `Iso20022Error` carries the message and wraps the cause; `errors.Is(err, ErrIso20022)` is what the tests check. `Write`, `Parse`, `FromPain001`, `ControlSum`, and `Xml.Child` all return `(T, error)`. Inside the two `Parse` functions a `need(...)` helper panics with that error and a deferred `catch` converts it back into the return value, so forty field reads do not each need an `if err != nil`; nothing escapes the function.
-- **Optional fields are empty strings, records are structs with `Equals`.** `Party.Bic` and `Remittance` use `""` where Java used `null`, dates are `time.Time` in UTC formatted with `"2006-01-02T15:04:05"`, and `PaymentInitiation.Equals` compares the transfer slices element by element because a struct holding a slice is not comparable with `==`.
+#### Step 2: The domain model
+
+Plain structs with `""` for an absent BIC or remittance. `ControlSum` returns `(Money, error)` because `Plus` is checked; `NumberOfTransactions` is `len`.
+
+```go
+type Party struct {
+	Name string
+	Iban string
+	Bic  string
+}
+
+// CreditTransfer is one payment inside a pain.001: CdtTrfTxInf. Remittance "" means absent.
+type CreditTransfer struct {
+	EndToEndId string
+	Amount     Money
+	Creditor   Party
+	Remittance string
+}
+
+type PaymentInitiation struct {
+	MessageId              string
+	CreatedAt              time.Time
+	InitiatingParty        string
+	PaymentInfoId          string
+	RequestedExecutionDate time.Time
+	Debtor                 Party
+	Transfers              []CreditTransfer
+}
+
+func (p PaymentInitiation) NumberOfTransactions() int { return len(p.Transfers) }
+
+func (p PaymentInitiation) ControlSum() (Money, error) {
+	sum := OfMinor(0, EUR)
+	for _, t := range p.Transfers {
+		var err error
+		if sum, err = sum.Plus(t.Amount); err != nil {
+			return Money{}, err
+		}
+	}
+	return sum, nil
+}
+```
+
+#### Step 3: SEPA rules as a list of violations
+
+The helpers take `*[]string` so they can append; `dateOnly` truncates `CreatedAt` for the execution-date comparison, and the duplicate check is a `map[string]bool`.
+
+```go
+func (r sepaRules) Violations(p PaymentInitiation) []string {
+	v := []string{}
+	r.id(&v, "MsgId", p.MessageId)
+	r.id(&v, "PmtInfId", p.PaymentInfoId)
+	r.text(&v, "InitgPty/Nm", p.InitiatingParty, 70)
+	r.party(&v, "Dbtr", p.Debtor)
+	if p.RequestedExecutionDate.Before(dateOnly(p.CreatedAt)) {
+		v = append(v, "ReqdExctnDt "+isoDate(p.RequestedExecutionDate)+" is before CreDtTm "+isoDate(p.CreatedAt))
+	}
+	if len(p.Transfers) == 0 {
+		v = append(v, "at least one CdtTrfTxInf is required")
+	}
+	seen := map[string]bool{}
+	for _, t := range p.Transfers {
+		where := "CdtTrfTxInf[" + t.EndToEndId + "]"
+		r.id(&v, where+"/EndToEndId", t.EndToEndId)
+		if seen[t.EndToEndId] {
+			v = append(v, where+": duplicate EndToEndId in message")
+		}
+		seen[t.EndToEndId] = true
+		if t.Amount.Currency != EUR {
+			v = append(v, where+": SEPA amounts must be EUR, got "+t.Amount.Currency.Code)
+		}
+		if t.Amount.MinorUnits < 1 || t.Amount.MinorUnits > MaxAmountMinor {
+			v = append(v, where+": amount out of range 0.01..999999999.99: "+t.Amount.String())
+		}
+		r.party(&v, where+"/Cdtr", t.Creditor)
+		if t.Remittance != "" {
+			r.text(&v, where+"/RmtInf/Ustrd", t.Remittance, 140)
+		}
+	}
+	return v
+}
+```
+
+#### Step 4: Writing with DOM
+
+`Write` validates, computes the control sum once (it can fail), builds the hand-rolled `Element` tree with `Xml.El`, and hands it to `Xml.Serialize`, which escapes text and indents by two spaces.
+
+```go
+func (pain001) Write(p PaymentInitiation) (string, error) {
+	if violations := SepaRules.Violations(p); len(violations) > 0 {
+		return "", isoErr("SEPA rule violations: %s", formatList(violations))
+	}
+	ctrl, err := p.ControlSum()
+	if err != nil {
+		return "", isoWrap(err, "control sum: %v", err)
+	}
+	root := &Element{Namespace: Pain001NS, Name: "Document"}
+	init := Xml.El(root, "CstmrCdtTrfInitn")
+
+	grp := Xml.El(init, "GrpHdr")
+	Xml.El(grp, "MsgId", p.MessageId)
+	Xml.El(grp, "CreDtTm", p.CreatedAt.Format(DateTimeLayout))
+	Xml.El(grp, "NbOfTxs", strconv.Itoa(p.NumberOfTransactions()))
+	Xml.El(grp, "CtrlSum", Xml.Decimal(ctrl))
+	Xml.El(Xml.El(grp, "InitgPty"), "Nm", p.InitiatingParty)
+
+	pmt := Xml.El(init, "PmtInf")
+	Xml.El(pmt, "PmtInfId", p.PaymentInfoId)
+	Xml.El(pmt, "PmtMtd", "TRF")
+	Xml.El(pmt, "NbOfTxs", strconv.Itoa(p.NumberOfTransactions()))
+	Xml.El(pmt, "CtrlSum", Xml.Decimal(ctrl))
+```
+
+#### Step 5: Parsing with namespace checks and totals
+
+`Parse` uses a named error return, `defer catch(&err)`, and `need(...)` around every field read: a missing mandatory element panics with an `Iso20022Error`, `catch` recovers only that error type and stores it in `err`, and anything else keeps propagating. Both totals blocks are verified by `checkTotals`.
+
+```go
+func (pain001) Parse(doc string) (p PaymentInitiation, err error) {
+	defer catch(&err)
+	init := need(Xml.ParseRoot(doc, Pain001NS, "CstmrCdtTrfInitn"))
+	grp := need(Xml.Child(init, "GrpHdr"))
+	pmts := Xml.Children(init, "PmtInf")
+	if len(pmts) != 1 {
+		return p, isoErr("this parser handles exactly one PmtInf, found %d", len(pmts))
+	}
+	pmt := pmts[0]
+	if need(Xml.Text(pmt, "PmtMtd")) != "TRF" {
+		return p, isoErr("PmtMtd must be TRF")
+	}
+	debtor := Party{need(Xml.Text(pmt, "Dbtr", "Nm")), need(Xml.Text(pmt, "DbtrAcct", "Id", "IBAN")),
+		Xml.OptText(pmt, "DbtrAgt", "FinInstnId", "BICFI")}
+	transfers := []CreditTransfer{}
+	for _, tx := range Xml.Children(pmt, "CdtTrfTxInf") {
+		creditor := Party{need(Xml.Text(tx, "Cdtr", "Nm")), need(Xml.Text(tx, "CdtrAcct", "Id", "IBAN")),
+			Xml.OptText(tx, "CdtrAgt", "FinInstnId", "BICFI")}
+		transfers = append(transfers, CreditTransfer{need(Xml.Text(tx, "PmtId", "EndToEndId")),
+			need(Xml.Amount(need(Xml.Child(tx, "Amt", "InstdAmt")))), creditor, Xml.OptText(tx, "RmtInf", "Ustrd")})
+	}
+	createdAt, e := parseDateTime(need(Xml.Text(grp, "CreDtTm")))
+	if e != nil {
+		return p, isoWrap(e, "bad CreDtTm: %v", e)
+	}
+	execDate, e := time.Parse("2006-01-02", need(Xml.Text(pmt, "ReqdExctnDt", "Dt")))
+	if e != nil {
+		return p, isoWrap(e, "bad ReqdExctnDt: %v", e)
+	}
+	p = PaymentInitiation{need(Xml.Text(grp, "MsgId")), createdAt, need(Xml.Text(grp, "InitgPty", "Nm")),
+		need(Xml.Text(pmt, "PmtInfId")), execDate, debtor, transfers}
+	if err := checkTotals("GrpHdr", grp, p); err != nil {
+		return p, err
+	}
+	if err := checkTotals("PmtInf", pmt, p); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+```
+
+```go
+func catch(err *error) {
+	if r := recover(); r != nil {
+		e, ok := r.(error)
+		if !ok || !errors.Is(e, ErrIso20022) {
+			panic(r)
+		}
+		*err = e
+	}
+}
+
+func need[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+```
+
+#### Step 6: The secure parser
+
+`ParseRoot` prescans for `<!DOCTYPE`, then `decode` runs the token loop with `Strict = true`, building the `Element` tree: `StartElement` pushes a node (dropping `xmlns` attributes), `EndElement` pops, and `CharData` accumulates text. The root's `Name` and `Namespace` are then compared against the expected message type.
+
+```go
+func (h xmlHelpers) ParseRoot(doc, expectedNamespace, expectedChild string) (*Element, error) {
+	if doctype.MatchString(doc) {
+		return nil, isoErr("malformed XML: DOCTYPE is disallowed when processing a payment file")
+	}
+	root, err := h.decode(doc)
+	if err != nil {
+		return nil, isoWrap(err, "malformed XML: %v", err)
+	}
+	if root.Name != "Document" || root.Namespace != expectedNamespace {
+		return nil, isoErr("expected Document in %s, got %s", expectedNamespace, root.Namespace)
+	}
+	return h.Child(root, expectedChild)
+}
+
+func (xmlHelpers) decode(doc string) (*Element, error) {
+	d := xml.NewDecoder(strings.NewReader(doc))
+	d.Strict = true
+	var root *Element
+	var stack []*Element
+	for {
+		tok, err := d.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			e := &Element{Namespace: t.Name.Space, Name: t.Name.Local}
+			for _, a := range t.Attr {
+				if a.Name.Space == "" && a.Name.Local != "xmlns" {
+					e.Attrs = append(e.Attrs, a)
+				}
+			}
+			if len(stack) == 0 {
+				if root != nil {
+					return nil, errors.New("more than one root element")
+				}
+				root = e
+			} else {
+				parent := stack[len(stack)-1]
+				parent.Children = append(parent.Children, e)
+			}
+			stack = append(stack, e)
+		case xml.EndElement:
+			stack = stack[:len(stack)-1]
+		case xml.CharData:
+			if len(stack) > 0 {
+				stack[len(stack)-1].Text += string(t)
+			}
+		}
+	}
+	if root == nil {
+		return nil, errors.New("no root element")
+	}
+	return root, nil
+}
+```
+
+#### Step 7: Mapping to pacs.008
+
+The directory is a `func(iban string) string` returning `""` for an unknown bank. The mapping is otherwise identical: copy `EndToEndId`, mint `TxId` with `%04d`, push the debtor down, settle on the requested execution date.
+
+```go
+func (pacs008) FromPain001(p PaymentInitiation, messageId string, createdAt time.Time, bicDirectory func(iban string) string) (InterbankMessage, error) {
+	out := []InterbankTransfer{}
+	seq := 1
+	for _, t := range p.Transfers {
+		creditor := t.Creditor
+		if creditor.Bic == "" {
+			bic := bicDirectory(creditor.Iban)
+			if bic == "" {
+				return InterbankMessage{}, isoErr("no BIC for IBAN %s in directory", creditor.Iban)
+			}
+			creditor = Party{creditor.Name, creditor.Iban, bic}
+		}
+		txId := fmt.Sprintf("%s-%04d", messageId, seq)
+		seq++
+		out = append(out, InterbankTransfer{t.EndToEndId, txId, t.Amount, p.Debtor, creditor, t.Remittance})
+	}
+	return InterbankMessage{messageId, createdAt, p.RequestedExecutionDate, out}, nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/09-sepa-and-iso-20022/code/go
@@ -447,7 +971,13 @@ go run .
 go test ./...
 ```
 
-The Go tests port all 42 checks (44 assertions, including an undefined-entity case) and the demo output is identical to the Java run, XML included.
+The demo output is identical to the Java run, XML included:
+
+```console
+rejected: bad amount 349.999: 349.999 has more decimals than EUR allows (2)
+rejected: expected Document in urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08, got urn:iso:std:iso:20022:tech:xsd:pain.001.001.09
+rejected: DOCTYPE (XXE guard)
+```
 
 ## Use It
 

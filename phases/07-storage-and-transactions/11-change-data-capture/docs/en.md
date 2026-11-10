@@ -353,28 +353,170 @@ Section 3 is the one to show a colleague who proposes a CDC consumer that increm
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Immutable images:** a frozen dataclass stops reassigning `record.after`, but not `record.after["x"] = "y"`, so `__post_init__` copies each image and wraps it in `types.MappingProxyType`, and mutation raises `TypeError` where Java throws `UnsupportedOperationException`; the test asserts exactly that, and `BalanceViewSink.all()` returns a key-sorted `MappingProxyType` for the same reason. **Interfaces become protocols:** `Clock` and `Sink` are `typing.Protocol`s, so any object with `now_millis()` or `apply(event)` fits, which is how `RecordingSink`, the two totals sinks and the view plug into one `CdcConnector`; the Java `poll(max)` / `poll(max, crash)` overloads become one method with `crash_before_commit: bool = False`. **Numbers and errors:** amounts are strings of minor units parsed with `int(...)`, `Money.plus` and `minus` check the signed 64-bit range by hand and raise `OverflowError`, mirroring `Math.addExact`, with a Python-only test pinning it; `LogTruncatedException` is a `RuntimeError` subclass carrying `requested` and `oldest_available`, and committing a finished transaction raises plain `RuntimeError`. **Same output:** maps print through `_jmap`, which matches Java's `{k=v}` format, so `diff` of the two demos is empty, including the skipped counts and the forced re-snapshot at LSN 17.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The log record and the log
+
+`LogRecord` freezes its two images in `__post_init__` through `object.__setattr__`, the only way to assign on a frozen dataclass. `CommitLog.read_from` raises `LogTruncatedException` first and then collects records strictly after `after_lsn`, up to `max`.
+
 ```python
 def _frozen(m: Mapping[str, str] | None) -> Mapping[str, str] | None:
-    """Copy then wrap read-only: Collections.unmodifiableMap(new LinkedHashMap<>(m))."""
     return None if m is None else MappingProxyType(dict(m))
+
 
 @dataclass(frozen=True)
 class LogRecord:
     lsn: int
     tx_id: int
     op: Op
-    ...
+    table: str
+    key: str
+    before: Mapping[str, str] | None
+    after: Mapping[str, str] | None
+
     def __post_init__(self) -> None:
+        if self.table is None or self.key is None:
+            raise TypeError("table and key are required")
         object.__setattr__(self, "before", _frozen(self.before))
         object.__setattr__(self, "after", _frozen(self.after))
 ```
 
-Differences, all in `code/python/main.py`:
+```python
+    def append(self, tx_id: int, op: Op, table: str, key: str, before, after) -> int:
+        r = LogRecord(self._next_lsn, tx_id, op, table, key, before, after)
+        self._next_lsn += 1
+        self._records.append(r)
+        return r.lsn
 
-- **Immutable images.** A frozen dataclass stops reassigning `record.after`, but not `record.after["x"] = "y"`. `__post_init__` therefore copies each image and wraps it in `types.MappingProxyType`, so mutation raises `TypeError` where Java throws `UnsupportedOperationException`; the test asserts exactly that. `BalanceViewSink.all()` returns a key-sorted `MappingProxyType` for the same reason.
-- **Interfaces become protocols.** `Clock` and `Sink` are `typing.Protocol`s; any object with `now_millis()` or `apply(event)` fits, which is how `RecordingSink`, the two totals sinks and the view plug into one `CdcConnector`. The Java `poll(max)` / `poll(max, crash)` overloads become one method with `crash_before_commit: bool = False`.
-- **Numbers and errors.** Amounts are strings of minor units parsed with `int(...)`. `Money.plus` and `minus` check the signed 64-bit range by hand and raise `OverflowError`, mirroring `Math.addExact`; a Python-only test pins it. `LogTruncatedException` is a `RuntimeError` subclass carrying `requested` and `oldest_available`; committing a finished transaction raises plain `RuntimeError`.
-- **Same output.** Maps print through `_jmap`, which matches Java's `{k=v}` format, so `diff` of the two demos is empty, including the skipped counts and the forced re-snapshot at LSN 17.
+    def read_from(self, after_lsn: int, max: int) -> list[LogRecord]:
+        if after_lsn + 1 < self._truncated_below:
+            raise LogTruncatedException(after_lsn + 1, self._truncated_below)
+        out: list[LogRecord] = []
+        for r in self._records:
+            if r.lsn > after_lsn:
+                out.append(r)
+                if len(out) >= max:
+                    break
+        return out
+```
+
+#### Step 2: Transactions that commit to tables and log together
+
+`Database.commit` is called by `Transaction.commit`. Tables are nested dicts; `setdefault` creates one on first write. The before image is read from the table at commit time, a delete of a missing row is skipped, and each applied write appends one record.
+
+```python
+    def commit(self, tx: "Transaction") -> int:
+        last_lsn = 0
+        for w in tx.writes:
+            t = self._tables.setdefault(w.table, {})
+            before = t.get(w.key)
+            if w.after is None:
+                if before is None:
+                    continue  # deleting a missing row logs nothing
+                del t[w.key]
+                op = Op.DELETE
+            else:
+                t[w.key] = dict(w.after)
+                op = Op.INSERT if before is None else Op.UPDATE
+            last_lsn = self._log.append(tx.tx_id, op, w.table, w.key, before, w.after)
+        return last_lsn
+```
+
+#### Step 3: The envelope
+
+`ChangeEvent` is a frozen dataclass with two static constructors. `from_log` maps the `Op` to Debezium's letter through a dict lookup; `snapshot_row` builds an `"r"` event with no before image, transaction 0, and the snapshot LSN.
+
+```python
+@dataclass(frozen=True)
+class ChangeEvent:
+    op: str
+    table: str
+    key: str
+    before: Mapping[str, str] | None
+    after: Mapping[str, str] | None
+    lsn: int
+    tx_id: int
+    ts_millis: int
+    snapshot: bool
+
+    @staticmethod
+    def from_log(r: LogRecord, ts_millis: int) -> "ChangeEvent":
+        op = {Op.INSERT: "c", Op.UPDATE: "u", Op.DELETE: "d"}[r.op]
+        return ChangeEvent(op, r.table, r.key, r.before, r.after, r.lsn, r.tx_id, ts_millis, False)
+
+    @staticmethod
+    def snapshot_row(table: str, key: str, row: Mapping[str, str], snapshot_lsn: int, ts_millis: int) -> "ChangeEvent":
+        return ChangeEvent("r", table, key, None, row, snapshot_lsn, 0, ts_millis, True)
+```
+
+#### Step 4: The connector and its offset discipline
+
+`poll` loads the offset (`frm`, since `from` is a keyword), reads the batch, delivers every event, and saves the offset unless the test hook says the process died first.
+
+```python
+    def poll(self, max_events: int, crash_before_commit: bool = False) -> int:
+        frm = self._offsets.load(self.name)
+        batch = self._db.log().read_from(frm, max_events)
+        if not batch:
+            return 0
+        last = frm
+        for r in batch:
+            self._deliver(ChangeEvent.from_log(r, self._clock.now_millis()))
+            last = r.lsn
+        if not crash_before_commit:
+            self._offsets.save(self.name, last)
+        return len(batch)
+```
+
+#### Step 5: Snapshot
+
+Head first, then scan, then save. `db.scan` returns a key-sorted dict, so the snapshot rows are emitted in the same order as the Java `TreeMap`.
+
+```python
+    def snapshot(self, table: str) -> int:
+        snapshot_lsn = self._db.log().head_lsn()
+        for key, row in self._db.scan(table).items():
+            self._deliver(ChangeEvent.snapshot_row(table, key, row, snapshot_lsn, self._clock.now_millis()))
+        self._offsets.save(self.name, snapshot_lsn)
+        return snapshot_lsn
+```
+
+#### Step 6: Two sinks, one idempotent
+
+`BalanceViewSink.apply` keeps the per-key LSN guard; `dict.pop(key, None)` handles a delete of an unknown key. `NaiveTotalsSink` has no guard and counts every `"c"` event it sees, which is the bug the demo shows. Amounts are `int(...)` of the minor-units string.
+
+```python
+    def apply(self, e: ChangeEvent) -> None:
+        if e.table != "accounts":
+            return
+        seen = self._applied_lsn.get(e.key, 0)
+        if e.lsn <= seen:
+            self.skipped += 1
+            return
+        if e.op == "d":
+            self._balances.pop(e.key, None)
+        else:
+            self._balances[e.key] = Money.of_minor(int(e.after["balance_minor"]), Currency.USD)
+        self._applied_lsn[e.key] = e.lsn
+        self.applied += 1
+```
+
+```python
+class NaiveTotalsSink:
+    def __init__(self) -> None:
+        self.payments_seen = 0
+        self.total = Money.of_minor(0, Currency.USD)
+
+    def apply(self, e: ChangeEvent) -> None:
+        if e.table != "payments" or e.op != "c":
+            return
+        self.payments_seen += 1
+        self.total = self.total.plus(Money.of_minor(int(e.after["amount_minor"]), Currency.USD))
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/11-change-data-capture/code/python
@@ -382,33 +524,223 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Section 3 prints the double count the lesson is about, identical to the Java run:
+
+```console
+== 3. Crash after apply, before offset commit: at-least-once redelivery ==
+  after crash: naive total=35.00 USD (2 payments), exact total=35.00 USD (2 payments), offsets still 0/0
+  after restart: naive total=80.00 USD (6 payments)  <- double counted
+                 exact total=45.00 USD (4 payments)  <- idempotent by payment key
+  true total of pay_001..pay_004 = 45.00 USD
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Rows are an ordered type, not a map:** Java's `LinkedHashMap<String, String>` with `null` for a missing image becomes `*Row`, an insertion-ordered column list behind `Get`, `Copy`, `Equal` and `String`, with `nil` standing for the missing `before` of an insert or `after` of a delete; `Row` has no public setter and every `Put`, commit and log append stores a `Copy`, which is how the port keeps log records immutable without Java's `Collections.unmodifiableMap`, and the test mutates the caller's row after commit and checks the record did not move. **Errors are values:** `ReadFrom` returns `([]LogRecord, error)`, the error being a `*LogTruncatedError` carrying `Requested` and `OldestAvailable` (unwrap with `errors.As`) that also matches the sentinel `ErrLogTruncated` through `errors.Is`, and `Poll`, `PollWithCrash` and `Snapshot` propagate it; `Transaction.Put` and `Delete` keep chaining (`db.Begin().Put(...).Put(...).Commit()`), so a use after `Commit`/`Rollback` is remembered and reported by the next `Commit` as `ErrTxnFinished`, and `Sink.Apply` returns `error`, because a sink that parses `amount_minor` with `strconv.ParseInt` can meet a value that is not an integer and must refuse it rather than guess. **Numeric model:** amounts travel as strings of minor units and are parsed with `strconv.ParseInt`, and `Money.Plus` uses a hand-written checked add in place of `Math.addExact` and returns `(Money, error)`, so `NaiveTotalsSink` and `IdempotentTotalsSink` surface overflow as an error from `Apply`. **Ordering and concurrency:** `Scan` returns a key-sorted `[]KeyedRow` (Java's `TreeMap`) so snapshot events are emitted in the same order, and `formatBalances` sorts keys to print the view the way Java does; everything is single-threaded, and a port that runs `Poll` in a goroutine beside writers must guard `CommitLog` and the tables with a mutex and pass `go test -race`, the LSN guard in `BalanceViewSink` then being what keeps the view correct across the snapshot seam.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same five sections as the Java version, line for line.
+
+#### Step 1: The log record and the log
+
+`NewLogRecord` copies both images (`Copy` on a nil `*Row` returns nil). `LogTruncatedError` carries the two LSNs and implements `Is` against the sentinel. `ReadFrom` returns the error first, then the strictly-after records.
+
 ```go
-// LogTruncatedError is returned when a reader asks for an LSN the log has already truncated.
+type LogRecord struct {
+	Lsn    int64
+	TxID   int64
+	Op     Op
+	Table  string
+	Key    string
+	Before *Row
+	After  *Row
+}
+
+func NewLogRecord(lsn, txID int64, op Op, table, key string, before, after *Row) LogRecord {
+	return LogRecord{lsn, txID, op, table, key, before.Copy(), after.Copy()}
+}
+
 type LogTruncatedError struct {
-    Requested       int64
-    OldestAvailable int64
+	Requested       int64
+	OldestAvailable int64
 }
 
 func (e *LogTruncatedError) Is(target error) bool { return target == ErrLogTruncated }
 
-func (c *CdcConnector) PollWithCrash(maxEvents int, crashBeforeCommit bool) (int, error) {
-    from := c.offsets.Load(c.Name)
-    batch, err := c.db.Log().ReadFrom(from, maxEvents)
-    if err != nil {
-        return 0, err // the consumer must re-snapshot
-    }
-    // ... deliver every record, then save the offset unless we "crash"
+func (l *CommitLog) Append(txID int64, op Op, table, key string, before, after *Row) int64 {
+	r := NewLogRecord(l.nextLsn, txID, op, table, key, before, after)
+	l.nextLsn++
+	l.records = append(l.records, r)
+	return r.Lsn
+}
+
+func (l *CommitLog) ReadFrom(afterLsn int64, max int) ([]LogRecord, error) {
+	if afterLsn+1 < l.truncatedBelow {
+		return nil, &LogTruncatedError{afterLsn + 1, l.truncatedBelow}
+	}
+	out := []LogRecord{}
+	for _, r := range l.records {
+		if r.Lsn > afterLsn {
+			out = append(out, r)
+			if len(out) >= max {
+				break
+			}
+		}
+	}
+	return out, nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: Transactions that commit to tables and log together
 
-- **Rows are an ordered type, not a map.** Java's `LinkedHashMap<String, String>` with `null` for a missing image becomes `*Row`: an insertion-ordered column list behind `Get`, `Copy`, `Equal` and `String`, with `nil` standing for the missing `before` of an insert or `after` of a delete. `Row` has no public setter and every `Put`, commit and log append stores a `Copy`, which is how the port keeps log records immutable without Java's `Collections.unmodifiableMap`; the test mutates the caller's row after commit and checks the record did not move.
-- **Errors are values.** `ReadFrom` returns `([]LogRecord, error)`; the error is a `*LogTruncatedError` carrying `Requested` and `OldestAvailable` (unwrap with `errors.As`) that also matches the sentinel `ErrLogTruncated` through `errors.Is`. `Poll`, `PollWithCrash` and `Snapshot` propagate it. `Transaction.Put` and `Delete` keep chaining (`db.Begin().Put(...).Put(...).Commit()`), so a use after `Commit`/`Rollback` is remembered and reported by the next `Commit` as `ErrTxnFinished`. `Sink.Apply` returns `error`, because a sink that parses `amount_minor` with `strconv.ParseInt` can meet a value that is not an integer and must refuse it rather than guess.
-- **Numeric model.** Amounts travel as strings of minor units and are parsed with `strconv.ParseInt`; `Money.Plus` uses a hand-written checked add in place of `Math.addExact` and returns `(Money, error)`, so `NaiveTotalsSink` and `IdempotentTotalsSink` surface overflow as an error from `Apply`.
-- **Ordering and concurrency.** `Scan` returns a key-sorted `[]KeyedRow` (Java's `TreeMap`) so snapshot events are emitted in the same order; `formatBalances` sorts keys to print the view the way Java does. Everything is single-threaded; a port that runs `Poll` in a goroutine beside writers must guard `CommitLog` and the tables with a mutex and pass `go test -race`, and the LSN guard in `BalanceViewSink` is then what keeps the view correct across the snapshot seam.
+The unexported `commit` creates the table map on first use, reads the before image as a `*Row` (nil for a missing row), stores a `Copy` of the after image, and appends one record per applied write.
+
+```go
+func (db *Database) commit(tx *Transaction) int64 {
+	var lastLsn int64
+	for _, w := range tx.Writes {
+		t, ok := db.tables[w.Table]
+		if !ok {
+			t = map[string]*Row{}
+			db.tables[w.Table] = t
+		}
+		before := t[w.Key]
+		var op Op
+		if w.After == nil {
+			if before == nil {
+				continue // deleting a missing row logs nothing
+			}
+			delete(t, w.Key)
+			op = Delete
+		} else {
+			t[w.Key] = w.After.Copy()
+			if before == nil {
+				op = Insert
+			} else {
+				op = Update
+			}
+		}
+		lastLsn = db.log.Append(tx.TxID, op, w.Table, w.Key, before, w.After)
+	}
+	return lastLsn
+}
+```
+
+#### Step 3: The envelope
+
+`FromLog` indexes an array literal by the `Op` value to get the Debezium letter; `SnapshotRow` builds the `"r"` event with a nil before image.
+
+```go
+type ChangeEvent struct {
+	Op       string
+	Table    string
+	Key      string
+	Before   *Row
+	After    *Row
+	Lsn      int64
+	TxID     int64
+	TsMillis int64
+	Snapshot bool
+}
+
+func FromLog(r LogRecord, tsMillis int64) ChangeEvent {
+	op := [...]string{"c", "u", "d"}[r.Op]
+	return ChangeEvent{op, r.Table, r.Key, r.Before, r.After, r.Lsn, r.TxID, tsMillis, false}
+}
+
+func SnapshotRow(table, key string, row *Row, snapshotLsn, tsMillis int64) ChangeEvent {
+	return ChangeEvent{"r", table, key, nil, row, snapshotLsn, 0, tsMillis, true}
+}
+```
+
+#### Step 4: The connector and its offset discipline
+
+`Poll` delegates to `PollWithCrash`. A truncation error from `ReadFrom` and a sink error from `deliver` both propagate; the offset is saved only when the whole batch applied and the crash flag is off.
+
+```go
+func (c *CdcConnector) Poll(maxEvents int) (int, error) { return c.PollWithCrash(maxEvents, false) }
+
+func (c *CdcConnector) PollWithCrash(maxEvents int, crashBeforeCommit bool) (int, error) {
+	from := c.offsets.Load(c.Name)
+	batch, err := c.db.Log().ReadFrom(from, maxEvents)
+	if err != nil {
+		return 0, err
+	}
+	if len(batch) == 0 {
+		return 0, nil
+	}
+	last := from
+	for _, r := range batch {
+		if err := c.deliver(FromLog(r, c.clock.NowMillis())); err != nil {
+			return 0, err
+		}
+		last = r.Lsn
+	}
+	if !crashBeforeCommit {
+		c.offsets.Save(c.Name, last)
+	}
+	return len(batch), nil
+}
+```
+
+#### Step 5: Snapshot
+
+Head, scan, save, in that order; `Scan` returns key-sorted `KeyedRow`s and a sink error aborts the snapshot before the offset is written.
+
+```go
+func (c *CdcConnector) Snapshot(table string) (int64, error) {
+	snapshotLsn := c.db.Log().HeadLsn()
+	for _, kr := range c.db.Scan(table) {
+		if err := c.deliver(SnapshotRow(table, kr.Key, kr.Row, snapshotLsn, c.clock.NowMillis())); err != nil {
+			return 0, err
+		}
+	}
+	c.offsets.Save(c.Name, snapshotLsn)
+	return snapshotLsn, nil
+}
+```
+
+#### Step 6: Two sinks, one idempotent
+
+`BalanceViewSink.Apply` keeps the LSN guard (a missing `appliedLsn` entry reads as 0) and parses the balance through `minorUnits`, returning its error. `NaiveTotalsSink` counts every `"c"` and returns the overflow error from `Plus` if there is one.
+
+```go
+func (s *BalanceViewSink) Apply(e ChangeEvent) error {
+	if e.Table != "accounts" {
+		return nil
+	}
+	if e.Lsn <= s.appliedLsn[e.Key] {
+		s.Skipped++
+		return nil
+	}
+	if e.Op == "d" {
+		delete(s.balances, e.Key)
+	} else {
+		m, err := minorUnits(e.After, "balance_minor")
+		if err != nil {
+			return err
+		}
+		s.balances[e.Key] = m
+	}
+	s.appliedLsn[e.Key] = e.Lsn
+	s.Applied++
+	return nil
+}
+
+func (s *NaiveTotalsSink) Apply(e ChangeEvent) error {
+	if e.Table != "payments" || e.Op != "c" {
+		return nil
+	}
+	amount, err := minorUnits(e.After, "amount_minor")
+	if err != nil {
+		return err
+	}
+	s.PaymentsSeen++
+	s.Total, err = s.Total.Plus(amount)
+	return err
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/11-change-data-capture/code/go
@@ -416,7 +748,14 @@ go run .
 go test ./...
 ```
 
-The demo prints the same five sections as the Java version, line for line.
+```console
+  truncated 7 records; oldest lsn now 8; late consumer offset is 0
+  poll failed: LSN 1 has been truncated; oldest available is 8
+  re-snapshot at lsn=17 then stream; late view: {acc_alice=90.00 USD, acc_bob=60.00 USD}
+  both views agree: true
+```
+
+The four sections before this are the Java output, including the double-counted `80.00 USD`.
 
 ## Use It
 

@@ -290,11 +290,73 @@ Run `python3 main.py` and `go run .` in the sibling folders. The five numbers, t
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **Python integers do not wrap**, so every addition and multiplication in SplitMix64 is masked with `& _MASK64` by hand; forget one mask and the state grows without bound, the output diverges from Java and Go on the second call, and nothing raises. The test against the published vector catches it. **`>>` is already a logical shift** on non-negative Python ints, so there is no `>>>` to reach for; the masking is what keeps the values non-negative, and `next_long` converts to signed so the three languages print the same number. **`Clock` is a `Protocol`:** any object with `now_millis()` qualifies, no inheritance needed; `FakeClock` does not subclass anything. **The harness is `unittest`:** classes group related tests, `setUp` builds a fresh `FakeClock` per method, `self.subTest(attempt=attempt)` labels each row of the two-hundred-attempt loop so a failure names the row, and `with self.assertRaises(ValueError)` is the `checkThrows` equivalent. The self-test asserts that `assertRaises` with no exception raises `AssertionError`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v` to see each method's name.
+
+#### Step 1: The clock interface and the real clock
+
+`Clock` is a `typing.Protocol`: structural typing means `SystemClock` and `FakeClock` satisfy it by having the method, with no `implements`. The real clock divides `time.time_ns()` down to milliseconds so the return type is a plain `int`, comparable with `<` exactly like the Java `long`.
+
 ```python
 class Clock(Protocol):
+    """A source of time in epoch milliseconds. Production code takes a Clock; tests hand it a FakeClock."""
+
     def now_millis(self) -> int: ...
 
+
+class SystemClock:
+    """The real clock. Never appears in a test."""
+
+    def now_millis(self) -> int:
+        return time.time_ns() // 1_000_000
+```
+
+#### Step 2: The fake, with its invariant
+
+A `threading.Lock` replaces the three `synchronized` methods; every read and write of `_now` happens inside `with self._lock`. The invariant is the same: a negative `advance` and a backwards `advance_to` raise `ValueError` and leave the clock where it was. There is no `addExact` because Python ints cannot overflow.
+
+```python
+class FakeClock:
+    def __init__(self, start_millis: int) -> None:
+        self._now = start_millis
+        self._lock = threading.Lock()
+
+    def now_millis(self) -> int:
+        with self._lock:
+            return self._now
+
+    def advance(self, millis: int) -> None:
+        if millis < 0:
+            raise ValueError(f"cannot advance by a negative duration: {millis}")
+        with self._lock:
+            self._now += millis
+
+    def advance_to(self, millis: int) -> None:
+        with self._lock:
+            if millis < self._now:
+                raise ValueError(f"cannot move the clock backwards from {self._now} to {millis}")
+            self._now = millis
+```
+
+#### Step 3: SplitMix64
+
+The generator works on an unsigned 64-bit value internally. Each `+` and `*` is followed by `& _MASK64`, which is the "mod 2^64" that Java gets for free from wrapping `long` arithmetic. Because the value is kept non-negative, `>>` is already the unsigned shift. `next_long` applies `_to_signed64` so the printed numbers match the other two languages, while `next_int` and `next_double` take their top bits straight from the unsigned value.
+
+```python
+_MASK64 = (1 << 64) - 1
+_GOLDEN_GAMMA = 0x9E3779B97F4A7C15
+
+
+def _to_signed64(u: int) -> int:
+    return u - (1 << 64) if u >= 1 << 63 else u
+
+
 class SeededRandom:
+    def __init__(self, seed: int) -> None:
+        self._seed = seed
+        self._state = seed & _MASK64
+
     def _next_u64(self) -> int:
         self._state = (self._state + _GOLDEN_GAMMA) & _MASK64
         z = self._state
@@ -303,54 +365,279 @@ class SeededRandom:
         return z ^ (z >> 31)
 
     def next_long(self) -> int:
+        """The next 64 bits, as a signed value so it matches Java's long and Go's int64 exactly."""
         return _to_signed64(self._next_u64())
+
+    def next_int(self, bound: int) -> int:
+        """Uniform in [0, bound). Uses the top 31 bits; the modulo bias is below 2^-31 for any realistic bound."""
+        if bound <= 0:
+            raise ValueError(f"bound must be positive: {bound}")
+        return (self._next_u64() >> 33) % bound
+
+    def next_double(self) -> float:
+        """Uniform in [0.0, 1.0): the top 53 bits scaled by 2^-53, so every float is exactly representable."""
+        return (self._next_u64() >> 11) * 2.0 ** -53
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 4: Shuffle
 
-- **Python integers do not wrap**, so every addition and multiplication is masked with `& _MASK64` by hand. Forget one mask and the state grows without bound, the output diverges from Java and Go on the second call, and nothing raises. The test against the published vector catches it.
-- **`>>` is already a logical shift** on non-negative Python ints, so there is no `>>>` to reach for; the masking is what keeps the values non-negative.
-- **`next_long` converts to signed** so the three languages print the same number. Internally the generator works on the unsigned value.
-- **`Clock` is a `Protocol`**: any object with `now_millis()` qualifies, no inheritance needed. `FakeClock` does not subclass anything.
-- **The harness is `unittest`.** Classes group related tests; `setUp` builds a fresh `FakeClock` per method; `self.subTest(attempt=attempt)` labels each row of the two-hundred-attempt loop so a failure names the row; `with self.assertRaises(ValueError)` is the `checkThrows` equivalent. The self-test asserts that `assertRaises` with no exception raises `AssertionError`. Run with `python3 -m unittest -v` to see each method's name.
+Fisher-Yates from the end, as a method on the generator. Tuple assignment does the swap without a temporary, and `range(len(items) - 1, 0, -1)` stops at `i = 1` just as the Java loop does. Same seed, same `next_int(i + 1)` draws, same permutation `[3, 2, 1, 6, 7, 5, 4, 8, 9, 0]` for seed 7.
+
+```python
+    def shuffle(self, items: list[T]) -> None:
+        """Fisher-Yates, in place: for i from n-1 down to 1, swap a[i] with a[next_int(i+1)]."""
+        for i in range(len(items) - 1, 0, -1):
+            j = self.next_int(i + 1)
+            items[i], items[j] = items[j], items[i]
+```
+
+#### Step 5: The consumers
+
+`Deadline` is a frozen dataclass holding any `Clock`; `expired` uses `>=` so a deadline is expired at the instant it names. `backoff_millis` raises `ValueError` where the Java throws `IllegalArgumentException`; `<<` on a Python int never overflows, but the shift is still capped at 30 so the window is clamped the same way in all three languages and the two-hundred-attempt test agrees.
+
+```python
+@dataclass(frozen=True)
+class Deadline:
+    clock: Clock
+    at_millis: int
+
+    def expired(self) -> bool:
+        return self.clock.now_millis() >= self.at_millis
+
+    def remaining_millis(self) -> int:
+        return max(0, self.at_millis - self.clock.now_millis())
+
+
+def backoff_millis(attempt: int, base_millis: int, cap_millis: int, rng: SeededRandom) -> int:
+    if attempt < 0 or base_millis <= 0 or cap_millis < base_millis:
+        raise ValueError("attempt >= 0, base > 0, cap >= base required")
+    shift = min(attempt, 30)  # 2^30 * base already exceeds any sane cap
+    window = min(cap_millis, base_millis << shift)
+    return rng.next_int(window)
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/00-setup-and-tooling/03-testing-from-the-standard-library/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== SeededRandom(42): the same five numbers in Java, Python, and Go ==
+-4767286540954276203
+2949826092126892291
+5139283748462763858
+6349198060258255764
+701532786141963250
+
+== next_int(100) x 8 and a shuffle of 0..9 with seed 7 ==
+51 53 71 35 65 97 82 63
+[3, 2, 1, 6, 7, 5, 4, 8, 9, 0]
+
+== FakeClock and a deadline: no time.sleep anywhere ==
+t+0s     expired=false remaining=30000ms
+t+29.999 expired=false remaining=1ms
+t+30s    expired=true remaining=0ms
+
+== Full-jitter backoff for a PSP call, base 100ms cap 2000ms, seed 42 ==
+attempt 0: window [0,  100) -> wait   51 ms
+attempt 1: window [0,  200) -> wait  153 ms
+attempt 2: window [0,  400) -> wait  171 ms
+attempt 3: window [0,  800) -> wait  735 ms
+attempt 4: window [0, 1600) -> wait  365 ms
+
+rejected: cannot advance by a negative duration: -1
+```
+
+The five numbers, the eight ints, and the permutation are identical to the Java run. That is the property the whole course leans on.
 
 ### In Go
 
+The Go port (`code/go/main.go`, tests in `main_test.go`) keeps the design with these differences. **`uint64` wraps**, which is exactly the arithmetic SplitMix64 wants: no masking, `>>` on an unsigned type is a logical shift, and `NextInt64` is a cast. **Errors are values:** `Advance` and `AdvanceTo` return an `error` wrapping the sentinel `ErrClockBackwards` so a test can `errors.Is`; `NextInt(0)` panics instead, because a non-positive bound is a programming error with no sensible recovery, and the test uses `recover()` to assert the panic. **`Shuffle` is a generic function**, not a method, because Go methods cannot have their own type parameters. **The harness is `testing`:** there are no assertion functions, so `main_test.go` defines `mustEqual` with `t.Helper()`, which makes a failure report the caller's line rather than the helper's; `t.Run` turns a table into named subtests you can run alone with `go test -run 'TestFakeClock/advance_adds'`; `t.Errorf` continues and `t.Fatalf` stops the current test. **`go test -race ./...`** instruments every load and store: `TestFakeClockConcurrentAdvancesAreNotLost` passes under `-race` because of the mutex; remove the mutex and the detector reports a data race with two stack traces on every run, which a plain `go test` would catch only sometimes.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...` and `go test -race ./...`.
+
+#### Step 1: The clock interface and the real clock
+
+A one-method interface and an empty struct that satisfies it. `time.Now().UnixMilli()` returns `int64` directly, so there is no conversion. `SystemClock` has a value receiver because it carries no state.
+
 ```go
-func mustEqual[T comparable](t *testing.T, name string, want, got T) {
-    t.Helper()
-    if want != got {
-        t.Errorf("%s: want %v, got %v", name, want, got)
-    }
+type Clock interface {
+	NowMillis() int64
 }
 
-func TestFakeClock(t *testing.T) {
-    cases := []struct {
-        name string
-        step func(c *FakeClock) error
-        want int64
-    }{
-        {"starts where told", func(c *FakeClock) error { return nil }, 1_000},
-        {"advance adds", func(c *FakeClock) error { return c.Advance(500) }, 1_500},
-        // ...
-    }
-    clock := NewFakeClock(1_000)
-    for _, tc := range cases {
-        t.Run(tc.name, func(t *testing.T) {
-            if err := tc.step(clock); err != nil { t.Fatalf("unexpected error: %v", err) }
-            mustEqual(t, "now", tc.want, clock.NowMillis())
-        })
-    }
+// SystemClock is the real clock. It never appears in a test.
+type SystemClock struct{}
+
+func (SystemClock) NowMillis() int64 { return time.Now().UnixMilli() }
+```
+
+#### Step 2: The fake, with its invariant
+
+A `sync.Mutex` embedded in the struct protects `now`; every method locks and defers the unlock. The two invariant violations are returned as errors wrapped around `ErrClockBackwards` with `%w`, so a caller can `errors.Is(err, ErrClockBackwards)` without parsing the message. `NewFakeClock` returns a pointer because a mutex must not be copied.
+
+```go
+var ErrClockBackwards = errors.New("fake clock cannot move backwards")
+
+type FakeClock struct {
+	mu  sync.Mutex
+	now int64
+}
+
+func NewFakeClock(startMillis int64) *FakeClock { return &FakeClock{now: startMillis} }
+
+func (c *FakeClock) NowMillis() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *FakeClock) Advance(millis int64) error {
+	if millis < 0 {
+		return fmt.Errorf("%w: cannot advance by a negative duration %d", ErrClockBackwards, millis)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now += millis
+	return nil
+}
+
+func (c *FakeClock) AdvanceTo(millis int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if millis < c.now {
+		return fmt.Errorf("%w: from %d to %d", ErrClockBackwards, c.now, millis)
+	}
+	c.now = millis
+	return nil
 }
 ```
 
-Differences, all in `code/go/main.go` and `main_test.go`:
+#### Step 3: SplitMix64
 
-- **`uint64` wraps**, which is exactly the arithmetic SplitMix64 wants; no masking, and `>>` on an unsigned type is a logical shift. `NextInt64` is a cast.
-- **Errors are values.** `Advance` and `AdvanceTo` return `error` wrapping the sentinel `ErrClockBackwards` so a test can `errors.Is`. `NextInt(0)` panics instead, because a non-positive bound is a programming error with no sensible recovery, and the test uses `recover()` to assert the panic.
-- **`Shuffle` is a generic function**, not a method, because Go methods cannot have their own type parameters.
-- **The harness is `testing`.** There are no assertion functions; `mustEqual` is written here with `t.Helper()`, which makes a failure report the caller's line rather than the helper's. `t.Run` turns the table into named subtests you can run alone with `go test -run 'TestFakeClock/advance_adds'`. `t.Errorf` continues, `t.Fatalf` stops the current test.
-- **`go test -race ./...`** instruments every load and store. `TestFakeClockConcurrentAdvancesAreNotLost` passes under `-race` because of the mutex; remove the mutex and the detector reports a data race with the two stack traces, every run, which a plain `go test` would catch only sometimes.
+The state is a `uint64`, so the reference algorithm transcribes directly: `+=` and `*` wrap modulo 2^64 and `>>` is logical. `NextInt64` is the cast `int64(...)`, which reinterprets the bits exactly as Java's `long` holds them. `NextInt` takes the top 31 bits with `>> 33` and panics on a non-positive bound; `NextFloat64` scales the top 53 bits by a constant that Go folds to exactly 2^-53.
+
+```go
+const goldenGamma uint64 = 0x9E3779B97F4A7C15
+
+type SeededRandom struct {
+	seed  int64
+	state uint64
+}
+
+func NewSeededRandom(seed int64) *SeededRandom { return &SeededRandom{seed: seed, state: uint64(seed)} }
+
+func (r *SeededRandom) nextUint64() uint64 {
+	r.state += goldenGamma
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
+// NextInt64 returns the next 64 bits as a signed value, matching Java's long and Python's next_long exactly.
+func (r *SeededRandom) NextInt64() int64 { return int64(r.nextUint64()) }
+
+// NextInt is uniform in [0, bound). Uses the top 31 bits; the modulo bias is below 2^-31 for any realistic bound.
+func (r *SeededRandom) NextInt(bound int) int {
+	if bound <= 0 {
+		panic(fmt.Sprintf("bound must be positive: %d", bound))
+	}
+	return int((r.nextUint64() >> 33) % uint64(bound))
+}
+
+// NextFloat64 is uniform in [0.0, 1.0): the top 53 bits scaled by 2^-53, so every float is exactly representable.
+func (r *SeededRandom) NextFloat64() float64 { return float64(r.nextUint64()>>11) * (1.0 / (1 << 53)) }
+```
+
+#### Step 4: Shuffle
+
+`Shuffle` is a package-level generic function taking the generator as its first argument, because a Go method cannot introduce the type parameter `T`. The loop body is the same Fisher-Yates swap with parallel assignment; the call site reads `Shuffle(NewSeededRandom(7), deck)`.
+
+```go
+// Shuffle is Fisher-Yates, in place: for i from n-1 down to 1, swap a[i] with a[NextInt(i+1)].
+func Shuffle[T any](r *SeededRandom, items []T) {
+	for i := len(items) - 1; i > 0; i-- {
+		j := r.NextInt(i + 1)
+		items[i], items[j] = items[j], items[i]
+	}
+}
+```
+
+#### Step 5: The consumers
+
+`Deadline` holds the `Clock` interface, so a `*FakeClock` and a `SystemClock` both fit. `BackoffMillis` returns `(int64, error)` for the argument check instead of throwing; the shift cap and the window clamp are written as explicit `if` statements because Go has no `min` for `int64` before 1.21 and the course keeps the arithmetic visible. The draw is still `NextInt(window)`, so the wait is in `[0, window)`.
+
+```go
+type Deadline struct {
+	Clock    Clock
+	AtMillis int64
+}
+
+func (d Deadline) Expired() bool { return d.Clock.NowMillis() >= d.AtMillis }
+
+func (d Deadline) RemainingMillis() int64 {
+	if rem := d.AtMillis - d.Clock.NowMillis(); rem > 0 {
+		return rem
+	}
+	return 0
+}
+
+func BackoffMillis(attempt int, baseMillis, capMillis int64, rng *SeededRandom) (int64, error) {
+	if attempt < 0 || baseMillis <= 0 || capMillis < baseMillis {
+		return 0, errors.New("attempt >= 0, base > 0, cap >= base required")
+	}
+	shift := attempt
+	if shift > 30 { // 2^30 * base already exceeds any sane cap
+		shift = 30
+	}
+	window := baseMillis << shift
+	if window > capMillis {
+		window = capMillis
+	}
+	return int64(rng.NextInt(int(window))), nil
+}
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/00-setup-and-tooling/03-testing-from-the-standard-library/code/go
+go run .
+go test ./...
+go test -race ./...
+```
+
+```console
+== SeededRandom(42): the same five numbers in Java, Python, and Go ==
+-4767286540954276203
+2949826092126892291
+5139283748462763858
+6349198060258255764
+701532786141963250
+
+== NextInt(100) x 8 and a shuffle of 0..9 with seed 7 ==
+51 53 71 35 65 97 82 63
+[3 2 1 6 7 5 4 8 9 0]
+
+== FakeClock and a deadline: no time.Sleep anywhere ==
+t+0s     expired=false remaining=30000ms
+t+29.999 expired=false remaining=1ms
+t+30s    expired=true remaining=0ms
+
+== Full-jitter backoff for a PSP call, base 100ms cap 2000ms, seed 42 ==
+attempt 0: window [0,  100) -> wait   51 ms
+attempt 1: window [0,  200) -> wait  153 ms
+attempt 2: window [0,  400) -> wait  171 ms
+attempt 3: window [0,  800) -> wait  735 ms
+attempt 4: window [0, 1600) -> wait  365 ms
+
+rejected: fake clock cannot move backwards: cannot advance by a negative duration -1
+```
+
+Only two lines differ from Java: `fmt.Println` prints a slice without commas, and the rejection message carries the wrapped sentinel's text in front of the detail.
 
 ## Use It
 

@@ -356,6 +356,14 @@ The test file runs eleven scenarios in isolated worlds: happy path, decline at e
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **Enums carry their fields:** `SagaStep` members are tuples unpacked by `__init__`, so `step.system` and `step.compensation` read like the Java constants; iterating `SagaStep` yields declaration order, which `next_forward` and `next_compensation` (via `reversed(list(SagaStep))`) rely on, and the `EnumMap`s become plain `dict[SagaStep, ...]`. **Exceptions subclass `RuntimeError`:** `ProcessorUnavailableError` and `ProcessCrashError` replace the two Java runtime exceptions, `IllegalStateException` (unknown saga, redrive of a live saga) becomes a bare `RuntimeError`, and the positive-amount check raises `ValueError`; tests use `assertRaises` with those classes. **The store copies with `copy.deepcopy`:** `SagaRecord.copy()` is one line instead of a field-by-field constructor, with the same semantics, a mutation that never reaches `save()` is invisible to `load()`. **`ProcessorResponse.approved` is a field**, so the static factory is `approved_with(reference)` to avoid shadowing it; `declined(code)` is unchanged.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The vocabulary
+
+Each `SagaStep` value is a `(system, compensation)` tuple that `Enum.__init__` unpacks into attributes, which is the Python idiom for a Java enum with fields. `SagaState.is_terminal` is a method on the enum and `StepStatus` is a third enum; `__str__` returns the member name so the journal lines match the Java output.
+
 ```python
 class SagaStep(Enum):
     TOKENIZE = ("vault", "deleteToken")
@@ -366,14 +374,223 @@ class SagaStep(Enum):
     def __init__(self, system: str, compensation: str) -> None:
         self.system = system
         self.compensation = compensation
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class SagaState(Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    COMPENSATING = "compensating"
+    COMPENSATED = "compensated"
+    DEAD_LETTERED = "dead_lettered"
+
+    def is_terminal(self) -> bool:
+        return self in (SagaState.COMPLETED, SagaState.COMPENSATED)
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class StepStatus(Enum):
+    PENDING = "pending"
+    DONE = "done"
+    COMPENSATED = "compensated"
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: The persisted record and its two cursors
 
-- **Enums carry their fields.** `SagaStep` members are tuples unpacked by `__init__`, so `step.system` and `step.compensation` read like the Java constants. Iterating `SagaStep` yields declaration order, which is what `next_forward` and `next_compensation` (via `reversed(list(SagaStep))`) rely on; the `EnumMap`s become plain `dict[SagaStep, ...]`.
-- **Exceptions subclass `RuntimeError`.** `ProcessorUnavailableError` and `ProcessCrashError` replace the two Java runtime exceptions; `IllegalStateException` (unknown saga, redrive of a live saga) becomes a bare `RuntimeError`, and the positive-amount check raises `ValueError`. Tests use `assertRaises` with those classes.
-- **The store copies with `copy.deepcopy`.** `SagaRecord.copy()` is one line instead of a field-by-field constructor, and gives the same semantics: a mutation that never reaches `save()` is invisible to `load()`.
-- **`ProcessorResponse.approved` is a field**, so the static factory is `approved_with(reference)` to avoid shadowing it; `declined(code)` is unchanged.
+`SagaRecord` is a mutable class whose constructor seeds every step to `PENDING` and every attempt counter to zero. `next_forward` walks `SagaStep` in declaration order and `next_compensation` walks it reversed; both return `None` rather than a null step. `mark_done` writes the status, the reference, and a journal line in one place.
+
+```python
+    def next_forward(self) -> Optional[SagaStep]:
+        """The first step not yet DONE, in forward order; None when every step is DONE."""
+        for s in SagaStep:
+            if self.steps[s] is StepStatus.PENDING:
+                return s
+        return None
+
+    def next_compensation(self) -> Optional[SagaStep]:
+        """The last DONE step, in reverse order; None when nothing remains to undo."""
+        for s in reversed(list(SagaStep)):
+            if self.steps[s] is StepStatus.DONE:
+                return s
+        return None
+
+    def mark_done(self, step: SagaStep, reference: str) -> None:
+        self.steps[step] = StepStatus.DONE
+        self.references[step] = reference
+        self.journal.append(f"{step.name} done -> {reference}")
+
+    def mark_compensated(self, step: SagaStep, how: str) -> None:
+        self.steps[step] = StepStatus.COMPENSATED
+        self.journal.append(f"{step.name} compensated via {how}")
+
+    def begin_compensation(self, reason: str) -> None:
+        self.state = SagaState.COMPENSATING
+        self.failure_reason = reason
+        self.journal.append(f"compensating: {reason}")
+```
+
+#### Step 3: A store that behaves like a database
+
+`copy()` is `copy.deepcopy(self)`, so the dictionaries inside the record are copied too. `save` bumps the version and stores a copy; `load` returns a copy; `unfinished` excludes both terminal states and `DEAD_LETTERED`, which is why `recover()` never touches a parked saga.
+
+```python
+    def copy(self) -> "SagaRecord":
+        return copy.deepcopy(self)
+
+    def __str__(self) -> str:
+        cells = " ".join(f"{s.name[0]}={self.steps[s].name[0]}" for s in SagaStep)
+        return f"{self.saga_id} {self.state.name} v{self.version} [{cells}]"
+
+
+class SagaStore:
+    """Durable storage for saga records. Stores copies so an in-flight mutation that never reaches
+    save() is lost on crash, as it would be in a database."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, SagaRecord] = {}
+
+    def save(self, r: SagaRecord) -> None:
+        r.version += 1
+        self._records[r.saga_id] = r.copy()
+
+    def load(self, saga_id: str) -> SagaRecord:
+        r = self._records.get(saga_id)
+        if r is None:
+            raise RuntimeError(f"unknown saga {saga_id}")
+        return r.copy()
+
+    def unfinished(self) -> list[SagaRecord]:
+        return [r.copy() for r in self._records.values()
+                if not r.state.is_terminal() and r.state is not SagaState.DEAD_LETTERED]
+```
+
+#### Step 4: Downstreams with idempotency and scripted faults
+
+`_call` is the one path every operation goes through. The key lookup comes first (replays never consult faults), an `OUTAGE` raises before anything is recorded, a `DECLINE` is stored under the key, and `CRASH_AFTER_COMMIT` stores the approved response and the side effect and *then* raises `ProcessCrashError`. Faults are a `deque` per operation, popped from the left.
+
+```python
+    def _call(self, operation: str, key: str, decline_code: str) -> ProcessorResponse:
+        stored = self._by_key.get(key)
+        if stored is not None:
+            self._replays += 1
+            return stored
+        q = self._faults.get(operation)
+        fault = q.popleft() if q else None
+        if fault is Fault.OUTAGE:
+            raise ProcessorUnavailableError(f"{self._name}.{operation}: connection reset")
+        if fault is Fault.DECLINE:
+            response = ProcessorResponse.declined(decline_code)
+        else:
+            self._side_effects[operation] = self._side_effects.get(operation, 0) + 1
+            self._sequence += 1
+            response = ProcessorResponse.approved_with(f"{self._name}_{operation}_{self._sequence:04d}")
+        self._by_key[key] = response
+        if fault is Fault.CRASH_AFTER_COMMIT:
+            raise ProcessCrashError(f"process died after {self._name}.{operation} committed")
+        return response
+```
+
+#### Step 5: The orchestrator loop, forward direction
+
+The `RUNNING` branch of `run` increments the attempt counter before calling `_forward`, catches only `ProcessorUnavailableError`, and saves on every exit path. `ProcessCrashError` is not caught, so it propagates out of `run` and `start`, which the tests assert with `assertRaises`.
+
+```python
+            if r.state is SagaState.RUNNING:
+                step = r.next_forward()
+                if step is None:
+                    r.state = SagaState.COMPLETED
+                    r.journal.append("completed")
+                    self._store.save(r)
+                    return r
+                r.forward_attempts[step] += 1
+                try:
+                    response = self._forward(step, r)
+                except ProcessorUnavailableError as e:
+                    r.journal.append(f"{step.name} attempt {r.forward_attempts[step]} failed: {e}")
+                    if r.forward_attempts[step] >= self._max_attempts:
+                        r.begin_compensation(f"{step.name} exhausted {self._max_attempts} attempts: {e}")
+                    self._store.save(r)
+                    continue
+                if not response.approved:
+                    r.begin_compensation(f"{step.name} declined with code {response.code}")
+                    self._store.save(r)
+                    continue
+                assert response.reference is not None
+                r.mark_done(step, response.reference)
+                self._store.save(r)
+```
+
+#### Step 6: Compensation, with the semantic no-op
+
+`_compensate` is an `if` chain over the step. The `AUTHORIZE` arm checks whether `CAPTURE` is already `COMPENSATED` and, if so, returns the `noop:auth-consumed-by-capture` response instead of calling `void_auth`, so the journal says why the acquirer shows no void.
+
+```python
+    def _compensate(self, step: SagaStep, r: SagaRecord) -> ProcessorResponse:
+        k = Orchestrator.key(r, step, True)
+        if step is SagaStep.TOKENIZE:
+            return self._vault.delete_token(k, r.references[SagaStep.TOKENIZE])
+        if step is SagaStep.AUTHORIZE:
+            # A captured authorization is consumed; the refund already returned the money. Voiding it would be
+            # refused by the acquirer, so the compensation is semantic: nothing to undo.
+            if r.steps[SagaStep.CAPTURE] is StepStatus.COMPENSATED:
+                return ProcessorResponse.approved_with("noop:auth-consumed-by-capture")
+            return self._acquirer.void_auth(k, r.references[SagaStep.AUTHORIZE])
+        if step is SagaStep.CAPTURE:
+            return self._acquirer.refund(k, r.references[SagaStep.CAPTURE], r.amount)
+        return ProcessorResponse.approved_with(self._ledger.reverse(k, r.payment_id, r.amount))
+```
+
+#### Step 7: Dead letters and redrive
+
+The `COMPENSATING` branch dead-letters when a compensation is unavailable past the budget or refused outright, leaving the step `DONE`. `redrive` refuses a saga that is not `DEAD_LETTERED` with a `RuntimeError`, resets the compensation counters, drops the dead letter, and re-enters `run`.
+
+```python
+            elif r.state is SagaState.COMPENSATING:
+                step = r.next_compensation()
+                if step is None:
+                    r.state = SagaState.COMPENSATED
+                    r.journal.append("compensated")
+                    self._store.save(r)
+                    return r
+                r.compensation_attempts[step] += 1
+                try:
+                    response = self._compensate(step, r)
+                except ProcessorUnavailableError as e:
+                    r.journal.append(f"{step.compensation} attempt {r.compensation_attempts[step]} failed: {e}")
+                    if r.compensation_attempts[step] >= self._max_attempts:
+                        self._dead_letter(r, step, str(e))
+                    self._store.save(r)
+                    if r.state is SagaState.DEAD_LETTERED:
+                        return r
+                    continue
+                if not response.approved:
+                    self._dead_letter(r, step, f"{step.compensation} refused with code {response.code}")
+                    self._store.save(r)
+                    return r
+                assert response.reference is not None
+                how = response.reference if response.reference.startswith("noop:") else step.compensation
+                r.mark_compensated(step, how)
+                self._store.save(r)
+
+    def redrive(self, saga_id: str) -> SagaRecord:
+        """Operator action on a dead letter: the downstream is back, try the remaining compensations again."""
+        r = self._store.load(saga_id)
+        if r.state is not SagaState.DEAD_LETTERED:
+            raise RuntimeError(f"{saga_id} is {r.state.name}, not DEAD_LETTERED")
+        r.state = SagaState.COMPENSATING
+        for s in SagaStep:
+            r.compensation_attempts[s] = 0
+        r.journal.append("redriven by operator")
+        self._store.save(r)
+        self._dead_letters = [d for d in self._dead_letters if d.saga_id != saga_id]
+        return self.run(saga_id)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/03-payment-orchestration/code/python
@@ -381,42 +598,323 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run; the first two sections read:
+
+```console
+== The saga: four steps, four compensations ==
+TOKENIZE     on vault     undone by deleteToken
+AUTHORIZE    on acquirer  undone by voidAuth
+CAPTURE      on acquirer  undone by refund
+LEDGER_POST  on ledger    undone by reverse
+
+== Happy path: tokenize -> authorize -> capture -> ledger post ==
+saga_1 COMPLETED v6 [T=D A=D C=D L=D]
+  TOKENIZE done -> vault_tokenize_0001
+  AUTHORIZE done -> acquirer_authorize_0001
+  CAPTURE done -> acquirer_capture_0002
+  LEDGER_POST done -> le_0001
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`, `money.go`, tests in `main_test.go`) keeps the design and changes how failure travels. **The crash is an error value, not an unwinding exception:** every downstream call returns `(ProcessorResponse, error)`; `ErrProcessorUnavailable` is handled inside the loop (journal, maybe compensate, `continue`) and any other error, in practice `ErrProcessCrash`, is returned from `Run` immediately, which is the Go spelling of "the process is gone". `Start`, `Recover`, and `Redrive` propagate it, and the tests assert `errors.Is(err, ErrProcessCrash)` where the Java test used `checkThrows`. The `downstreamError` type keeps the message the Java exception carried, so the journal lines are byte-identical across languages. **`iota` enums need an explicit order:** `SagaSteps` is the forward slice that `NextForward` walks and `NextCompensation` walks backwards; `System()` and `Compensation()` read from parallel arrays indexed by the step, and `NextForward` returns `(SagaStep, bool)` instead of `null`. **`IllegalStateException` and `IllegalArgumentException` become sentinels:** `SagaStore.Load` and `Redrive` wrap `ErrIllegalState`, `NewSagaRecord` wraps `ErrInvalidAmount`, and the `StepStatus` value for an undone step is `STEP_COMPENSATED` because `COMPENSATED` is already the saga state in the same package. **`LinkedHashMap` is a map plus an order slice**, so `Unfinished` returns sagas in insertion order and `Recover` resumes them in the order they started. **No goroutines:** the orchestrator is single-threaded by design; concurrency between sagas belongs in the store's version check (Lesson 02).
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The vocabulary
+
+Three `int` enums with `iota`. `SagaSteps` is the explicit forward order, and the step's system and compensation names live in parallel arrays behind `System()` and `Compensation()`. The two sentinel errors and the `downstreamError` wrapper that carries the downstream's message are declared alongside.
+
 ```go
+type SagaStep int
+
+const (
+	TOKENIZE SagaStep = iota
+	AUTHORIZE
+	CAPTURE
+	LEDGER_POST
+)
+
+// SagaSteps is the forward order; Go's iota has no values() so the slice is explicit.
+var SagaSteps = []SagaStep{TOKENIZE, AUTHORIZE, CAPTURE, LEDGER_POST}
+
+var sagaStepNames = [...]string{"TOKENIZE", "AUTHORIZE", "CAPTURE", "LEDGER_POST"}
+var sagaStepSystems = [...]string{"vault", "acquirer", "acquirer", "ledger"}
+var sagaStepCompensations = [...]string{"deleteToken", "voidAuth", "refund", "reverse"}
+
+func (s SagaStep) String() string       { return sagaStepNames[s] }
+func (s SagaStep) System() string       { return sagaStepSystems[s] }
+func (s SagaStep) Compensation() string { return sagaStepCompensations[s] }
+
+// ErrProcessorUnavailable: a downstream system could not be reached. The call may or may not have happened.
+var ErrProcessorUnavailable = errors.New("processor unavailable")
+
+// ErrProcessCrash simulates our own process dying after the downstream committed but before we persisted.
+var ErrProcessCrash = errors.New("process crash")
+
+// ErrIllegalState: unknown saga, or an operator action on a saga in the wrong state.
+var ErrIllegalState = errors.New("illegal state")
+
 // downstreamError carries the downstream's own message (what the journal records) and matches a
 // sentinel through errors.Is, so callers branch on the kind without parsing text.
 type downstreamError struct {
-    kind error
-    msg  string
+	kind error
+	msg  string
 }
 
 func (e *downstreamError) Error() string        { return e.msg }
 func (e *downstreamError) Is(target error) bool { return target == e.kind }
 
-response, err := o.forward(step, r)
-if errors.Is(err, ErrProcessorUnavailable) {
-    r.Journal = append(r.Journal, fmt.Sprintf("%v attempt %d failed: %v", step, r.ForwardAttempts[step], err))
-    ...
-    continue
+func unavailable(msg string) error { return &downstreamError{ErrProcessorUnavailable, msg} }
+func crash(msg string) error       { return &downstreamError{ErrProcessCrash, msg} }
+```
+
+#### Step 2: The persisted record and its two cursors
+
+`NewSagaRecord` is the validating constructor (it wraps `ErrInvalidAmount`) and seeds the four maps. `NextForward` and `NextCompensation` return `(SagaStep, bool)`; the `false` is the Go spelling of the Java `null`. `MarkDone` writes status, reference, and journal line together.
+
+```go
+func (r *SagaRecord) NextForward() (SagaStep, bool) {
+	for _, s := range SagaSteps {
+		if r.Steps[s] == PENDING {
+			return s, true
+		}
+	}
+	return 0, false
 }
-if err != nil {
-    return nil, err // the crash: nothing after this line runs
+
+// NextCompensation is the last DONE step, in reverse order; false when nothing remains to undo.
+func (r *SagaRecord) NextCompensation() (SagaStep, bool) {
+	for i := len(SagaSteps) - 1; i >= 0; i-- {
+		if r.Steps[SagaSteps[i]] == DONE {
+			return SagaSteps[i], true
+		}
+	}
+	return 0, false
+}
+
+func (r *SagaRecord) MarkDone(step SagaStep, reference string) {
+	r.Steps[step] = DONE
+	r.References[step] = reference
+	r.Journal = append(r.Journal, fmt.Sprintf("%v done -> %s", step, reference))
 }
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+#### Step 3: A store that behaves like a database
 
-- **The crash is an error value, not an unwinding exception.** Every downstream call returns `(ProcessorResponse, error)`. `ErrProcessorUnavailable` is handled inside the loop (journal, maybe compensate, `continue`); any other error, in practice `ErrProcessCrash`, is returned from `Run` immediately, which is the Go spelling of "the process is gone". `Start`, `Recover`, and `Redrive` propagate it, and the tests assert `errors.Is(err, ErrProcessCrash)` where the Java test used `checkThrows`. The `downstreamError` type keeps the message the Java exception carried, so the journal lines are byte-identical across languages.
-- **`iota` enums need an explicit order.** `SagaSteps` is the forward slice that `NextForward` walks and `NextCompensation` walks backwards; `System()` and `Compensation()` read from parallel arrays indexed by the step. `NextForward` returns `(SagaStep, bool)` instead of `null`.
-- **`IllegalStateException` and `IllegalArgumentException` become sentinels.** `SagaStore.Load` and `Redrive` wrap `ErrIllegalState`; `NewSagaRecord` wraps `ErrInvalidAmount`, so a zero amount cannot build a record. The `StepStatus` value for an undone step is `STEP_COMPENSATED`, because `COMPENSATED` is already the saga state in the same package.
-- **`LinkedHashMap` is a map plus an order slice.** `SagaStore` keeps `order []string` so `Unfinished` returns sagas in insertion order and `Recover` resumes them in the order they started, as the Java version does.
-- **No goroutines.** The orchestrator is single-threaded by design; concurrency between sagas belongs in the store's version check (Lesson 02).
+`Copy` rebuilds the record field by field, copying each map, because Go has no generic deep copy. `Save` records the insertion order the first time it sees an id so `Unfinished` can iterate like a `LinkedHashMap`; `Load` returns a copy or wraps `ErrIllegalState`.
+
+```go
+func (s *SagaStore) Save(r *SagaRecord) {
+	r.Version++
+	if _, exists := s.records[r.SagaID]; !exists {
+		s.order = append(s.order, r.SagaID)
+	}
+	s.records[r.SagaID] = r.Copy()
+}
+
+func (s *SagaStore) Load(sagaID string) (*SagaRecord, error) {
+	r, ok := s.records[sagaID]
+	if !ok {
+		return nil, fmt.Errorf("%w: unknown saga %s", ErrIllegalState, sagaID)
+	}
+	return r.Copy(), nil
+}
+
+func (s *SagaStore) Unfinished() []*SagaRecord {
+	var out []*SagaRecord
+	for _, id := range s.order {
+		r := s.records[id]
+		if !r.State.IsTerminal() && r.State != DEAD_LETTERED {
+			out = append(out, r.Copy())
+		}
+	}
+	return out
+}
+```
+
+#### Step 4: Downstreams with idempotency and scripted faults
+
+`call` returns `(ProcessorResponse, error)`. The order is the same contract: key lookup first, `OUTAGE` returns `unavailable(...)` before anything is recorded, `DECLINE` is stored under the key, and `CRASH_AFTER_COMMIT` stores the approved response and side effect and then returns `crash(...)`. Faults are a slice per operation consumed from the front.
+
+```go
+func (p *FakeProcessor) call(operation, key, declineCode string) (ProcessorResponse, error) {
+	if stored, ok := p.byKey[key]; ok {
+		p.replays++
+		return stored, nil
+	}
+	fault, hasFault := Fault(0), false
+	if q := p.faults[operation]; len(q) > 0 {
+		fault, hasFault = q[0], true
+		p.faults[operation] = q[1:]
+	}
+	if hasFault && fault == OUTAGE {
+		return ProcessorResponse{}, unavailable(fmt.Sprintf("%s.%s: connection reset", p.name, operation))
+	}
+	var response ProcessorResponse
+	if hasFault && fault == DECLINE {
+		response = DeclinedResponse(declineCode)
+	} else {
+		p.sideEffects[operation]++
+		p.sequence++
+		response = ApprovedResponse(fmt.Sprintf("%s_%s_%04d", p.name, operation, p.sequence))
+	}
+	p.byKey[key] = response
+	if hasFault && fault == CRASH_AFTER_COMMIT {
+		return ProcessorResponse{}, crash(fmt.Sprintf("process died after %s.%s committed", p.name, operation))
+	}
+	return response, nil
+}
+```
+
+#### Step 5: The orchestrator loop, forward direction
+
+The `RUNNING` arm uses `errors.Is(err, ErrProcessorUnavailable)` to pick out the retryable failure; any other error is returned at once, and nothing after that `return` runs, which is how the crash leaves the record `RUNNING` with the step still `PENDING`.
+
+```go
+		case RUNNING:
+			step, ok := r.NextForward()
+			if !ok {
+				r.State = COMPLETED
+				r.Journal = append(r.Journal, "completed")
+				o.store.Save(r)
+				return r, nil
+			}
+			r.ForwardAttempts[step]++
+			response, err := o.forward(step, r)
+			if errors.Is(err, ErrProcessorUnavailable) {
+				r.Journal = append(r.Journal, fmt.Sprintf("%v attempt %d failed: %v", step, r.ForwardAttempts[step], err))
+				if r.ForwardAttempts[step] >= o.maxAttempts {
+					r.BeginCompensation(fmt.Sprintf("%v exhausted %d attempts: %v", step, o.maxAttempts, err))
+				}
+				o.store.Save(r)
+				continue
+			}
+			if err != nil {
+				return nil, err // the crash: nothing after this line runs
+			}
+			if !response.Approved {
+				r.BeginCompensation(fmt.Sprintf("%v declined with code %s", step, response.Code))
+				o.store.Save(r)
+				continue
+			}
+			r.MarkDone(step, response.Reference)
+			o.store.Save(r)
+```
+
+#### Step 6: Compensation, with the semantic no-op
+
+`compensate` is a `switch` over the step. The `AUTHORIZE` arm returns the `noop:` response when `Steps[CAPTURE]` is `STEP_COMPENSATED`; the ledger arms convert the `(string, error)` from `Reverse` into a `ProcessorResponse`.
+
+```go
+func (o *Orchestrator) compensate(step SagaStep, r *SagaRecord) (ProcessorResponse, error) {
+	k := Key(r, step, true)
+	switch step {
+	case TOKENIZE:
+		return o.vault.DeleteToken(k, r.References[TOKENIZE])
+	case AUTHORIZE:
+		// A captured authorization is consumed; the refund already returned the money. Voiding it would be
+		// refused by the acquirer, so the compensation is semantic: nothing to undo.
+		if r.Steps[CAPTURE] == STEP_COMPENSATED {
+			return ApprovedResponse("noop:auth-consumed-by-capture"), nil
+		}
+		return o.acquirer.VoidAuth(k, r.References[AUTHORIZE])
+	case CAPTURE:
+		return o.acquirer.Refund(k, r.References[CAPTURE], r.Amount)
+	default: // LEDGER_POST
+		ref, err := o.ledger.Reverse(k, r.PaymentID, r.Amount)
+		if err != nil {
+			return ProcessorResponse{}, err
+		}
+		return ApprovedResponse(ref), nil
+	}
+}
+```
+
+#### Step 7: Dead letters and redrive
+
+The `COMPENSATING` arm dead-letters on an exhausted budget or an outright refusal and returns `(r, nil)`, because a dead letter is a normal outcome, not an error. `Redrive` wraps `ErrIllegalState` for a saga that is not parked, resets the counters, filters the dead-letter slice in place, and calls `Run`.
+
+```go
+		case COMPENSATING:
+			step, ok := r.NextCompensation()
+			if !ok {
+				r.State = COMPENSATED
+				r.Journal = append(r.Journal, "compensated")
+				o.store.Save(r)
+				return r, nil
+			}
+			r.CompensationAttempts[step]++
+			response, err := o.compensate(step, r)
+			if errors.Is(err, ErrProcessorUnavailable) {
+				r.Journal = append(r.Journal, fmt.Sprintf("%s attempt %d failed: %v", step.Compensation(), r.CompensationAttempts[step], err))
+				if r.CompensationAttempts[step] >= o.maxAttempts {
+					o.deadLetter(r, step, err.Error())
+				}
+				o.store.Save(r)
+				if r.State == DEAD_LETTERED {
+					return r, nil
+				}
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if !response.Approved {
+				o.deadLetter(r, step, fmt.Sprintf("%s refused with code %s", step.Compensation(), response.Code))
+				o.store.Save(r)
+				return r, nil
+			}
+			how := step.Compensation()
+			if strings.HasPrefix(response.Reference, "noop:") {
+				how = response.Reference
+			}
+			r.MarkCompensated(step, how)
+			o.store.Save(r)
+
+func (o *Orchestrator) Redrive(sagaID string) (*SagaRecord, error) {
+	r, err := o.store.Load(sagaID)
+	if err != nil {
+		return nil, err
+	}
+	if r.State != DEAD_LETTERED {
+		return nil, fmt.Errorf("%w: %s is %v, not DEAD_LETTERED", ErrIllegalState, sagaID, r.State)
+	}
+	r.State = COMPENSATING
+	for _, s := range SagaSteps {
+		r.CompensationAttempts[s] = 0
+	}
+	r.Journal = append(r.Journal, "redriven by operator")
+	o.store.Save(r)
+	kept := o.deadLetters[:0]
+	for _, d := range o.deadLetters {
+		if d.SagaID != sagaID {
+			kept = append(kept, d)
+		}
+	}
+	o.deadLetters = kept
+	return o.Run(sagaID)
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/03-payment-orchestration/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run; the decline section reads:
+
+```console
+== Decline at CAPTURE: compensations run in reverse order (void, delete token) ==
+saga_2 COMPENSATED v7 [T=C A=C C=P L=P]  reason: CAPTURE declined with code auth_expired
+  TOKENIZE done -> vault_tokenize_0002
+  AUTHORIZE done -> acquirer_authorize_0003
+  compensating: CAPTURE declined with code auth_expired
+  AUTHORIZE compensated via voidAuth
+  TOKENIZE compensated via deleteToken
 ```
 
 ## Use It

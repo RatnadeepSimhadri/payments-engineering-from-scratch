@@ -351,13 +351,32 @@ The test suite has 37 assertions: simulator ordering, store concurrency accounti
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **The event queue is `heapq` over `(at_ms, seq, action)` tuples:** the sequence number is the tie-breaker that keeps same-instant events in scheduling order, and it also stops Python from ever comparing two callables when the times are equal. `Waiter` and `Runnable` become plain functions; each strategy's load callback is a nested `def loaded(value)` closing over `started`, `key`, and `w`. **Both RNGs are `java.util.Random`, not `random.Random`:** the jitter in `Scenario.run` and the XFetch draw in `should_recompute` port the 48-bit LCG (`next_int(2)` takes the power-of-two path, `next_double` is `(next(26) << 27 + next(27)) / 2**53`), so the loads, peak in-flight, and stale columns match the Java table digit for digit; `Double.MIN_VALUE` is spelled as the literal subnormal `5e-324`. **Integer division is explicit:** `average_lead_ms` uses `//` on non-negative totals, and `gap_micros = 1_000_000 // requests_per_second`; the `now + gap >= fresh_until` comparison mixes `int` and `float` exactly as the Java `long + double` does. **Closures in a loop:** the beta sweep binds the loop variable with a default argument (`lambda sim, st, b=beta: ...`) so each factory keeps its own beta; the request-scheduling loops are safe because `key` and `s` do not change.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A discrete-event simulator
+
+A min-heap of `(at_ms, seq, action)` tuples: the heap orders by time, then by sequence number, so events at the same instant run in the order they were scheduled, and the tuple never reaches the third element when comparing. `schedule` in the past is a `ValueError`.
+
 ```python
 class Simulator:
+    def __init__(self) -> None:
+        self._queue: list[tuple[int, int, Action]] = []
+        self._now_ms = 0
+        self._seq = 0
+
+    def now(self) -> int:
+        return self._now_ms
+
     def schedule(self, at_ms: int, action: Action) -> None:
         if at_ms < self._now_ms:
             raise ValueError(f"cannot schedule in the past: {at_ms} < {self._now_ms}")
         heapq.heappush(self._queue, (at_ms, self._seq, action))
         self._seq += 1
+
+    def after(self, delay_ms: int, action: Action) -> None:
+        self.schedule(self._now_ms + delay_ms, action)
 
     def run(self) -> None:
         while self._queue:
@@ -366,12 +385,161 @@ class Simulator:
             action()
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: A store that counts concurrency
 
-- **The event queue is `heapq` over `(at_ms, seq, action)` tuples.** The sequence number is the tie-breaker that keeps same-instant events in scheduling order, and it also stops Python from ever comparing two callables when the times are equal. `Waiter` and `Runnable` become plain functions; each strategy's load callback is a nested `def loaded(value)` closing over `started`, `key`, and `w`.
-- **Both RNGs are `java.util.Random`, not `random.Random`.** The jitter in `Scenario.run` and the XFetch draw in `should_recompute` port the 48-bit LCG (`next_int(2)` takes the power-of-two path, `next_double` is `(next(26) << 27 + next(27)) / 2**53`), so the loads, peak in-flight, and stale columns match the Java table digit for digit. `Double.MIN_VALUE` is spelled as the literal subnormal `5e-324`.
-- **Integer division is explicit.** `average_lead_ms` uses `//` on non-negative totals, and `gap_micros = 1_000_000 // requests_per_second`; the `now + gap >= fresh_until` comparison mixes `int` and `float` exactly as the Java `long + double` does.
-- **Closures in a loop.** The beta sweep binds the loop variable with a default argument (`lambda sim, st, b=beta: ...`) so each factory keeps its own beta; the request-scheduling loops are safe because `key` and `s` do not change.
+`peak_in_flight` is the stampede meter. The nested `complete` closure runs after the simulated latency and reads the row as it stands *then*, which is what lets a write during a load be visible to the loaded value.
+
+```python
+    def load(self, key: str, cb: Waiter) -> None:
+        self.loads += 1
+        self.in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+
+        def complete() -> None:
+            self.in_flight -= 1
+            cb(self._rows.get(key))
+
+        self._sim.after(self._latency_ms, complete)
+```
+
+#### Step 3: The measuring wrapper every strategy uses
+
+`measured` returns a new function that records latency (completion minus arrival) and staleness (value versus the store's current row, compared with `!=` on frozen dataclasses) before calling the inner waiter.
+
+```python
+    def measured(self, key: str, arrived_ms: int, inner: Waiter) -> Waiter:
+        def complete(value: Money) -> None:
+            stale = value != self.store.peek(key)
+            self.stats.record(self.sim.now() - arrived_ms, stale)
+            inner(value)
+
+        return complete
+```
+
+#### Step 4: The naive strategy, which is the bug
+
+Lesson 03's cache-aside read path: fresh hit or load. Nothing between the miss and the load asks whether someone else is already loading, which is the stampede.
+
+```python
+    def get(self, key: str, waiter: Waiter) -> None:
+        w = self.measured(key, self.sim.now(), waiter)
+        e = self.entries.get(key)
+        if e is not None and e.is_fresh(self.sim.now()):
+            self.stats.hits += 1
+            w(e.value)
+            return
+        self.stats.misses += 1
+        started = self.sim.now()
+
+        def loaded(value: Money) -> None:
+            self.entries[key] = self.fresh_entry(value, self.sim.now() - started, 0)
+            w(value)
+
+        self.store.load(key, loaded)
+```
+
+#### Step 5: Single-flight
+
+`_in_flight` maps a key to the list of waiters for the load already in the air. A miss that finds a list appends to it and returns; the first miss creates the list and starts the load. The entry is written before the waiters are completed, so a same-instant arrival sees a hit; `pop(key)` removes and returns the list in one step.
+
+```python
+        self.stats.misses += 1
+        waiters = self._in_flight.get(key)
+        if waiters is not None:  # join the flight already in the air
+            waiters.append(w)
+            return
+        self._in_flight[key] = [w]
+        started = self.sim.now()
+
+        def loaded(value: Money) -> None:
+            self.entries[key] = self.fresh_entry(value, self.sim.now() - started, 0)
+            for each in self._in_flight.pop(key):
+                each(value)
+
+        self.store.load(key, loaded)
+```
+
+#### Step 6: Lock and retry
+
+`_locks` is a `set`; `key not in self._locks` followed by `add` is `SET NX`. The loser schedules a lambda to retry after `retry_ms`, carrying its original `arrived_ms` so latency counts from the first attempt, and `first=False` so the retry is not counted as a second miss.
+
+```python
+        if key not in self._locks:  # SET key NX: we own the reload
+            self._locks.add(key)
+            started = self.sim.now()
+
+            def loaded(value: Money) -> None:
+                self.entries[key] = self.fresh_entry(value, self.sim.now() - started, 0)
+                self._locks.discard(key)
+                self.measured(key, arrived_ms, waiter)(value)
+
+            self.store.load(key, loaded)
+        else:
+            self.stats.lock_retries += 1
+            self.sim.after(self._retry_ms, lambda: self._attempt(key, arrived_ms, waiter, False))
+```
+
+#### Step 7: Probabilistic early expiration
+
+The one formula from the paper, with `DOUBLE_MIN_VALUE` (`5e-324`) guarding `log(0)`. `now + gap` adds an `int` and a `float`, which Python does exactly as Java's `long + double`.
+
+```python
+    def should_recompute(self, e: Entry, now: int) -> bool:
+        u = self._rng.next_double()
+        if u == 0.0:
+            u = DOUBLE_MIN_VALUE
+        gap = e.load_took_ms * self._beta * -math.log(u)  # >= 0, heavy-tailed
+        return now + gap >= e.fresh_until_ms
+```
+
+#### Step 8: Stale-while-revalidate
+
+Three tiers: fresh serves; stale-within-grace serves and starts one background refresh; cold or past grace joins `_cold_waiters` (a `setdefault` list) and coalesces behind `_start_refresh`, which returns early if the key is already refreshing.
+
+```python
+    def get(self, key: str, waiter: Waiter) -> None:
+        w = self.measured(key, self.sim.now(), waiter)
+        e = self.entries.get(key)
+        now = self.sim.now()
+        if e is not None and e.is_fresh(now):
+            self.stats.hits += 1
+            w(e.value)
+            return
+        if e is not None and e.is_usable(now):  # stale but within grace: serve it, refresh once
+            self.stats.hits += 1
+            w(e.value)
+            self._start_refresh(key)
+            return
+        self.stats.misses += 1  # cold or past grace: must wait, but coalesce
+        self._cold_waiters.setdefault(key, []).append(w)
+        self._start_refresh(key)
+```
+
+#### Step 9: The scenario
+
+A fresh simulator and store per strategy, one warm-up request at t=0, then one request per `gap_micros` with 0-1 ms of `JavaRandom` jitter. The lambdas capture `s` and `key`, which never change inside the loop, so no default-argument binding is needed here.
+
+```python
+    def run(self, factory: Factory) -> Strategy:
+        sim = Simulator()
+        store = BackingStore(sim, self.store_latency_ms)
+        key = "balance:acct-hot"
+        store.write(key, Money.of_minor(100_000, USD))
+        s = factory(sim, store)
+        jitter = JavaRandom(self.seed)
+        gap_micros = 1_000_000 // self.requests_per_second
+        sim.schedule(0, lambda: s.get(key, _ignore))  # one warm-up request fills the cache at t=0
+        for t in range(self.WARM_UP_MS * 1000, self.duration_ms * 1000, gap_micros):
+            at = t // 1000 + jitter.next_int(2)  # one request every gap, with 0-1 ms of jitter
+            sim.schedule(at, lambda: s.get(key, _ignore))
+        if self.write_at_ms >= 0:
+            sim.schedule(self.write_at_ms,
+                         lambda: store.write(key, Money.of_minor(100_000, USD).minus(Money.of_minor(8_000, USD))))
+        sim.run()
+        return s
+```
+
+#### Step 10: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/04-cache-invalidation-and-stampedes/code/python
@@ -379,39 +547,250 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The tables match the Java output digit for digit:
+
+```console
+== Invalidation is a cliff you chose: same traffic, key invalidated at t=2.5 s ==
+naive (every miss loads)                   loads  203  peak in-flight  101  p50    0 ms  p99  100 ms  max  100 ms  stale     0  retries     0  early   0
+single-flight (coalesce)                   loads    3  peak in-flight    1  p50    0 ms  p99   52 ms  max  100 ms  stale     0  retries     0  early   0
+
+== Why beta matters: early-expiry behaviour over 30 s of traffic, no writes, at different beta ==
+  beta=0.5  loads  44  peak in-flight 13  early refreshes  43  avg lead before expiry  123 ms  p99   0 ms
+  beta=1.0  loads  23  peak in-flight  6  early refreshes  22  avg lead before expiry  371 ms  p99   0 ms
+  beta=2.0  loads  13  peak in-flight  3  early refreshes  12  avg lead before expiry 1036 ms  p99   0 ms
+```
+
 ### In Go
 
+The Go port (`code/go/main.go` and `javarandom.go`) keeps the design with five differences. **The event queue is `container/heap`:** `eventQueue` implements `heap.Interface` with `Less` ordering by `(atMs, seq)`, so same-instant events run in scheduling order exactly as the Java `PriorityQueue` comparator does. `Runnable` becomes `func()`, `Waiter` and `Callback` become `func(Money)`; each strategy's load callback is a closure over `started`, `key`, and the measured waiter, which is the same shape as the Java lambdas. **The abstract class is an interface plus an embedded struct:** `Strategy` declares `Name`, `Get`, `Invalidate`, `Stats`, `Store`; `strategyBase` holds the shared fields and the `freshEntry`, `measured`, and `freshHit` helpers, and the five concrete strategies embed it. `Factory` is `func(*Simulator, *BackingStore) Strategy`, so the beta sweep needs no default-argument trick: Go 1.22 gives each loop iteration its own `beta`. **Both RNGs are `java.util.Random`:** the jitter in `Scenario.Run` and the XFetch draw in `ShouldRecompute` use `JavaRandom` (48-bit LCG; `NextInt(2)` takes the power-of-two path, `NextDouble` is `(next(26)<<27 + next(27)) / 2^53`), so the loads, peak in-flight, and stale columns match the Java table digit for digit; `TestDemoParity` pins 103/102/1099 for naive and 5/3/761 for early expiry. `Double.MIN_VALUE` is `math.SmallestNonzeroFloat64`. **Errors are values, panics are bugs:** `Money.Minus` returns `(Money, error)` with `ErrCurrencyMismatch`; the scenario's debit uses `must(...)` because a failing subtraction there is a programming error. `Simulator.Schedule` panics rather than returning an error for the same reason, and the test recovers it with `defer`/`recover()`. **Integer semantics match:** `AverageLeadMs` and `gapMicros = 1_000_000 / requestsPerSecond` are `int64` division, which truncates like Java `long`; `float64(now) + gap >= float64(freshUntil)` is the Java `long + double` comparison written out.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A discrete-event simulator
+
+`eventQueue` is a slice implementing the five methods of `heap.Interface`; `Less` is the Java comparator. `Schedule` panics on time travel because the caller is wrong, not the environment; `Run` pops until the heap is empty, setting `nowMs` before each action.
+
 ```go
-// Schedule queues an action at an absolute time; it panics on time travel because that is a bug in the caller.
-func (s *Simulator) Schedule(atMs int64, action func()) {
-    if atMs < s.nowMs {
-        panic(fmt.Sprintf("cannot schedule in the past: %d < %d", atMs, s.nowMs))
-    }
-    heap.Push(&s.queue, event{atMs, s.seq, action})
-    s.seq++
+type event struct {
+	atMs   int64
+	seq    int64
+	action func()
 }
 
+type eventQueue []event
+
+func (q eventQueue) Len() int { return len(q) }
+func (q eventQueue) Less(i, j int) bool {
+	if q[i].atMs != q[j].atMs {
+		return q[i].atMs < q[j].atMs
+	}
+	return q[i].seq < q[j].seq
+}
+func (q eventQueue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
+func (q *eventQueue) Push(x any)   { *q = append(*q, x.(event)) }
+func (q *eventQueue) Pop() any     { old := *q; e := old[len(old)-1]; *q = old[:len(old)-1]; return e }
+
+func (s *Simulator) Schedule(atMs int64, action func()) {
+	if atMs < s.nowMs {
+		panic(fmt.Sprintf("cannot schedule in the past: %d < %d", atMs, s.nowMs))
+	}
+	heap.Push(&s.queue, event{atMs, s.seq, action})
+	s.seq++
+}
+
+func (s *Simulator) After(delayMs int64, action func()) { s.Schedule(s.nowMs+delayMs, action) }
+
 func (s *Simulator) Run() {
-    for s.queue.Len() > 0 {
-        e := heap.Pop(&s.queue).(event)
-        s.nowMs = e.atMs
-        e.action()
-    }
+	for s.queue.Len() > 0 {
+		e := heap.Pop(&s.queue).(event)
+		s.nowMs = e.atMs
+		e.action()
+	}
 }
 ```
 
-Differences, all in `code/go/main.go` and `javarandom.go`:
+#### Step 2: A store that counts concurrency
 
-- **The event queue is `container/heap`.** `eventQueue` implements `heap.Interface` with `Less` ordering by `(atMs, seq)`, so same-instant events run in scheduling order exactly as the Java `PriorityQueue` comparator does. `Runnable` becomes `func()`, `Waiter` and `Callback` become `func(Money)`; each strategy's load callback is a closure over `started`, `key`, and the measured waiter, which is the same shape as the Java lambdas.
-- **The abstract class is an interface plus an embedded struct.** `Strategy` declares `Name`, `Get`, `Invalidate`, `Stats`, `Store`; `strategyBase` holds the shared fields and the `freshEntry`, `measured`, and `freshHit` helpers, and the five concrete strategies embed it. `Factory` is `func(*Simulator, *BackingStore) Strategy`, so the beta sweep needs no default-argument trick: Go 1.22 gives each loop iteration its own `beta`.
-- **Both RNGs are `java.util.Random`.** The jitter in `Scenario.Run` and the XFetch draw in `ShouldRecompute` use `JavaRandom` (48-bit LCG; `NextInt(2)` takes the power-of-two path, `NextDouble` is `(next(26)<<27 + next(27)) / 2^53`), so the loads, peak in-flight, and stale columns match the Java table digit for digit; `TestDemoParity` pins 103/102/1099 for naive and 5/3/761 for early expiry. `Double.MIN_VALUE` is `math.SmallestNonzeroFloat64`.
-- **Errors are values, panics are bugs.** `Money.Minus` returns `(Money, error)` with `ErrCurrencyMismatch`; the scenario's debit uses `must(...)` because a failing subtraction there is a programming error. `Simulator.Schedule` panics rather than returning an error for the same reason, and the test recovers it with `defer`/`recover()`.
-- **Integer semantics match.** `AverageLeadMs` and `gapMicros = 1_000_000 / requestsPerSecond` are `int64` division, which truncates like Java `long`; `float64(now) + gap >= float64(freshUntil)` is the Java `long + double` comparison written out.
+The counters are exported fields; the closure passed to `After` decrements `InFlight` and reads the row at completion time. The builtin `max` is Go 1.21+.
+
+```go
+func (s *BackingStore) Load(key string, cb Callback) {
+	s.Loads++
+	s.InFlight++
+	s.PeakInFlight = max(s.PeakInFlight, s.InFlight)
+	s.sim.After(s.latencyMs, func() {
+		s.InFlight--
+		cb(s.rows[key])
+	})
+}
+```
+
+#### Step 3: The measuring wrapper every strategy uses
+
+`measured` lives on `strategyBase` and returns a `Waiter` closure. Because `Peek` returns `(Money, bool)`, a missing row counts as stale (`!ok`) before the value comparison; `Money` is a comparable struct so `!=` works. `freshHit` is the shared "exists and is fresh" check the strategies open with.
+
+```go
+func (b *strategyBase) measured(key string, arrivedMs int64, inner Waiter) Waiter {
+	return func(value Money) {
+		truth, ok := b.store.Peek(key)
+		stale := !ok || value != truth
+		b.stats.Record(b.sim.Now()-arrivedMs, stale)
+		inner(value)
+	}
+}
+
+func (b *strategyBase) freshHit(key string) (Entry, bool) {
+	e, ok := b.entries[key]
+	return e, ok && e.IsFresh(b.sim.Now())
+}
+```
+
+#### Step 4: The naive strategy, which is the bug
+
+The embedded `freshHit` then a load whose callback writes the entry and completes the waiter. Correct, and a stampede.
+
+```go
+func (s *NaiveStrategy) Get(key string, waiter Waiter) {
+	w := s.measured(key, s.sim.Now(), waiter)
+	if e, ok := s.freshHit(key); ok {
+		s.stats.Hits++
+		w(e.Value)
+		return
+	}
+	s.stats.Misses++
+	started := s.sim.Now()
+	s.store.Load(key, func(value Money) {
+		s.entries[key] = s.freshEntry(value, s.sim.Now()-started, 0)
+		w(value)
+	})
+}
+```
+
+#### Step 5: Single-flight
+
+`inFlight` is `map[string][]Waiter`. The comma-ok lookup decides join-or-start; because `append` may reallocate, the joined slice is written back to the map. The callback copies the slice out, deletes the key, then completes the waiters, in that order.
+
+```go
+	s.stats.Misses++
+	if waiters, flying := s.inFlight[key]; flying { // join the flight already in the air
+		s.inFlight[key] = append(waiters, w)
+		return
+	}
+	s.inFlight[key] = []Waiter{w}
+	started := s.sim.Now()
+	s.store.Load(key, func(value Money) {
+		s.entries[key] = s.freshEntry(value, s.sim.Now()-started, 0)
+		done := s.inFlight[key]
+		delete(s.inFlight, key)
+		for _, each := range done {
+			each(value)
+		}
+	})
+```
+
+#### Step 6: Lock and retry
+
+`locks` is a `map[string]bool`; `!s.locks[key]` followed by setting it is `SET NX`. The loser schedules a closure that calls `attempt` again with the original `arrivedMs` and `first=false`.
+
+```go
+	if !s.locks[key] { // SET key NX: we own the reload
+		s.locks[key] = true
+		started := s.sim.Now()
+		s.store.Load(key, func(value Money) {
+			s.entries[key] = s.freshEntry(value, s.sim.Now()-started, 0)
+			delete(s.locks, key)
+			s.measured(key, arrivedMs, waiter)(value)
+		})
+	} else {
+		s.stats.LockRetries++
+		s.sim.After(s.retryMs, func() { s.attempt(key, arrivedMs, waiter, false) })
+	}
+```
+
+#### Step 7: Probabilistic early expiration
+
+The same formula with `math.SmallestNonzeroFloat64` as the guard. Go does not mix `int64` and `float64` implicitly, so both sides of the comparison are converted explicitly, which is the Java `long + double` promotion written out.
+
+```go
+func (s *EarlyExpirationStrategy) ShouldRecompute(e Entry, now int64) bool {
+	u := s.rng.NextDouble()
+	if u == 0.0 {
+		u = math.SmallestNonzeroFloat64
+	}
+	gap := float64(e.LoadTookMs) * s.beta * -math.Log(u) // >= 0, heavy-tailed
+	return float64(now)+gap >= float64(e.FreshUntilMs)
+}
+```
+
+#### Step 8: Stale-while-revalidate
+
+The same three tiers. Appending to `s.coldWaiters[key]` works on a nil slice, so no `computeIfAbsent` is needed; `startRefresh` consults the `refreshing` set and returns early if a refresh is already running.
+
+```go
+func (s *StaleWhileRevalidateStrategy) Get(key string, waiter Waiter) {
+	w := s.measured(key, s.sim.Now(), waiter)
+	e, present := s.entries[key]
+	now := s.sim.Now()
+	if present && e.IsFresh(now) {
+		s.stats.Hits++
+		w(e.Value)
+		return
+	}
+	if present && e.IsUsable(now) { // stale but within grace: serve it, refresh once
+		s.stats.Hits++
+		w(e.Value)
+		s.startRefresh(key)
+		return
+	}
+	s.stats.Misses++ // cold or past grace: must wait, but coalesce
+	s.coldWaiters[key] = append(s.coldWaiters[key], w)
+	s.startRefresh(key)
+}
+```
+
+#### Step 9: The scenario
+
+The same shape: warm-up at t=0, a request every `gapMicros` with `JavaRandom` jitter, an optional debit through `must(...)`. Each closure captures `s`, `key`, and `store`, which do not change inside the loop.
+
+```go
+func (sc Scenario) Run(factory Factory) Strategy {
+	sim := NewSimulator()
+	store := NewBackingStore(sim, sc.StoreLatencyMs)
+	key := "balance:acct-hot"
+	store.Write(key, OfMinor(100_000, USD))
+	s := factory(sim, store)
+	jitter := NewJavaRandom(sc.Seed)
+	gapMicros := 1_000_000 / sc.RequestsPerSecond
+	sim.Schedule(0, func() { s.Get(key, discard) }) // one warm-up request fills the cache at t=0
+	for t := WarmUpMs * 1000; t < sc.DurationMs*1000; t += gapMicros {
+		at := t/1000 + int64(jitter.NextInt(2)) // one request every gap, with 0-1 ms of jitter
+		sim.Schedule(at, func() { s.Get(key, discard) })
+	}
+	if sc.WriteAtMs >= 0 {
+		sim.Schedule(sc.WriteAtMs, func() { store.Write(key, must(OfMinor(100_000, USD).Minus(OfMinor(8_000, USD)))) })
+	}
+	sim.Run()
+	return s
+}
+```
+
+#### Step 10: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/04-cache-invalidation-and-stampedes/code/go
 go run .
 go test ./...
+```
+
+The tables match the Java output digit for digit:
+
+```console
+== The stampede: one hot balance key, 1,000 requests/s, 10 s of traffic, TTL 5 s, store latency 100 ms ==
+naive (every miss loads)                   loads  103  peak in-flight  102  p50    0 ms  p99  100 ms  max  100 ms  stale  1099  retries     0  early   0
+single-flight (coalesce)                   loads    2  peak in-flight    1  p50    0 ms  p99    3 ms  max  100 ms  stale  1099  retries     0  early   0
+lock + retry (10 ms)                       loads    2  peak in-flight    1  p50    0 ms  p99   10 ms  max  100 ms  stale  1099  retries   547  early   0
+probabilistic early expiry (beta=1.0)      loads    5  peak in-flight    3  p50    0 ms  p99    0 ms  max  100 ms  stale   761  retries     0  early   4
+stale-while-revalidate (grace 2000 ms)     loads    2  peak in-flight    1  p50    0 ms  p99    0 ms  max  100 ms  stale  1201  retries     0  early   0
 ```
 
 ## Use It

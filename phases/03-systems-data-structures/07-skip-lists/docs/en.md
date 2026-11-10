@@ -352,18 +352,205 @@ level=1, average steps per get = 11364 (n/2 = 10000)
 
 ### In Python
 
-`code/python/main.py` is the same `SkipList` with `forward` and `span` lists per node, the same `update`/`rank` arrays in `put`, and the same method names in snake_case (`by_rank`, `level_histogram`, `check_invariants`, `default_max_level`). Three things differ:
+`code/python/main.py` is the same `SkipList` with `forward` and `span` lists per node, the same `update`/`rank` arrays in `put`, and the same method names in snake_case (`by_rank`, `level_histogram`, `check_invariants`, `default_max_level`). Three things differ. **The coin is a bit-exact `java.util.Random`:** `random.Random(seed)` would give a different stream, so `JavaRandom` ports the 48-bit LCG and `nextDouble` (`(next(26) << 27) + next(27)` scaled by 2^-53). Seed 2024 then yields the same levels for every node, and the histogram, level counts, search-step averages, and ranks match Java line for line. **One constructor per signature:** Python has no overloading, so the Java `IntSupplier` constructor becomes the class method `with_level_source`, and the degenerate demo passes `lambda: 1`. **The flat demo inserts in descending order:** with the coin fixed at 1, the list depends only on the key set. Java's ascending inserts each walk the whole list, about 2 * 10^8 pointer steps: trivial for the JIT but about a minute in CPython. Inserting from the top puts each key at the head in `O(1)`, which builds the same list, so the measured search cost (the point of the demo) is unchanged. The test still inserts its 2,000-key flat list in ascending order. `ValueError` replaces `IllegalArgumentException`, and `IllegalStateError` replaces `IllegalStateException`.
 
-- **The coin is a bit-exact `java.util.Random`.** `random.Random(seed)` would give a different stream, so `JavaRandom` ports the 48-bit LCG and `nextDouble` (`(next(26) << 27) + next(27)` scaled by 2^-53). Seed 2024 then yields the same levels for every node, and the histogram, level counts, search-step averages, and ranks match Java line for line.
-- **One constructor per signature.** Python has no overloading, so the Java `IntSupplier` constructor becomes a class method, and the degenerate demo passes a lambda:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Nodes with forward pointers and spans
+
+`Node` is a `__slots__` class whose `forward` and `span` lists are sized to the node's own level; `[None] * levels` and `[0] * levels` are the zero-filled arrays. The header is a `Node(None, None, max_level)`.
 
 ```python
-flat: SkipList[int, int] = SkipList.with_level_source(16, 0.5, lambda: 1)
-for i in range(20_000 - 1, -1, -1):
-    flat.put(i, i)
+class Node:
+    __slots__ = ("key", "value", "forward", "span")
+
+    def __init__(self, key: Any, value: Any, levels: int) -> None:
+        self.key = key
+        self.value = value
+        self.forward: list[Optional[Node]] = [None] * levels  # forward[i]: next node at level i
+        self.span: list[int] = [0] * levels                   # span[i]: level-0 steps forward[i] jumps over
 ```
 
-- **The flat demo inserts in descending order.** With the coin fixed at 1, the list depends only on the key set. Java's ascending inserts each walk the whole list, about 2 * 10^8 pointer steps: trivial for the JIT but about a minute in CPython. Inserting from the top puts each key at the head in `O(1)`, which builds the same list, so the measured search cost (the point of the demo) is unchanged. The test still inserts its 2,000-key flat list in ascending order. `ValueError` replaces `IllegalArgumentException`, and `IllegalStateError` replaces `IllegalStateException`.
+#### Step 2: The coin, injected
+
+The validating constructor builds the `coin` closure over the caller's `JavaRandom` and `p`; `with_level_source` bypasses validation and installs any zero-argument callable, which is how the demo gets a list whose coin always says 1. Both share `_init`.
+
+```python
+    def __init__(self, max_level: int, p: float, rng: JavaRandom) -> None:
+        if max_level < 1 or max_level > 64:
+            raise ValueError(f"maxLevel must be 1..64: {max_level}")
+        if not 0 < p < 1:
+            raise ValueError(f"p must be in (0,1): {p}")
+
+        def coin() -> int:
+            lvl = 1
+            while lvl < max_level and rng.next_double() < p:
+                lvl += 1
+            return lvl
+
+        self._init(max_level, p, coin)
+
+    @classmethod
+    def with_level_source(cls, max_level: int, p: float, level_source: Callable[[], int]) -> "SkipList":
+        """For the degenerate-case demo: a list whose "coin" is supplied by the caller (Java's IntSupplier overload)."""
+        self = cls.__new__(cls)
+        self._init(max_level, p, level_source)
+        return self
+
+    @staticmethod
+    def default_max_level(expected_size: int, p: float) -> int:
+        return max(1, math.ceil(math.log(expected_size) / math.log(1.0 / p)))
+```
+
+#### Step 3: Search
+
+The descent reads `x.forward[i]` into `nxt` once per step to save an attribute lookup in the hot loop; the counting is the same: one step per forward move, one per level descended. `None` is returned for a missing key.
+
+```python
+    def get(self, key: K) -> Optional[V]:
+        """One step per forward move and one per level descended: the comparisons Pugh's analysis bounds."""
+        x = self._header
+        steps = 0
+        for i in range(self._level - 1, -1, -1):
+            nxt = x.forward[i]
+            while nxt is not None and nxt.key < key:
+                x = nxt
+                nxt = x.forward[i]
+                steps += 1
+            steps += 1  # the comparison that failed, sending us down a level
+        self.search_steps += steps
+        x = x.forward[0]
+        return x.value if x is not None and x.key == key else None
+```
+
+#### Step 4: Insert with ranks and spans
+
+`zslInsert` with lists for `update` and `rank`. `range(self._level - 1, -1, -1)` is the top-down descent, and the span arithmetic after the splice is unchanged from the Java.
+
+```python
+    def put(self, key: K, value: V) -> None:
+        update: list[Optional[Node]] = [None] * self.max_level
+        rank = [0] * self.max_level
+        x = self._header
+        for i in range(self._level - 1, -1, -1):
+            rank[i] = 0 if i == self._level - 1 else rank[i + 1]
+            while x.forward[i] is not None and x.forward[i].key < key:
+                rank[i] += x.span[i]
+                x = x.forward[i]
+            update[i] = x
+        existing = x.forward[0]
+        if existing is not None and existing.key == key:
+            existing.value = value
+            return
+
+        lvl = self.random_level()
+        if lvl > self._level:
+            for i in range(self._level, lvl):
+                rank[i] = 0
+                update[i] = self._header
+                update[i].span[i] = self._size  # the header's new level spans the whole list so far
+            self._level = lvl
+        node = Node(key, value, lvl)
+        for i in range(lvl):
+            node.forward[i] = update[i].forward[i]
+            update[i].forward[i] = node
+            node.span[i] = update[i].span[i] - (rank[0] - rank[i])
+            update[i].span[i] = (rank[0] - rank[i]) + 1
+        for i in range(lvl, self._level):
+            update[i].span[i] += 1  # levels above the new node now jump over one more
+        self._size += 1
+```
+
+#### Step 5: Delete
+
+`update[i].forward[i] is x` is the identity test the Java performs with `==` on references. The span absorption, the level lowering, and the `False` for a missing key are the same.
+
+```python
+    def remove(self, key: K) -> bool:
+        update: list[Optional[Node]] = [None] * self.max_level
+        x = self._header
+        for i in range(self._level - 1, -1, -1):
+            while x.forward[i] is not None and x.forward[i].key < key:
+                x = x.forward[i]
+            update[i] = x
+        x = x.forward[0]
+        if x is None or x.key != key:
+            return False
+        for i in range(self._level):
+            if update[i].forward[i] is x:
+                update[i].span[i] += x.span[i] - 1
+                update[i].forward[i] = x.forward[i]
+            else:
+                update[i].span[i] -= 1
+        while self._level > 1 and self._header.forward[self._level - 1] is None:
+            self._level -= 1
+        self._size -= 1
+        return True
+```
+
+#### Step 6: Rank and byRank
+
+`rank` uses `<=` to land on the key and `x is not self._header` to avoid comparing against the header's `None` key. `by_rank` returns `None` outside `1..size`.
+
+```python
+    def rank(self, key: K) -> int:
+        """1-based position of key in sorted order, or 0 if absent. O(log n) thanks to spans."""
+        traversed = 0
+        x = self._header
+        for i in range(self._level - 1, -1, -1):
+            while x.forward[i] is not None and x.forward[i].key <= key:
+                traversed += x.span[i]
+                x = x.forward[i]
+            if x is not self._header and x.key == key:
+                return traversed
+        return 0
+
+    def by_rank(self, r: int) -> Optional[K]:
+        """The key at 1-based rank r, or None. O(log n)."""
+        if r < 1 or r > self._size:
+            return None
+        traversed = 0
+        x = self._header
+        for i in range(self._level - 1, -1, -1):
+            while x.forward[i] is not None and traversed + x.span[i] <= r:
+                traversed += x.span[i]
+                x = x.forward[i]
+            if traversed == r:
+                return x.key
+        return None
+```
+
+#### Step 7: The invariant checker
+
+The same span-versus-level-0 check at every level, plus two extra guards (level 0 holds exactly `size` keys and nothing lives above the current level). Violations raise `IllegalStateError`.
+
+```python
+    def check_invariants(self) -> bool:
+        base = self.keys()
+        if len(base) != self._size:
+            raise IllegalStateError(f"level 0 holds {len(base)} keys, size says {self._size}")
+        for i in range(1, len(base)):
+            if base[i - 1] >= base[i]:
+                raise IllegalStateError(f"level 0 not sorted at {base[i]}")
+        for i in range(self._level):
+            position = 0  # 1-based rank of x; header is 0
+            x = self._header
+            while x.forward[i] is not None:
+                target = position + x.span[i]
+                if target < 1 or target > self._size or base[target - 1] != x.forward[i].key:
+                    where = "header" if x is self._header else x.key
+                    raise IllegalStateError(f"span mismatch at level {i} after {where}")
+                position = target
+                x = x.forward[i]
+            if i == 0 and position != self._size:
+                raise IllegalStateError("level 0 spans do not reach the end")
+        for i in range(self._level, self.max_level):
+            if self._header.forward[i] is not None:
+                raise IllegalStateError(f"node above current level {i}")
+        return True
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/03-systems-data-structures/07-skip-lists/code/python
@@ -371,27 +558,275 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Merchant risk scores as a sorted set (Redis ZADD / ZRANK / ZRANGE) ==
+sorted: [59, 118, 288, 367, 456, 512, 674, 742, 831, 905]
+rank of 512 = 6, key at rank 3 = 288, scores in [300, 700] = [367, 456, 512, 674]
+levels in use: 5, nodes per level: [10, 6, 3, 2, 2]
+```
+
+The histogram and the search-step averages match the Java run because `JavaRandom(2024)` flips the same coins.
+
 ### In Go
 
-`code/go/main.go` is the same `SkipList[K cmp.Ordered, V any]` with `forward` and `span` slices per node, the same `update`/`rank` arrays in `Put`, and the same method names in exported CamelCase (`ByRank`, `LevelHistogram`, `CheckInvariants`, `DefaultMaxLevel`). Three things differ:
+`code/go/main.go` is the same `SkipList[K cmp.Ordered, V any]` with `forward` and `span` slices per node, the same `update`/`rank` arrays in `Put`, and the same method names in exported CamelCase (`ByRank`, `LevelHistogram`, `CheckInvariants`, `DefaultMaxLevel`). Three things differ. **The coin is a bit-exact `java.util.Random`:** `math/rand` would give a different stream, so `javarandom.go` ports the 48-bit LCG and `NextDouble` and `Shuffle` reproduces `Collections.shuffle`. Seed 2024 then yields the same level for every node, and the histogram, level counts, search-step averages, and ranks match Java line for line (only Java's half-up `%.0f` of 1562.5 prints differently). **Two constructors, one with an error:** Go has no overloading, so the Java `IntSupplier` constructor becomes `NewSkipListWithLevelSource(maxLevel, p, func() int)`, and the degenerate demo passes a closure that always returns 1. `NewSkipList(maxLevel, p, rng)` validates its arguments and returns `(*SkipList, error)` with `ErrInvalidArgument`; the level-source constructor, like its Java twin, does not validate. **Absence and violations are values:** `Get` returns `(V, bool)` and `ByRank` returns `(K, bool)` instead of `null`; the header node holds the zero `K` and is recognised by pointer identity (`x != s.header`), which is what the Java does with its `null` key. `CheckInvariants` returns an `error` wrapping `ErrInvariantViolated` instead of throwing `IllegalStateException`. Keys compare with `<` and `==` directly, which `cmp.Ordered` guarantees.
 
-- **The coin is a bit-exact `java.util.Random`.** `math/rand` would give a different stream, so `javarandom.go` ports the 48-bit LCG and `NextDouble` (`(next(26) << 27) + next(27)` scaled by 2^-53) and `Shuffle` reproduces `Collections.shuffle`. Seed 2024 then yields the same level for every node, and the histogram, level counts, search-step averages, and ranks match Java line for line (only Java's half-up `%.0f` of 1562.5 prints differently).
-- **Two constructors, one with an error.** Go has no overloading, so the Java `IntSupplier` constructor becomes `NewSkipListWithLevelSource(maxLevel, p, func() int)`, and the degenerate demo passes a closure that always returns 1. `NewSkipList(maxLevel, p, rng)` validates its arguments and returns `(*SkipList, error)` with `ErrInvalidArgument`; the level-source constructor, like its Java twin, does not validate:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Nodes with forward pointers and spans
+
+A generic struct with two slices sized by `make` to the node's level. The header holds the zero `K`, which is why the algorithms recognise it by pointer rather than by key.
 
 ```go
-flat := NewSkipListWithLevelSource[int, int](16, 0.5, func() int { return 1 })
-for i := 0; i < 20_000; i++ {
-    flat.Put(i, i)
+type Node[K cmp.Ordered, V any] struct {
+	Key     K
+	Value   V
+	forward []*Node[K, V]
+	span    []int
+}
+
+func newNode[K cmp.Ordered, V any](key K, value V, levels int) *Node[K, V] {
+	return &Node[K, V]{Key: key, Value: value, forward: make([]*Node[K, V], levels), span: make([]int, levels)}
 }
 ```
 
-- **Absence and violations are values.** `Get` returns `(V, bool)` and `ByRank` returns `(K, bool)` instead of `null`; the header node holds the zero `K` and is recognised by pointer identity (`x != s.header`), which is what the Java does with its `null` key. `CheckInvariants` returns an `error` wrapping `ErrInvariantViolated` instead of throwing `IllegalStateException`. Keys compare with `<` and `==` directly, which `cmp.Ordered` guarantees.
+#### Step 2: The coin, injected
+
+`NewSkipList` validates, builds the coin closure over the `*JavaRandom`, and delegates to `NewSkipListWithLevelSource`, which takes any `func() int` and does not validate, mirroring the Java overload pair.
+
+```go
+func NewSkipList[K cmp.Ordered, V any](maxLevel int, p float64, rng *JavaRandom) (*SkipList[K, V], error) {
+	if maxLevel < 1 || maxLevel > 64 {
+		return nil, fmt.Errorf("%w: maxLevel must be 1..64: %d", ErrInvalidArgument, maxLevel)
+	}
+	if !(p > 0 && p < 1) {
+		return nil, fmt.Errorf("%w: p must be in (0,1): %g", ErrInvalidArgument, p)
+	}
+	return NewSkipListWithLevelSource[K, V](maxLevel, p, func() int {
+		lvl := 1
+		for lvl < maxLevel && rng.NextDouble() < p {
+			lvl++
+		}
+		return lvl
+	}), nil
+}
+
+// NewSkipListWithLevelSource is for the degenerate-case demo: a list whose "coin" is supplied by the caller.
+func NewSkipListWithLevelSource[K cmp.Ordered, V any](maxLevel int, p float64, levelSource func() int) *SkipList[K, V] {
+	var zeroK K
+	var zeroV V
+	return &SkipList[K, V]{MaxLevel: maxLevel, P: p, levelSource: levelSource, header: newNode(zeroK, zeroV, maxLevel), level: 1}
+}
+
+func DefaultMaxLevel(expectedSize int, p float64) int {
+	return max(1, int(math.Ceil(math.Log(float64(expectedSize))/math.Log(1.0/p))))
+}
+```
+
+#### Step 3: Search
+
+The Java loop with `SearchSteps` as an exported counter and `(V, bool)` instead of `null`.
+
+```go
+func (s *SkipList[K, V]) Get(key K) (V, bool) {
+	x := s.header
+	for i := s.level - 1; i >= 0; i-- {
+		for x.forward[i] != nil && x.forward[i].Key < key {
+			x = x.forward[i]
+			s.SearchSteps++
+		}
+		s.SearchSteps++ // the comparison that failed, sending us down a level
+	}
+	x = x.forward[0]
+	if x != nil && x.Key == key {
+		return x.Value, true
+	}
+	var zero V
+	return zero, false
+}
+```
+
+#### Step 4: Insert with ranks and spans
+
+`update` and `rank` are `make`d to `MaxLevel`; the ternary for `rank[i]` becomes an `if`/`else`, and the `if existing := ...; cond` form checks for an existing key. The splice and span arithmetic are unchanged.
+
+```go
+func (s *SkipList[K, V]) Put(key K, value V) {
+	update := make([]*Node[K, V], s.MaxLevel)
+	rank := make([]int, s.MaxLevel)
+	x := s.header
+	for i := s.level - 1; i >= 0; i-- {
+		if i == s.level-1 {
+			rank[i] = 0
+		} else {
+			rank[i] = rank[i+1]
+		}
+		for x.forward[i] != nil && x.forward[i].Key < key {
+			rank[i] += x.span[i]
+			x = x.forward[i]
+		}
+		update[i] = x
+	}
+	if existing := x.forward[0]; existing != nil && existing.Key == key {
+		existing.Value = value
+		return
+	}
+
+	lvl := s.RandomLevel()
+	if lvl > s.level {
+		for i := s.level; i < lvl; i++ {
+			rank[i] = 0
+			update[i] = s.header
+			update[i].span[i] = s.size // the header's new level spans the whole list so far
+		}
+		s.level = lvl
+	}
+	node := newNode(key, value, lvl)
+	for i := 0; i < lvl; i++ {
+		node.forward[i] = update[i].forward[i]
+		update[i].forward[i] = node
+		node.span[i] = update[i].span[i] - (rank[0] - rank[i])
+		update[i].span[i] = (rank[0] - rank[i]) + 1
+	}
+	for i := lvl; i < s.level; i++ {
+		update[i].span[i]++ // levels above the new node now jump over one more
+	}
+	s.size++
+}
+```
+
+#### Step 5: Delete
+
+Pointer equality on `update[i].forward[i] == x` picks the levels that bypass the victim; the rest is the Java method.
+
+```go
+func (s *SkipList[K, V]) Remove(key K) bool {
+	update := make([]*Node[K, V], s.MaxLevel)
+	x := s.header
+	for i := s.level - 1; i >= 0; i-- {
+		for x.forward[i] != nil && x.forward[i].Key < key {
+			x = x.forward[i]
+		}
+		update[i] = x
+	}
+	x = x.forward[0]
+	if x == nil || x.Key != key {
+		return false
+	}
+	for i := 0; i < s.level; i++ {
+		if update[i].forward[i] == x {
+			update[i].span[i] += x.span[i] - 1
+			update[i].forward[i] = x.forward[i]
+		} else {
+			update[i].span[i]--
+		}
+	}
+	for s.level > 1 && s.header.forward[s.level-1] == nil {
+		s.level--
+	}
+	s.size--
+	return true
+}
+```
+
+#### Step 6: Rank and byRank
+
+`x != s.header` is the pointer-identity check that replaces the Java's null-key test. `ByRank` returns `(K, bool)` so a zero key is distinguishable from "no such rank".
+
+```go
+func (s *SkipList[K, V]) Rank(key K) int {
+	traversed := 0
+	x := s.header
+	for i := s.level - 1; i >= 0; i-- {
+		for x.forward[i] != nil && x.forward[i].Key <= key {
+			traversed += x.span[i]
+			x = x.forward[i]
+		}
+		if x != s.header && x.Key == key {
+			return traversed
+		}
+	}
+	return 0
+}
+
+func (s *SkipList[K, V]) ByRank(r int) (K, bool) {
+	var zero K
+	if r < 1 || r > s.size {
+		return zero, false
+	}
+	traversed := 0
+	x := s.header
+	for i := s.level - 1; i >= 0; i-- {
+		for x.forward[i] != nil && traversed+x.span[i] <= r {
+			traversed += x.span[i]
+			x = x.forward[i]
+		}
+		if traversed == r {
+			return x.Key, true
+		}
+	}
+	return zero, false
+}
+```
+
+#### Step 7: The invariant checker
+
+Returns the first violation as an error wrapping `ErrInvariantViolated`; the span check per level is the Java loop, with `fmt.Sprint(x.Key)` to name the offending node.
+
+```go
+func (s *SkipList[K, V]) CheckInvariants() error {
+	base := s.Keys()
+	if len(base) != s.size {
+		return fmt.Errorf("%w: level 0 holds %d keys, size says %d", ErrInvariantViolated, len(base), s.size)
+	}
+	for i := 1; i < len(base); i++ {
+		if base[i-1] >= base[i] {
+			return fmt.Errorf("%w: level 0 not sorted at %v", ErrInvariantViolated, base[i])
+		}
+	}
+	for i := 0; i < s.level; i++ {
+		position := 0 // 1-based rank of x; header is 0
+		for x := s.header; x.forward[i] != nil; x = x.forward[i] {
+			target := position + x.span[i]
+			if target < 1 || target > s.size || base[target-1] != x.forward[i].Key {
+				after := "header"
+				if x != s.header {
+					after = fmt.Sprint(x.Key)
+				}
+				return fmt.Errorf("%w: span mismatch at level %d after %s", ErrInvariantViolated, i, after)
+			}
+			position = target
+		}
+		if i == 0 && position != s.size {
+			return fmt.Errorf("%w: level 0 spans do not reach the end", ErrInvariantViolated)
+		}
+	}
+	for i := s.level; i < s.MaxLevel; i++ {
+		if s.header.forward[i] != nil {
+			return fmt.Errorf("%w: node above current level %d", ErrInvariantViolated, i)
+		}
+	}
+	return nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/03-systems-data-structures/07-skip-lists/code/go
 go run .
 go test ./...
 ```
+
+```console
+== What the coin buys: a list whose coin always says 1 is a linked list ==
+level=1, average steps per get = 11364 (n/2 = 10000)
+
+== Removes keep spans and ranks consistent ==
+after removing even keys: size=50000, rank(99999)=50000, byRank(1)=1, byRank(50000)=99999
+```
+
+The sorted-set, histogram, and search-cost sections print the same numbers as the Java run.
 
 ## Use It
 

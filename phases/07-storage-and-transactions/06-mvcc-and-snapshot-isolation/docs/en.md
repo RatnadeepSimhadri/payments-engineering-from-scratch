@@ -347,21 +347,158 @@ Section 4 is worth reading twice. The first vacuum, with the long-running transa
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`Optional<V>` becomes `V | None`:** a tombstone is a `Version` whose `value` is `None`, and an own buffered delete is a `None` in `txn.writes`, so `read` returns `None` for "absent" in every case; `write` rejects `None` with `TypeError`, as Java's `requireNonNull` does, so a delete can only come from `delete()`. The store is `Generic[V]` for readers; at runtime the tests store plain `int`s and the demo stores `Money`. **Overflow is checked by hand:** `Money.plus` and `minus` route through `_check_int64`, which raises `OverflowError` outside the signed 64-bit range, the Python twin of `Math.addExact`; `Money` also rejects floats in `__post_init__`, as the Phase 10 reference does, and a Python-only test pins the overflow. **Errors:** `WriteConflictException` is a `RuntimeError` subclass, using a finished transaction raises a plain `RuntimeError` (Java's `IllegalStateException`) and the test checks it is not the conflict type; `history` returns a tuple, the read-only view `Collections.unmodifiableList` gives in Java. **No threads:** concurrency is the order of calls, as in Java, so the demo's timestamps, the conflict message and the vacuum counts (6 with the long runner open, then 5) match line for line.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The oracle and the version
+
+`current` and `next` keep the Java asymmetry. `Version` is a frozen generic dataclass whose `value` is `V | None`, and `is_tombstone` is the `None` test.
+
 ```python
-def read(self, txn: Transaction[V], key: str) -> V | None:
-    self._require_active(txn)
-    if key in txn.writes:
-        return txn.writes[key]
-    v = self._visible_version(key, txn.start_ts)
-    return None if v is None or v.is_tombstone() else v.value
+class TimestampOracle:
+    def __init__(self) -> None:
+        self._last = 0
+
+    def current(self) -> int:
+        return self._last
+
+    def next(self) -> int:
+        self._last += 1
+        return self._last
+
+
+@dataclass(frozen=True)
+class Version(Generic[V]):
+    commit_ts: int
+    txn_id: int
+    value: V | None
+
+    def is_tombstone(self) -> bool:
+        return self.value is None
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The transaction
 
-- **`Optional<V>` becomes `V | None`.** A tombstone is a `Version` whose `value` is `None`, and an own buffered delete is a `None` in `txn.writes`, so `read` returns `None` for "absent" in every case. `write` rejects `None` with `TypeError`, as Java's `requireNonNull` does, so a delete can only come from `delete()`. The store is `Generic[V]` for readers; at runtime the tests store plain `int`s and the demo stores `Money`.
-- **Overflow is checked by hand.** `Money.plus` and `minus` route through `_check_int64`, which raises `OverflowError` outside the signed 64-bit range: the Python twin of `Math.addExact`. `Money` also rejects floats in `__post_init__`, as the Phase 10 reference does. A Python-only test pins the overflow.
-- **Errors.** `WriteConflictException` is a `RuntimeError` subclass; using a finished transaction raises a plain `RuntimeError` (Java's `IllegalStateException`), and the test checks it is not the conflict type. `history` returns a tuple, the read-only view `Collections.unmodifiableList` gives in Java.
-- **No threads.** Concurrency is the order of calls, as in Java, so the demo's timestamps, the conflict message and the vacuum counts (6 with the long runner open, then 5) match line for line.
+A plain class with an insertion-ordered `dict` for the write set, where a `None` value is a pending delete. `commit_ts` starts at -1 until commit assigns it.
+
+```python
+class Transaction(Generic[V]):
+    def __init__(self, id: int, start_ts: int) -> None:
+        self.id = id
+        self.start_ts = start_ts
+        self.writes: dict[str, V | None] = {}  # None value = delete
+        self.status = TxnStatus.ACTIVE
+        self.commit_ts = -1
+
+    def is_active(self) -> bool:
+        return self.status is TxnStatus.ACTIVE
+
+    def __str__(self) -> str:
+        return f"T{self.id}@{self.start_ts}"
+```
+
+#### Step 3: Snapshot reads
+
+`begin` takes `oracle.current()` as the snapshot and registers the transaction as active. `read` checks own writes first and then the visible version; `_visible_version` walks the chain with `reversed(...)` and returns the first version at or below the snapshot.
+
+```python
+    def begin(self) -> Transaction[V]:
+        txn: Transaction[V] = Transaction(self._next_txn_id, self._oracle.current())
+        self._next_txn_id += 1
+        self._active[txn.id] = txn
+        return txn
+
+    def read(self, txn: Transaction[V], key: str) -> V | None:
+        self._require_active(txn)
+        if key in txn.writes:
+            return txn.writes[key]
+        v = self._visible_version(key, txn.start_ts)
+        return None if v is None or v.is_tombstone() else v.value
+
+    def _visible_version(self, key: str, snapshot_ts: int) -> Version[V] | None:
+        for v in reversed(self._versions.get(key, ())):
+            if v.commit_ts <= snapshot_ts:
+                return v
+        return None
+```
+
+#### Step 4: First committer wins
+
+Validate every written key against its newest version before publishing anything; a loss aborts and then raises `WriteConflictException`. Read-only transactions reuse `start_ts` and consume no timestamp. `setdefault(key, []).append(...)` is the `computeIfAbsent(...).add(...)`.
+
+```python
+    def commit(self, txn: Transaction[V]) -> int:
+        self._require_active(txn)
+        for key in txn.writes:
+            newest = self._newest_version(key)
+            if newest is not None and newest.commit_ts > txn.start_ts:
+                self.abort(txn)
+                raise WriteConflictException(
+                    f"{txn} lost {key} to T{newest.txn_id} (committed at {newest.commit_ts} > snapshot {txn.start_ts})")
+        ts = txn.start_ts if not txn.writes else self._oracle.next()  # read-only transactions consume no timestamp
+        for key, value in txn.writes.items():
+            self._versions.setdefault(key, []).append(Version(ts, txn.id, value))
+        txn.status = TxnStatus.COMMITTED
+        txn.commit_ts = ts
+        del self._active[txn.id]
+        self._commits += 1
+        return ts
+```
+
+#### Step 5: Aborts and dead transactions
+
+`abort` is idempotent on a finished transaction, clears the private write set, and removes the transaction from `_active` so it stops pinning the horizon. `_require_active` raises a plain `RuntimeError`, deliberately not the conflict type.
+
+```python
+    def abort(self, txn: Transaction[V]) -> None:
+        if not txn.is_active():
+            return
+        txn.status = TxnStatus.ABORTED
+        txn.writes.clear()
+        del self._active[txn.id]
+        self._aborts += 1
+
+    def _require_active(self, txn: Transaction[V]) -> None:
+        if not txn.is_active():
+            raise RuntimeError(f"{txn} is {txn.status.name}")
+```
+
+#### Step 6: Vacuum against the horizon
+
+`keep_from` is found with `enumerate`, the dead prefix is removed with `del chain[:keep_from]`, and a tombstone that is the oldest survivor at or below the horizon is popped. Keys whose chains empty out are collected and deleted after the loop, since a dict cannot be modified while iterating it.
+
+```python
+    def vacuum(self) -> int:
+        horizon = self.oldest_active_snapshot()
+        removed = 0
+        empty_keys: list[str] = []
+        for key, chain in self._versions.items():
+            keep_from = 0  # index of the newest version with commit_ts <= horizon; everything before it is dead
+            for i, v in enumerate(chain):
+                if v.commit_ts <= horizon:
+                    keep_from = i
+            if keep_from > 0:
+                removed += keep_from
+                del chain[:keep_from]
+            oldest_kept = chain[0]
+            if oldest_kept.is_tombstone() and oldest_kept.commit_ts <= horizon:
+                chain.pop(0)
+                removed += 1
+            if not chain:
+                empty_keys.append(key)
+        for key in empty_keys:
+            del self._versions[key]
+        return removed
+
+    def oldest_active_snapshot(self) -> int:
+        horizon = self._oracle.current()
+        for t in self._active.values():
+            horizon = min(horizon, t.start_ts)
+        return horizon
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/06-mvcc-and-snapshot-isolation/code/python
@@ -369,38 +506,229 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output matches the Java run, including the two vacuum counts:
+
+```console
+== 4. Garbage collection: a long-running snapshot pins old versions ==
+versions of A before vacuum: 10, total: 13
+vacuum with T12@6 still open removed 6 versions (horizon = ts 6)
+vacuum after it finished removed 5; versions of A now: 1, total: 2
+commits = 16, aborts = 1
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Generics with an explicit tombstone:** `MvccStore[V any]`, `Transaction[V]` and `Version[V]` are type parameters like the Java generics, but Go has no `null` for an arbitrary `V`, so a deleted key is a `Version` with `Tombstone: true` and a buffered delete is a `pendingWrite{Delete: true}`; `Read` returns `(V, bool, error)`, where the `bool` is Java's `Optional` (false for a missing key or a tombstone) and the `error` is `ErrNotActive` for a finished transaction. **Conflicts are values:** `Commit` returns `(int64, error)`, a first-committer-wins loss wraps the sentinel `ErrWriteConflict` and still aborts the transaction before returning, exactly as the Java `commit` aborts before throwing, and callers check `errors.Is(err, ErrWriteConflict)`; `Money.Plus`/`Minus` return `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow` instead of `Math.addExact` throwing. **Version chains are slices:** each key's chain is a `[]Version[V]` in ascending `CommitTs`, `Vacuum` reslices (`chain = chain[keepFrom:]`) instead of `subList(...).clear()` and iterates keys in sorted order so the removed count is deterministic, and the `LinkedHashMap` write set is a key slice plus a map so versions are published in the order the writes were issued. **No goroutines:** the store is single-threaded by design and concurrency is modelled by interleaving calls, so there is no mutex and `go test -race` passes trivially; a version that commits from several goroutines must hold one mutex across the whole of `Commit`, because validate-then-publish is the critical section.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same four sections as the Java version, line for line (commits = 16, aborts = 1).
+
+#### Step 1: The oracle and the version
+
+The oracle is a struct with one field. `Version[V]` carries an explicit `Tombstone` flag because the zero value of `V` cannot stand in for `null`.
+
 ```go
-// Version is one immutable version of a key. Tombstone replaces Java's null value.
-type Version[V any] struct {
-    CommitTs  int64
-    TxnID     int64
-    Value     V
-    Tombstone bool
+type TimestampOracle struct {
+	last int64
 }
 
-func (s *MvccStore[V]) Commit(txn *Transaction[V]) (int64, error) {
-    if err := s.requireActive(txn); err != nil {
-        return 0, err
-    }
-    for _, key := range txn.writeKeys {
-        if newest, ok := s.newestVersion(key); ok && newest.CommitTs > txn.StartTs {
-            s.Abort(txn)
-            return 0, fmt.Errorf("%w: %s lost %s to T%d (committed at %d > snapshot %d)",
-                ErrWriteConflict, txn, key, newest.TxnID, newest.CommitTs, txn.StartTs)
-        }
-    }
-    // ... publish every write at one fresh timestamp
+func (o *TimestampOracle) Current() int64 { return o.last }
+
+func (o *TimestampOracle) Next() int64 {
+	o.last++
+	return o.last
+}
+
+type Version[V any] struct {
+	CommitTs  int64
+	TxnID     int64
+	Value     V
+	Tombstone bool
+}
+
+func (v Version[V]) IsTombstone() bool { return v.Tombstone }
+```
+
+#### Step 2: The transaction
+
+`pendingWrite` is the buffered write with a `Delete` flag. `writeKeys` records insertion order beside the `Writes` map, and `put` appends to it only on the first write of a key, which is the `LinkedHashMap` behaviour.
+
+```go
+type pendingWrite[V any] struct {
+	Value  V
+	Delete bool
+}
+
+type Transaction[V any] struct {
+	ID        int64
+	StartTs   int64
+	writeKeys []string // insertion order (LinkedHashMap)
+	Writes    map[string]pendingWrite[V]
+	Status    TxnStatus
+	CommitTs  int64
+}
+
+func (t *Transaction[V]) IsActive() bool { return t.Status == Active }
+
+func (t *Transaction[V]) put(key string, w pendingWrite[V]) {
+	if _, seen := t.Writes[key]; !seen {
+		t.writeKeys = append(t.writeKeys, key)
+	}
+	t.Writes[key] = w
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: Snapshot reads
 
-- **Generics with an explicit tombstone.** `MvccStore[V any]`, `Transaction[V]` and `Version[V]` are type parameters like the Java generics, but Go has no `null` for an arbitrary `V`, so a deleted key is a `Version` with `Tombstone: true` and a buffered delete is a `pendingWrite{Delete: true}`. `Read` returns `(V, bool, error)`: the `bool` is Java's `Optional` (false for a missing key or a tombstone), the `error` is `ErrNotActive` for a finished transaction.
-- **Conflicts are values.** `Commit` returns `(int64, error)`; a first-committer-wins loss wraps the sentinel `ErrWriteConflict` and still aborts the transaction before returning, exactly as the Java `commit` aborts before throwing. Callers check `errors.Is(err, ErrWriteConflict)`. `Money.Plus`/`Minus` return `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow` instead of `Math.addExact` throwing.
-- **Version chains are slices.** Each key's chain is a `[]Version[V]` in ascending `CommitTs`; `Vacuum` reslices (`chain = chain[keepFrom:]`) instead of `subList(...).clear()`, and iterates keys in sorted order so the removed count is deterministic. The `LinkedHashMap` write set is a key slice plus a map so versions are published in the order the writes were issued.
-- **No goroutines.** The store is single-threaded by design and concurrency is modelled by interleaving calls, so there is no mutex and `go test -race` passes trivially. A version that commits from several goroutines must hold one mutex across the whole of `Commit`, because validate-then-publish is the critical section.
+`Begin` also appends to `activeKeys`, the ordered view of the active set. `Read` returns the zero value with `false` for an own delete, a missing key, or a tombstone, and `visibleVersion` returns `(Version, bool)` from the newest-first walk.
+
+```go
+func (s *MvccStore[V]) Begin() *Transaction[V] {
+	txn := newTransaction[V](s.nextTxnID, s.oracle.Current())
+	s.nextTxnID++
+	s.active[txn.ID] = txn
+	s.activeKeys = append(s.activeKeys, txn.ID)
+	return txn
+}
+
+func (s *MvccStore[V]) Read(txn *Transaction[V], key string) (V, bool, error) {
+	var zero V
+	if err := s.requireActive(txn); err != nil {
+		return zero, false, err
+	}
+	if w, ok := txn.Writes[key]; ok {
+		if w.Delete {
+			return zero, false, nil
+		}
+		return w.Value, true, nil
+	}
+	v, ok := s.visibleVersion(key, txn.StartTs)
+	if !ok || v.IsTombstone() {
+		return zero, false, nil
+	}
+	return v.Value, true, nil
+}
+
+func (s *MvccStore[V]) visibleVersion(key string, snapshotTs int64) (Version[V], bool) {
+	chain := s.versions[key]
+	for i := len(chain) - 1; i >= 0; i-- {
+		if chain[i].CommitTs <= snapshotTs {
+			return chain[i], true
+		}
+	}
+	return Version[V]{}, false
+}
+```
+
+#### Step 4: First committer wins
+
+Validation walks `writeKeys` in order, aborts on the first newer version, and returns a wrapped `ErrWriteConflict`. Publication appends a `Version` per key with the tombstone flag copied from the pending write; appending to a nil slice from the map is safe in Go.
+
+```go
+func (s *MvccStore[V]) Commit(txn *Transaction[V]) (int64, error) {
+	if err := s.requireActive(txn); err != nil {
+		return 0, err
+	}
+	for _, key := range txn.writeKeys {
+		if newest, ok := s.newestVersion(key); ok && newest.CommitTs > txn.StartTs {
+			s.Abort(txn)
+			return 0, fmt.Errorf("%w: %s lost %s to T%d (committed at %d > snapshot %d)", ErrWriteConflict, txn, key, newest.TxnID, newest.CommitTs, txn.StartTs)
+		}
+	}
+	ts := txn.StartTs
+	if len(txn.writeKeys) > 0 { // read-only transactions consume no timestamp
+		ts = s.oracle.Next()
+	}
+	for _, key := range txn.writeKeys {
+		w := txn.Writes[key]
+		s.versions[key] = append(s.versions[key], Version[V]{CommitTs: ts, TxnID: txn.ID, Value: w.Value, Tombstone: w.Delete})
+	}
+	txn.Status = Committed
+	txn.CommitTs = ts
+	s.removeActive(txn.ID)
+	s.commits++
+	return ts, nil
+}
+```
+
+#### Step 5: Aborts and dead transactions
+
+`Abort` replaces the write map and nils the key slice, then `removeActive` deletes from both the map and the ordered slice. `requireActive` returns a wrapped `ErrNotActive` so misuse is loud without panicking.
+
+```go
+func (s *MvccStore[V]) Abort(txn *Transaction[V]) {
+	if !txn.IsActive() {
+		return
+	}
+	txn.Status = Aborted
+	txn.Writes = map[string]pendingWrite[V]{}
+	txn.writeKeys = nil
+	s.removeActive(txn.ID)
+	s.aborts++
+}
+
+func (s *MvccStore[V]) removeActive(id int64) {
+	delete(s.active, id)
+	for i, k := range s.activeKeys {
+		if k == id {
+			s.activeKeys = append(s.activeKeys[:i], s.activeKeys[i+1:]...)
+			break
+		}
+	}
+}
+
+func (s *MvccStore[V]) requireActive(txn *Transaction[V]) error {
+	if !txn.IsActive() {
+		return fmt.Errorf("%w: %s is %s", ErrNotActive, txn, txn.Status)
+	}
+	return nil
+}
+```
+
+#### Step 6: Vacuum against the horizon
+
+Keys are visited through `sortedKeys()` for a deterministic count. The dead prefix and a leading tombstone are dropped by reslicing, and the shortened chain is written back to the map or the key deleted when nothing remains; deleting from a map while ranging over a separate key slice is safe.
+
+```go
+func (s *MvccStore[V]) Vacuum() int {
+	horizon := s.OldestActiveSnapshot()
+	removed := 0
+	for _, key := range s.sortedKeys() {
+		chain := s.versions[key]
+		keepFrom := 0 // index of the newest version with CommitTs <= horizon; everything before it is dead
+		for i, v := range chain {
+			if v.CommitTs <= horizon {
+				keepFrom = i
+			}
+		}
+		if keepFrom > 0 {
+			removed += keepFrom
+			chain = chain[keepFrom:]
+		}
+		if oldestKept := chain[0]; oldestKept.IsTombstone() && oldestKept.CommitTs <= horizon {
+			chain = chain[1:]
+			removed++
+		}
+		if len(chain) == 0 {
+			delete(s.versions, key)
+		} else {
+			s.versions[key] = chain
+		}
+	}
+	return removed
+}
+
+func (s *MvccStore[V]) OldestActiveSnapshot() int64 {
+	horizon := s.oracle.Current()
+	for _, t := range s.active {
+		if t.StartTs < horizon {
+			horizon = t.StartTs
+		}
+	}
+	return horizon
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/06-mvcc-and-snapshot-isolation/code/go
@@ -408,7 +736,12 @@ go run .
 go test ./...
 ```
 
-The demo prints the same four sections as the Java version, line for line (commits = 16, aborts = 1).
+```console
+vacuum after it finished removed 5; versions of A now: 1, total: 2
+commits = 16, aborts = 1
+```
+
+The four sections above these lines are the Java output, line for line.
 
 ## Use It
 

@@ -361,28 +361,228 @@ The test suite has 49 assertions: pending is never paid and time alone settles n
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **Dates are `datetime.date`** and `java.time.DayOfWeek` becomes a small `Enum` over `date.weekday()`, so `PayoutSchedule` keeps the same `weekly_day` field and the same weekend check; `release_on + timedelta(days=hold_days)` replaces `plusDays`, and "not before" is `not today < since + timedelta(...)`. **Integer arithmetic:** fees and reserves are `(x * bps + 5_000) // 10_000` and `(net * bps) // 10_000` on non-negative values; `//` is the floor `Math.floorDiv` gave, and `int` cannot overflow so `multiplyExact` goes away. **Tranche bookkeeping uses list comprehensions:** `release_reserves` collects the due tranches and keeps `[t for t in tranches if t not in due]` (the semantics of `removeAll`); `cover_from_reserve` sorts the merchant's tranches by `release_on` and `list.remove` finds them by dataclass equality, as `List.remove` did by record equality. **Exceptions:** reconciliation failures, duplicate captures and bad state changes (`IllegalStateException`) raise `RuntimeError`; unknown ids and bad arguments (`IllegalArgumentException`) raise `ValueError`; `confirm` on an already-`PAID` payout still returns silently.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Four accounts per merchant and a balance read from them
+
+`onboard` opens the four liability accounts whose names come from the static `*_acct` helpers; `balance` reads all four from the ledger and returns a frozen `Balance` dataclass. Nothing is cached, so the balance can never disagree with the journal.
+
 ```python
-class DayOfWeek(Enum):          # date.weekday(): Monday is 0, Sunday is 6
-    MONDAY = 0
-    ...
-    SUNDAY = 6
+    def onboard(self, m: Merchant) -> None:
+        self._merchants[m.id] = m
+        self._ledger.open(BalanceService.pending_acct(m.id), AccountType.LIABILITY)
+        self._ledger.open(BalanceService.available_acct(m.id), AccountType.LIABILITY)
+        self._ledger.open(BalanceService.reserve_acct(m.id), AccountType.LIABILITY)
+        self._ledger.open(BalanceService.in_transit_acct(m.id), AccountType.LIABILITY)
 
-    @staticmethod
-    def of(d: date) -> "DayOfWeek":
-        return DayOfWeek(d.weekday())
+    def merchant(self, id: str) -> Merchant:
+        m = self._merchants.get(id)
+        if m is None:
+            raise ValueError(f"unknown merchant {id}")
+        return m
 
-def due_on(self, d: date) -> bool:
-    dow = DayOfWeek.of(d)
-    business_day = dow is not DayOfWeek.SATURDAY and dow is not DayOfWeek.SUNDAY
-    return business_day and (self.frequency is PayoutFrequency.DAILY or dow is self.weekly_day)
+    def balance(self, merchant_id: str) -> Balance:
+        self.merchant(merchant_id)
+        return Balance(self._ledger.balance(BalanceService.pending_acct(merchant_id)),
+                       self._ledger.balance(BalanceService.available_acct(merchant_id)),
+                       self._ledger.balance(BalanceService.reserve_acct(merchant_id)),
+                       self._ledger.balance(BalanceService.in_transit_acct(merchant_id)))
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: Capture into pending
 
-- **Dates are `datetime.date`** and `java.time.DayOfWeek` becomes a small `Enum` over `date.weekday()`, so `PayoutSchedule` keeps the same `weekly_day` field and the same weekend check. `release_on + timedelta(days=hold_days)` replaces `plusDays`, and "not before" is `not today < since + timedelta(...)`.
-- **Integer arithmetic.** Fees and reserves are `(x * bps + 5_000) // 10_000` and `(net * bps) // 10_000` on non-negative values; `//` is the floor `Math.floorDiv` gave, and `int` cannot overflow so `multiplyExact` goes away.
-- **Tranche bookkeeping uses list comprehensions.** `release_reserves` collects the due tranches and keeps `[t for t in tranches if t not in due]` (the semantics of `removeAll`); `cover_from_reserve` sorts the merchant's tranches by `release_on` and `list.remove` finds them by dataclass equality, as `List.remove` did by record equality.
-- **Exceptions:** reconciliation failures, duplicate captures and bad state changes (`IllegalStateException`) raise `RuntimeError`; unknown ids and bad arguments (`IllegalArgumentException`) raise `ValueError`. `confirm` on an already-PAID payout still returns silently.
+`capture` computes the fee with integer `//`, credits the net to the merchant's pending account, and appends the fee line only when the fee is positive, because `Posting` refuses a zero amount.
+
+```python
+    def capture(self, capture_id: str, merchant_id: str, gross: Money, fee_bps: int, fixed_fee_minor: int) -> CaptureRecord:
+        """A capture: the scheme owes us the gross; the merchant is owed the net, but it is PENDING until settlement."""
+        self.merchant(merchant_id)
+        if capture_id in self._captures:
+            raise RuntimeError(f"capture exists: {capture_id}")
+        variable = (gross.minor_units * fee_bps + 5_000) // 10_000
+        c = CaptureRecord(capture_id, merchant_id, gross, Money.of_minor(variable + fixed_fee_minor, self._currency), self._clock.today())
+        postings = [Posting.debit(BalanceService.SCHEME, gross), Posting.credit(BalanceService.pending_acct(merchant_id), c.net())]
+        if c.fee.is_positive():
+            postings.append(Posting.credit(BalanceService.FEES, c.fee))
+        self._ledger.post(self._clock.today(), f"capture {capture_id}", postings)
+        self._captures[capture_id] = c
+        return c
+```
+
+#### Step 3: Settlement: reconcile, then move
+
+All three checks (known capture, not yet settled, total matches) raise `RuntimeError` before anything is written. The per-merchant nets accumulate in a dict (insertion-ordered, like the Java `LinkedHashMap`), the reserve is `(net * bps) // 10_000`, and the tranche's release date counts from the report's `value_date`.
+
+```python
+    def settle(self, report: SettlementReport) -> None:
+        """Apply a settlement report. It must reconcile first: every capture known and unsettled, and the report's
+        total equal to the sum of their gross amounts. Only then does cash arrive and pending become available,
+        minus the merchant's rolling reserve, which is held as a tranche with its own release date."""
+        total = Money.zero(self._currency)
+        for cid in report.capture_ids:
+            c = self._captures.get(cid)
+            if c is None:
+                raise RuntimeError(f"report {report.id} names unknown capture {cid}")
+            if self.is_settled(cid):
+                raise RuntimeError(f"report {report.id}: {cid} already settled by {self._settled_by[cid]}")
+            total = total.plus(c.gross)
+        if total != report.total_gross:
+            raise RuntimeError(f"report {report.id} does not reconcile: total {report.total_gross} but captures sum to {total}")
+        postings = [Posting.debit(BalanceService.BANK, total), Posting.credit(BalanceService.SCHEME, total)]
+        net_by_merchant: dict[str, Money] = {}
+        for cid in report.capture_ids:
+            c = self._captures[cid]
+            net_by_merchant[c.merchant_id] = net_by_merchant.get(c.merchant_id, Money.zero(self._currency)).plus(c.net())
+            self._settled_by[cid] = report.id
+        for merchant_id, net in net_by_merchant.items():
+            m = self.merchant(merchant_id)
+            reserve = Money.of_minor((net.minor_units * m.reserve.basis_points) // 10_000, self._currency)
+            postings.append(Posting.debit(BalanceService.pending_acct(m.id), net))
+            postings.append(Posting.credit(BalanceService.available_acct(m.id), net.minus(reserve)))
+            if reserve.is_positive():
+                postings.append(Posting.credit(BalanceService.reserve_acct(m.id), reserve))
+                self._tranches.append(ReserveTranche(m.id, reserve, report.value_date + timedelta(days=m.reserve.hold_days)))
+        self._ledger.post(self._clock.today(), f"settlement {report.id}", postings)
+```
+
+#### Step 4: Debits may go negative
+
+`debit_merchant` posts against available without checking the balance and then calls `_track_negative`, which uses `setdefault` to record the first negative day and `pop` to clear it when the balance recovers.
+
+```python
+    def debit_merchant(self, merchant_id: str, amount: Money, reason: str) -> None:
+        """A refund, chargeback, or fee: it comes out of available, which may go negative. The scheme nets it from what it owes us."""
+        self.merchant(merchant_id)
+        if not amount.is_positive():
+            raise ValueError("debit must be positive")
+        self._ledger.post(self._clock.today(), f"{reason} {merchant_id}", [
+            Posting.debit(BalanceService.available_acct(merchant_id), amount), Posting.credit(BalanceService.SCHEME, amount)])
+        self._track_negative(merchant_id)
+
+    def _track_negative(self, merchant_id: str) -> None:
+        if self._ledger.balance(BalanceService.available_acct(merchant_id)).is_negative():
+            self._negative_since.setdefault(merchant_id, self._clock.today())
+        else:
+            self._negative_since.pop(merchant_id, None)
+```
+
+#### Step 5: Apply the reserve, earliest tranche first
+
+`sorted(..., key=lambda t: t.release_on)` orders the merchant's tranches; `self._tranches.remove(t)` removes by dataclass equality and a partly used tranche is re-appended with its remainder and original date. The ledger entry moves exactly `used` from reserve to available.
+
+```python
+    def cover_from_reserve(self, merchant_id: str) -> Money:
+        """Negative balance, step 1: use the merchant's own reserve, earliest-releasing tranches first, before
+        asking anyone for money. That is what the reserve is for."""
+        deficit = self._ledger.balance(BalanceService.available_acct(merchant_id)).negate()
+        used = Money.zero(self._currency)
+        if not deficit.is_positive():
+            return used
+        mine = sorted((t for t in self._tranches if t.merchant_id == merchant_id), key=lambda t: t.release_on)
+        for t in mine:
+            if not deficit.is_positive():
+                break
+            take = t.amount.min(deficit)
+            self._tranches.remove(t)
+            if take.compare_to(t.amount) < 0:
+                self._tranches.append(ReserveTranche(merchant_id, t.amount.minus(take), t.release_on))
+            used = used.plus(take)
+            deficit = deficit.minus(take)
+        if used.is_positive():
+            self._ledger.post(self._clock.today(), f"reserve applied to negative balance {merchant_id}", [
+                Posting.debit(BalanceService.reserve_acct(merchant_id), used),
+                Posting.credit(BalanceService.available_acct(merchant_id), used)])
+        self._track_negative(merchant_id)
+        return used
+```
+
+#### Step 6: The payout run
+
+Per merchant, in order: cover from reserve, collect if the balance has been negative for `collect_after_negative_days` (a `DEBIT` payout into `collections_receivable`), otherwise pay only if due, not paused, positive, and at least the minimum. The loop iterates `list(self._merchants.values())` so the dict is not mutated under iteration.
+
+```python
+    def run_payouts(self) -> list[Payout]:
+        """The daily payout run. For each merchant: cover a negative balance from reserve; if it has been negative
+        for collect_after_negative_days, ask its bank for the deficit (a DEBIT line); otherwise, if its schedule is
+        due, it is not paused, and available meets the minimum, pay out all of available (a CREDIT line). One
+        file per run, with a trailer carrying the counts and totals the bank checks."""
+        today = self._clock.today()
+        batch: list[Payout] = []
+        for m in list(self._merchants.values()):
+            self.cover_from_reserve(m.id)
+            available = self._ledger.balance(BalanceService.available_acct(m.id))
+            since = self._negative_since.get(m.id)
+            if available.is_negative() and since is not None and not today < since + timedelta(days=self._collect_after_negative_days):
+                self._payout_seq += 1
+                debit = Payout(f"co_{self._payout_seq:04d}", m.id, available.negate(), PayoutDirection.DEBIT, today)
+                self._ledger.post(today, f"collection {debit.id}", [
+                    Posting.debit(BalanceService.COLLECTIONS, debit.amount),
+                    Posting.credit(BalanceService.available_acct(m.id), debit.amount)])
+                self._track_negative(m.id)
+                self._payouts[debit.id] = debit
+                batch.append(debit)
+                continue
+            if not m.schedule.due_on(today) or self.is_paused(m.id):
+                continue
+            if available.compare_to(m.schedule.minimum_payout) < 0 or not available.is_positive():
+                continue
+            self._payout_seq += 1
+            credit = Payout(f"po_{self._payout_seq:04d}", m.id, available, PayoutDirection.CREDIT, today)
+            self._ledger.post(today, f"payout {credit.id}", [
+                Posting.debit(BalanceService.available_acct(m.id), available),
+                Posting.credit(BalanceService.in_transit_acct(m.id), available)])
+            self._payouts[credit.id] = credit
+            batch.append(credit)
+        if batch:
+            self._write_file(today, batch)
+        return batch
+```
+
+#### Step 7: The file and the bank's answers
+
+`_write_file` emits the header, one `D` line per payout with the amount in integer minor units, and a trailer with counts and totals. `returned` reverses a credit back to available and pauses the merchant, or restores a collection's deficit and restarts the negative clock from today.
+
+```python
+    def _write_file(self, today: date, batch: list[Payout]) -> None:
+        self._file_seq += 1
+        name = f"payouts_{today}_{self._file_seq:03d}.csv"
+        lines = [f"H,{today},{name},{self._currency.code}"]
+        credits = 0
+        debits = 0
+        for p in batch:
+            lines.append(f"D,{p.id},{p.merchant_id},{self.merchant(p.merchant_id).bank_account_token},{p.direction.name},{p.amount.minor_units}")
+            if p.direction is PayoutDirection.CREDIT:
+                credits += p.amount.minor_units
+            else:
+                debits += p.amount.minor_units
+        lines.append(f"T,{len(batch)},{credits},{debits}")
+        self._sink.write(name, lines)
+
+    def returned(self, payout_id: str, return_code: str) -> None:
+        """The bank returns a line (NACHA return codes: R01 insufficient funds, R02 account closed, R03 no account).
+        A returned credit goes back to available and payouts pause until the bank details are fixed; a returned
+        debit puts the deficit back on the merchant's balance."""
+        p = self.payout(payout_id)
+        if p.state is not PayoutState.IN_TRANSIT:
+            raise RuntimeError(f"{payout_id} is {p.state.name}; cannot return")
+        if p.direction is PayoutDirection.CREDIT:
+            self._ledger.post(self._clock.today(), f"payout returned {p.id} {return_code}", [
+                Posting.debit(BalanceService.in_transit_acct(p.merchant_id), p.amount),
+                Posting.credit(BalanceService.available_acct(p.merchant_id), p.amount)])
+            self._paused[p.merchant_id] = f"payout {p.id} returned {return_code}"
+        else:
+            self._ledger.post(self._clock.today(), f"collection returned {p.id} {return_code}", [
+                Posting.debit(BalanceService.available_acct(p.merchant_id), p.amount),
+                Posting.credit(BalanceService.COLLECTIONS, p.amount)])
+            self._negative_since.pop(p.merchant_id, None)
+            self._track_negative(p.merchant_id)
+        p.state = PayoutState.RETURNED
+        p.return_code = return_code
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/08-payouts-and-balance-management/code/python
@@ -390,35 +590,353 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### In Go
+The output matches the Java run line for line:
 
-```go
-func (s PayoutSchedule) DueOn(d time.Time) bool {
-    wd := d.Weekday()
-    businessDay := wd != time.Saturday && wd != time.Sunday
-    return businessDay && (s.Frequency == DAILY || wd == s.WeeklyDay)
-}
+```console
+2026-03-02 MON after 3 captures (400.00 gross)        pending 387.50 USD  available 0.00 USD     reserve 0.00 USD   in transit 0.00 USD
+payout run Monday -> []  (nothing settled, nothing to pay)
+payout run Tuesday -> []  (the expected T+1 report did not arrive)
 
-func (s *BalanceService) Settle(report SettlementReport) error {
-    ...
-    if sum != report.TotalGross {
-        return fmt.Errorf("%w: report %s does not reconcile: total %v but captures sum to %v",
-            ErrIllegalState, report.ID, report.TotalGross, sum)
-    }
+== Wednesday: the settlement report arrives and reconciles; 10% of m_shoe's net goes to a 90-day reserve ==
+refused: report st_bad does not reconcile: total 399.99 USD but captures sum to 400.00 USD
+2026-03-04 WED after settlement st_0302               pending 0.00 USD    available 348.75 USD   reserve 38.75 USD  in transit 0.00 USD
+payout run Wednesday -> [po_0001 CREDIT m_shoe 348.75 USD IN_TRANSIT]
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+### In Go
 
-- **Every mutation returns an `error`, and nothing is written until every check passes.** `Settle` reconciles, builds the full posting list, posts once, and only then marks captures settled and appends tranches; `RunPayouts` returns `([]*Payout, error)`; `Confirm` and `Returned` return `error`. Two sentinels cover the Java exceptions: `ErrIllegalState` (a report that does not reconcile, a double settlement, a line that cannot be confirmed) and `ErrInvalidArgument` (unknown merchant, zero debit, a reserve over 100%), and the tests match them with `errors.Is`.
-- **`null` is `(T, bool)` or the zero value.** `NegativeSince` returns `(time.Time, bool)` instead of a nullable date; `Payout.ReturnCode` is `""` until the bank returns the line; a `DAILY` schedule simply ignores its `WeeklyDay` field where Java passed `null`.
-- **Record equality becomes an explicit method.** Java's `tranches.remove(t)` removes the first element `equals` to a record; `removeTranche` does the same with `ReserveTranche.equal`, comparing the date with `time.Time.Equal` rather than `==`, and `ReleaseReserves` filters into a kept slice instead of `removeAll`. `LinkedHashMap`s (merchants, files, net-by-merchant in `Settle`) are a map plus an order slice so files and payouts come out in the Java order.
-- **Dates and days.** `Date(2026, time.March, 2)` is `LocalDate.of`, `AddDate(0, 0, n)` is `plusDays`, `Weekday()` replaces `getDayOfWeek()`, and the demo prints `MON`/`TUE` with `strings.ToUpper(wd.String()[:3])`. Everything is midnight UTC, so `Before`/`After` compare whole days.
-- **Integer fees without `multiplyExact`.** The fee and the reserve share use `mulChecked` and `floorDiv` from `money.go`, so an overflow is an error rather than a silent wrap and the floor is a floor (Go's `/` truncates toward zero).
+The Go port (`code/go/main.go`, `money.go`, tests in `main_test.go`) keeps the design with five differences. **Every mutation returns an `error`, and nothing is written until every check passes:** `Settle` reconciles, builds the full posting list, posts once, and only then marks captures settled and appends tranches; `RunPayouts` returns `([]*Payout, error)`; `Confirm` and `Returned` return `error`. Two sentinels cover the Java exceptions, `ErrIllegalState` (a report that does not reconcile, a double settlement, a line that cannot be confirmed) and `ErrInvalidArgument` (unknown merchant, zero debit, a reserve over 100%), and the tests match them with `errors.Is`. **`null` is `(T, bool)` or the zero value:** `NegativeSince` returns `(time.Time, bool)` instead of a nullable date; `Payout.ReturnCode` is `""` until the bank returns the line; a `DAILY` schedule simply ignores its `WeeklyDay` field where Java passed `null`. **Record equality becomes an explicit method:** Java's `tranches.remove(t)` removes the first element `equals` to a record; `removeTranche` does the same with `ReserveTranche.equal`, comparing the date with `time.Time.Equal` rather than `==`, and `ReleaseReserves` filters into a kept slice instead of `removeAll`; `LinkedHashMap`s (merchants, files, net-by-merchant in `Settle`) are a map plus an order slice so files and payouts come out in the Java order. **Dates and days:** `Date(2026, time.March, 2)` is `LocalDate.of`, `AddDate(0, 0, n)` is `plusDays`, `Weekday()` replaces `getDayOfWeek()`, and the demo prints `MON`/`TUE` with `strings.ToUpper(wd.String()[:3])`; everything is midnight UTC, so `Before`/`After` compare whole days. **Integer fees without `multiplyExact`:** the fee and the reserve share use `mulChecked` and `floorDiv` from `money.go`, so an overflow is an error rather than a silent wrap and the floor is a floor (Go's `/` truncates toward zero).
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Four accounts per merchant and a balance read from them
+
+`Onboard` refuses a duplicate merchant, opens the four accounts in a loop, and records the merchant in `merchantOrder` so later runs iterate deterministically. `Balance` validates the id and reads the four balances with `mustBalance`, which is safe because `Onboard` opened them.
+
+```go
+func PendingAcct(m string) string   { return m + ":pending" }
+func AvailableAcct(m string) string { return m + ":available" }
+func ReserveAcct(m string) string   { return m + ":reserve" }
+func InTransitAcct(m string) string { return m + ":in_transit" }
+
+func (s *BalanceService) Ledger() *Ledger { return s.ledger }
+
+func (s *BalanceService) Onboard(m Merchant) error {
+	if _, exists := s.merchants[m.ID]; exists {
+		return fmt.Errorf("%w: merchant exists: %s", ErrInvalidArgument, m.ID)
+	}
+	for _, acct := range []string{PendingAcct(m.ID), AvailableAcct(m.ID), ReserveAcct(m.ID), InTransitAcct(m.ID)} {
+		if err := s.ledger.Open(acct, LIABILITY); err != nil {
+			return err
+		}
+	}
+	s.merchants[m.ID] = m
+	s.merchantOrder = append(s.merchantOrder, m.ID)
+	return nil
+}
+
+func (s *BalanceService) Merchant(id string) (Merchant, error) {
+	m, ok := s.merchants[id]
+	if !ok {
+		return Merchant{}, fmt.Errorf("%w: unknown merchant %s", ErrInvalidArgument, id)
+	}
+	return m, nil
+}
+
+func (s *BalanceService) Balance(merchantID string) (Balance, error) {
+	if _, err := s.Merchant(merchantID); err != nil {
+		return Balance{}, err
+	}
+	return Balance{s.ledger.mustBalance(PendingAcct(merchantID)), s.ledger.mustBalance(AvailableAcct(merchantID)),
+		s.ledger.mustBalance(ReserveAcct(merchantID)), s.ledger.mustBalance(InTransitAcct(merchantID))}, nil
+}
+```
+
+#### Step 2: Capture into pending
+
+`Capture` returns `(CaptureRecord, error)`; the fee goes through `mulChecked` and `floorDiv`, and the fee posting is appended only when positive.
+
+```go
+func (s *BalanceService) Capture(captureID, merchantID string, gross Money, feeBps, fixedFeeMinor int64) (CaptureRecord, error) {
+	if _, err := s.Merchant(merchantID); err != nil {
+		return CaptureRecord{}, err
+	}
+	if _, exists := s.captures[captureID]; exists {
+		return CaptureRecord{}, fmt.Errorf("%w: capture exists: %s", ErrIllegalState, captureID)
+	}
+	scaled, err := mulChecked(gross.MinorUnits, feeBps)
+	if err != nil {
+		return CaptureRecord{}, err
+	}
+	variable := floorDiv(scaled+5_000, 10_000)
+	c := CaptureRecord{captureID, merchantID, gross, OfMinor(variable+fixedFeeMinor, s.currency), s.clock.Today()}
+	postings := []Posting{Debit(SCHEME, gross), Credit(PendingAcct(merchantID), c.Net())}
+	if c.Fee.IsPositive() {
+		postings = append(postings, Credit(FEES, c.Fee))
+	}
+	if err := s.ledger.Post(s.clock.Today(), "capture "+captureID, postings); err != nil {
+		return CaptureRecord{}, err
+	}
+	s.captures[captureID] = c
+	return c, nil
+}
+```
+
+#### Step 3: Settlement: reconcile, then move
+
+`Settle` runs the three checks and returns `ErrIllegalState` before any write. It builds the posting list and the new tranches into locals, posts once, and only then records `settledBy` and appends the tranches, so a failed post leaves no partial state. `merchantOrder` is the explicit insertion order a Go map lacks.
+
+```go
+func (s *BalanceService) Settle(report SettlementReport) error {
+	sum := Zero(s.currency)
+	for _, id := range report.CaptureIDs {
+		c, ok := s.captures[id]
+		if !ok {
+			return fmt.Errorf("%w: report %s names unknown capture %s", ErrIllegalState, report.ID, id)
+		}
+		if s.IsSettled(id) {
+			return fmt.Errorf("%w: report %s: %s already settled by %s", ErrIllegalState, report.ID, id, s.settledBy[id])
+		}
+		sum = mustPlus(sum, c.Gross)
+	}
+	if sum != report.TotalGross {
+		return fmt.Errorf("%w: report %s does not reconcile: total %v but captures sum to %v", ErrIllegalState, report.ID, report.TotalGross, sum)
+	}
+	postings := []Posting{Debit(BANK, sum), Credit(SCHEME, sum)}
+	var merchantOrder []string
+	netByMerchant := map[string]Money{}
+	for _, id := range report.CaptureIDs {
+		c := s.captures[id]
+		if prev, seen := netByMerchant[c.MerchantID]; seen {
+			netByMerchant[c.MerchantID] = mustPlus(prev, c.Net())
+		} else {
+			merchantOrder = append(merchantOrder, c.MerchantID)
+			netByMerchant[c.MerchantID] = c.Net()
+		}
+	}
+	var newTranches []ReserveTranche
+	for _, mid := range merchantOrder {
+		m := s.merchants[mid]
+		net := netByMerchant[mid]
+		scaled, err := mulChecked(net.MinorUnits, m.Reserve.BasisPoints)
+		if err != nil {
+			return err
+		}
+		reserve := OfMinor(floorDiv(scaled, 10_000), s.currency)
+		postings = append(postings, Debit(PendingAcct(m.ID), net), Credit(AvailableAcct(m.ID), mustMinus(net, reserve)))
+		if reserve.IsPositive() {
+			postings = append(postings, Credit(ReserveAcct(m.ID), reserve))
+			newTranches = append(newTranches, ReserveTranche{m.ID, reserve, report.ValueDate.AddDate(0, 0, m.Reserve.HoldDays)})
+		}
+	}
+	if err := s.ledger.Post(s.clock.Today(), "settlement "+report.ID, postings); err != nil {
+		return err
+	}
+	for _, id := range report.CaptureIDs {
+		s.settledBy[id] = report.ID
+	}
+	s.tranches = append(s.tranches, newTranches...)
+	return nil
+}
+```
+
+#### Step 4: Debits may go negative
+
+`DebitMerchant` posts without a balance check and calls `trackNegative`, which records the first negative day only when not already tracked and deletes the entry once the balance recovers.
+
+```go
+func (s *BalanceService) DebitMerchant(merchantID string, amount Money, reason string) error {
+	if _, err := s.Merchant(merchantID); err != nil {
+		return err
+	}
+	if !amount.IsPositive() {
+		return fmt.Errorf("%w: debit must be positive", ErrInvalidArgument)
+	}
+	if err := s.ledger.Post(s.clock.Today(), reason+" "+merchantID, []Posting{Debit(AvailableAcct(merchantID), amount), Credit(SCHEME, amount)}); err != nil {
+		return err
+	}
+	s.trackNegative(merchantID)
+	return nil
+}
+
+func (s *BalanceService) trackNegative(merchantID string) {
+	if s.available(merchantID).IsNegative() {
+		if _, tracked := s.negativeSince[merchantID]; !tracked {
+			s.negativeSince[merchantID] = s.clock.Today()
+		}
+	} else {
+		delete(s.negativeSince, merchantID)
+	}
+}
+```
+
+#### Step 5: Apply the reserve, earliest tranche first
+
+`CoverFromReserve` sorts the merchant's tranches with `sort.SliceStable` on `ReleaseOn.Before`, removes each consumed tranche via `removeTranche` (first element `equal` to it, like `List.remove`), and re-appends any remainder with its original date.
+
+```go
+func (s *BalanceService) CoverFromReserve(merchantID string) (Money, error) {
+	deficit := s.available(merchantID).Negate()
+	used := Zero(s.currency)
+	if !deficit.IsPositive() {
+		return used, nil
+	}
+	var mine []ReserveTranche
+	for _, t := range s.tranches {
+		if t.MerchantID == merchantID {
+			mine = append(mine, t)
+		}
+	}
+	sort.SliceStable(mine, func(i, j int) bool { return mine[i].ReleaseOn.Before(mine[j].ReleaseOn) })
+	for _, t := range mine {
+		if !deficit.IsPositive() {
+			break
+		}
+		take := t.Amount.Min(deficit)
+		s.removeTranche(t)
+		if take.Compare(t.Amount) < 0 {
+			s.tranches = append(s.tranches, ReserveTranche{merchantID, mustMinus(t.Amount, take), t.ReleaseOn})
+		}
+		used = mustPlus(used, take)
+		deficit = mustMinus(deficit, take)
+	}
+	if used.IsPositive() {
+		if err := s.ledger.Post(s.clock.Today(), "reserve applied to negative balance "+merchantID,
+			[]Posting{Debit(ReserveAcct(merchantID), used), Credit(AvailableAcct(merchantID), used)}); err != nil {
+			return Zero(s.currency), err
+		}
+	}
+	s.trackNegative(merchantID)
+	return used, nil
+}
+
+// removeTranche drops the first tranche equal to t, as List.remove(Object) does for a record.
+func (s *BalanceService) removeTranche(t ReserveTranche) {
+	for i, x := range s.tranches {
+		if x.equal(t) {
+			s.tranches = append(s.tranches[:i], s.tranches[i+1:]...)
+			return
+		}
+	}
+}
+```
+
+#### Step 6: The payout run
+
+`RunPayouts` walks `merchantOrder`, covers from reserve, collects when `negativeSince` is set and the grace period has elapsed (`!today.Before(since.AddDate(...))`), and otherwise pays out `available` when due, unpaused, positive, and at least the minimum. Any ledger error returns the batch so far.
+
+```go
+func (s *BalanceService) RunPayouts() ([]*Payout, error) {
+	today := s.clock.Today()
+	batch := []*Payout{}
+	for _, mid := range s.merchantOrder {
+		m := s.merchants[mid]
+		if _, err := s.CoverFromReserve(m.ID); err != nil {
+			return batch, err
+		}
+		available := s.available(m.ID)
+		since, negative := s.negativeSince[m.ID]
+		if available.IsNegative() && negative && !today.Before(since.AddDate(0, 0, s.collectAfterNegativeDays)) {
+			s.payoutSeq++
+			debit := &Payout{ID: fmt.Sprintf("co_%04d", s.payoutSeq), MerchantID: m.ID, Amount: available.Negate(), Direction: PAYOUT_DEBIT, InitiatedOn: today, State: IN_TRANSIT}
+			if err := s.ledger.Post(today, "collection "+debit.ID, []Posting{Debit(COLLECTIONS, debit.Amount), Credit(AvailableAcct(m.ID), debit.Amount)}); err != nil {
+				return batch, err
+			}
+			s.trackNegative(m.ID)
+			s.payouts[debit.ID] = debit
+			batch = append(batch, debit)
+			continue
+		}
+		if !m.Schedule.DueOn(today) || s.IsPaused(m.ID) {
+			continue
+		}
+		if available.Compare(m.Schedule.MinimumPayout) < 0 || !available.IsPositive() {
+			continue
+		}
+		s.payoutSeq++
+		credit := &Payout{ID: fmt.Sprintf("po_%04d", s.payoutSeq), MerchantID: m.ID, Amount: available, Direction: PAYOUT_CREDIT, InitiatedOn: today, State: IN_TRANSIT}
+		if err := s.ledger.Post(today, "payout "+credit.ID, []Posting{Debit(AvailableAcct(m.ID), available), Credit(InTransitAcct(m.ID), available)}); err != nil {
+			return batch, err
+		}
+		s.payouts[credit.ID] = credit
+		batch = append(batch, credit)
+	}
+	if len(batch) > 0 {
+		s.writeFile(today, batch)
+	}
+	return batch, nil
+}
+```
+
+#### Step 7: The file and the bank's answers
+
+`writeFile` prints amounts as `MinorUnits` integers with a trailer of counts and totals. `Returned` reverses a credit into available and pauses the merchant, or reverses a collection and restarts the negative clock; both paths end by setting `RETURNED` and the return code.
+
+```go
+func (s *BalanceService) writeFile(today time.Time, batch []*Payout) {
+	s.fileSeq++
+	name := fmt.Sprintf("payouts_%s_%03d.csv", fmtDate(today), s.fileSeq)
+	lines := []string{"H," + fmtDate(today) + "," + name + "," + s.currency.Code}
+	var credits, debits int64
+	for _, p := range batch {
+		lines = append(lines, fmt.Sprintf("D,%s,%s,%s,%v,%d", p.ID, p.MerchantID, s.merchants[p.MerchantID].BankAccountToken, p.Direction, p.Amount.MinorUnits))
+		if p.Direction == PAYOUT_CREDIT {
+			credits += p.Amount.MinorUnits
+		} else {
+			debits += p.Amount.MinorUnits
+		}
+	}
+	lines = append(lines, fmt.Sprintf("T,%d,%d,%d", len(batch), credits, debits))
+	s.sink.Write(name, lines)
+}
+
+func (s *BalanceService) Returned(payoutID, returnCode string) error {
+	p, err := s.Payout(payoutID)
+	if err != nil {
+		return err
+	}
+	if p.State != IN_TRANSIT {
+		return fmt.Errorf("%w: %s is %v; cannot return", ErrIllegalState, payoutID, p.State)
+	}
+	if p.Direction == PAYOUT_CREDIT {
+		if err := s.ledger.Post(s.clock.Today(), "payout returned "+p.ID+" "+returnCode,
+			[]Posting{Debit(InTransitAcct(p.MerchantID), p.Amount), Credit(AvailableAcct(p.MerchantID), p.Amount)}); err != nil {
+			return err
+		}
+		s.paused[p.MerchantID] = "payout " + p.ID + " returned " + returnCode
+	} else {
+		if err := s.ledger.Post(s.clock.Today(), "collection returned "+p.ID+" "+returnCode,
+			[]Posting{Debit(AvailableAcct(p.MerchantID), p.Amount), Credit(COLLECTIONS, p.Amount)}); err != nil {
+			return err
+		}
+		delete(s.negativeSince, p.MerchantID)
+		s.trackNegative(p.MerchantID)
+	}
+	p.State = RETURNED
+	p.ReturnCode = returnCode
+	return nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/08-payouts-and-balance-management/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run; the closing ledger reads:
+
+```console
+== Ledger ==
+   scheme_receivable         -600.00 USD
+   bank_cash                  795.12 USD
+   collections_receivable       0.00 USD
+   fee_revenue                 20.64 USD
+   m_shoe                       0.00 USD owed in total
+   m_art                      174.48 USD owed in total
+   ledger balances: true, journal entries: 16
 ```
 
 ## Use It

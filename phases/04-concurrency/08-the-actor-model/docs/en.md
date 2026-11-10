@@ -350,24 +350,223 @@ seed 42: 32 messages delivered, 32 traced
 
 ### In Python
 
-`code/python/main.py` is the same runtime class for class: `ActorCell`, `DeterministicScheduler`, `ThreadedScheduler`, `AccountActor`, `TransferCoordinator`. Four things differ.
+The Python port (`code/python/main.py`) is the same runtime class for class: `ActorCell`, `DeterministicScheduler`, `ThreadedScheduler`, `AccountActor`, `TransferCoordinator`. Four things differ. **Messages are frozen dataclasses and `receive` is a `match`.** Python has no sealed hierarchy, so the exhaustiveness check the Java compiler gives you becomes a `case _:` that raises `ValueError`, exactly like the Java `default` branch. `Transfer.from_` carries a trailing underscore because `from` is a keyword. **The mailbox is a `collections.deque`.** `append` and `popleft` are atomic in CPython, which is the property `ConcurrentLinkedQueue` gives Java. `AtomicBoolean` and `AtomicInteger` are tiny lock-guarded classes: the GIL makes `count += 1` *look* atomic, but it is a read, an add and a write, and a thread switch can land between them. **The GIL does not change the lesson.** Only one thread runs Python bytecode at a time, but the interpreter switches threads between bytecodes, so two pool threads can still both be inside `receive` for the same actor if the CAS on `scheduled` is removed. The `max_concurrent_receives == 1` assertion is what proves the scheduler, not the GIL, keeps rule 3. **The seeded scheduler uses a port of `java.util.Random`.** `JavaRandom` reproduces the JDK's 48-bit LCG and `nextInt(bound)`, so seed 42 picks the same actor at every step in both languages and the demo traces are identical line for line.
 
-- **Messages are frozen dataclasses and `receive` is a `match`.** Python has no sealed hierarchy, so the exhaustiveness check the Java compiler gives you becomes a `case _:` that raises `ValueError`, exactly like the Java `default` branch. `Transfer.from_` carries a trailing underscore because `from` is a keyword.
-- **The mailbox is a `collections.deque`.** `append` and `popleft` are atomic in CPython, which is the property `ConcurrentLinkedQueue` gives Java. `AtomicBoolean` and `AtomicInteger` are tiny lock-guarded classes: the GIL makes `count += 1` *look* atomic, but it is a read, an add and a write, and a thread switch can land between them.
-- **The GIL does not change the lesson.** Only one thread runs Python bytecode at a time, but the interpreter switches threads between bytecodes, so two pool threads can still both be inside `receive` for the same actor if the CAS on `scheduled` is removed. The `max_concurrent_receives == 1` assertion is what proves the scheduler, not the GIL, keeps rule 3.
-- **The seeded scheduler uses a port of `java.util.Random`.** `JavaRandom` reproduces the JDK's 48-bit LCG and `nextInt(bound)`, so seed 42 picks the same actor at every step in both languages and the demo traces are identical line for line.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Messages are records, references can only tell
+
+Every message is a `@dataclass(frozen=True)` subclass of an empty `Message` base; frozen gives immutability and structural equality, which is what a Java record gives. `reply_to` is `Optional`, so a fire-and-forget deposit passes `None`. `ActorRef.tell` rejects `None` with `TypeError` (Java's `NullPointerException`) and otherwise just enqueues; there is no return value.
 
 ```python
-def _run(self, cell: ActorCell) -> None:
-    try:
-        for _ in range(self._throughput):  # drain a batch
-            if not cell.process_one():
-                break
-    finally:
-        cell.scheduled.set(False)          # release first ...
-        if cell.mailbox:                   # ... then re-check: a message may have landed in between
-            self.schedule(cell)
+@dataclass(frozen=True)
+class Deposit(Message):
+    correlation_id: str
+    amount: Money
+    reply_to: Optional["ActorRef"]
+
+
+@dataclass(frozen=True)
+class Withdraw(Message):
+    correlation_id: str
+    amount: Money
+    reply_to: Optional["ActorRef"]
+
+
+@dataclass(frozen=True)
+class Transfer(Message):
+    transfer_id: str
+    from_: str
+    to: str
+    amount: Money
+    reply_to: Optional["ActorRef"]
+
+
+class ActorRef:
+    def tell(self, message: Message) -> None:
+        if message is None:
+            raise TypeError("message")
+        self._cell.enqueue(message)
 ```
+
+#### Step 2: The actor and its cell
+
+`Actor` is a plain base class with `receive` raising `NotImplementedError`. The cell's mailbox is a `deque`; `process_one` uses `popleft` inside `try/except IndexError` as the non-blocking poll. The `concurrent_receives` counter and its running maximum are the invariant check, and any `Exception` from `receive` (Python's equivalent of `RuntimeException`) goes to `_supervise`, with the `finally` decrementing the counter on every path.
+
+```python
+class ActorCell:
+    def enqueue(self, message: Message) -> None:
+        if self.stopped:
+            self.dead_letters.increment_and_get()
+            self._system.dead_letter(self.name, message)
+            return
+        self.mailbox.append(message)
+        self._system.scheduler().schedule(self)
+
+    def process_one(self) -> bool:
+        """Process one message. Returns False if the mailbox was empty. The scheduler guarantees no overlap."""
+        try:
+            message = self.mailbox.popleft()
+        except IndexError:
+            return False
+        if self.stopped:
+            self.dead_letters.increment_and_get()
+            self._system.dead_letter(self.name, message)
+            return True
+        now = self.concurrent_receives.increment_and_get()
+        self.max_concurrent_receives.accumulate_max(now)
+        try:
+            self._system.trace(self.name, message)
+            self._actor.receive(message)
+            self.processed.increment_and_get()
+        except Exception as e:  # RuntimeException: supervision decides
+            self.failures.increment_and_get()
+            self._supervise(message, e)
+        finally:
+            self.concurrent_receives.decrement_and_get()
+        return True
+```
+
+#### Step 3: Supervision
+
+The three strategies are an `Enum` tested with `is`. RESTART calls the same zero-argument `factory` that `spawn` was given, binds a fresh `ActorContext` to the *same* `self_ref`, and runs `pre_start`; STOP flips the flag and drains the deque into dead letters. The failing message is dropped in every branch.
+
+```python
+    def _supervise(self, message: Message, e: Exception) -> None:
+        self._system.failure(self.name, message, e, self.strategy)
+        if self.strategy is SupervisorStrategy.RESUME:
+            pass  # state kept, message dropped
+        elif self.strategy is SupervisorStrategy.RESTART:
+            self.restarts.increment_and_get()
+            self._actor = self.factory()
+            self._actor.bind(ActorContext(self.self_ref, self._system))
+            self._actor.pre_start()
+        elif self.strategy is SupervisorStrategy.STOP:
+            self.stopped = True
+            while True:
+                try:
+                    m = self.mailbox.popleft()
+                except IndexError:
+                    break
+                self.dead_letters.increment_and_get()
+                self._system.dead_letter(self.name, m)
+```
+
+#### Step 4: The deterministic scheduler
+
+The runnable set is a list; `cell not in self._runnable` is the O(n) membership check the Java `contains` does. Seed 0 means round-robin (`pop(0)`); any other seed draws the index from `JavaRandom.next_int`, which is why the Python trace for seed 42 matches the Java trace step for step. `run_until_idle` is the whole test harness: no sleeping, no waiting.
+
+```python
+class DeterministicScheduler(Scheduler):
+    def __init__(self, seed: int) -> None:
+        self._runnable: list[ActorCell] = []
+        self._random = JavaRandom(seed)
+        self._round_robin = seed == 0
+        self._steps = 0
+
+    def schedule(self, cell: ActorCell) -> None:
+        if cell not in self._runnable:
+            self._runnable.append(cell)
+
+    def step(self) -> bool:
+        """Deliver one message to one actor. Returns False when nothing is runnable."""
+        if not self._runnable:
+            return False
+        if self._round_robin:
+            cell = self._runnable.pop(0)
+        else:
+            index = self._random.next_int(len(self._runnable))
+            cell = self._runnable.pop(index)
+        cell.process_one()
+        self._steps += 1
+        if cell.mailbox and cell not in self._runnable:
+            self._runnable.append(cell)
+        return True
+
+    def run_until_idle(self) -> int:
+        delivered = 0
+        while self.step():
+            delivered += 1
+        return delivered
+```
+
+#### Step 5: The threaded scheduler
+
+`AtomicBoolean.compare_and_set` is a lock around a compare and a store, but the shape is the Java CAS: whoever flips `scheduled` from `False` to `True` submits exactly one drain to the `concurrent.futures.Executor`. The `finally` clears the flag first and only then re-checks the deque; swap those two lines and a message appended between them is stranded.
+
+```python
+class ThreadedScheduler(Scheduler):
+    def __init__(self, executor: Executor, throughput: int) -> None:
+        self._executor = executor
+        self._throughput = throughput
+
+    def schedule(self, cell: ActorCell) -> None:
+        if cell.scheduled.compare_and_set(False, True):
+            self._executor.submit(self._run, cell)
+
+    def _run(self, cell: ActorCell) -> None:
+        try:
+            for _ in range(self._throughput):  # drain a batch
+                if not cell.process_one():
+                    break
+        finally:
+            cell.scheduled.set(False)          # release first ...
+            if cell.mailbox:                   # ... then re-check: a message may have landed in between
+                self.schedule(cell)
+```
+
+#### Step 6: The account and the coordinator
+
+`match` with class patterns destructures each message by field name. `Deposit` lets `Money.plus` raise `CurrencyMismatchError` on a wrong-currency amount, which is the failure the supervision demo uses; `Withdraw` is the lock-free check-then-act, and `Crash` raises `RuntimeError` on purpose. The coordinator matches on type alone and reads fields from `message`, popping `_in_flight` when a transfer settles.
+
+```python
+    def receive(self, message: Message) -> None:
+        match message:
+            case Deposit(correlation_id=cid, amount=amount, reply_to=reply_to):
+                self._balance = self._balance.plus(amount)  # raises CurrencyMismatchError for a wrong-currency deposit
+                if reply_to is not None:
+                    reply_to.tell(Deposited(cid, self._account_id, self._balance))
+            case Withdraw(correlation_id=cid, amount=amount, reply_to=reply_to):
+                if self._balance.compare_to(amount) < 0:  # check ...
+                    if reply_to is not None:
+                        reply_to.tell(InsufficientFunds(cid, self._account_id, amount, self._balance))
+                else:
+                    self._balance = self._balance.minus(amount)  # ... and act: nothing can interleave between them
+                    if reply_to is not None:
+                        reply_to.tell(Withdrawn(cid, self._account_id, amount, self._balance))
+            case GetBalance(reply_to=reply_to):
+                reply_to.tell(BalanceIs(self._account_id, self._balance))
+            case Crash(reason=reason):
+                raise RuntimeError(reason)
+            case _:
+                raise ValueError(f"account does not understand {describe(message)}")
+```
+
+```python
+    def receive(self, message: Message) -> None:
+        match message:
+            case Transfer():
+                self._in_flight[message.transfer_id] = message
+                self.context().lookup(message.from_).tell(Withdraw(message.transfer_id, message.amount, self.self_ref()))
+            case Withdrawn():
+                t = self._in_flight[message.correlation_id]
+                self.context().lookup(t.to).tell(Deposit(t.transfer_id, t.amount, self.self_ref()))
+            case Deposited():
+                t = self._in_flight.pop(message.correlation_id)
+                self._completed += 1
+                if t.reply_to is not None:
+                    t.reply_to.tell(TransferResult(t.transfer_id, True, ""))
+            case InsufficientFunds():
+                t = self._in_flight.pop(message.correlation_id)
+                self._rejected += 1
+                if t.reply_to is not None:
+                    t.reply_to.tell(TransferResult(t.transfer_id, False,
+                                                   f"{message.account} has {message.balance}, needs {message.requested}"))
+            case _:
+                raise ValueError(f"coordinator does not understand {describe(message)}")
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/04-concurrency/08-the-actor-model/code/python
@@ -375,33 +574,325 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Line for line the Java output, including the seed-42 ordering of the six `TransferResult`s:
+
+```console
+== One account, one mailbox: six transfers on a deterministic scheduler ==
+seed 42: 32 messages delivered, 32 traced
+  TransferResult(t2, failed: acct-B has 100.00 USD, needs 120.00 USD)
+  TransferResult(t4, failed: acct-A has 25.00 USD, needs 90.00 USD)
+  TransferResult(t1, ok)
+  TransferResult(t6, ok)
+  TransferResult(t5, ok)
+  TransferResult(t3, ok)
+  balances: A=100.00 USD B=160.00 USD C=40.00 USD  total=300.00 USD
+
+== Supervision: RESUME keeps state, RESTART resets it, STOP turns the mailbox into dead letters ==
+  acct-X failed on Deposit(d1, 1.00 EUR): cannot combine USD with EUR -> RESUME
+  acct-X balance after the bad deposit was dropped: 50.00 USD
+  counter-resume reports 3 (2 before the crash + 1 after); counter-restart reports 1 (state reset); counter-stop reports nothing, dead letters = 2
+
+== Threaded scheduler: 4 threads x 25,000 deposits into one account, no locks in AccountActor ==
+  balance = 1000.00 USD (expected 1000.00 USD); messages processed = 100001; max concurrent receive() = 1
+```
+
 ### In Go
 
-`code/go/main.go` keeps the same runtime: `ActorCell`, `DeterministicScheduler`, `ThreadedScheduler`, `AccountActor`, `TransferCoordinator`, and the same seeded `JavaRandom` (`javarandom.go`), so seed 42 produces the same 32-line trace as Java. Four things differ.
+The Go port (`code/go/main.go`) keeps the same runtime: `ActorCell`, `DeterministicScheduler`, `ThreadedScheduler`, `AccountActor`, `TransferCoordinator`, and the same seeded `JavaRandom` (`javarandom.go`), so seed 42 produces the same 32-line trace as Java. Four things differ. **Failures are returned, not thrown.** `Receive(message Message) error` replaces `void receive(Message)`. A wrong-currency deposit returns a `*CurrencyMismatchError` (which matches `ErrCurrencyMismatch` under `errors.Is`), a `Crash` returns `errors.New(reason)`, and `ProcessOne` hands any non-nil error to `supervise`. A `panic` is reserved for programming errors the Java code also treats as such: `Tell(nil)` and a negative opening balance in a factory that cannot return an error. **The sealed hierarchy is a marker interface.** `type Message interface{ isMessage() }` closes the set to the structs in this package; `Describe`'s type switch is the exhaustive case list. `Spawn` and `Ref` return `(*ActorRef, error)` with `ErrActorExists` and `ErrNoSuchActor` instead of throwing. **The mailbox is a mutex-guarded slice and the counters are `sync/atomic` types.** Go's `atomic.Bool.CompareAndSwap` is the real CAS the `scheduled` flag needs. `MaxConcurrentReceives` is updated with a CAS loop, the hand-written form of `accumulateAndGet(now, Math::max)`. **The executor is a bounded semaphore.** `ThreadedScheduler` runs each drain in its own goroutine but holds a slot in a channel of capacity `workers`, so at most four drains run at once, and `Close()` waits on a `sync.WaitGroup` the way closing an `ExecutorService` does. `go test -race ./...` is the proof that rule 3 holds: with the CAS removed, the detector reports the overlapping `Receive` calls on `balance`.
 
-- **Failures are returned, not thrown.** `Receive(message Message) error` replaces `void receive(Message)`. A wrong-currency deposit returns a `*CurrencyMismatchError` (which matches `ErrCurrencyMismatch` under `errors.Is`), a `Crash` returns `errors.New(reason)`, and `ProcessOne` hands any non-nil error to `supervise`. A `panic` is reserved for programming errors the Java code also treats as such: `Tell(nil)` and a negative opening balance in a factory that cannot return an error.
-- **The sealed hierarchy is a marker interface.** `type Message interface{ isMessage() }` closes the set to the structs in this package; `Describe`'s type switch is the exhaustive case list. `Spawn` and `Ref` return `(*ActorRef, error)` with `ErrActorExists` and `ErrNoSuchActor` instead of throwing.
-- **The mailbox is a mutex-guarded slice and the counters are `sync/atomic` types.** Go's `atomic.Bool.CompareAndSwap` is the real CAS the `scheduled` flag needs. `MaxConcurrentReceives` is updated with a CAS loop, the hand-written form of `accumulateAndGet(now, Math::max)`.
-- **The executor is a bounded semaphore.** `ThreadedScheduler` runs each drain in its own goroutine but holds a slot in a channel of capacity `workers`, so at most four drains run at once, and `Close()` waits on a `sync.WaitGroup` the way closing an `ExecutorService` does. `go test -race ./...` is the proof that rule 3 holds: with the CAS removed, the detector reports the overlapping `Receive` calls on `balance`.
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: Messages are records, references can only tell
+
+Plain structs with exported fields and an unexported `isMessage()` method; only types in this package can satisfy `Message`, which is as close to `sealed` as Go gets. `ReplyTo` is a `*ActorRef`, nil for fire-and-forget. `Tell` panics on `nil` because a nil message is a programming error, exactly where Java throws `NullPointerException`.
 
 ```go
-func (s *ThreadedScheduler) run(cell *ActorCell) {
-    defer func() {
-        cell.Scheduled.Store(false)  // release first ...
-        if !cell.Mailbox.IsEmpty() { // ... then re-check: a message may have landed in between
-            s.Schedule(cell)
-        }
-    }()
-    for i := 0; i < s.throughput && cell.ProcessOne(); i++ {
-        // drain a batch
-    }
+type Message interface{ isMessage() }
+
+type Deposit struct {
+	CorrelationID string
+	Amount        Money
+	ReplyTo       *ActorRef
+}
+type Withdraw struct {
+	CorrelationID string
+	Amount        Money
+	ReplyTo       *ActorRef
+}
+type Transfer struct {
+	TransferID string
+	From       string
+	To         string
+	Amount     Money
+	ReplyTo    *ActorRef
+}
+
+type ActorRef struct {
+	name string
+	cell *ActorCell
+}
+
+// Tell enqueues the message. A nil message is a programming error and panics, like Java's NullPointerException.
+func (r *ActorRef) Tell(message Message) {
+	if message == nil {
+		panic("message must not be nil")
+	}
+	r.cell.enqueue(message)
 }
 ```
+
+#### Step 2: The actor and its cell
+
+`Actor` is an interface; `BaseActor` supplies `Bind`, `Context`, `Self`, and a no-op `PreStart` for embedding. `Mailbox` is a mutex-guarded slice with `Offer`/`Poll` (the `items[0] = nil` lets the GC reclaim the head). `ProcessOne` returns the error path to `supervise`; the CAS loop on `MaxConcurrentReceives` is `accumulateAndGet(now, Math::max)` by hand, and the `defer` decrements the counter on every path.
+
+```go
+type Actor interface {
+	Bind(context *ActorContext)
+	Receive(message Message) error
+	// PreStart is called after a RESTART before the first message of the new incarnation.
+	PreStart()
+}
+
+func (c *ActorCell) ProcessOne() bool {
+	message, ok := c.Mailbox.Poll()
+	if !ok {
+		return false
+	}
+	if c.Stopped.Load() {
+		c.DeadLetters.Add(1)
+		c.system.deadLetter(c.Name, message)
+		return true
+	}
+	now := c.ConcurrentReceives.Add(1)
+	for {
+		max := c.MaxConcurrentReceives.Load()
+		if now <= max || c.MaxConcurrentReceives.CompareAndSwap(max, now) {
+			break
+		}
+	}
+	defer c.ConcurrentReceives.Add(-1)
+	c.system.trace(c.Name, message)
+	if err := c.Actor().Receive(message); err != nil {
+		c.Failures.Add(1)
+		c.supervise(message, err)
+		return true
+	}
+	c.Processed.Add(1)
+	return true
+}
+```
+
+#### Step 3: Supervision
+
+A `switch` on the strategy constant. RESTART calls `c.install(c.Factory())`, which binds the new instance to the unchanged `Self` reference and runs `PreStart`; STOP sets the atomic `Stopped` flag and drains the mailbox into dead letters. The failing message is never re-delivered.
+
+```go
+func (c *ActorCell) supervise(message Message, err error) {
+	c.system.failure(c.Name, message, err, c.Strategy)
+	switch c.Strategy {
+	case Resume:
+		// state kept, message dropped
+	case Restart:
+		c.Restarts.Add(1)
+		c.install(c.Factory())
+	case Stop:
+		c.Stopped.Store(true)
+		for {
+			m, ok := c.Mailbox.Poll()
+			if !ok {
+				break
+			}
+			c.DeadLetters.Add(1)
+			c.system.deadLetter(c.Name, m)
+		}
+	}
+}
+```
+
+#### Step 4: The deterministic scheduler
+
+The runnable set is a slice with a linear `contains`. Round-robin takes the head; a seeded run takes `JavaRandom.NextInt(len)` and removes that element with the three-index slice expression `s.runnable[:index:index]`, which forces `append` to copy rather than overwrite the tail in place. Everything else is the Java loop.
+
+```go
+func (s *DeterministicScheduler) Schedule(cell *ActorCell) {
+	if !s.contains(cell) {
+		s.runnable = append(s.runnable, cell)
+	}
+}
+
+// Step delivers one message to one actor. Returns false when nothing is runnable.
+func (s *DeterministicScheduler) Step() bool {
+	if len(s.runnable) == 0 {
+		return false
+	}
+	var cell *ActorCell
+	if s.roundRobin {
+		cell = s.runnable[0]
+		s.runnable = s.runnable[1:]
+	} else {
+		index := int(s.random.NextInt(int32(len(s.runnable))))
+		cell = s.runnable[index]
+		s.runnable = append(s.runnable[:index:index], s.runnable[index+1:]...)
+	}
+	cell.ProcessOne()
+	s.steps++
+	if !cell.Mailbox.IsEmpty() && !s.contains(cell) {
+		s.runnable = append(s.runnable, cell)
+	}
+	return true
+}
+
+func (s *DeterministicScheduler) RunUntilIdle() int {
+	delivered := 0
+	for s.Step() {
+		delivered++
+	}
+	return delivered
+}
+```
+
+#### Step 5: The threaded scheduler
+
+`atomic.Bool.CompareAndSwap` is the hardware CAS; the winner calls `execute`, which starts a goroutine that must first take a slot in the `sem` channel, giving the bounded pool Java got from a fixed executor. The `defer` in `run` plays the `finally`: clear the flag, then re-check the mailbox and reschedule if anything arrived in between.
+
+```go
+func (s *ThreadedScheduler) Schedule(cell *ActorCell) {
+	if cell.Scheduled.CompareAndSwap(false, true) {
+		s.execute(func() { s.run(cell) })
+	}
+}
+
+func (s *ThreadedScheduler) execute(task func()) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.sem <- struct{}{}
+		defer func() { <-s.sem }()
+		task()
+	}()
+}
+
+func (s *ThreadedScheduler) run(cell *ActorCell) {
+	defer func() {
+		cell.Scheduled.Store(false)  // release first ...
+		if !cell.Mailbox.IsEmpty() { // ... then re-check: a message may have landed in between
+			s.Schedule(cell)
+		}
+	}()
+	for i := 0; i < s.throughput && cell.ProcessOne(); i++ {
+		// drain a batch
+	}
+}
+```
+
+#### Step 6: The account and the coordinator
+
+A type switch binds `m` to the concrete message. `Money.Plus` and `Minus` return `(Money, error)`, so the wrong-currency deposit surfaces as a returned error that supervision handles, and `Crash` returns `errors.New(m.Reason)`. The coordinator's `Lookup` also returns an error, and an unknown message wraps `ErrUnknownMessage`.
+
+```go
+func (a *AccountActor) Receive(message Message) error {
+	switch m := message.(type) {
+	case Deposit:
+		next, err := a.balance.Plus(m.Amount) // fails with ErrCurrencyMismatch for a wrong-currency deposit
+		if err != nil {
+			return err
+		}
+		a.balance = next
+		if m.ReplyTo != nil {
+			m.ReplyTo.Tell(Deposited{m.CorrelationID, a.accountID, a.balance})
+		}
+	case Withdraw:
+		if a.balance.Compare(m.Amount) < 0 { // check ...
+			if m.ReplyTo != nil {
+				m.ReplyTo.Tell(InsufficientFunds{m.CorrelationID, a.accountID, m.Amount, a.balance})
+			}
+		} else {
+			next, err := a.balance.Minus(m.Amount) // ... and act: nothing can interleave between them
+			if err != nil {
+				return err
+			}
+			a.balance = next
+			if m.ReplyTo != nil {
+				m.ReplyTo.Tell(Withdrawn{m.CorrelationID, a.accountID, m.Amount, a.balance})
+			}
+		}
+	case GetBalance:
+		m.ReplyTo.Tell(BalanceIs{a.accountID, a.balance})
+	case Crash:
+		return errors.New(m.Reason)
+	default:
+		return fmt.Errorf("%w: account does not understand %s", ErrUnknownMessage, Describe(message))
+	}
+	return nil
+}
+```
+
+```go
+func (c *TransferCoordinator) Receive(message Message) error {
+	switch m := message.(type) {
+	case Transfer:
+		c.inFlight[m.TransferID] = m
+		from, err := c.Context().Lookup(m.From)
+		if err != nil {
+			return err
+		}
+		from.Tell(Withdraw{m.TransferID, m.Amount, c.Self()})
+	case Withdrawn:
+		t := c.inFlight[m.CorrelationID]
+		to, err := c.Context().Lookup(t.To)
+		if err != nil {
+			return err
+		}
+		to.Tell(Deposit{t.TransferID, t.Amount, c.Self()})
+	case Deposited:
+		t := c.inFlight[m.CorrelationID]
+		delete(c.inFlight, m.CorrelationID)
+		c.completed++
+		if t.ReplyTo != nil {
+			t.ReplyTo.Tell(TransferResult{t.TransferID, true, ""})
+		}
+	case InsufficientFunds:
+		t := c.inFlight[m.CorrelationID]
+		delete(c.inFlight, m.CorrelationID)
+		c.rejected++
+		if t.ReplyTo != nil {
+			t.ReplyTo.Tell(TransferResult{t.TransferID, false,
+				m.Account + " has " + m.Balance.String() + ", needs " + m.Requested.String()})
+		}
+	default:
+		return fmt.Errorf("%w: coordinator does not understand %s", ErrUnknownMessage, Describe(message))
+	}
+	return nil
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/04-concurrency/08-the-actor-model/code/go
 go run .
 go test -race ./...
+```
+
+Identical to Java apart from "workers" in the threaded heading:
+
+```console
+== One account, one mailbox: six transfers on a deterministic scheduler ==
+seed 42: 32 messages delivered, 32 traced
+  TransferResult(t2, failed: acct-B has 100.00 USD, needs 120.00 USD)
+  TransferResult(t4, failed: acct-A has 25.00 USD, needs 90.00 USD)
+  TransferResult(t1, ok)
+  TransferResult(t6, ok)
+  TransferResult(t5, ok)
+  TransferResult(t3, ok)
+  balances: A=100.00 USD B=160.00 USD C=40.00 USD  total=300.00 USD
+
+== Supervision: RESUME keeps state, RESTART resets it, STOP turns the mailbox into dead letters ==
+  acct-X balance after the bad deposit was dropped: 50.00 USD
+  counter-resume reports 3 (2 before the crash + 1 after); counter-restart reports 1 (state reset); counter-stop reports nothing, dead letters = 2
+
+== Threaded scheduler: 4 workers x 25,000 deposits into one account, no locks in AccountActor ==
+  balance = 1000.00 USD (expected 1000.00 USD); messages processed = 100001; max concurrent Receive = 1
 ```
 
 ## Use It

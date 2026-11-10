@@ -349,20 +349,223 @@ files written=3 deleted=2 (compaction rewrote, then removed the inputs)
 
 ### In Python
 
-`code/python/main.py` has the same classes (`Entry`, `Hashing`, `BloomFilter`, `SimulatedDisk`, `Memtable`, `SSTable`, `LsmTree`) and the same file format byte for byte, so the demo's disk totals and write amplification match Java's exactly. Four things differ:
+`code/python/main.py` has the same classes (`Entry`, `Hashing`, `BloomFilter`, `SimulatedDisk`, `Memtable`, `SSTable`, `LsmTree`) and the same file format byte for byte, so the demo's disk totals and write amplification match Java's exactly. Four things differ. **No sorted map in the standard library:** `Memtable` is a plain `dict`, and `entries()` returns `dict(sorted(...))`, a key-ordered snapshot, at flush time. That is `O(n log n)` once per flush instead of `O(log n)` per put, which is fine for a write buffer of 1,000 entries. Every "sorted map" the Java code passes around (SSTable input, decoded blocks, compaction output) is an insertion-ordered `dict` built in key order. **`struct` replaces `DataOutputStream`:** `writeInt`, `writeLong`, and `writeBoolean` become `struct.pack(">i")` and `struct.pack(">q?")`. `writeUTF` is not plain UTF-8: it writes a 2-byte length and then *modified* UTF-8 (NUL as `C0 80`, characters outside the BMP as two 3-byte surrogates). `write_utf` and `read_utf` implement exactly that, and a test pins the bytes against Java's output. **`heapq` with a tuple key is the k-way merge:** the tuple sorts by key, then by negated `seq` so the newest version pops first, with the table index as a tie-breaker so iterators are never compared. **Names that collide:** Java's `Entry.value(v, seq)` and `Entry.tombstone(seq)` factories share names with the record's fields, which a frozen dataclass cannot express, so they are `Entry.of_value` and `Entry.of_tombstone`. Bloom-filter hashes are masked to 64 bits after every multiply so they equal Java's `long` values. The demo uses `JavaRandom` (a bit-exact `java.util.Random`), so the payment statuses and every counter match line for line.
 
-- **No sorted map in the standard library.** `Memtable` is a plain `dict`, and `entries()` returns `dict(sorted(...))`, a key-ordered snapshot, at flush time. That is `O(n log n)` once per flush instead of `O(log n)` per put, which is fine for a write buffer of 1,000 entries. Every "sorted map" the Java code passes around (SSTable input, decoded blocks, compaction output) is an insertion-ordered `dict` built in key order.
-- **`struct` replaces `DataOutputStream`.** `writeInt`, `writeLong`, and `writeBoolean` become `struct.pack(">i")` and `struct.pack(">q?")`. `writeUTF` is not plain UTF-8: it writes a 2-byte length and then *modified* UTF-8 (NUL as `C0 80`, characters outside the BMP as two 3-byte surrogates). `write_utf` and `read_utf` implement exactly that, and a test pins the bytes against Java's output.
-- **`heapq` with a tuple key is the k-way merge.** The tuple sorts by key, then by negated `seq` so the newest version pops first, with the table index as a tie-breaker so iterators are never compared:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Entries, sequence numbers, and tombstones
+
+A frozen dataclass with `value` as `Optional[str]`; the two factories are renamed because a dataclass field and a static method cannot share a name. A tombstone is `Entry(None, True, seq)`.
 
 ```python
-heap.append((head[0], -head[1].seq, idx, head[1], it))  # key, then newest first on ties
-...
-k, _, idx, e, it = heapq.heappop(heap)
-if k != last_key:  # first occurrence of k is the newest
+@dataclass(frozen=True)
+class Entry:
+    """A value or a tombstone, stamped with the sequence number of the write that produced it. Higher seq wins."""
+
+    value: Optional[str]
+    tombstone: bool
+    seq: int
+
+    @staticmethod
+    def of_value(v: str, seq: int) -> "Entry":
+        return Entry(v, False, seq)
+
+    @staticmethod
+    def of_tombstone(seq: int) -> "Entry":
+        return Entry(None, True, seq)
 ```
 
-- **Names that collide.** Java's `Entry.value(v, seq)` and `Entry.tombstone(seq)` factories share names with the record's fields, which a frozen dataclass cannot express, so they are `Entry.of_value` and `Entry.of_tombstone`. Bloom-filter hashes are masked to 64 bits after every multiply so they equal Java's `long` values. The demo uses `JavaRandom` (a bit-exact `java.util.Random`), so the payment statuses and every counter match line for line.
+#### Step 2: The memtable
+
+With no `TreeMap` in the standard library, the memtable is a `dict` and the sort happens once at flush: `entries()` returns a fresh `dict` built from `sorted(items)`, which preserves insertion (hence key) order. `put` keeps the approximate byte count in UTF-16 units so it matches the Java's `String.length()` arithmetic.
+
+```python
+class Memtable:
+    def __init__(self) -> None:
+        self._map: dict[str, Entry] = {}
+        self._approximate_bytes = 0
+
+    def put(self, key: str, entry: Entry) -> None:
+        old = self._map.get(key)
+        self._map[key] = entry
+        self._approximate_bytes += _utf16_len(key) + (0 if entry.value is None else _utf16_len(entry.value)) + 16
+        if old is not None:
+            self._approximate_bytes -= _utf16_len(key) + (0 if old.value is None else _utf16_len(old.value)) + 16
+
+    def get(self, key: str) -> Optional[Entry]:
+        return self._map.get(key)
+
+    def entries(self) -> dict[str, Entry]:
+        """A key-ordered snapshot (dicts keep insertion order), the counterpart of TreeMap iteration."""
+        return dict(sorted(self._map.items()))
+```
+
+#### Step 3: A simulated disk of immutable files
+
+The same refusal to overwrite, raising `IllegalStateError`. `bytes(data)` makes the defensive copy that `clone()` made; `dict.pop(name, None)` is `remove` with a null check.
+
+```python
+class SimulatedDisk:
+    def __init__(self) -> None:
+        self._files: dict[str, bytes] = {}
+        self.bytes_written = self.bytes_read = self.files_written = self.files_deleted = 0
+
+    def write(self, name: str, data: bytes) -> None:
+        if name in self._files:
+            raise IllegalStateError(f"files are immutable: {name}")
+        self._files[name] = bytes(data)
+        self.bytes_written += len(data)
+        self.files_written += 1
+
+    def read(self, name: str) -> bytes:
+        data = self._files.get(name)
+        if data is None:
+            raise IllegalStateError(f"no such file: {name}")
+        self.bytes_read += len(data)
+        return data
+
+    def delete(self, name: str) -> None:
+        if self._files.pop(name, None) is not None:
+            self.files_deleted += 1
+```
+
+#### Step 4: Writing an SSTable with its Bloom filter and sparse index
+
+A `bytearray` is the output stream. `struct.pack(">i")` is `writeInt`, `struct.pack(">q?")` packs `seq` and the tombstone flag in one call, and `write_utf` produces the modified UTF-8 that `writeUTF` does. `len(out)` at the start of every 16th entry is the block offset.
+
+```python
+    @staticmethod
+    def write(disk: SimulatedDisk, file_name: str, sorted_entries: dict[str, Entry]) -> "SSTable":
+        """Write a key-ordered mapping as one file and return the handle."""
+        out = bytearray()
+        bloom = BloomFilter(len(sorted_entries))
+        sparse_keys: list[str] = []
+        sparse_offsets: list[int] = []
+        out += struct.pack(">i", len(sorted_entries))
+        for i, (key, e) in enumerate(sorted_entries.items()):
+            if i % SSTable.BLOCK_ENTRIES == 0:
+                sparse_keys.append(key)
+                sparse_offsets.append(len(out))
+            write_utf(out, key)
+            out += struct.pack(">q?", e.seq, e.tombstone)
+            write_utf(out, "" if e.tombstone else e.value)
+            bloom.add(key)
+        data = bytes(out)
+        disk.write(file_name, data)
+        keys = list(sorted_entries)
+        table = SSTable(file_name, disk, len(sorted_entries), len(data),
+                        keys[0] if keys else None, keys[-1] if keys else None, bloom)
+        table._sparse_keys.extend(sparse_keys)
+        table._sparse_offsets.extend(sparse_offsets)
+        return table
+```
+
+#### Step 5: Reading one block, not the file
+
+Range, Bloom, then one block, with the same two counters. `read_block` returns a key-ordered `dict`, so iterating `.items()` and breaking on the first key above the target is the Java loop. `block_for` is the upper-bound binary search, with `>> 1` for `>>> 1`.
+
+```python
+    def get(self, key: str) -> Optional[Entry]:
+        """Point lookup: key range, then Bloom, then one block. None when the key is not in this table."""
+        if self.min_key is None or key < self.min_key or key > self.max_key:
+            self.range_negatives += 1
+            return None
+        if not self._bloom.might_contain(key):
+            self.bloom_negatives += 1
+            return None
+        for k, e in self.read_block(self.block_for(key)).items():
+            if k == key:
+                return e
+            if k > key:
+                break
+        return None
+
+    def block_for(self, key: str) -> int:
+        """Index of the last sparse key <= key (binary search over the in-memory index)."""
+        lo, hi = 0, len(self._sparse_keys) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) >> 1
+            if self._sparse_keys[mid] <= key:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+```
+
+#### Step 6: Flush
+
+Freeze, write, replace, check for compaction. The file name counter is incremented after use, as the Java `nextFileId++` does.
+
+```python
+    def flush(self) -> None:
+        """Freeze the memtable, write it as a new SSTable, start an empty memtable, then check for compaction."""
+        if self._memtable.is_empty():
+            return
+        t = SSTable.write(self.disk, f"sst-{self._next_file_id}.db", self._memtable.entries())
+        self._next_file_id += 1
+        self._tables.append(t)
+        self._memtable = Memtable()
+        self.flushes += 1
+        self.maybe_compact()
+```
+
+#### Step 7: Compaction by k-way merge
+
+Each heap element is `(key, -seq, idx, entry, iterator)`: tuple comparison gives key order, then newest-first, and `idx` guarantees two equal `(key, -seq)` entries never fall through to comparing iterators (which would raise). The `last_key` skip and the tombstone rule are the Java's; inputs are deleted only after the merged table is written.
+
+```python
+    def compact(self, chosen: list[SSTable]) -> None:
+        """k-way merge; highest seq wins per key; drop tombstones only when every table is being compacted."""
+        everything = len(chosen) == len(self._tables)
+        heap: list[tuple[str, int, int, Entry, Iterator]] = []
+        for idx, t in enumerate(chosen):
+            self.bytes_compacted += t.bytes
+            it = iter(t.read_all().items())
+            head = next(it, None)
+            if head is not None:
+                heap.append((head[0], -head[1].seq, idx, head[1], it))  # key, then newest first on ties
+        heapq.heapify(heap)
+        merged: dict[str, Entry] = {}
+        last_key: Optional[str] = None
+        while heap:
+            k, _, idx, e, it = heapq.heappop(heap)
+            if k != last_key:  # first occurrence of k is the newest
+                last_key = k
+                if not (e.tombstone and everything):
+                    merged[k] = e
+            nxt = next(it, None)
+            if nxt is not None:
+                heapq.heappush(heap, (nxt[0], -nxt[1].seq, idx, nxt[1], it))
+        for t in chosen:
+            self._tables.remove(t)
+            self.disk.delete(t.file_name)
+        if merged:
+            self._tables.append(SSTable.write(self.disk, f"sst-{self._next_file_id}.db", merged))
+            self._next_file_id += 1
+        self.compactions += 1
+```
+
+#### Step 8: Choosing a tier
+
+`sorted` with a key function is stable, like `List.sort`, so same-size tables keep their order and the same tier compacts first. The strict `< 2 * base` is preserved; the inner `for` becomes a `while` so the bound is re-read each step.
+
+```python
+    def _full_tier(self) -> Optional[list[SSTable]]:
+        """Group tables whose entry counts are less than twice the smallest in the group."""
+        ordered = sorted(self._tables, key=lambda t: t.entry_count)  # stable, like List.sort
+        for i in range(len(ordered)):
+            base = max(1, ordered[i].entry_count)
+            tier = []
+            j = i
+            while j < len(ordered) and ordered[j].entry_count < 2 * base:
+                tier.append(ordered[j])
+                j += 1
+            if len(tier) >= self.tier_threshold:
+                return tier
+        return None
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/03-systems-data-structures/05-lsm-trees/code/python
@@ -370,30 +573,314 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Payment status store: 20,000 payments, each updated three times ==
+flushes=60 compactions=18 tables=6 memtable=0 entries
+disk: 6 files, 2,293,278 bytes; user wrote 1,513,254 bytes; write amplification 4.25x
+table sizes (entries): [16000, 16000, 16000, 4000, 4000, 4000]
+```
+
+The byte totals are identical to Java's because the file format is identical down to the modified-UTF-8 string encoding.
+
 ### In Go
 
-`code/go/main.go` has the same types (`Entry`, `BloomFilter`, `SimulatedDisk`, `Memtable`, `SSTable`, `LsmTree`) and the same file format byte for byte, so the demo's disk totals, table sizes, and write amplification match Java's exactly. Four things differ:
+`code/go/main.go` has the same types (`Entry`, `BloomFilter`, `SimulatedDisk`, `Memtable`, `SSTable`, `LsmTree`) and the same file format byte for byte, so the demo's disk totals, table sizes, and write amplification match Java's exactly. Four things differ. **No ordered map in the standard library:** `sortedmap.go` is a small `SortedMap`, a sorted `[]string` of keys found with `sort.SearchStrings` plus a `map[string]Entry`. It stands in for every `TreeMap` the Java passes around (memtable, decoded blocks, compaction output) and offers `Keys`, `FirstKey`, `LastKey`, `SubMap(lo, hi)`, and `Equal`. `fullTier` uses `slices.SortStableFunc` because Java's `List.sort` is stable and the order of same-size tables decides which tier compacts first. **`encoding/binary` replaces `DataOutputStream`:** `writeInt`, `writeLong`, and `writeBoolean` become big-endian appends. `writeUTF` is not plain UTF-8: it writes a 2-byte length and then *modified* UTF-8 (NUL as `C0 80`, characters outside the BMP as two 3-byte surrogates), so `writeUTF` and `readUTF` encode via `unicode/utf16` and a test pins the bytes against Java's output. Reads use `io.ReadFull`, because a `bytes.Reader` reports `EOF` even for a zero-length read when the empty tombstone value is the last thing in the file. **`container/heap` is the k-way merge:** a `cursorHeap` orders cursors by key, then by descending `Seq` so the newest version pops first. **Absence and errors are values:** `Get` returns `(string, bool)` because Go strings cannot be null, which also removes Java's "null value is not a delete" path: `Delete` is the only way to write a tombstone. `SimulatedDisk.Write` returns `ErrIllegalState` for a second write to the same name, `NewLsmTree` returns `ErrInvalidArgument` for bad limits, and `CheckInvariants` returns an error instead of throwing. `Range` returns `[]KV` in key order rather than a `NavigableMap`. The demo uses `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random`), so the payment statuses and every counter match line for line.
 
-- **No ordered map in the standard library.** `sortedmap.go` is a small `SortedMap`: a sorted `[]string` of keys found with `sort.SearchStrings` plus a `map[string]Entry`. It stands in for every `TreeMap` the Java passes around (memtable, decoded blocks, compaction output) and offers `Keys`, `FirstKey`, `LastKey`, `SubMap(lo, hi)`, and `Equal`. `fullTier` uses `slices.SortStableFunc` because Java's `List.sort` is stable and the order of same-size tables decides which tier compacts first.
-- **`encoding/binary` replaces `DataOutputStream`.** `writeInt`, `writeLong`, and `writeBoolean` become big-endian appends. `writeUTF` is not plain UTF-8: it writes a 2-byte length and then *modified* UTF-8 (NUL as `C0 80`, characters outside the BMP as two 3-byte surrogates), so `writeUTF` and `readUTF` encode via `unicode/utf16` and a test pins the bytes against Java's output. Reads use `io.ReadFull`, because a `bytes.Reader` reports `EOF` even for a zero-length read when the empty tombstone value is the last thing in the file.
-- **`container/heap` is the k-way merge.** A `cursorHeap` orders cursors by key, then by descending `Seq` so the newest version pops first:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Entries, sequence numbers, and tombstones
+
+A plain struct; a tombstone has the zero-value `Value` and the flag set. The two factories are package-level functions named `EntryValue` and `EntryTombstone` because Go has no static methods.
 
 ```go
-func (h cursorHeap) Less(i, j int) bool {
-    if h[i].key() != h[j].key() {
-        return h[i].key() < h[j].key()
-    }
-    return h[i].entry().Seq > h[j].entry().Seq // newest first on ties
+type Entry struct {
+	Value     string
+	Tombstone bool
+	Seq       int64
+}
+
+func EntryValue(v string, seq int64) Entry { return Entry{Value: v, Seq: seq} }
+func EntryTombstone(seq int64) Entry       { return Entry{Tombstone: true, Seq: seq} }
+```
+
+#### Step 2: The memtable
+
+`Memtable` wraps the hand-written `SortedMap` from `sortedmap.go`: `Put` keeps a sorted key slice with `sort.SearchStrings` and `slices.Insert` and returns the previous entry like `TreeMap.put`. `Entries()` hands the map straight to the flush, already in key order.
+
+```go
+type SortedMap struct {
+	keys []string
+	m    map[string]Entry
+}
+
+// Put stores the entry and returns the previous entry for the key, if there was one (TreeMap.put's return).
+func (s *SortedMap) Put(key string, e Entry) (Entry, bool) {
+	old, had := s.m[key]
+	if !had {
+		i := sort.SearchStrings(s.keys, key)
+		s.keys = slices.Insert(s.keys, i, key)
+	}
+	s.m[key] = e
+	return old, had
 }
 ```
 
-- **Absence and errors are values.** `Get` returns `(string, bool)` because Go strings cannot be null, which also removes Java's "null value is not a delete" path: `Delete` is the only way to write a tombstone. `SimulatedDisk.Write` returns `ErrIllegalState` for a second write to the same name, `NewLsmTree` returns `ErrInvalidArgument` for bad limits, and `CheckInvariants` returns an error instead of throwing. `Range` returns `[]KV` in key order rather than a `NavigableMap`. The demo uses `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random`), so the payment statuses and every counter match line for line.
+```go
+type Memtable struct {
+	m                *SortedMap
+	approximateBytes int64
+}
+
+func (mt *Memtable) Put(key string, entry Entry) {
+	old, had := mt.m.Put(key, entry)
+	mt.approximateBytes += int64(len(key) + len(entry.Value) + 16)
+	if had {
+		mt.approximateBytes -= int64(len(key) + len(old.Value) + 16)
+	}
+}
+
+func (mt *Memtable) Get(key string) (Entry, bool) { return mt.m.Get(key) }
+func (mt *Memtable) Entries() *SortedMap          { return mt.m }
+```
+
+#### Step 3: A simulated disk of immutable files
+
+Because a Go map has no insertion order, the disk keeps a `names` slice beside the `files` map so listings are deterministic. `Write` returns an `ErrIllegalState` error for a second write to the same name instead of throwing; `slices.Clone` is the defensive copy.
+
+```go
+type SimulatedDisk struct {
+	names                                               []string // insertion order, like the Java LinkedHashMap
+	files                                               map[string][]byte
+	BytesWritten, BytesRead, FilesWritten, FilesDeleted int64
+}
+
+func (d *SimulatedDisk) Write(name string, data []byte) error {
+	if _, exists := d.files[name]; exists {
+		return fmt.Errorf("%w: files are immutable: %s", ErrIllegalState, name)
+	}
+	d.names = append(d.names, name)
+	d.files[name] = slices.Clone(data)
+	d.BytesWritten += int64(len(data))
+	d.FilesWritten++
+	return nil
+}
+
+func (d *SimulatedDisk) Delete(name string) {
+	if _, ok := d.files[name]; ok {
+		delete(d.files, name)
+		d.names = slices.DeleteFunc(d.names, func(n string) bool { return n == name })
+		d.FilesDeleted++
+	}
+}
+```
+
+#### Step 4: Writing an SSTable with its Bloom filter and sparse index
+
+A `bytes.Buffer` with `binary.BigEndian.AppendUint32`/`AppendUint64` for `writeInt`/`writeLong`, a single byte for the boolean, and `writeUTF` for modified UTF-8. The function returns an error (from the disk or an over-long string) instead of throwing; `hasKeys` replaces the Java's null `minKey`.
+
+```go
+func WriteSSTable(disk *SimulatedDisk, fileName string, sorted *SortedMap) (*SSTable, error) {
+	var buf bytes.Buffer
+	bloom := NewBloomFilter(sorted.Len())
+	var sparseKeys []string
+	var sparseOffsets []int
+	buf.Write(binary.BigEndian.AppendUint32(nil, uint32(sorted.Len())))
+	for i, k := range sorted.Keys() {
+		e, _ := sorted.Get(k)
+		if i%BlockEntries == 0 {
+			sparseKeys = append(sparseKeys, k)
+			sparseOffsets = append(sparseOffsets, buf.Len())
+		}
+		if err := writeUTF(&buf, k); err != nil {
+			return nil, err
+		}
+		buf.Write(binary.BigEndian.AppendUint64(nil, uint64(e.Seq)))
+		if e.Tombstone {
+			buf.WriteByte(1)
+		} else {
+			buf.WriteByte(0)
+		}
+		value := e.Value
+		if e.Tombstone {
+			value = ""
+		}
+		if err := writeUTF(&buf, value); err != nil {
+			return nil, err
+		}
+		bloom.Add(k)
+	}
+	data := buf.Bytes()
+	if err := disk.Write(fileName, data); err != nil {
+		return nil, err
+	}
+	t := &SSTable{FileName: fileName, disk: disk, EntryCount: sorted.Len(), Bytes: int64(len(data)), bloom: bloom,
+		sparseKeys: sparseKeys, sparseOffsets: sparseOffsets}
+	if !sorted.IsEmpty() {
+		t.MinKey, t.MaxKey, t.hasKeys = sorted.FirstKey(), sorted.LastKey(), true
+	}
+	return t, nil
+}
+```
+
+#### Step 5: Reading one block, not the file
+
+`Get` returns `(Entry, bool)`. The three filters and counters are the same; the decoded block is a `SortedMap`, iterated by `Keys()`. `BlockFor` uses `uint(lo+hi+1) >> 1` for Java's `>>> 1`.
+
+```go
+func (t *SSTable) Get(key string) (Entry, bool) {
+	if !t.hasKeys || key < t.MinKey || key > t.MaxKey {
+		t.RangeNegatives++
+		return Entry{}, false
+	}
+	if !t.bloom.MightContain(key) {
+		t.BloomNegatives++
+		return Entry{}, false
+	}
+	block := t.ReadBlock(t.BlockFor(key))
+	for _, k := range block.Keys() {
+		if k == key {
+			e, _ := block.Get(k)
+			return e, true
+		}
+		if k > key {
+			break
+		}
+	}
+	return Entry{}, false
+}
+
+func (t *SSTable) BlockFor(key string) int {
+	lo, hi := 0, len(t.sparseKeys)-1
+	for lo < hi {
+		mid := int(uint(lo+hi+1) >> 1)
+		if t.sparseKeys[mid] <= key {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo
+}
+```
+
+#### Step 6: Flush
+
+`WriteSSTable` can only fail if the disk refuses a fresh file name, which is a broken simulation, so `Flush` panics on that error just as the Java wraps the `IOException` in an `IllegalStateException`.
+
+```go
+func (l *LsmTree) Flush() {
+	if l.memtable.IsEmpty() {
+		return
+	}
+	t, err := WriteSSTable(l.Disk, l.nextFileName(), l.memtable.Entries())
+	if err != nil {
+		panic(err) // the Java wraps the IOException in IllegalStateException: a disk that refuses a fresh file name is broken
+	}
+	l.tables = append(l.tables, t)
+	l.memtable = NewMemtable()
+	l.Flushes++
+	l.maybeCompact()
+}
+```
+
+#### Step 7: Compaction by k-way merge
+
+A `cursor` is a table's key slice plus a position; `cursorHeap.Less` orders by key and then by descending `Seq`, the `PriorityQueue` comparator. Instead of an iterator the cursor advances `pos` and is pushed back while keys remain; `haveLast` replaces the null `lastKey`.
+
+```go
+type cursorHeap []*cursor
+
+func (h cursorHeap) Len() int { return len(h) }
+func (h cursorHeap) Less(i, j int) bool {
+	if h[i].key() != h[j].key() {
+		return h[i].key() < h[j].key()
+	}
+	return h[i].entry().Seq > h[j].entry().Seq
+}
+```
+
+```go
+func (l *LsmTree) compact(chosen []*SSTable) {
+	everything := len(chosen) == len(l.tables)
+	h := &cursorHeap{}
+	for _, t := range chosen {
+		l.BytesCompacted += t.Bytes
+		all := t.ReadAll()
+		if !all.IsEmpty() {
+			heap.Push(h, &cursor{keys: all.Keys(), src: all})
+		}
+	}
+	merged := NewSortedMap()
+	lastKey, haveLast := "", false
+	for h.Len() > 0 {
+		c := heap.Pop(h).(*cursor)
+		k := c.key()
+		if !haveLast || k != lastKey { // first occurrence of k is the newest
+			lastKey, haveLast = k, true
+			e := c.entry()
+			if !(e.Tombstone && everything) {
+				merged.Put(k, e)
+			}
+		}
+		c.pos++
+		if c.pos < len(c.keys) {
+			heap.Push(h, c)
+		}
+	}
+	for _, t := range chosen {
+		l.tables = slices.DeleteFunc(l.tables, func(x *SSTable) bool { return x == t })
+		l.Disk.Delete(t.FileName)
+	}
+	if !merged.IsEmpty() {
+		t, err := WriteSSTable(l.Disk, l.nextFileName(), merged)
+		if err != nil {
+			panic(err)
+		}
+		l.tables = append(l.tables, t)
+	}
+	l.Compactions++
+}
+```
+
+#### Step 8: Choosing a tier
+
+`slices.SortStableFunc` is required: the plain `SortFunc` is not stable, and the order of same-size tables decides which tier compacts first. The comparison is widened to `int64` before doubling, and `nil` is the "no tier" result.
+
+```go
+func (l *LsmTree) fullTier() []*SSTable {
+	sorted := slices.Clone(l.tables)
+	slices.SortStableFunc(sorted, func(a, b *SSTable) int { return a.EntryCount - b.EntryCount })
+	for i := range sorted {
+		var tier []*SSTable
+		base := max(1, sorted[i].EntryCount)
+		for j := i; j < len(sorted) && int64(sorted[j].EntryCount) < 2*int64(base); j++ {
+			tier = append(tier, sorted[j])
+		}
+		if len(tier) >= l.TierThreshold {
+			return tier
+		}
+	}
+	return nil
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/03-systems-data-structures/05-lsm-trees/code/go
 go run .
 go test ./...
 ```
+
+```console
+pay_000040..pay_000044 -> [pay_000040, pay_000041, pay_000043, pay_000044]  (42 is gone)
+
+== Forcing compaction down to one table drops the tombstone ==
+tables=1, keys=[a, c, d, e, f, g], b -> null
+files written=3 deleted=2 (compaction rewrote, then removed the inputs)
+```
+
+The first sections print the same flush, compaction, byte, and amplification figures as the Java run.
 
 ## Use It
 

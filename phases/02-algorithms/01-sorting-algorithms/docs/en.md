@@ -343,8 +343,152 @@ The test run prints `66 passed, 0 failed`.
 
 ### In Python
 
+The design is the same; four things differ in `code/python/main.py`. **Comparators are plain callables:** a comparator is any `(a, b) -> int` function; `Transaction.BY_AMOUNT` and `BY_SEQ` are static methods and `then_comparing(BY_AMOUNT, BY_SEQ)` replaces `Comparator.thenComparing`. `CountingComparator` is a callable object, so it can be passed anywhere a comparator is expected. The library equivalent, `sorted(xs, key=...)`, takes a key function instead; `functools.cmp_to_key` adapts a comparator when you need one. **The same seed gives the same numbers:** `JavaRandom` is a bit-for-bit port of `java.util.Random` (the 48-bit LCG, `next(bits)`, and `nextInt(bound)` with its rejection loop), so the pivots, the random arrays, and every comparison count in the demo match the Java output exactly. Python's own `random.Random(42)` is a Mersenne Twister and would give different counts. **No primitive/object split:** a Python list holds references, so there is no `int[]` fast path and no `(T[]) new Object[]` cast; `merge_sort` allocates `[None] * len(a)` once. The closing line of the demo names `sorted()`/`list.sort()` (Timsort, stable) instead of the two `Arrays.sort` overloads. **Overloads become defaults:** `insertion_sort(a, cmp, from_=0, to=None)` covers both Java overloads; `from` is a keyword, hence `from_`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v` (insertion sort on 4096 elements makes the run take a couple of seconds in CPython).
+
+#### Step 1: Insertion sort, the base case for everything else
+
+One static method with keyword defaults covers both Java overloads. The strict `> 0` is the stability guarantee, exactly as in Java: an element only moves past elements strictly greater than it.
+
+```python
+    @staticmethod
+    def insertion_sort(a: list, cmp: Comparator, from_: int = 0, to: int | None = None) -> None:
+        """O(n^2) worst and average, O(n) on nearly-sorted input, stable, in place."""
+        if to is None:
+            to = len(a)
+        for i in range(from_ + 1, to):
+            key = a[i]
+            j = i - 1
+            # strict > keeps equal keys in their original order: this is what makes it stable
+            while j >= from_ and cmp(a[j], key) > 0:
+                a[j + 1] = a[j]
+                j -= 1
+            a[j + 1] = key
+```
+
+#### Step 2: Merge sort
+
+The buffer is `[None] * len(a)`, allocated once and threaded through the recursion. `//` is the midpoint division (both operands are non-negative, so it agrees with Java's `/`). The pre-merge check skips the merge when the halves are already ordered.
+
+```python
+    @staticmethod
+    def merge_sort(a: list, cmp: Comparator) -> None:
+        """O(n log n) always, stable, O(n) extra memory. Top-down with an insertion-sort base case."""
+        buffer = [None] * len(a)
+        Sorts._merge_sort(a, buffer, 0, len(a), cmp)
+
+    @staticmethod
+    def _merge_sort(a: list, buffer: list, from_: int, to: int, cmp: Comparator) -> None:
+        if to - from_ <= Sorts.INSERTION_CUTOFF:
+            Sorts.insertion_sort(a, cmp, from_, to)
+            return
+        mid = from_ + (to - from_) // 2
+        Sorts._merge_sort(a, buffer, from_, mid, cmp)
+        Sorts._merge_sort(a, buffer, mid, to, cmp)
+        if cmp(a[mid - 1], a[mid]) <= 0:
+            return  # halves already in order: skip the merge
+        Sorts.merge(a, buffer, from_, mid, to, cmp)
+```
+
+The slice assignment `buffer[from_:to] = a[from_:to]` is `System.arraycopy`; the `<=` on ties is what keeps the left half's elements first.
+
+```python
+    @staticmethod
+    def merge(a: list, buffer: list, from_: int, mid: int, to: int, cmp: Comparator) -> None:
+        buffer[from_:to] = a[from_:to]
+        i, j, k = from_, mid, from_
+        while i < mid and j < to:
+            # <= takes from the left half on ties, so the earlier element stays earlier: stability
+            if cmp(buffer[i], buffer[j]) <= 0:
+                a[k] = buffer[i]
+                i += 1
+            else:
+                a[k] = buffer[j]
+                j += 1
+            k += 1
+        while i < mid:
+            a[k] = buffer[i]
+            i += 1
+            k += 1
+        while j < to:
+            a[k] = buffer[j]
+            j += 1
+            k += 1
+```
+
+#### Step 3: Quicksort with a three-way partition and a random pivot
+
+The `rng` is a `JavaRandom`, so the pivot choices are the ones the Java demo makes and the comparison counts agree. The three-way partition and the recurse-on-the-smaller-side loop are unchanged; the post-increments are spelled out as separate statements.
+
+```python
+    @staticmethod
+    def _quick_sort(a: list, lo: int, hi: int, cmp: Comparator, rng: JavaRandom) -> None:
+        while hi - lo + 1 > Sorts.INSERTION_CUTOFF:
+            Sorts.swap(a, lo, lo + rng.next_int(hi - lo + 1))  # random pivot: no fixed input is a worst case
+            pivot = a[lo]
+            lt, gt, i = lo, hi, lo + 1
+            while i <= gt:
+                c = cmp(a[i], pivot)
+                if c < 0:
+                    Sorts.swap(a, lt, i)
+                    lt += 1
+                    i += 1
+                elif c > 0:
+                    Sorts.swap(a, i, gt)
+                    gt -= 1
+                else:
+                    i += 1
+            # a[lo..lt-1] < pivot, a[lt..gt] == pivot, a[gt+1..hi] > pivot
+            # recurse on the smaller side, loop on the larger: stack depth stays O(log n)
+            if lt - lo < hi - gt:
+                Sorts._quick_sort(a, lo, lt - 1, cmp, rng)
+                lo = gt + 1
+            else:
+                Sorts._quick_sort(a, gt + 1, hi, cmp, rng)
+                hi = lt - 1
+        Sorts.insertion_sort(a, cmp, lo, hi + 1)
+```
+
+#### Step 4: Heap sort
+
+Two descending `range` loops: build the max-heap from the last internal node, then extract. `_sift_down` compares each child against the current largest, two comparisons per level.
+
+```python
+    @staticmethod
+    def heap_sort(a: list, cmp: Comparator) -> None:
+        """O(n log n) always, in place, O(1) extra memory, not stable."""
+        n = len(a)
+        for i in range(n // 2 - 1, -1, -1):
+            Sorts._sift_down(a, i, n, cmp)  # build max-heap bottom-up: O(n)
+        for end in range(n - 1, 0, -1):
+            Sorts.swap(a, 0, end)  # largest to its final slot
+            Sorts._sift_down(a, 0, end, cmp)  # restore the heap on the prefix
+
+    @staticmethod
+    def _sift_down(a: list, root: int, size: int, cmp: Comparator) -> None:
+        while True:
+            left = 2 * root + 1
+            right = left + 1
+            largest = root
+            if left < size and cmp(a[left], a[largest]) > 0:
+                largest = left
+            if right < size and cmp(a[right], a[largest]) > 0:
+                largest = right
+            if largest == root:
+                return
+            Sorts.swap(a, root, largest)
+            root = largest
+```
+
+#### Step 5: Measuring instead of asserting
+
+`CountingComparator` defines `__call__`, so an instance is itself a comparator. `comparisons` is a public attribute the tests read to assert the complexity bounds.
+
 ```python
 class CountingComparator:
+    """Wraps a comparator and counts how many times it is consulted."""
+
     def __init__(self, inner: Comparator) -> None:
         self._inner = inner
         self.comparisons = 0
@@ -352,18 +496,33 @@ class CountingComparator:
     def __call__(self, a: Any, b: Any) -> int:
         self.comparisons += 1
         return self._inner(a, b)
+
+    @staticmethod
+    def natural() -> CountingComparator:
+        return CountingComparator(natural_order)
 ```
 
-The design is the same; four things differ, all in `code/python/main.py`:
+#### Step 6: Checking stability mechanically
 
-- **Comparators are plain callables.** A comparator is any `(a, b) -> int` function; `Transaction.BY_AMOUNT` and `BY_SEQ` are static methods and `then_comparing(BY_AMOUNT, BY_SEQ)` replaces `Comparator.thenComparing`. `CountingComparator` is a callable object, so it can be passed anywhere a comparator is expected. The library equivalent, `sorted(xs, key=...)`, takes a key function instead; `functools.cmp_to_key` adapts a comparator when you need one.
-- **The same seed gives the same numbers.** `JavaRandom` is a bit-for-bit port of `java.util.Random` (the 48-bit LCG, `next(bits)`, and `nextInt(bound)` with its rejection loop), so the pivots, the random arrays, and every comparison count in the demo match the Java output exactly. Python's own `random.Random(42)` is a Mersenne Twister and would give different counts.
-- **No primitive/object split.** A Python list holds references, so there is no `int[]` fast path and no `(T[]) new Object[]` cast; `merge_sort` allocates `[None] * len(a)` once. The closing line of the demo names `sorted()`/`list.sort()` (Timsort, stable) instead of the two `Arrays.sort` overloads.
-- **Overloads become defaults.** `insertion_sort(a, cmp, from_=0, to=None)` covers both Java overloads; `from` is a keyword, hence `from_`.
+`sorted_` carries a trailing underscore because `sorted` is a builtin. For each adjacent pair with equal keys, the earlier output element must have the smaller index in the input, found through the `identity` comparator.
 
 ```python
-def insertion_sort(a: list, cmp: Comparator, from_: int = 0, to: int | None = None) -> None:
+    @staticmethod
+    def is_stable_permutation(original: list, sorted_: list, key: Comparator, identity: Comparator) -> bool:
+        """True when every run of equal keys in `sorted_` appears in the same relative order as in `original`."""
+        if len(original) != len(sorted_) or not Sorts.is_sorted(sorted_, key):
+            return False
+        remaining = list(original)
+        for i in range(1, len(sorted_)):
+            if key(sorted_[i - 1], sorted_[i]) == 0:
+                p = Sorts._index_of(remaining, sorted_[i - 1], identity)
+                q = Sorts._index_of(remaining, sorted_[i], identity)
+                if p < 0 or q < 0 or p > q:
+                    return False
+        return True
 ```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/01-sorting-algorithms/code/python
@@ -371,32 +530,236 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo numbers are identical to the Java run; the test suite runs the same 66 checks (insertion sort on 4096 elements makes the run take a couple of seconds in CPython).
+```console
+merge preserves seq order within equal amounts: true
+heap preserves seq order within equal amounts:  false
+heapSort with a (amount, seq) tie-break is deterministic: true
+
+== Comparison counts, n = 4096 random ints, seed 42 ==
+  insertion      4,182,628 comparisons  sorted=true
+  merge             51,140 comparisons  sorted=true
+  quick(3-way)      56,728 comparisons  sorted=true
+  heap              85,675 comparisons  sorted=true
+  n log2 n           49,152
+
+== Duplicate-heavy input: 4096 values drawn from only 3 keys ==
+  quick(3-way)     6,817 comparisons (three-way partition finishes equal keys in one pass)
+  merge           41,709 comparisons
+
+== Nearly sorted input: 4096 ascending ints with 8 adjacent swaps ==
+  insertion        4,103 comparisons (adaptive: close to n)
+  heap            88,825 comparisons (oblivious: always n log n)
+```
+
+Every comparison count matches the Java run, because `JavaRandom` draws the same arrays and the same pivots.
 
 ### In Go
 
+The design is the same; four things differ in `code/go/main.go`. **Generics replace erasure:** `InsertionSort[T any]`, `MergeSort`, `QuickSort`, and `HeapSort` take a `[]T` and a `Comparator[T]` (a `func(a, b T) int`). There is no `(T[]) new Object[]` cast: `make([]T, len(a))` allocates the merge buffer with the right element type. `NaturalOrder[T cmp.Ordered]()` is `Comparator.naturalOrder()`; `ThenComparing` is `Comparator.thenComparing`. **The counting comparator is a method value:** `CountingComparator[T]` keeps `Comparisons` and exposes `Func()`, which returns the bound method `c.Compare` so the sorts can call it like any other comparator while the struct keeps the count. **The same seed gives the same numbers:** `javarandom.go` is a bit-for-bit port of `java.util.Random` (48-bit LCG, `next(bits)`, `nextInt(bound)` with its rejection loop), so the pivots, the random arrays, and every comparison count in the demo match the Java output exactly. `math/rand` seeded with 42 would give different counts. **Compare panics; constructors return errors:** `Money.Compare` cannot return an error, so a currency mismatch panics, as in the Phase 10 Money type; `NewCurrency` returns `(Currency, error)` where Java's compact constructor throws.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The test file ports all 66 Java checks and adds a handful that pin the demo's comparison counts.
+
+#### Step 1: Insertion sort, the base case for everything else
+
+`Comparator[T]` is a named function type. `InsertionSort` is the whole-slice convenience and `InsertionSortRange` is the version merge sort and quicksort call on sub-ranges, with the same strict `> 0` for stability.
+
 ```go
+// Comparator orders two values: negative when a < b, zero when equal, positive when a > b.
 type Comparator[T any] func(a, b T) int
 
+// InsertionSort: O(n^2) worst and average, O(n) on nearly-sorted input, stable, in place. The workhorse for short runs.
+func InsertionSort[T any](a []T, cmp Comparator[T]) { InsertionSortRange(a, 0, len(a), cmp) }
+
+// InsertionSortRange sorts a[from:to] in place.
 func InsertionSortRange[T any](a []T, from, to int, cmp Comparator[T]) {
-    for i := from + 1; i < to; i++ {
-        key := a[i]
-        j := i - 1
-        for j >= from && cmp(a[j], key) > 0 { // strict >: equal keys keep their order
-            a[j+1] = a[j]
-            j--
-        }
-        a[j+1] = key
-    }
+	for i := from + 1; i < to; i++ {
+		key := a[i]
+		j := i - 1
+		// strict > keeps equal keys in their original order: this is what makes it stable
+		for j >= from && cmp(a[j], key) > 0 {
+			a[j+1] = a[j]
+			j--
+		}
+		a[j+1] = key
+	}
 }
 ```
 
-The design is the same; four things differ, all in `code/go/main.go`:
+#### Step 2: Merge sort
 
-- **Generics replace erasure.** `InsertionSort[T any]`, `MergeSort`, `QuickSort`, and `HeapSort` take a `[]T` and a `Comparator[T]` (a `func(a, b T) int`). There is no `(T[]) new Object[]` cast: `make([]T, len(a))` allocates the merge buffer with the right element type. `NaturalOrder[T cmp.Ordered]()` is `Comparator.naturalOrder()`; `ThenComparing` is `Comparator.thenComparing`.
-- **The counting comparator is a method value.** `CountingComparator[T]` keeps `Comparisons` and exposes `Func()`, which returns the bound method `c.Compare` so the sorts can call it like any other comparator while the struct keeps the count.
-- **The same seed gives the same numbers.** `javarandom.go` is a bit-for-bit port of `java.util.Random` (48-bit LCG, `next(bits)`, `nextInt(bound)` with its rejection loop), so the pivots, the random arrays, and every comparison count in the demo match the Java output exactly. `math/rand` seeded with 42 would give different counts.
-- **Compare panics; constructors return errors.** `Money.Compare` cannot return an error, so a currency mismatch panics, as in the Phase 10 Money type; `NewCurrency` returns `(Currency, error)` where Java's compact constructor throws.
+`make([]T, len(a))` is the typed buffer, allocated once. The recursive helper is unexported; the midpoint, cutoff, and pre-merge check are identical to Java.
+
+```go
+// MergeSort: O(n log n) always, stable, O(n) extra memory. Top-down with an insertion-sort base case.
+func MergeSort[T any](a []T, cmp Comparator[T]) {
+	buffer := make([]T, len(a))
+	mergeSort(a, buffer, 0, len(a), cmp)
+}
+
+func mergeSort[T any](a, buffer []T, from, to int, cmp Comparator[T]) {
+	if to-from <= InsertionCutoff {
+		InsertionSortRange(a, from, to, cmp)
+		return
+	}
+	mid := from + (to-from)/2
+	mergeSort(a, buffer, from, mid, cmp)
+	mergeSort(a, buffer, mid, to, cmp)
+	if cmp(a[mid-1], a[mid]) <= 0 { // halves already in order: skip the merge
+		return
+	}
+	Merge(a, buffer, from, mid, to, cmp)
+}
+```
+
+The built-in `copy` on two slices is `System.arraycopy`; the `<=` keeps the left half first on ties.
+
+```go
+// Merge combines the sorted halves a[from:mid] and a[mid:to] through `buffer`.
+func Merge[T any](a, buffer []T, from, mid, to int, cmp Comparator[T]) {
+	copy(buffer[from:to], a[from:to])
+	i, j, k := from, mid, from
+	for i < mid && j < to {
+		// <= takes from the left half on ties, so the earlier element stays earlier: stability
+		if cmp(buffer[i], buffer[j]) <= 0 {
+			a[k] = buffer[i]
+			i++
+		} else {
+			a[k] = buffer[j]
+			j++
+		}
+		k++
+	}
+	for i < mid {
+		a[k] = buffer[i]
+		i++
+		k++
+	}
+	for j < to {
+		a[k] = buffer[j]
+		j++
+		k++
+	}
+}
+```
+
+#### Step 3: Quicksort with a three-way partition and a random pivot
+
+The pivot comes from `rng.NextIntN`, the port's `nextInt(bound)`. The three-way partition and the smaller-side recursion are the Java code with Go's `for` as the `while`.
+
+```go
+func quickSort[T any](a []T, lo, hi int, cmp Comparator[T], rng *JavaRandom) {
+	for hi-lo+1 > InsertionCutoff {
+		Swap(a, lo, lo+rng.NextIntN(hi-lo+1)) // random pivot: no fixed input is a worst case
+		pivot := a[lo]
+		lt, gt, i := lo, hi, lo+1
+		for i <= gt {
+			c := cmp(a[i], pivot)
+			if c < 0 {
+				Swap(a, lt, i)
+				lt++
+				i++
+			} else if c > 0 {
+				Swap(a, i, gt)
+				gt--
+			} else {
+				i++
+			}
+		}
+		// a[lo..lt-1] < pivot, a[lt..gt] == pivot, a[gt+1..hi] > pivot
+		// recurse on the smaller side, loop on the larger: stack depth stays O(log n)
+		if lt-lo < hi-gt {
+			quickSort(a, lo, lt-1, cmp, rng)
+			lo = gt + 1
+		} else {
+			quickSort(a, gt+1, hi, cmp, rng)
+			hi = lt - 1
+		}
+	}
+	InsertionSortRange(a, lo, hi+1, cmp)
+}
+```
+
+#### Step 4: Heap sort
+
+Identical structure: bottom-up heap construction, then `n - 1` extractions, each restoring the heap on the shrinking prefix with `siftDown`.
+
+```go
+// HeapSort: O(n log n) always, in place, O(1) extra memory, not stable.
+func HeapSort[T any](a []T, cmp Comparator[T]) {
+	n := len(a)
+	for i := n/2 - 1; i >= 0; i-- { // build max-heap bottom-up: O(n)
+		siftDown(a, i, n, cmp)
+	}
+	for end := n - 1; end > 0; end-- {
+		Swap(a, 0, end)          // largest to its final slot
+		siftDown(a, 0, end, cmp) // restore the heap on the prefix
+	}
+}
+
+func siftDown[T any](a []T, root, size int, cmp Comparator[T]) {
+	for {
+		left, right, largest := 2*root+1, 2*root+2, root
+		if left < size && cmp(a[left], a[largest]) > 0 {
+			largest = left
+		}
+		if right < size && cmp(a[right], a[largest]) > 0 {
+			largest = right
+		}
+		if largest == root {
+			return
+		}
+		Swap(a, root, largest)
+		root = largest
+	}
+}
+```
+
+#### Step 5: Measuring instead of asserting
+
+A struct cannot be called, so `Func()` returns the method value `c.Compare`, which closes over the pointer receiver and therefore keeps counting into the same struct. The sorts take the function; the test reads `Comparisons`.
+
+```go
+// CountingComparator wraps a comparator and counts how many times it is consulted.
+type CountingComparator[T any] struct {
+	inner       Comparator[T]
+	Comparisons int64
+}
+
+// NewCountingComparator wraps `inner`.
+func NewCountingComparator[T any](inner Comparator[T]) *CountingComparator[T] {
+	return &CountingComparator[T]{inner: inner}
+}
+
+// Compare counts the call and delegates.
+func (c *CountingComparator[T]) Compare(a, b T) int { c.Comparisons++; return c.inner(a, b) }
+
+// Func exposes the counter as a Comparator the sorts accept.
+func (c *CountingComparator[T]) Func() Comparator[T] { return c.Compare }
+```
+
+#### Step 6: Checking stability mechanically
+
+`append([]T(nil), original...)` is the copy of the input. Otherwise the check is the Java one: adjacent equal keys in the output must appear in input order according to `identity`.
+
+```go
+func IsStablePermutation[T any](original, sorted []T, key, identity Comparator[T]) bool {
+	if len(original) != len(sorted) || !IsSorted(sorted, key) {
+		return false
+	}
+	remaining := append([]T(nil), original...)
+	for i := 1; i < len(sorted); i++ {
+		if key(sorted[i-1], sorted[i]) == 0 {
+			p, q := indexOf(remaining, sorted[i-1], identity), indexOf(remaining, sorted[i], identity)
+			if p < 0 || q < 0 || p > q {
+				return false
+			}
+		}
+	}
+	return true
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/02-algorithms/01-sorting-algorithms/code/go
@@ -404,7 +767,28 @@ go run .
 go test ./...
 ```
 
-The demo numbers are identical to the Java run; the closing library note names `slices.SortStableFunc` and `slices.Sort` (pattern-defeating quicksort, unstable) in place of the two `Arrays.sort` overloads. The test file ports all 66 Java checks and adds a handful that pin the demo's comparison counts.
+```console
+merge preserves seq order within equal amounts: true
+heap preserves seq order within equal amounts:  false
+heapSort with a (amount, seq) tie-break is deterministic: true
+
+== Comparison counts, n = 4096 random ints, seed 42 ==
+  insertion      4,182,628 comparisons  sorted=true
+  merge             51,140 comparisons  sorted=true
+  quick(3-way)      56,728 comparisons  sorted=true
+  heap              85,675 comparisons  sorted=true
+  n log2 n           49,152
+
+== Duplicate-heavy input: 4096 values drawn from only 3 keys ==
+  quick(3-way)     6,817 comparisons (three-way partition finishes equal keys in one pass)
+  merge           41,709 comparisons
+
+== Nearly sorted input: 4096 ascending ints with 8 adjacent swaps ==
+  insertion        4,103 comparisons (adaptive: close to n)
+  heap            88,825 comparisons (oblivious: always n log n)
+```
+
+The counts are identical to the Java and Python runs. Only the closing library note differs: it names `slices.SortStableFunc` / `sort.Stable` (stable, O(1) buffer) and `slices.Sort` / `sort.Sort` (pattern-defeating quicksort, unstable) in place of the two `Arrays.sort` overloads.
 
 ## Use It
 

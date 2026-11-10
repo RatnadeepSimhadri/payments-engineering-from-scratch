@@ -349,39 +349,496 @@ Read the first two blocks against the theory. Under a uniform hash a fresh inser
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Explicit 32-bit wrap:** Python integers do not overflow, so the FNV multiply must be masked with `& MASK32` or the hash would grow without bound and disagree with Java and Go. **`hash()` is salted:** `hash("idem-000001")` differs between two runs of the interpreter unless `PYTHONHASHSEED` is fixed. That is a deliberate defence against the collision attack in The Problem and it is why the lesson ships its own hash. **`bytearray` for slot states:** it is a compact, mutable byte array; a list of ints would be eight times larger per slot. **`None` as the key sentinel:** `put(None, ...)` raises `TypeError`, matching Java's `NullPointerException` and keeping `get` able to return `None` for "absent" without ambiguity.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A hash function you can reproduce
+
+`str.encode("utf-8")` yields unsigned byte values, so there is no `& 0xff`; the mask after the multiply is the `mod 2^32` that Java gets from `int` wrapping. `index_for` masks after the spread as well, because `hash32 >> 16` on a Python int is fine but the XOR could otherwise carry bits above 32 if a caller passed an unmasked value.
+
 ```python
+MASK32 = 0xFFFFFFFF
+
+
 def fnv1a(s: str) -> int:
     h = 0x811C9DC5
     for b in s.encode("utf-8"):
         h ^= b
         h = (h * 0x01000193) & MASK32
     return h
+
+
+def index_for(hash32: int, capacity: int) -> int:
+    """Map a 32-bit hash to a slot in a power-of-two table, mixing the high bits into the low ones first."""
+    spread = (hash32 ^ (hash32 >> 16)) & MASK32
+    return spread & (capacity - 1)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: One interface for two tables
 
-- **Explicit 32-bit wrap.** Python integers do not overflow, so the multiply must be masked or the hash would grow without bound and disagree with Java and Go.
-- **`hash()` is salted.** `hash("idem-000001")` differs between two runs of the interpreter unless `PYTHONHASHSEED` is fixed. That is a deliberate defence against the collision attack in The Problem and it is why the lesson ships its own hash.
-- **`bytearray` for slot states.** It is a compact, mutable byte array; a list of ints would be eight times larger per slot.
-- **`None` as the key sentinel.** `put(None, ...)` raises `TypeError`, matching Java's `NullPointerException` and keeping `get` able to return `None` for "absent" without ambiguity.
+Python has no interface declaration; both classes simply implement the same method names (`put`, `get`, `remove`, `contains_key`, `size`, `capacity`, `load_factor`, `collisions`), and the test file runs one shared contract against each. The only place the shared shape is written down is the union type hint on `IdempotencyStore`, shown here, which is documentation for the reader rather than a constraint the interpreter enforces.
+
+```python
+class IdempotencyStore:
+    def __init__(self, backing: ChainedHashMap[str, StoredResponse] | OpenAddressingHashMap[str, StoredResponse]) -> None:
+        self._responses = backing
+        self._handler_runs = 0
+```
+
+#### Step 3: Separate chaining
+
+`_Node` uses `__slots__` so ten thousand entries do not each carry a dict. `put` walks the chain for replace semantics, counts a collision when the bucket was occupied, prepends, and resizes after the insert, exactly as in Java; `_resize` relinks the existing node objects after saving `n.next`.
+
+```python
+    def put(self, key: K, value: V) -> Optional[V]:
+        if key is None:
+            raise TypeError("key must not be None")
+        b = self._bucket_of(key)
+        n = self._table[b]
+        while n is not None:
+            if n.key == key:
+                old = n.value
+                n.value = value
+                return old
+            n = n.next
+        if self._table[b] is not None:
+            self._collisions += 1
+        self._table[b] = _Node(key, value, self._table[b])
+        self._size += 1
+        if self._size > len(self._table) * self.MAX_LOAD:
+            self._resize(len(self._table) * 2)
+        return None
+```
+
+```python
+    def _resize(self, new_capacity: int) -> None:
+        old = self._table
+        self._table = [None] * new_capacity
+        for head in old:
+            n = head
+            while n is not None:
+                nxt = n.next
+                b = index_for(self._hasher(n.key), new_capacity)
+                n.next = self._table[b]
+                self._table[b] = n
+                n = nxt
+        self._resizes += 1
+```
+
+#### Step 4: Open addressing, the lookup
+
+The three states are module-level ints stored in a `bytearray`. `slot_of` reads the state byte once per probe, stops at `_EMPTY`, matches only `_OCCUPIED` slots, and is bounded by `range(cap)` as a safety net.
+
+```python
+_EMPTY, _OCCUPIED, _TOMBSTONE = 0, 1, 2
+```
+
+```python
+    def slot_of(self, key: K) -> int:
+        """Slot holding the key, or -1. Probing stops at EMPTY and walks through TOMBSTONEs."""
+        cap = len(self._keys)
+        i = self._home_of(key)
+        for _ in range(cap):
+            state = self._states[i]
+            if state == _EMPTY:
+                return -1
+            if state == _OCCUPIED and self._keys[i] == key:
+                return i
+            i = (i + 1) & (cap - 1)
+        return -1
+```
+
+#### Step 5: Open addressing, insert with tombstone reuse
+
+The `while True` loop breaks on `_EMPTY`, replaces on a match, and remembers the first tombstone without stopping there. The resize threshold counts tombstones as occupied. `displacement` is recomputed when a grave is reused, and the sum goes into `_collisions`.
+
+```python
+    def put(self, key: K, value: V) -> Optional[V]:
+        if key is None:
+            raise TypeError("key must not be None")
+        if self._size + self._tombstones + 1 > len(self._keys) * self.MAX_LOAD:
+            self._resize(len(self._keys) * 2)
+        cap = len(self._keys)
+        home = self._home_of(key)
+        i = home
+        first_tombstone = -1
+        displacement = 0
+        while True:
+            state = self._states[i]
+            if state == _EMPTY:
+                break
+            if state == _OCCUPIED and self._keys[i] == key:
+                old = self._values[i]
+                self._values[i] = value
+                return old
+            if state == _TOMBSTONE and first_tombstone < 0:
+                first_tombstone = i
+            i = (i + 1) & (cap - 1)
+            displacement += 1
+        if first_tombstone >= 0:  # reuse the grave rather than extend the cluster
+            i = first_tombstone
+            self._tombstones -= 1
+            displacement = (i - home) & (cap - 1)
+        self._collisions += displacement
+        self._keys[i] = key
+        self._values[i] = value
+        self._states[i] = _OCCUPIED
+        self._size += 1
+        return None
+```
+
+#### Step 6: Deletion and resize
+
+`remove` clears the key and value references and marks the state byte `_TOMBSTONE`. `_resize` reallocates all three arrays through `_allocate` (which also zeroes `_tombstones`) and reinserts only `_OCCUPIED` slots with a plain linear probe, so graves vanish.
+
+```python
+    def remove(self, key: K) -> Optional[V]:
+        i = self.slot_of(key)
+        if i < 0:
+            return None
+        old = self._values[i]
+        self._keys[i] = None
+        self._values[i] = None
+        self._states[i] = _TOMBSTONE  # not EMPTY: a probe chain may run through this slot
+        self._tombstones += 1
+        self._size -= 1
+        return old
+
+    def _resize(self, new_capacity: int) -> None:
+        old_keys, old_values, old_states = self._keys, self._values, self._states
+        self._allocate(new_capacity)
+        for j, state in enumerate(old_states):
+            if state != _OCCUPIED:  # tombstones are dropped here
+                continue
+            k = old_keys[j]
+            i = index_for(self._hasher(k), new_capacity)
+            while self._states[i] != _EMPTY:
+                i = (i + 1) & (new_capacity - 1)
+            self._keys[i] = k
+            self._values[i] = old_values[j]
+            self._states[i] = _OCCUPIED
+        self._resizes += 1
+```
+
+#### Step 7: The idempotency store
+
+The handler is any zero-argument callable (the demo passes a `lambda`). `get` returning `None` is the "absent" signal, which is safe because a `StoredResponse` is never `None`. `handler_runs` is the observable the test pins at 1.
+
+```python
+    def handle(self, idempotency_key: str, handler: Callable[[], StoredResponse]) -> Outcome:
+        existing = self._responses.get(idempotency_key)
+        if existing is not None:
+            return Outcome(existing, True)
+        fresh = handler()
+        self._handler_runs += 1
+        self._responses.put(idempotency_key, fresh)
+        return Outcome(fresh, False)
+
+    def handler_runs(self) -> int:
+        return self._handler_runs
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/01-complexity-and-core-structures/06-hash-maps-from-scratch/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== FNV-1a is the same in every language ==
+fnv1a("idem-000001") = 0xa594bf06
+fnv1a("") = 0x811c9dc5
+
+== 10,000 idempotency keys, separate chaining ==
+size=10000 capacity=16384 load=0.610 resizes=11 collisions=4079 maxChain=5
+
+== Same keys, open addressing (linear probing) ==
+size=10000 capacity=32768 load=0.305 resizes=12 displacement=7604 maxProbeRun=13
+
+== Tombstones: remove half, re-insert, probe chains survive ==
+after removing 5,000: size=5000 tombstones=5000 get(idem-000001)=1
+after re-inserting: size=10000 tombstones=0 (graves were reused)
+
+== Worst case: a hasher that returns 0 for every key ==
+chaining: 64 keys -> collisions=63 maxChain=64 (every lookup is O(n))
+probing:  64 keys -> displacement=2016 maxProbeRun=64 (sum 0..63 = 2016)
+
+== Idempotency store: retry the same charge three times ==
+attempt 1: status=201 replayed=false body={"charge":"ch_1","amount":1999,"currency":"USD"}
+attempt 2: status=201 replayed=true body={"charge":"ch_1","amount":1999,"currency":"USD"}
+handler ran 1 time(s) for 3 attempts
+```
+
+Every number is identical to the Java run, which is the point of shipping a shared hash function.
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with four differences. **Two return values instead of null:** `Get` returns `(value, ok)` and `Put` returns `(old, replaced)`, because a zero value such as `0` or `""` is a legitimate stored value and cannot double as "absent". **Generics with `comparable`:** `K comparable` is what allows `m.keys[i] == key`; it is the Go equivalent of Java's `equals` contract and Python's `__eq__`. **Clearing a slot needs explicit zero values:** `var zeroK K; m.keys[i] = zeroK` is how a generic slot is released for the garbage collector. **Go's built-in `map` is also seeded per process**, and iteration order is deliberately randomised so that nobody depends on it.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A hash function you can reproduce
+
+`uint32` arithmetic wraps natively, so the multiply needs no mask, and indexing a string yields unsigned bytes, so there is no `& 0xff`. `Hasher[K]` is a named function type so the tables can take `FNV1a` or `ConstantHasher[string]` interchangeably.
+
 ```go
-func (m *OpenAddressingHashMap[K, V]) Put(key K, value V) (old V, replaced bool) {
-    if float64(m.size+m.tombstones+1) > float64(len(m.keys))*OpenMaxLoad {
-        m.resize(len(m.keys) * 2)
-    }
-    // ... same probe loop as Java
+// Hasher turns a key into a 32-bit hash. Go's built-in map seeds its hash per process, so a
+// deterministic demo needs its own function.
+type Hasher[K comparable] func(K) uint32
+
+// FNV1a is FNV-1a, 32-bit, over the UTF-8 bytes of the string. Same result in Java, Python, and Go.
+func FNV1a(s string) uint32 {
+	h := uint32(0x811c9dc5)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 0x01000193
+	}
+	return h
+}
+
+// IndexFor maps a 32-bit hash to a slot in a power-of-two table, mixing the high bits into the low ones first.
+func IndexFor(hash uint32, capacity int) int {
+	spread := hash ^ (hash >> 16)
+	return int(spread & uint32(capacity-1))
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: One interface for two tables
 
-- **Two return values instead of null.** `Get` returns `(value, ok)` and `Put` returns `(old, replaced)`, because a zero value such as `0` or `""` is a legitimate stored value and cannot double as "absent".
-- **Generics with `comparable`.** `K comparable` is what allows `m.keys[i] == key`; it is the Go equivalent of Java's `equals` contract and Python's `__eq__`.
-- **Clearing a slot needs explicit zero values.** `var zeroK K; m.keys[i] = zeroK` is how a generic slot is released for the garbage collector.
-- **Go's built-in `map` is also seeded per process**, and iteration order is deliberately randomised so that nobody depends on it.
+`SimpleMap` is a generic interface; both tables satisfy it implicitly, and `IdempotencyStore` holds one. There is no default method, so `LoadFactor` is a concrete method on each table rather than part of the interface.
+
+```go
+// SimpleMap is what both tables share, so the idempotency store can be built on either one.
+type SimpleMap[K comparable, V any] interface {
+	Put(key K, value V) (V, bool)
+	Get(key K) (V, bool)
+	Remove(key K) (V, bool)
+	ContainsKey(key K) bool
+	Size() int
+	Capacity() int
+	Collisions() int64
+}
+```
+
+#### Step 3: Separate chaining
+
+`Put` returns `(old, replaced)`; on a fresh insert `old` is the zero value and `replaced` is `false`. The chain walk, the collision count, the prepend, and the post-insert resize are the Java logic; the load comparison is done in `float64` because `ChainedMaxLoad` is a float constant. `resize` saves `next` before relinking, as it must.
+
+```go
+// Put inserts or replaces; it returns the previous value and whether there was one.
+func (m *ChainedHashMap[K, V]) Put(key K, value V) (old V, replaced bool) {
+	b := m.bucketOf(key)
+	for n := m.table[b]; n != nil; n = n.next {
+		if n.key == key {
+			old = n.value
+			n.value = value
+			return old, true
+		}
+	}
+	if m.table[b] != nil {
+		m.collisions++
+	}
+	m.table[b] = &node[K, V]{key, value, m.table[b]}
+	m.size++
+	if float64(m.size) > float64(len(m.table))*ChainedMaxLoad {
+		m.resize(len(m.table) * 2)
+	}
+	return old, false
+}
+```
+
+```go
+func (m *ChainedHashMap[K, V]) resize(newCapacity int) {
+	old := m.table
+	m.table = make([]*node[K, V], newCapacity)
+	for _, head := range old {
+		for n := head; n != nil; {
+			next := n.next
+			b := IndexFor(m.hasher(n.key), newCapacity)
+			n.next = m.table[b]
+			m.table[b] = n
+			n = next
+		}
+	}
+	m.resizes++
+}
+```
+
+#### Step 4: Open addressing, the lookup
+
+`slotState` is a `byte` with three `iota` constants, stored in a `[]slotState`. `SlotOf` uses a `switch` on the state: `empty` returns `-1`, `occupied` compares keys, and `tombstone` falls through to the next probe. The `probes < capacity` bound is the same safety net.
+
+```go
+type slotState byte
+
+const (
+	empty slotState = iota
+	occupied
+	tombstone
+)
+
+// SlotOf returns the slot holding the key, or -1. Probing stops at empty and walks through tombstones.
+func (m *OpenAddressingHashMap[K, V]) SlotOf(key K) int {
+	capacity := len(m.keys)
+	i := m.homeOf(key)
+	for probes := 0; probes < capacity; probes++ {
+		switch m.states[i] {
+		case empty:
+			return -1
+		case occupied:
+			if m.keys[i] == key {
+				return i
+			}
+		}
+		i = (i + 1) & (capacity - 1)
+	}
+	return -1
+}
+```
+
+#### Step 5: Open addressing, insert with tombstone reuse
+
+The probe loop is `for m.states[i] != empty`, which reads the same as Java's `while (true) { if EMPTY break; ... }`. It does not stop at the first tombstone, the threshold counts tombstones, and the displacement is recomputed when a grave is reused.
+
+```go
+func (m *OpenAddressingHashMap[K, V]) Put(key K, value V) (old V, replaced bool) {
+	if float64(m.size+m.tombstones+1) > float64(len(m.keys))*OpenMaxLoad {
+		m.resize(len(m.keys) * 2)
+	}
+	capacity := len(m.keys)
+	home := m.homeOf(key)
+	i := home
+	firstTombstone := -1
+	displacement := 0
+	for m.states[i] != empty {
+		if m.states[i] == occupied && m.keys[i] == key {
+			old = m.values[i]
+			m.values[i] = value
+			return old, true
+		}
+		if m.states[i] == tombstone && firstTombstone < 0 {
+			firstTombstone = i
+		}
+		i = (i + 1) & (capacity - 1)
+		displacement++
+	}
+	if firstTombstone >= 0 { // reuse the grave rather than extend the cluster
+		i = firstTombstone
+		m.tombstones--
+		displacement = (i - home) & (capacity - 1)
+	}
+	m.collisions += int64(displacement)
+	m.keys[i] = key
+	m.values[i] = value
+	m.states[i] = occupied
+	m.size++
+	return old, false
+}
+```
+
+#### Step 6: Deletion and resize
+
+`Remove` writes explicit zero values into the key and value slots (there is no `nil` for a generic `K`) and marks the state `tombstone`. `resize` reallocates through `allocate` and reinserts only `occupied` slots, so `Tombstones()` is 0 afterwards.
+
+```go
+func (m *OpenAddressingHashMap[K, V]) Remove(key K) (V, bool) {
+	i := m.SlotOf(key)
+	if i < 0 {
+		var zero V
+		return zero, false
+	}
+	old := m.values[i]
+	var zeroK K
+	var zeroV V
+	m.keys[i] = zeroK
+	m.values[i] = zeroV
+	m.states[i] = tombstone // not empty: a probe chain may run through this slot
+	m.tombstones++
+	m.size--
+	return old, true
+}
+
+func (m *OpenAddressingHashMap[K, V]) resize(newCapacity int) {
+	oldKeys, oldValues, oldStates := m.keys, m.values, m.states
+	m.allocate(newCapacity)
+	for j, state := range oldStates {
+		if state != occupied { // tombstones are dropped here
+			continue
+		}
+		i := IndexFor(m.hasher(oldKeys[j]), newCapacity)
+		for m.states[i] != empty {
+			i = (i + 1) & (newCapacity - 1)
+		}
+		m.keys[i] = oldKeys[j]
+		m.values[i] = oldValues[j]
+		m.states[i] = occupied
+	}
+	m.resizes++
+}
+```
+
+#### Step 7: The idempotency store
+
+The store holds a `SimpleMap[string, StoredResponse]`, so either table works. The `ok` from `Get` is the replay decision; a `StoredResponse` zero value is never confused with "absent".
+
+```go
+type IdempotencyStore struct {
+	responses   SimpleMap[string, StoredResponse]
+	handlerRuns int
+}
+
+func NewIdempotencyStore(backing SimpleMap[string, StoredResponse]) *IdempotencyStore {
+	return &IdempotencyStore{responses: backing}
+}
+
+func (s *IdempotencyStore) Handle(idempotencyKey string, handler func() StoredResponse) Outcome {
+	if existing, ok := s.responses.Get(idempotencyKey); ok {
+		return Outcome{existing, true}
+	}
+	fresh := handler()
+	s.handlerRuns++
+	s.responses.Put(idempotencyKey, fresh)
+	return Outcome{fresh, false}
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/01-complexity-and-core-structures/06-hash-maps-from-scratch/code/go
+go run .
+go test ./...
+```
+
+```console
+== FNV-1a is the same in every language ==
+fnv1a("idem-000001") = 0xa594bf06
+fnv1a("") = 0x811c9dc5
+
+== 10,000 idempotency keys, separate chaining ==
+size=10000 capacity=16384 load=0.610 resizes=11 collisions=4079 maxChain=5
+
+== Same keys, open addressing (linear probing) ==
+size=10000 capacity=32768 load=0.305 resizes=12 displacement=7604 maxProbeRun=13
+
+== Tombstones: remove half, re-insert, probe chains survive ==
+after removing 5,000: size=5000 tombstones=5000 get(idem-000001)=1
+after re-inserting: size=10000 tombstones=0 (graves were reused)
+
+== Worst case: a hasher that returns 0 for every key ==
+chaining: 64 keys -> collisions=63 maxChain=64 (every lookup is O(n))
+probing:  64 keys -> displacement=2016 maxProbeRun=64 (sum 0..63 = 2016)
+
+== Idempotency store: retry the same charge three times ==
+attempt 1: status=201 replayed=false body={"charge":"ch_1","amount":1999,"currency":"USD"}
+attempt 2: status=201 replayed=true body={"charge":"ch_1","amount":1999,"currency":"USD"}
+handler ran 1 time(s) for 3 attempts
+```
+
+The Go output is byte-identical to the Python output; `diff` between the two runs prints nothing.
 
 ## Use It
 

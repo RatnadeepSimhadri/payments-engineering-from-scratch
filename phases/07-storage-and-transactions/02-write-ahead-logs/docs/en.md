@@ -386,11 +386,56 @@ The frame hex line is the one to memorise: four bytes of length, four of CRC, ei
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`struct` replaces `ByteBuffer`:** the format string `">IIQ"` is the whole header layout, `>` is big-endian, and because `I` is unsigned a length over 2^31 reads as a large positive number rather than a negative one, so the only check needed is `length > MAX_PAYLOAD_BYTES`. **`zlib.crc32` is masked with `& 0xFFFFFFFF`:** on Python 3 the result is already unsigned, but the mask documents the intent and makes the value comparable to Java's `(int)` cast and Go's `uint32`. **`Storage` is a `typing.Protocol`:** any object with the five methods satisfies it, there is no `implements`, and `MemoryStorage` uses `bytearray` for both copies. **The ledger raises `RuntimeError` for insufficient funds and `ValueError` for a bad amount,** mirroring Java's `IllegalStateException` and `IllegalArgumentException`; `CorruptRecordError` carries `.offset` as an attribute, as the Java exception does.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A disk you can crash
+
+`Storage` is a `Protocol` with the five operations. `MemoryStorage` keeps `_visible` and `_durable` as `bytearray`s; `sync` copies visible into durable, `crash` copies durable back, and `crash_keeping_unsynced` keeps only the first `keep_bytes` of the unsynced tail, which is the torn write.
+
 ```python
-_HEADER = struct.Struct(">IIQ")  # u32 length | u32 crc32(seq || payload) | u64 seq, big-endian
+class Storage(Protocol):
+    def size(self) -> int: ...
+    def read(self, offset: int, length: int) -> bytes: ...
+    def write(self, offset: int, data: bytes) -> None: ...
+    def truncate(self, size: int) -> None: ...
+    def sync(self) -> None: ...
+
+
+class MemoryStorage:
+    def __init__(self) -> None:
+        self._visible = bytearray()
+        self._durable = bytearray()
+        self.sync_count = 0
+
+    def sync(self) -> None:
+        self._durable = bytearray(self._visible)
+        self.sync_count += 1
+
+    def crash(self) -> None:
+        self._visible = bytearray(self._durable)
+
+    def crash_keeping_unsynced(self, keep_bytes: int) -> None:
+        keep = min(keep_bytes, max(0, len(self._visible) - len(self._durable)))
+        tail = self._visible[len(self._durable) : len(self._durable) + keep]
+        self._visible = bytearray(self._durable) + tail
+        self._durable = bytearray(self._visible)
+```
+
+#### Step 2: The frame
+
+The header is one `struct.Struct` compiled once. `crc32` packs the sequence number as a big-endian `u64` and feeds it to `zlib.crc32` concatenated with the payload, which is the same polynomial as `java.util.zip.CRC32`; the test pins `0x341ac4bc` for `(1, b"hello")`. `encode` is `pack` plus the payload.
+
+```python
+HEADER_BYTES = 16
+MAX_PAYLOAD_BYTES = 1 << 20  # 1 MiB: anything larger is a corrupt length, not a record
+_HEADER = struct.Struct(">IIQ")  # u32 payload length | u32 crc32(seq || payload) | u64 seq, big-endian
+
 
 def crc32(seq: int, payload: bytes) -> int:
     return zlib.crc32(struct.pack(">Q", seq) + payload) & 0xFFFFFFFF
+
 
 def encode(seq: int, payload: bytes) -> bytes:
     if len(payload) > MAX_PAYLOAD_BYTES:
@@ -398,36 +443,426 @@ def encode(seq: int, payload: bytes) -> bytes:
     return _HEADER.pack(len(payload), crc32(seq, payload), seq) + payload
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 3: Append and sync
 
-- **`struct` replaces `ByteBuffer`.** The format string `">IIQ"` is the whole header layout; `>` is big-endian. `I` is unsigned, so a length over 2^31 reads as a large positive number rather than a negative one, and the only check needed is `length > MAX_PAYLOAD_BYTES`.
-- **`zlib.crc32` is masked with `& 0xFFFFFFFF`.** On Python 3 the result is already unsigned, but the mask documents the intent and makes the value comparable to Java's `(int)` cast and Go's `uint32`.
-- **`Storage` is a `typing.Protocol`.** Any object with the five methods satisfies it; there is no `implements`. `MemoryStorage` uses `bytearray` for `visible` and `bytes` for `durable`.
-- **The ledger raises `RuntimeError` for insufficient funds and `ValueError` for a bad amount**, mirroring Java's `IllegalStateException` and `IllegalArgumentException`. `CorruptRecordError` carries `.offset` as an attribute, as the Java exception does.
+`append` writes the frame at `_end`, advances `_end` and `_next_seq`, and returns the sequence number; `sync` delegates to the storage. Nothing is durable until `sync` returns.
+
+```python
+    def append(self, payload: bytes) -> int:
+        seq = self._next_seq
+        frame = encode(seq, payload)
+        self._storage.write(self._end, frame)
+        self._end += len(frame)
+        self._next_seq += 1
+        return seq
+
+    def sync(self) -> None:
+        self._storage.sync()
+```
+
+#### Step 4: Replay, the longest valid prefix
+
+`_HEADER.unpack` yields the three header fields in one call. The torn-tail cases `break`; the corruption cases raise `CorruptRecordError` with the offset. Because `length` is unsigned, the Java `length < 0` test disappears. The consumer is called before `offset` advances, and the torn bytes are truncated and synced only after the loop.
+
+```python
+    def replay(self, consumer: Callable[[Record], None]) -> ReplayResult:
+        file_size = self._storage.size()
+        replayed = 0
+        offset = 0
+        last_seq = 0
+        first = True
+        while offset < file_size:
+            remaining = file_size - offset
+            if remaining < HEADER_BYTES:
+                break  # torn: header cut off
+            length, stored_crc, seq = _HEADER.unpack(self._storage.read(offset, HEADER_BYTES))
+            if length > MAX_PAYLOAD_BYTES:
+                raise CorruptRecordError(offset, f"implausible length {length}")
+            if remaining - HEADER_BYTES < length:
+                break  # torn: payload cut off
+            payload = self._storage.read(offset + HEADER_BYTES, length)
+            actual_crc = crc32(seq, payload)
+            is_last = offset + HEADER_BYTES + length == file_size
+            if actual_crc != stored_crc:
+                if is_last:
+                    break  # torn: tail record half-written
+                after = file_size - (offset + HEADER_BYTES + length)
+                raise CorruptRecordError(
+                    offset, f"crc mismatch (stored {stored_crc:08x}, computed {actual_crc:08x}) with {after} bytes after it"
+                )
+            if not first and seq != last_seq + 1:
+                raise CorruptRecordError(offset, f"sequence gap: expected {last_seq + 1}, found {seq}")
+            consumer(Record(seq, offset, payload))
+            replayed += 1
+            last_seq = seq
+            first = False
+            offset += HEADER_BYTES + length
+        truncated = file_size - offset
+        if truncated > 0:
+            self._storage.truncate(offset)
+            self._storage.sync()
+        self._end = offset
+        if replayed > 0:
+            self._next_seq = last_seq + 1
+        return ReplayResult(replayed, offset, truncated, last_seq)
+```
+
+#### Step 5: The ledger's commit
+
+`transfer` validates against in-memory state first (`RuntimeError` for insufficient funds, `ValueError` from `_require_positive`) and then calls `_commit`, which is append, sync, apply in that order. `_apply` is the same method recovery calls.
+
+```python
+    def transfer(self, source: str, target: str, amount: Money) -> None:
+        self._require_positive(amount)
+        if self.balance(source).minus(amount).is_negative():
+            raise RuntimeError(f"insufficient funds in {source}: {self.balance(source)} < {amount}")
+        self._commit(encode_op(OP_TRANSFER, source, target, amount))
+
+    def _require_positive(self, amount: Money) -> None:
+        if amount.currency != self._currency:
+            raise ValueError(f"ledger is {self._currency.code}")
+        if amount.minor_units <= 0:
+            raise ValueError(f"amount must be positive: {amount}")
+
+    def _commit(self, payload: bytes) -> None:
+        seq = self._wal.append(payload)
+        self._wal.sync()
+        self._apply(Record(seq, -1, payload))
+```
+
+#### Step 6: Open, with snapshot and sequence check
+
+`open` is a static method. The snapshot log is replayed into a list and the last record is loaded; then a closure over `covered` skips WAL records the snapshot already contains. The final `reset` completes an interrupted checkpoint.
+
+```python
+    @staticmethod
+    def open(wal_storage: Storage, snapshot_storage: Storage, currency: Currency) -> "Ledger":
+        ledger = Ledger(wal_storage, snapshot_storage, currency)
+        latest: list[Record] = []
+        ledger._snapshots.replay(lambda r: latest.append(r))
+        if latest:
+            ledger._load_snapshot(latest[-1].payload)
+        covered = ledger._applied_seq
+
+        def on_record(record: Record) -> None:
+            if record.seq <= covered:
+                return  # already inside the snapshot: skip, do not double-apply
+            ledger._apply(record)
+
+        ledger.last_recovery = ledger._wal.replay(on_record)
+        if ledger.last_recovery.last_seq <= covered:
+            ledger._wal.reset(covered + 1)  # every WAL record (if any) is inside the snapshot: finish the interrupted checkpoint
+        return ledger
+```
+
+#### Step 7: Checkpoint
+
+The snapshot payload is built with `struct.pack` into a `bytearray`, iterating `sorted(self._balances.items())` so the bytes are deterministic (the Java `TreeMap` order). Append, sync, then `reset` the WAL, in that order.
+
+```python
+    def checkpoint(self) -> None:
+        out = bytearray(struct.pack(">QI", self._applied_seq, len(self._balances)))
+        for account, money in sorted(self._balances.items()):
+            k = account.encode("utf-8")
+            out += struct.pack(">H", len(k)) + k + money.currency.code.encode("ascii") + struct.pack(">q", money.minor_units)
+        self._snapshots.append(bytes(out))
+        self._snapshots.sync()
+        self._wal.reset(self._applied_seq + 1)
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/07-storage-and-transactions/02-write-ahead-logs/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The frame bytes and every count match the Java run:
+
+```console
+== One frame on disk ==
+crc32(seq=1, "hello") = 341ac4bc
+frame = 00000005341ac4bc000000000000000168656c6c6f  (len | crc | seq | payload)
+
+== Balances survive kill -9 ==
+before crash: {customer:ann=30.01 USD, merchant:acme=119.99 USD}, wal bytes = 146, syncs = 3
+after restart: {customer:ann=30.01 USD, merchant:acme=119.99 USD}, replayed 3 records
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Errors are values:** `Append`, `Replay`, `OpenLedger`, `Credit`, `Debit`, `Transfer`, and `Checkpoint` return `error`; `CorruptRecordError` is a pointer type that tests match with `errors.As`, and `ErrInsufficientFunds` is a sentinel matched with `errors.Is` and wrapped with `%w` so the message still names the account and amounts. **The consumer returns an error:** a Java consumer throws, a Go consumer returns, and `Replay` stops and propagates it before advancing `offset` or truncating. **`crc32.Update` chains the two inputs** without allocating a combined buffer; `hash/crc32` with `IEEETable` is the same polynomial as the Java and Python libraries, which the pinned `0x341ac4bc` test proves. **Unsigned types are native:** `length` is `uint32` and `seq` is `uint64`, so there is no negative-length check and sequence arithmetic cannot go negative; `View()` sorts map keys before printing because Go map iteration order is randomised.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A disk you can crash
+
+`Storage` is an interface and `MemoryStorage` holds two byte slices. Every copy is an `append([]byte(nil), ...)` so the two slices never share a backing array, which would make `Crash` a no-op. `CrashKeepingUnsynced` rebuilds `visible` as durable plus the kept tail.
+
 ```go
-func CRC32(seq uint64, payload []byte) uint32 {
-    var seqBytes [8]byte
-    binary.BigEndian.PutUint64(seqBytes[:], seq)
-    return crc32.Update(crc32.ChecksumIEEE(seqBytes[:]), crc32.IEEETable, payload)
+type Storage interface {
+	Size() int64
+	Read(offset int64, length int) []byte
+	Write(offset int64, data []byte)
+	Truncate(size int64)
+	Sync()
 }
 
-func (w *WriteAheadLog) Replay(consumer func(Record) error) (ReplayResult, error) {
-    // ...
-    if actualCRC != storedCRC {
-        if isLast { break }
-        return ReplayResult{}, &CorruptRecordError{offset, "crc mismatch ..."}
-    }
+type MemoryStorage struct {
+	visible   []byte
+	durable   []byte
+	SyncCount int
+}
+
+func (s *MemoryStorage) Sync() {
+	s.durable = append([]byte(nil), s.visible...)
+	s.SyncCount++
+}
+
+func (s *MemoryStorage) Crash() { s.visible = append([]byte(nil), s.durable...) }
+
+func (s *MemoryStorage) CrashKeepingUnsynced(keepBytes int) {
+	unsynced := len(s.visible) - len(s.durable)
+	if unsynced < 0 {
+		unsynced = 0
+	}
+	keep := min(keepBytes, unsynced)
+	tail := append([]byte(nil), s.visible[len(s.durable):len(s.durable)+keep]...)
+	s.visible = append(append([]byte(nil), s.durable...), tail...)
+	s.durable = append([]byte(nil), s.visible...)
+}
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The frame
 
-- **Errors are values.** `Append`, `Replay`, `OpenLedger`, `Credit`, `Debit`, `Transfer`, and `Checkpoint` return `error`. `CorruptRecordError` is a pointer type that tests match with `errors.As`; `ErrInsufficientFunds` is a sentinel matched with `errors.Is` and wrapped with `%w` so the message still names the account and amounts.
-- **The consumer returns an error.** A Java consumer throws; a Go consumer returns, and `Replay` stops and propagates it before advancing `offset` or truncating.
-- **`crc32.Update` chains the two inputs** without allocating a combined buffer. `hash/crc32` with `IEEETable` is the same polynomial as the Java and Python libraries, which the pinned `0x341ac4bc` test proves.
-- **Unsigned types are native.** `length` is `uint32` and `seq` is `uint64`, so there is no negative-length check and sequence arithmetic cannot go negative. `View()` sorts map keys before printing because Go map iteration order is randomised.
+`CRC32` checksums the eight sequence bytes and then continues the running CRC over the payload with `crc32.Update`. `Encode` writes the three header fields with `binary.BigEndian` into fixed slots of a preallocated slice and returns an error, not a panic, for an oversized payload.
+
+```go
+const (
+	HeaderBytes     = 16
+	MaxPayloadBytes = 1 << 20 // 1 MiB: anything larger is a corrupt length, not a record
+)
+
+func CRC32(seq uint64, payload []byte) uint32 {
+	var seqBytes [8]byte
+	binary.BigEndian.PutUint64(seqBytes[:], seq)
+	return crc32.Update(crc32.ChecksumIEEE(seqBytes[:]), crc32.IEEETable, payload)
+}
+
+func Encode(seq uint64, payload []byte) ([]byte, error) {
+	if len(payload) > MaxPayloadBytes {
+		return nil, fmt.Errorf("payload too large: %d", len(payload))
+	}
+	frame := make([]byte, HeaderBytes+len(payload))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(frame[4:8], CRC32(seq, payload))
+	binary.BigEndian.PutUint64(frame[8:16], seq)
+	copy(frame[HeaderBytes:], payload)
+	return frame, nil
+}
+```
+
+#### Step 3: Append and sync
+
+`Append` propagates `Encode`'s error and otherwise mirrors the Java; `Sync` is a one-line delegate.
+
+```go
+func (w *WriteAheadLog) Append(payload []byte) (uint64, error) {
+	seq := w.nextSeq
+	frame, err := Encode(seq, payload)
+	if err != nil {
+		return 0, err
+	}
+	w.storage.Write(w.end, frame)
+	w.end += int64(len(frame))
+	w.nextSeq++
+	return seq, nil
+}
+
+func (w *WriteAheadLog) Sync() { w.storage.Sync() }
+```
+
+#### Step 4: Replay, the longest valid prefix
+
+The header fields are decoded with `binary.BigEndian.Uint32`/`Uint64` from fixed slices. Corruption returns `&CorruptRecordError{...}`, and a consumer error is returned immediately, before `offset` moves. Everything else, including the torn-tail truncation after the loop, is the Java logic.
+
+```go
+func (w *WriteAheadLog) Replay(consumer func(Record) error) (ReplayResult, error) {
+	fileSize := w.storage.Size()
+	replayed := 0
+	var offset int64
+	var lastSeq uint64
+	first := true
+	for offset < fileSize {
+		remaining := fileSize - offset
+		if remaining < HeaderBytes {
+			break // torn: header cut off
+		}
+		header := w.storage.Read(offset, HeaderBytes)
+		length := binary.BigEndian.Uint32(header[0:4])
+		storedCRC := binary.BigEndian.Uint32(header[4:8])
+		seq := binary.BigEndian.Uint64(header[8:16])
+		if length > MaxPayloadBytes {
+			return ReplayResult{}, &CorruptRecordError{offset, fmt.Sprintf("implausible length %d", length)}
+		}
+		if remaining-HeaderBytes < int64(length) {
+			break // torn: payload cut off
+		}
+		payload := w.storage.Read(offset+HeaderBytes, int(length))
+		actualCRC := CRC32(seq, payload)
+		isLast := offset+HeaderBytes+int64(length) == fileSize
+		if actualCRC != storedCRC {
+			if isLast {
+				break // torn: tail record half-written
+			}
+			after := fileSize - (offset + HeaderBytes + int64(length))
+			return ReplayResult{}, &CorruptRecordError{offset, fmt.Sprintf(
+				"crc mismatch (stored %08x, computed %08x) with %d bytes after it", storedCRC, actualCRC, after)}
+		}
+		if !first && seq != lastSeq+1 {
+			return ReplayResult{}, &CorruptRecordError{offset, fmt.Sprintf("sequence gap: expected %d, found %d", lastSeq+1, seq)}
+		}
+		if err := consumer(Record{seq, offset, payload}); err != nil {
+			return ReplayResult{}, err
+		}
+		replayed++
+		lastSeq = seq
+		first = false
+		offset += HeaderBytes + int64(length)
+	}
+	truncated := fileSize - offset
+	if truncated > 0 {
+		w.storage.Truncate(offset)
+		w.storage.Sync()
+	}
+	w.end = offset
+	if replayed > 0 {
+		w.nextSeq = lastSeq + 1
+	}
+	return ReplayResult{replayed, offset, truncated, lastSeq}, nil
+}
+```
+
+#### Step 5: The ledger's commit
+
+`Transfer` returns the wrapped `ErrInsufficientFunds` sentinel, so callers can `errors.Is` it and humans can read the amounts. `commit` is append, sync, apply, with `apply`'s error returned to the caller.
+
+```go
+func (l *Ledger) Transfer(from, to string, amount Money) error {
+	if err := l.requirePositive(amount); err != nil {
+		return err
+	}
+	if l.Balance(from).Minus(amount).IsNegative() {
+		return fmt.Errorf("%w in %s: %s < %s", ErrInsufficientFunds, from, l.Balance(from), amount)
+	}
+	return l.commit(EncodeOp(OpTransfer, from, to, amount))
+}
+
+func (l *Ledger) requirePositive(amount Money) error {
+	if amount.Currency != l.currency {
+		return fmt.Errorf("ledger is %s", l.currency.Code)
+	}
+	if amount.MinorUnits <= 0 {
+		return fmt.Errorf("amount must be positive: %s", amount)
+	}
+	return nil
+}
+
+func (l *Ledger) commit(payload []byte) error {
+	seq, err := l.wal.Append(payload)
+	if err != nil {
+		return err
+	}
+	l.wal.Sync()
+	return l.apply(Record{seq, -1, payload})
+}
+```
+
+#### Step 6: Open, with snapshot and sequence check
+
+`OpenLedger` returns `(*Ledger, error)`. The snapshot replay captures the last record through a pointer; the WAL replay's closure skips covered sequence numbers and returns `apply`'s error, which `Replay` propagates. The interrupted-checkpoint `Reset` is the same as in Java.
+
+```go
+func OpenLedger(walStorage, snapshotStorage Storage, currency Currency) (*Ledger, error) {
+	l := &Ledger{
+		wal:       NewWriteAheadLog(walStorage),
+		snapshots: NewWriteAheadLog(snapshotStorage),
+		currency:  currency,
+		balances:  map[string]Money{},
+	}
+	var latest *Record
+	if _, err := l.snapshots.Replay(func(r Record) error { latest = &r; return nil }); err != nil {
+		return nil, err
+	}
+	if latest != nil {
+		if err := l.loadSnapshot(latest.Payload); err != nil {
+			return nil, err
+		}
+	}
+	covered := l.appliedSeq
+	result, err := l.wal.Replay(func(r Record) error {
+		if r.Seq <= covered {
+			return nil // already inside the snapshot: skip, do not double-apply
+		}
+		return l.apply(r)
+	})
+	if err != nil {
+		return nil, err
+	}
+	l.LastRecovery = result
+	if result.LastSeq <= covered {
+		l.wal.Reset(covered + 1) // every WAL record (if any) is inside the snapshot: finish the interrupted checkpoint
+	}
+	return l, nil
+}
+```
+
+#### Step 7: Checkpoint
+
+Map keys are sorted first so the snapshot bytes are deterministic, then the payload is built with the `binary.BigEndian.Append*` helpers. Append, sync, then `Reset`.
+
+```go
+func (l *Ledger) Checkpoint() error {
+	keys := make([]string, 0, len(l.balances))
+	for k := range l.balances {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	buf := binary.BigEndian.AppendUint64(nil, l.appliedSeq)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(keys)))
+	for _, k := range keys {
+		m := l.balances[k]
+		buf = binary.BigEndian.AppendUint16(buf, uint16(len(k)))
+		buf = append(buf, k...)
+		buf = append(buf, m.Currency.Code...)
+		buf = binary.BigEndian.AppendUint64(buf, uint64(m.MinorUnits))
+	}
+	if _, err := l.snapshots.Append(buf); err != nil {
+		return err
+	}
+	l.snapshots.Sync()
+	l.wal.Reset(l.appliedSeq + 1)
+	return nil
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/07-storage-and-transactions/02-write-ahead-logs/code/go
+go run .
+go test ./...
+```
+
+```console
+== Checkpoint compacts the log; sequence numbers make it safe ==
+50 credits: wal bytes = 2396, applied seq = 53
+after checkpoint: wal bytes = 0, snapshots = 1, snapshot bytes = 79
+after restart: {customer:ann=31.01 USD, merchant:acme=120.49 USD}, replayed 1 wal record(s) on top of the snapshot, next seq = 55
+```
+
+The earlier sections, including the `341ac4bc` frame, are byte-identical to the Java and Python output.
 
 ## Use It
 

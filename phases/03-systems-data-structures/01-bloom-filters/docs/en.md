@@ -382,45 +382,376 @@ The measurement inserts `k-0` through `k-9999` and probes `q-0` through `q-49999
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **Unbounded integers need an explicit mask:** Java and Go overflow at 64 bits for free; Python would happily compute a 128-bit product, and `% m` of a 128-bit number is a different bit position. Every multiplication and the `h1 + i*h2` sum is masked with `MASK64 = (1 << 64) - 1`. Forget one mask and the Python filter silently disagrees with the other two. **The bit array is a `bytearray`:** Python has no fixed-width `long[]`; a `bytearray` of `ceil(m/8)` bytes with `divmod(idx, 8)` addressing is the closest mutable equivalent. `bit_count` uses `bin(b).count("1")` per byte, which is slow but honest; `int.from_bytes(...).bit_count()` is the fast path if you need it. **`add` and `might_contain` accept `str` or `bytes`:** the `str` path encodes as UTF-8, matching Java's `getBytes(UTF_8)` and Go's `[]byte(s)`, so `"pay_7f3a"` lands on the same bits in all three.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Two 64-bit hash functions
+
+Iterating a `bytes` object yields unsigned ints 0..255, so the `& 0xff` that Java needs for its signed `byte` is unnecessary; what Python needs instead is `& MASK64` after every multiply, because the product would otherwise grow without bound. The state is unsigned, so `>>` is the logical shift Java spells `>>>`.
+
 ```python
+MASK64 = (1 << 64) - 1
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+
+
 def fnv1a64(data: bytes) -> int:
+    """FNV-1a, 64-bit: xor the byte in, then multiply by the prime. Returns an unsigned 64-bit int."""
     h = FNV_OFFSET
     for b in data:
         h ^= b
         h = (h * FNV_PRIME) & MASK64
     return h
 
-def indexes(self, key: bytes) -> list[int]:
-    h1 = fnv1a64(key)
-    h2 = mix64(h1)
-    return [((h1 + i * h2) & MASK64) % self.m for i in range(self.k)]
+
+def mix64(h: int) -> int:
+    h &= MASK64
+    h ^= h >> 33
+    h = (h * 0xFF51AFD7ED558CCD) & MASK64
+    h ^= h >> 33
+    h = (h * 0xC4CEB9FE1A85EC53) & MASK64
+    h ^= h >> 33
+    return h
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The bit array and its parameters
 
-- **Unbounded integers need an explicit mask.** Java and Go overflow at 64 bits for free; Python would happily compute a 128-bit product, and `% m` of a 128-bit number is a different bit position. Every multiplication and the `h1 + i*h2` sum is masked with `MASK64 = (1 << 64) - 1`. Forget one mask and the Python filter silently disagrees with the other two.
-- **The bit array is a `bytearray`.** Python has no fixed-width `long[]`; a `bytearray` of `ceil(m/8)` bytes with `divmod(idx, 8)` addressing is the closest mutable equivalent. `bit_count` uses `bin(b).count("1")` per byte, which is slow but honest; `int.from_bytes(...).bit_count()` is the fast path if you need it.
-- **`add` and `might_contain` accept `str` or `bytes`.** The `str` path encodes as UTF-8, matching Java's `getBytes(UTF_8)` and Go's `[]byte(s)`, so `"pay_7f3a"` lands on the same bits in all three.
+A `bytearray` of `(bits + 7) // 8` bytes, zero-filled on creation, holds the bits eight per byte rather than 64 per word. `m`, `k`, and `insertions` are public attributes; the argument checks raise `ValueError`.
+
+```python
+class BloomFilter:
+    def __init__(self, bits: int, hashes: int) -> None:
+        if bits <= 0:
+            raise ValueError(f"bits must be positive: {bits}")
+        if hashes <= 0:
+            raise ValueError(f"hashes must be positive: {hashes}")
+        self.m = bits
+        self.k = hashes
+        self._words = bytearray((bits + 7) // 8)
+        self.insertions = 0
+```
+
+#### Step 3: Sizing from the formulas
+
+The chained comparison `0.0 < false_positive_rate < 1.0` is false for `NaN`, so negating it rejects `NaN` just as the Java `!(x > 0 && x < 1)` does. Python's `round` is banker's rounding, but `k` is only ever near a tie for contrived inputs; `create` is a `classmethod` so subclasses would construct themselves.
+
+```python
+    @staticmethod
+    def optimal_bits(expected_items: int, false_positive_rate: float) -> int:
+        """m = -n ln p / (ln 2)^2, rounded up."""
+        if expected_items <= 0:
+            raise ValueError("expected_items must be positive")
+        if not 0.0 < false_positive_rate < 1.0:
+            raise ValueError("false_positive_rate must be in (0, 1)")
+        return int(math.ceil(-expected_items * math.log(false_positive_rate) / (math.log(2) ** 2)))
+
+    @staticmethod
+    def optimal_hashes(bits: int, expected_items: int) -> int:
+        """k = (m / n) ln 2, rounded to the nearest integer, at least 1."""
+        return max(1, round(bits / expected_items * math.log(2)))
+
+    @staticmethod
+    def expected_false_positive_rate(bits: int, hashes: int, items: int) -> float:
+        """p = (1 - e^(-kn/m))^k: the classic approximation, exact enough for sizing."""
+        if items == 0:
+            return 0.0
+        return (1.0 - math.exp(-hashes * items / bits)) ** hashes
+
+    @classmethod
+    def create(cls, expected_items: int, false_positive_rate: float) -> "BloomFilter":
+        bits = cls.optimal_bits(expected_items, false_positive_rate)
+        return cls(bits, cls.optimal_hashes(bits, expected_items))
+```
+
+#### Step 4: Double hashing into k indexes
+
+One list comprehension. The `& MASK64` on the sum is the step that replaces `Long.remainderUnsigned`: once the sum is truncated to 64 bits, Python's `%` on a non-negative int is already the unsigned remainder. Drop the mask and `h1 + i * h2` for `i >= 1` is a 65-bit number whose remainder differs.
+
+```python
+    def indexes(self, key: bytes) -> list[int]:
+        """The k bit positions for a key: index_i = (h1 + i * h2) mod m, Kirsch-Mitzenmacher
+        double hashing. Two 64-bit hashes stand in for k independent ones."""
+        h1 = fnv1a64(key)
+        h2 = mix64(h1)
+        return [((h1 + i * h2) & MASK64) % self.m for i in range(self.k)]
+```
+
+#### Step 5: add and mightContain
+
+`divmod(idx, 8)` splits a bit index into byte and bit-in-byte, the `bytearray` analogue of `idx >>> 6` and `idx & 63`. Both methods accept a `str` and encode it as UTF-8 first, so the demo can pass `"pay_7f3a"` directly; `add` still returns whether any bit changed.
+
+```python
+    def add(self, key: bytes | str) -> bool:
+        data = key.encode("utf-8") if isinstance(key, str) else key
+        changed = False
+        for idx in self.indexes(data):
+            byte, bit = divmod(idx, 8)
+            mask = 1 << bit
+            if not self._words[byte] & mask:
+                self._words[byte] |= mask
+                changed = True
+        self.insertions += 1
+        return changed
+
+    def might_contain(self, key: bytes | str) -> bool:
+        """False means definitely never added. True means possibly added."""
+        data = key.encode("utf-8") if isinstance(key, str) else key
+        for idx in self.indexes(data):
+            byte, bit = divmod(idx, 8)
+            if not self._words[byte] & (1 << bit):
+                return False
+        return True
+```
+
+#### Step 6: Fill, estimate, and union
+
+`bit_count` counts ones per byte with `bin(b).count("1")`; there is no `POPCNT` shortcut on a `bytearray`, and the honest version is fast enough for 12 KB. `approximate_count` inverts the fill formula, and `union` ORs the two byte arrays with `zip` after the same parameter check, raising `ValueError` on a mismatch.
+
+```python
+    def bit_count(self) -> int:
+        """Number of set bits (the filter's fill)."""
+        return sum(bin(b).count("1") for b in self._words)
+
+    def approximate_count(self) -> int:
+        x = self.bit_count()
+        if x >= self.m:
+            return self.m  # saturated; the estimate is unbounded
+        return int(round(-(self.m / self.k) * math.log(1.0 - x / self.m)))
+
+    def union(self, other: "BloomFilter") -> "BloomFilter":
+        """OR two filters built with identical m and k. The result answers for both key sets."""
+        if self.m != other.m or self.k != other.k:
+            raise ValueError(f"cannot union filters with different parameters: ({self.m},{self.k}) vs ({other.m},{other.k})")
+        result = BloomFilter(self.m, self.k)
+        result._words = bytearray(a | b for a, b in zip(self._words, other._words))
+        result.insertions = self.insertions + other.insertions
+        return result
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/03-systems-data-structures/01-bloom-filters/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The hash, the three indexes, the 49,798 set bits, and the measured 1.014% are the same numbers as the Java run; only the `repr` formatting of keys and booleans is Python's:
+
+```console
+== Where a key lands ==
+fnv1a64(b'idem-key-1') = 0x170107aea5203aea
+mix64(h1)          = 0x6ee2bd7c56057bf8
+indexes in m=1000, k=3: [994, 570, 146]
+
+== Measured false-positive rate against the formula ==
+BloomFilter(m=95851, k=7, insertions=10000, set_bits=49798)
+fill ratio = 0.5195 (theory: 1 - e^(-kn/m) = 0.5182)
+measured p = 0.01014, formula p = 0.01004
+approximate_count = 10037 (actual 10000)
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design with three differences. **`uint64` makes the modulo honest:** Go has unsigned integers, so `%` on `uint64` is already the unsigned remainder and no `remainderUnsigned` helper is needed. This is the most natural of the three implementations. **Errors are values:** `NewBloomFilter`, `OptimalBits`, `Create`, and `Union` return `(value, error)`; `ErrParameterMismatch` is a sentinel for `errors.Is`. The demo and tests use a `mustNew` helper for parameters that are known-good. **`math/bits.OnesCount64`** is the population count, and like `Long.bitCount` it compiles to `POPCNT` where available.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Two 64-bit hash functions
+
+With `uint64` the two functions are the Java lines minus the workarounds: a Go `byte` is unsigned so `uint64(b)` never sign-extends, multiplication wraps modulo 2^64 by definition, and `>>` on an unsigned value is the logical shift.
+
 ```go
-func (bf *BloomFilter) Indexes(key []byte) []uint64 {
-    h1 := Fnv1a64(key)
-    h2 := Mix64(h1)
-    out := make([]uint64, bf.K)
-    for i := 0; i < bf.K; i++ {
-        out[i] = (h1 + uint64(i)*h2) % bf.M
-    }
-    return out
+func Fnv1a64(data []byte) uint64 {
+	h := fnvOffset
+	for _, b := range data {
+		h ^= uint64(b)
+		h *= fnvPrime
+	}
+	return h
+}
+
+func Mix64(h uint64) uint64 {
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return h
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The bit array and its parameters
 
-- **`uint64` makes the modulo honest.** Go has unsigned integers, so `%` on `uint64` is already the unsigned remainder and no `remainderUnsigned` helper is needed. This is the most natural of the three implementations.
-- **Errors are values.** `NewBloomFilter`, `OptimalBits`, `Create`, and `Union` return `(value, error)`; `ErrParameterMismatch` is a sentinel for `errors.Is`. The demo and tests use a `mustNew` helper for parameters that are known-good.
-- **`math/bits.OnesCount64`** is the population count, and like `Long.bitCount` it compiles to `POPCNT` where available.
+A `[]uint64` of `(bits+63)/64` words, exported `M`, `K`, and `Insertions`, and a constructor that returns an error for a zero bit count or non-positive `k`. `mustNew` wraps it for the known-good parameters the demo and tests use.
+
+```go
+type BloomFilter struct {
+	words      []uint64
+	M          uint64 // number of bits
+	K          int    // number of hash functions
+	Insertions uint64 // how many Add calls so far
+}
+
+func NewBloomFilter(bitsN uint64, hashes int) (*BloomFilter, error) {
+	if bitsN == 0 {
+		return nil, fmt.Errorf("bits must be positive: %d", bitsN)
+	}
+	if hashes <= 0 {
+		return nil, fmt.Errorf("hashes must be positive: %d", hashes)
+	}
+	return &BloomFilter{words: make([]uint64, (bitsN+63)/64), M: bitsN, K: hashes}, nil
+}
+
+func mustNew(bitsN uint64, hashes int) *BloomFilter {
+	bf, err := NewBloomFilter(bitsN, hashes)
+	if err != nil {
+		panic(err)
+	}
+	return bf
+}
+```
+
+#### Step 3: Sizing from the formulas
+
+`OptimalBits` returns an error for a bad argument and keeps the `!(x > 0 && x < 1)` form that rejects `NaN`. `OptimalHashes` uses `math.Round` (ties away from zero) and clamps to at least 1 by hand; `Create` chains the two.
+
+```go
+func OptimalBits(expectedItems uint64, falsePositiveRate float64) (uint64, error) {
+	if expectedItems == 0 {
+		return 0, errors.New("expectedItems must be positive")
+	}
+	if !(falsePositiveRate > 0 && falsePositiveRate < 1) {
+		return 0, errors.New("falsePositiveRate must be in (0, 1)")
+	}
+	ln2 := math.Log(2)
+	return uint64(math.Ceil(-float64(expectedItems) * math.Log(falsePositiveRate) / (ln2 * ln2))), nil
+}
+
+func OptimalHashes(bitsN, expectedItems uint64) int {
+	k := int(math.Round(float64(bitsN) / float64(expectedItems) * math.Log(2)))
+	if k < 1 {
+		return 1
+	}
+	return k
+}
+
+func ExpectedFalsePositiveRate(bitsN uint64, hashes int, items uint64) float64 {
+	if items == 0 {
+		return 0
+	}
+	return math.Pow(1-math.Exp(-float64(hashes)*float64(items)/float64(bitsN)), float64(hashes))
+}
+
+func Create(expectedItems uint64, falsePositiveRate float64) (*BloomFilter, error) {
+	m, err := OptimalBits(expectedItems, falsePositiveRate)
+	if err != nil {
+		return nil, err
+	}
+	return NewBloomFilter(m, OptimalHashes(m, expectedItems))
+}
+```
+
+#### Step 4: Double hashing into k indexes
+
+Because `h1`, `h2`, and `M` are all `uint64`, `(h1 + uint64(i)*h2) % bf.M` wraps and reduces as an unsigned quantity with no helper at all. `Indexes` is exported so the tests can pin `[994 570 146]`.
+
+```go
+func (bf *BloomFilter) Indexes(key []byte) []uint64 {
+	h1 := Fnv1a64(key)
+	h2 := Mix64(h1)
+	out := make([]uint64, bf.K)
+	for i := 0; i < bf.K; i++ {
+		out[i] = (h1 + uint64(i)*h2) % bf.M
+	}
+	return out
+}
+```
+
+#### Step 5: add and mightContain
+
+`idx>>6` and `idx&63` address the word and the bit as in Java. `Add` reports whether any bit changed; `AddString` and `MightContainString` are thin wrappers that convert with `[]byte(s)`, Go's UTF-8 encoding, so string keys hash identically to the other ports.
+
+```go
+func (bf *BloomFilter) Add(key []byte) bool {
+	changed := false
+	for _, idx := range bf.Indexes(key) {
+		word, mask := idx>>6, uint64(1)<<(idx&63)
+		if bf.words[word]&mask == 0 {
+			bf.words[word] |= mask
+			changed = true
+		}
+	}
+	bf.Insertions++
+	return changed
+}
+
+func (bf *BloomFilter) AddString(s string) bool { return bf.Add([]byte(s)) }
+
+func (bf *BloomFilter) MightContain(key []byte) bool {
+	for _, idx := range bf.Indexes(key) {
+		if bf.words[idx>>6]&(uint64(1)<<(idx&63)) == 0 {
+			return false
+		}
+	}
+	return true
+}
+```
+
+#### Step 6: Fill, estimate, and union
+
+`bits.OnesCount64` is `Long.bitCount`. `Union` returns a wrapped `ErrParameterMismatch` instead of throwing, builds the result through `mustNew` (the parameters are known to be valid because they are the receiver's own), and ORs word by word.
+
+```go
+func (bf *BloomFilter) BitCount() uint64 {
+	var total uint64
+	for _, w := range bf.words {
+		total += uint64(bits.OnesCount64(w))
+	}
+	return total
+}
+
+func (bf *BloomFilter) ApproximateCount() uint64 {
+	x := bf.BitCount()
+	if x >= bf.M {
+		return bf.M // saturated; the estimate is unbounded
+	}
+	return uint64(math.Round(-(float64(bf.M) / float64(bf.K)) * math.Log(1-float64(x)/float64(bf.M))))
+}
+
+func (bf *BloomFilter) Union(other *BloomFilter) (*BloomFilter, error) {
+	if bf.M != other.M || bf.K != other.K {
+		return nil, fmt.Errorf("%w: (%d,%d) vs (%d,%d)", ErrParameterMismatch, bf.M, bf.K, other.M, other.K)
+	}
+	result := mustNew(bf.M, bf.K)
+	for i := range bf.words {
+		result.words[i] = bf.words[i] | other.words[i]
+	}
+	result.Insertions = bf.Insertions + other.Insertions
+	return result, nil
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/03-systems-data-structures/01-bloom-filters/code/go
+go run .
+go test ./...
+```
+
+```console
+== What happens when you overfill it ==
+ 5x capacity: fill = 0.974, predicted p = 0.8319
+10x capacity: fill = 0.999, predicted p = 0.9953
+
+== Union of two shards' filters ==
+union mightContain shard-a-key: true, shard-b-key: true
+rejected: cannot union filters with different parameters: (4096,4) vs (2048,4)
+```
+
+The sizing, index, and measurement sections print the same numbers as the Java run, including the 507 false positives out of 50,000 probes.
 
 ## Use It
 

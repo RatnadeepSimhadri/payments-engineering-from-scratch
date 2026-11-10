@@ -339,25 +339,203 @@ Read the first `ArrayList.get` row carefully. Its first fork is 58 ns and the ne
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps every type and the scripted-ticker invariant (two readings per iteration). What differs: **the ticker is `time.perf_counter_ns()`**, CPython's monotonic nanosecond clock; `time.time_ns()` is wall-clock and can jump, exactly like `currentTimeMillis`. **No JIT, so warm-up barely shows:** CPython 3.11 interprets bytecode (its specialising interpreter adapts within a few calls), so section 1's warm-up samples sit close to the measured ones. Dead-code elimination is not a concern either; the `Blackhole` exists to keep the design identical, and its XOR fold is masked to 64 bits so it matches a Java `long`. Section 1 runs 2,000 ops per iteration instead of 20,000 so the interpreted demo stays under ten seconds. **Different structures, same question:** the stdlib has no `LinkedList` or `TreeMap`, so section 2 compares `list` with `collections.deque` (a linked list of 64-slot blocks, so `deque[i]` is O(n) but with a small constant) and section 3 compares `dict` with a `SortedMap` built on `bisect`. Expect every Python row to be 10-50x the Java row: one interpreted call per op dominates. **Seeded data matches Java:** `seeded_ints` uses a `JavaRandom` that reproduces `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so both languages benchmark the same index sequence, and sections 4 and 5 print the same numbers as Java.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A ticker you can script
+
+`Ticker` is a base class whose `nano_time` raises `NotImplementedError`; the two implementations override it. `SystemTicker` reads `perf_counter_ns()`, and `FakeTicker` serves its tuple of readings in order, raising `RuntimeError` when the script runs out so a harness that reads the ticker more often than it should fails the test immediately. `readings_consumed()` is what the harness test asserts against.
+
 ```python
-def _time_iteration(self, body: BenchmarkBody) -> int:
-    bh = self._blackhole
-    start = self._ticker.nano_time()
-    for _ in range(self._config.ops_per_iteration):
-        body(bh)
-    end = self._ticker.nano_time()
-    elapsed = end - start
-    if elapsed < 0:
-        raise RuntimeError(f"ticker went backwards: {start} -> {end}")
-    return elapsed // self._config.ops_per_iteration  # elapsed >= 0, so floor == Java truncation
+class Ticker:
+    def nano_time(self) -> int:
+        raise NotImplementedError
+
+
+class SystemTicker(Ticker):
+    """time.perf_counter_ns: monotonic, not wall-clock, the only correct source for elapsed time."""
+
+    def nano_time(self) -> int:
+        return time.perf_counter_ns()
+
+
+class FakeTicker(Ticker):
+    """Returns scripted readings in order. The harness reads the ticker exactly twice per iteration."""
+
+    def __init__(self, *readings: int) -> None:
+        self._readings = tuple(readings)
+        self._next = 0
+
+    def nano_time(self) -> int:
+        if self._next >= len(self._readings):
+            raise RuntimeError(f"FakeTicker exhausted after {len(self._readings)} readings")
+        value = self._readings[self._next]
+        self._next += 1
+        return value
+
+    def readings_consumed(self) -> int:
+        return self._next
 ```
 
-`code/python/main.py` keeps every type and the scripted-ticker invariant (two readings per iteration). What differs:
+#### Step 2: The blackhole
 
-- **The ticker is `time.perf_counter_ns()`**, CPython's monotonic nanosecond clock. `time.time_ns()` is wall-clock and can jump, exactly like `currentTimeMillis`.
-- **No JIT, so warm-up barely shows.** CPython 3.11 interprets bytecode (its specialising interpreter adapts within a few calls), so section 1's warm-up samples sit close to the measured ones. Dead-code elimination is not a concern either; the `Blackhole` exists to keep the design identical, and its XOR fold is masked to 64 bits so it matches a Java `long`. Section 1 runs 2,000 ops per iteration instead of 20,000 so the interpreted demo stays under ten seconds.
-- **Different structures, same question.** The stdlib has no `LinkedList` or `TreeMap`, so section 2 compares `list` with `collections.deque` (a linked list of 64-slot blocks, so `deque[i]` is O(n) but with a small constant) and section 3 compares `dict` with a `SortedMap` built on `bisect`. Expect every Python row to be 10-50x the Java row: one interpreted call per op dominates.
-- **Seeded data matches Java.** `seeded_ints` uses a `JavaRandom` that reproduces `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so both languages benchmark the same index sequence. Sections 4 and 5 print the same numbers as Java.
+There is no `volatile` and no dead-code elimination in CPython, so the blackhole's job here is to keep the harness's contract identical: every body hands its result to `consume`. Ints are folded directly and everything else through `hash()`, and `to_int64` wraps the running XOR into Java's signed 64-bit range so the test that checks the fold agrees with the Java one. `bool` is excluded from the int path because `True` is an `int`.
+
+```python
+class Blackhole:
+    def __init__(self) -> None:
+        self._sink = 0
+
+    def consume(self, value: object) -> None:
+        if value is None:
+            return
+        if isinstance(value, int) and not isinstance(value, bool):
+            self._sink = to_int64(self._sink ^ value)
+        else:
+            self._sink = to_int64(self._sink ^ hash(value))
+
+    def value(self) -> int:
+        return self._sink
+```
+
+#### Step 3: Nearest-rank statistics
+
+`Stats` is a class of static methods. `sorted(samples)` returns a new list, so the caller's sample order is preserved just as the Java clone does; `math.ceil` gives the 1-based rank. Bad arguments raise `ValueError`. `coefficient_of_variation` is standard deviation over mean, with the zero-mean guard.
+
+```python
+class Stats:
+    @staticmethod
+    def percentile(samples: list[int], p: float) -> int:
+        """Nearest-rank percentile: the smallest value such that at least p% of samples are <= it."""
+        if len(samples) == 0:
+            raise ValueError("no samples")
+        if p < 0 or p > 100:
+            raise ValueError(f"percentile must be in 0..100: {p}")
+        ordered = sorted(samples)
+        if p == 0:
+            return ordered[0]
+        rank = math.ceil(p / 100.0 * len(ordered))  # 1-based rank
+        return ordered[rank - 1]
+
+    @staticmethod
+    def coefficient_of_variation(samples: list[int]) -> float:
+        """stddev / mean. Dimensionless, so comparable across benchmarks."""
+        mean = Stats.mean(samples)
+        return 0.0 if mean == 0 else Stats.stddev(samples) / mean
+```
+
+#### Step 4: Configuration and the harness loop
+
+`HarnessConfig` is a frozen dataclass that validates in `__post_init__`; `QUICK` and `HEAVY` are attached as class attributes after the class body. The loop in `run` is the same two-phase loop per fork, with a list comprehension for the warm-up samples. In `_time_iteration` the division is `//`, which equals Java's truncating `/` because `elapsed` has already been checked to be non-negative; the ticker is read exactly twice, so a `FakeTicker` can script every sample.
+
+```python
+@dataclass(frozen=True)
+class HarnessConfig:
+    warmup_iterations: int
+    measured_iterations: int
+    forks: int
+    ops_per_iteration: int
+
+
+HarnessConfig.QUICK = HarnessConfig(10, 7, 3, 5_000)
+HarnessConfig.HEAVY = HarnessConfig(5, 7, 3, 200)
+```
+
+```python
+    def run(self, benchmark: Benchmark) -> BenchmarkResult:
+        fork_results: list[ForkResult] = []
+        pooled: list[int] = []
+        for fork in range(1, self._config.forks + 1):
+            warm = [self._time_iteration(benchmark.body) for _ in range(self._config.warmup_iterations)]
+            measured: list[int] = []
+            for _ in range(self._config.measured_iterations):
+                sample = self._time_iteration(benchmark.body)
+                measured.append(sample)
+                pooled.append(sample)
+            fork_results.append(ForkResult(fork, warm, measured))
+        return BenchmarkResult(benchmark.name, fork_results, pooled)
+
+    def _time_iteration(self, body: BenchmarkBody) -> int:
+        bh = self._blackhole
+        start = self._ticker.nano_time()
+        for _ in range(self._config.ops_per_iteration):
+            body(bh)
+        end = self._ticker.nano_time()
+        elapsed = end - start
+        if elapsed < 0:
+            raise RuntimeError(f"ticker went backwards: {start} -> {end}")
+        return elapsed // self._config.ops_per_iteration  # elapsed >= 0, so floor == Java truncation
+```
+
+#### Step 5: Results that report their own uncertainty
+
+`BenchmarkResult` is a frozen dataclass with `UNSTABLE_CV` as a class attribute. The per-fork medians come from a comprehension over `ForkResult.median()`, and `fork_spread` is zero for a single fork (there is nothing to disagree with). `row()` prints the same columns as the Java version and appends `UNSTABLE` when the spread exceeds 10%.
+
+```python
+@dataclass(frozen=True)
+class BenchmarkResult:
+    name: str
+    forks: list[ForkResult]
+    pooled_ns_per_op: list[int]
+
+    UNSTABLE_CV = 0.10
+
+    def p50(self) -> int:
+        return Stats.percentile(self.pooled_ns_per_op, 50)
+
+    def p99(self) -> int:
+        return Stats.percentile(self.pooled_ns_per_op, 99)
+
+    def fork_medians(self) -> list[int]:
+        return [f.median() for f in self.forks]
+
+    def fork_spread(self) -> float:
+        """Spread of the per-fork medians. Above UNSTABLE_CV the forks disagree and the result is noise."""
+        return 0.0 if len(self.forks) < 2 else Stats.coefficient_of_variation(self.fork_medians())
+
+    def stable(self) -> bool:
+        return self.fork_spread() <= self.UNSTABLE_CV
+```
+
+#### Step 6: The coordinated-omission recorder
+
+The back-fill loop is a `while` instead of a three-clause `for`, but the arithmetic is identical: starting from `latency - interval`, append and subtract while the remainder is still at least one interval. `record(5_000, 1_000)` adds `5000, 4000, 3000, 2000, 1000` to `corrected`; `record(500, 1_000)` adds only the observed sample. The two argument checks raise `ValueError`.
+
+```python
+    def record(self, latency_nanos: int, expected_interval_nanos: int) -> None:
+        if latency_nanos < 0:
+            raise ValueError("latency must be >= 0")
+        if expected_interval_nanos <= 0:
+            raise ValueError("expected interval must be > 0")
+        self._raw.append(latency_nanos)
+        self._corrected.append(latency_nanos)
+        missing = latency_nanos - expected_interval_nanos
+        while missing >= expected_interval_nanos:
+            self._corrected.append(missing)
+            missing -= expected_interval_nanos
+```
+
+#### Step 7: The sampling-profile aggregator
+
+`dict.fromkeys(stack_root_first)` is the ordered de-duplication that `LinkedHashSet` provides in Java, so a recursive stack `main, f, f, f` counts `f` once in inclusive time. The leaf is `stack_root_first[-1]`. `_top` sorts by `(-count, name)`, which is descending count with ties broken by name, so the report is deterministic.
+
+```python
+    def record(self, *stack_root_first: str) -> None:
+        if len(stack_root_first) == 0:
+            raise ValueError("empty stack")
+        self._samples += 1
+        leaf = stack_root_first[-1]
+        self._self[leaf] = self._self.get(leaf, 0) + 1
+        for frame in dict.fromkeys(stack_root_first):  # ordered de-dup, like LinkedHashSet
+            self._inclusive[frame] = self._inclusive.get(frame, 0) + 1
+
+    @staticmethod
+    def _top(counts: dict[str, int], n: int) -> list[tuple[str, int]]:
+        return sorted(counts.items(), key=lambda e: (-e[1], e[0]))[:n]
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/00-setup-and-tooling/05-benchmarking-and-profiling/code/python
@@ -365,35 +543,325 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Timing numbers will differ on your machine; the shape is what matters. One run:
+
+```console
+== 1. Why warm-up matters: the first iterations pay for caches and allocation, not your code ==
+warm-up samples (discarded) ns/op: [23014, 22641, 22889, 22351, 22040]
+measured samples           ns/op: [23478, 21483, 26508, 21193, 38860]
+CPython has no JIT, so the warm-up drop is small; in Java the first sample is often several times the last.
+
+== 2. list vs deque, honestly ==
+benchmark (ns/op)                p50           p90           p99           max            per-fork medians
+list[i] (random)                 p50      571  p90      665  p99      918  max       918  forks [636, 601, 501]  spread   9.9%
+deque[i] (random)                p50      345  p90      358  p99      367  max       367  forks [345, 349, 348]  spread   0.5%
+list insert(0)+pop(0)            p50      548  p90      561  p99      716  max       716  forks [548, 550, 547]  spread   0.2%
+deque appendleft+popleft         p50      217  p90      233  p99      285  max       285  forks [175, 226, 228]  spread  11.7% UNSTABLE
+
+== 4. Coordinated omission: one stall, two very different p99s (scripted, deterministic) ==
+raw:       1000 samples, p50 0.2 ms, p99 0.2 ms, max 2000 ms
+corrected: 2999 samples, p50 501.0 ms, p99 1971.0 ms, max 2000 ms
+
+== 5. What a sampling profiler computes (scripted stacks) ==
+100 samples
+frame                          self   incl
+Money.times                   60.0%  60.0%
+FileChannel.write             25.0%  25.0%
+```
+
+Notice that `list[i]` is not faster than `deque[i]` here: at n=2000 the deque walks at most 16 blocks, and the interpreted call overhead dominates both. Sections 4 and 5 are identical to Java, as the tests require.
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps every type and the scripted-ticker invariant (two readings per iteration). What differs: **errors are values.** `Harness.Run`, `Percentile`, `LatencyRecorder.Record`, and `SampleProfile.Record` return an `error` instead of throwing; `ErrTickerBackwards` and `ErrNoSamples` are sentinels the tests match with `errors.Is`. The one deliberate panic is `FakeTicker` running out of script: that is a harness bug, not a runtime condition, so it fails as loudly as Java's `IllegalStateException`. **The ticker is `time.Since(origin)`.** Go's `time.Now()` carries a monotonic reading since 1.9, and `time.Since` subtracts on it, so the harness never sees a wall-clock jump. There is no JIT, so section 1's warm-up drop is small; the compiler still eliminates dead stores, which is why the `Blackhole` XOR fold stays. **Different structures, same question:** Go has no `LinkedList` or `TreeMap` in the standard library, so section 2 compares a slice with `container/list` (the index read walks `Front()` and `Next()`, the O(n) pointer chase) and section 3 compares `map` with a `SortedMap` built on `sort.SearchInts`, the same stand-in the Python port uses. **Seeded data matches Java:** `JavaRandom` reproduces `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so all three languages benchmark the same index sequence; the test pins the first five values of `SeededInts(100, 42)`. Sections 4 and 5 print the same numbers as Java.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A ticker you can script
+
+`Ticker` is a one-method interface. `SystemTicker` subtracts a package-level `origin` captured at start-up, which keeps the reading on the monotonic clock. `NewFakeTicker` copies its readings so the caller cannot mutate the script afterwards, and `NanoTime` panics when exhausted; `ReadingsConsumed` is what the harness test checks.
+
 ```go
-func (h *Harness) timeIteration(body BenchmarkBody) (int64, error) {
-    start := h.ticker.NanoTime()
-    for op := 0; op < h.config.OpsPerIteration; op++ {
-        body(&h.blackhole)
-    }
-    end := h.ticker.NanoTime()
-    elapsed := end - start
-    if elapsed < 0 {
-        return 0, fmt.Errorf("%w: %d -> %d", ErrTickerBackwards, start, end)
-    }
-    return elapsed / int64(h.config.OpsPerIteration), nil
+type Ticker interface {
+	NanoTime() int64
+}
+
+// SystemTicker reads the monotonic clock: time.Since on a fixed origin never goes backwards.
+type SystemTicker struct{}
+
+var origin = time.Now()
+
+// NanoTime returns nanoseconds elapsed since program start.
+func (SystemTicker) NanoTime() int64 { return int64(time.Since(origin)) }
+
+// FakeTicker returns scripted readings in order. The harness reads the ticker exactly twice per iteration.
+type FakeTicker struct {
+	readings []int64
+	next     int
+}
+
+// NewFakeTicker copies the readings so the caller cannot mutate the script.
+func NewFakeTicker(readings ...int64) *FakeTicker {
+	return &FakeTicker{readings: append([]int64(nil), readings...)}
+}
+
+// NanoTime panics when exhausted: a benchmark that reads more than it scripted is a harness bug.
+func (f *FakeTicker) NanoTime() int64 {
+	if f.next >= len(f.readings) {
+		panic(fmt.Sprintf("FakeTicker exhausted after %d readings", len(f.readings)))
+	}
+	v := f.readings[f.next]
+	f.next++
+	return v
 }
 ```
 
-`code/go/main.go` keeps every type and the scripted-ticker invariant (two readings per iteration). What differs:
+#### Step 2: The blackhole
 
-- **Errors are values.** `Harness.Run`, `Percentile`, `LatencyRecorder.Record`, and `SampleProfile.Record` return an `error` instead of throwing; `ErrTickerBackwards` and `ErrNoSamples` are sentinels the tests match with `errors.Is`. The one deliberate panic is `FakeTicker` running out of script: that is a harness bug, not a runtime condition, so it fails as loudly as Java's `IllegalStateException`.
-- **The ticker is `time.Since(origin)`.** Go's `time.Now()` carries a monotonic reading since 1.9, and `time.Since` subtracts on it, so the harness never sees a wall-clock jump. There is no JIT, so section 1's warm-up drop is small; the compiler still eliminates dead stores, which is why the `Blackhole` XOR fold stays.
-- **Different structures, same question.** Go has no `LinkedList` or `TreeMap` in the standard library, so section 2 compares a slice with `container/list` (the index read walks `Front()` and `Next()`, the O(n) pointer chase) and section 3 compares `map` with a `SortedMap` built on `sort.SearchInts`, the same stand-in the Python port uses.
-- **Seeded data matches Java.** `JavaRandom` reproduces `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so all three languages benchmark the same index sequence; the test pins the first five values of `SeededInts(100, 42)`. Sections 4 and 5 print the same numbers as Java.
+Go has no `volatile`, but a value that reaches a field of a struct the caller holds a pointer to is a store the compiler must keep, so XOR-folding into `sink` is enough. `Consume` takes `int64` for the common case; `ConsumeAny` type-switches so bodies that produce other values still have somewhere to put them. The harness exposes its blackhole so tests can prove the bodies ran.
+
+```go
+type Blackhole struct {
+	sink int64
+}
+
+// Consume folds a value into the sink.
+func (b *Blackhole) Consume(value int64) { b.sink ^= value }
+
+// ConsumeAny folds an arbitrary value's hash in; nil is tolerated.
+func (b *Blackhole) ConsumeAny(value any) {
+	if value == nil {
+		return
+	}
+	switch v := value.(type) {
+	case int:
+		b.sink ^= int64(v)
+	case int64:
+		b.sink ^= v
+	default:
+		b.sink ^= int64(len(fmt.Sprint(v)))
+	}
+}
+
+// Value is the current fold.
+func (b *Blackhole) Value() int64 { return b.sink }
+```
+
+#### Step 3: Nearest-rank statistics
+
+`Percentile` returns `(int64, error)` with the `ErrNoSamples` sentinel for the empty case; `MustPercentile` wraps it for callers (the result methods, the demo) that know their sample is valid. `append([]int64(nil), samples...)` is the idiomatic copy, so the caller's order survives the sort. `CoefficientOfVariation` is the same ratio with the zero-mean guard.
+
+```go
+var ErrNoSamples = errors.New("no samples")
+
+// Percentile is the nearest-rank percentile: the smallest value such that at least p% of samples are <= it.
+func Percentile(samples []int64, p float64) (int64, error) {
+	if len(samples) == 0 {
+		return 0, ErrNoSamples
+	}
+	if p < 0 || p > 100 {
+		return 0, fmt.Errorf("percentile must be in 0..100: %v", p)
+	}
+	sorted := append([]int64(nil), samples...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	if p == 0 {
+		return sorted[0], nil
+	}
+	rank := int(math.Ceil(p / 100.0 * float64(len(sorted)))) // 1-based rank
+	return sorted[rank-1], nil
+}
+
+// CoefficientOfVariation is stddev / mean. Dimensionless, so comparable across benchmarks.
+func CoefficientOfVariation(samples []int64) float64 {
+	mean := Mean(samples)
+	if mean == 0 {
+		return 0
+	}
+	return Stddev(samples) / mean
+}
+```
+
+#### Step 4: Configuration and the harness loop
+
+`HarnessConfig` is a plain struct; `NewHarnessConfig` validates and the two package-level values `Quick` and `Heavy` are known-good literals. `Run` returns `(BenchmarkResult, error)` and propagates the first `timeIteration` error, which is how a backwards ticker surfaces. `timeIteration` is otherwise the Java method line for line: two reads, `OpsPerIteration` calls, truncating division.
+
+```go
+var (
+	// Quick: cheap bodies (a get, a relink): many ops per iteration so a sample is not dominated by the two ticker reads.
+	Quick = HarnessConfig{10, 7, 3, 5_000}
+	// Heavy: bodies that already walk thousands of elements; fewer ops per iteration keeps the demo under ten seconds.
+	Heavy = HarnessConfig{5, 7, 3, 200}
+)
+```
+
+```go
+func (h *Harness) Run(benchmark Benchmark) (BenchmarkResult, error) {
+	var forks []ForkResult
+	var pooled []int64
+	for fork := 1; fork <= h.config.Forks; fork++ {
+		warm := make([]int64, h.config.WarmupIterations)
+		for i := range warm {
+			v, err := h.timeIteration(benchmark.Body)
+			if err != nil {
+				return BenchmarkResult{}, err
+			}
+			warm[i] = v
+		}
+		measured := make([]int64, h.config.MeasuredIterations)
+		for i := range measured {
+			v, err := h.timeIteration(benchmark.Body)
+			if err != nil {
+				return BenchmarkResult{}, err
+			}
+			measured[i] = v
+			pooled = append(pooled, v)
+		}
+		forks = append(forks, ForkResult{fork, warm, measured})
+	}
+	return BenchmarkResult{benchmark.Name, forks, pooled}, nil
+}
+
+func (h *Harness) timeIteration(body BenchmarkBody) (int64, error) {
+	start := h.ticker.NanoTime()
+	for op := 0; op < h.config.OpsPerIteration; op++ {
+		body(&h.blackhole)
+	}
+	end := h.ticker.NanoTime()
+	elapsed := end - start
+	if elapsed < 0 {
+		return 0, fmt.Errorf("%w: %d -> %d", ErrTickerBackwards, start, end)
+	}
+	return elapsed / int64(h.config.OpsPerIteration), nil
+}
+```
+
+#### Step 5: Results that report their own uncertainty
+
+`UnstableCV` is a package constant. The percentile accessors go through `MustPercentile` because a result always holds at least one measured sample per fork. `ForkMedians` preallocates with `make` and `ForkSpread` returns 0 for a single fork; `Row` builds the `UNSTABLE` marker first and then formats the same columns as the Java `row()`.
+
+```go
+const UnstableCV = 0.10
+
+func (r BenchmarkResult) P50() int64 { return MustPercentile(r.PooledNsPerOp, 50) }
+func (r BenchmarkResult) P99() int64 { return MustPercentile(r.PooledNsPerOp, 99) }
+
+// ForkMedians lists each fork's median in fork order.
+func (r BenchmarkResult) ForkMedians() []int64 {
+	medians := make([]int64, len(r.Forks))
+	for i, f := range r.Forks {
+		medians[i] = f.Median()
+	}
+	return medians
+}
+
+// ForkSpread is the spread of the per-fork medians. Above UnstableCV the forks disagree and the result is noise.
+func (r BenchmarkResult) ForkSpread() float64 {
+	if len(r.Forks) < 2 {
+		return 0
+	}
+	return CoefficientOfVariation(r.ForkMedians())
+}
+
+// Stable reports whether the forks agree.
+func (r BenchmarkResult) Stable() bool { return r.ForkSpread() <= UnstableCV }
+```
+
+#### Step 6: The coordinated-omission recorder
+
+`Record` returns an `error` for the two argument checks and otherwise mirrors the Java loop exactly, including the three-clause `for` that back-fills one sample per missed interval. `RawSamples` and `CorrectedSamples` hand out copies so a test cannot disturb the recorder's state.
+
+```go
+func (l *LatencyRecorder) Record(latencyNanos, expectedIntervalNanos int64) error {
+	if latencyNanos < 0 {
+		return errors.New("latency must be >= 0")
+	}
+	if expectedIntervalNanos <= 0 {
+		return errors.New("expected interval must be > 0")
+	}
+	l.raw = append(l.raw, latencyNanos)
+	l.corrected = append(l.corrected, latencyNanos)
+	for missing := latencyNanos - expectedIntervalNanos; missing >= expectedIntervalNanos; missing -= expectedIntervalNanos {
+		l.corrected = append(l.corrected, missing)
+	}
+	return nil
+}
+```
+
+#### Step 7: The sampling-profile aggregator
+
+Go maps return the zero value for a missing key, so `p.self[leaf]++` needs no `merge`. A local `seen` map replaces `LinkedHashSet` for the once-per-stack inclusive count (order does not matter for counting, only distinctness). `top` collects the map into a slice of `FrameCount` and sorts by count descending with name as the tie-break, because Go map iteration order is random and the report must not be.
+
+```go
+func (p *SampleProfile) Record(stackRootFirst ...string) error {
+	if len(stackRootFirst) == 0 {
+		return errors.New("empty stack")
+	}
+	p.samples++
+	p.self[stackRootFirst[len(stackRootFirst)-1]]++
+	seen := map[string]bool{}
+	for _, frame := range stackRootFirst {
+		if !seen[frame] {
+			seen[frame] = true
+			p.inclusive[frame]++
+		}
+	}
+	return nil
+}
+
+// top orders frames by count descending, ties broken by name so the output is deterministic.
+func top(counts map[string]int, n int) []FrameCount {
+	entries := make([]FrameCount, 0, len(counts))
+	for k, v := range counts {
+		entries = append(entries, FrameCount{k, v})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Count == entries[j].Count {
+			return entries[i].Frame < entries[j].Frame
+		}
+		return entries[i].Count > entries[j].Count
+	})
+	if n < len(entries) {
+		entries = entries[:n]
+	}
+	return entries
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/00-setup-and-tooling/05-benchmarking-and-profiling/code/go
 go run .
 go test ./...
 ```
+
+Timing numbers will differ on your machine. One run:
+
+```console
+== 1. Why warm-up matters: the first iterations pay for caches and allocation, not your code ==
+warm-up samples (discarded) ns/op: [400, 404, 373, 308, 309]
+measured samples           ns/op: [312, 303, 304, 306, 305]
+Go compiles ahead of time, so the warm-up drop is small; in Java the first sample is often several times the last.
+
+== 2. slice vs container/list, honestly ==
+benchmark (ns/op)                p50           p90           p99           max            per-fork medians
+slice[i] (random)                p50        6  p90        6  p99        7  max         7  forks [6, 6, 6]  spread   0.0%
+list.Front()+i (random)          p50     1635  p90     1866  p99     1996  max      1996  forks [1562, 1708, 1708]  spread   4.1%
+slice insert(0)+remove(0)        p50      870  p90     1096  p99     1669  max      1669  forks [870, 860, 902]  spread   2.0%
+list PushFront+Remove(Front)     p50       38  p90      101  p99      218  max       218  forks [39, 42, 22]  spread  25.7% UNSTABLE
+
+== 4. Coordinated omission: one stall, two very different p99s (scripted, deterministic) ==
+raw:       1000 samples, p50 0.2 ms, p99 0.2 ms, max 2000 ms
+corrected: 2999 samples, p50 501.0 ms, p99 1971.0 ms, max 2000 ms
+
+== 5. What a sampling profiler computes (scripted stacks) ==
+100 samples
+frame                          self   incl
+Money.times                   60.0%  60.0%
+FileChannel.write             25.0%  25.0%
+```
+
+The `list PushFront+Remove(Front)` row is marked `UNSTABLE` because one fork's median (22 ns) disagrees with the other two; the pooled p50 of 38 ns is not a number to quote. Sections 4 and 5 match Java and Python exactly.
 
 ## Use It
 

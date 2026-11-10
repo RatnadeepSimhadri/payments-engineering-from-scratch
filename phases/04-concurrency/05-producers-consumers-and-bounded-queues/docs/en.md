@@ -315,40 +315,389 @@ capacity 1000: all 20 queued, producer waited 0 times, high-water mark 20: nothi
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with five differences. **Two `Condition` objects share one `Lock`** by passing the lock to each constructor; this is the direct equivalent of `lock.newCondition()` twice, and `with self._lock:` is the `try/finally`. **`Condition.wait(timeout)` takes seconds as a float**; the `Clock.wait` seam converts from nanoseconds so the queue's arithmetic stays in integers and matches Java and Go exactly. **`poll` returns `T | None`** rather than `Optional`, which is why `put(None)` is rejected: a stored `None` would be indistinguishable from "empty". **The GIL does not make this simpler.** `self._count == len(self._items)` followed by `self._items[self._tail] = item` is two bytecodes with a possible switch between them; the lock is what makes the check-then-act atomic, exactly as in Lesson 02. **Yielding is `time.sleep(0)`.** There is no `onSpinWait`; `sleep(0)` releases the GIL and returns at the next opportunity. It is a yield, not a delay, and the spin loop still checks the queue's own counter.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The clock seam
+
+`Clock` is a `Protocol` with two methods; `SystemClock.nanos` uses `time.monotonic_ns` (monotonic, like `System.nanoTime`) and its `wait` divides by 10⁹ because `Condition.wait` wants float seconds. `FakeClock.wait` ignores the condition and just advances `_now`, which, to a timed loop holding the lock, looks exactly like a wait that expired.
+
 ```python
-self._lock = threading.Lock()
-self._not_full = threading.Condition(self._lock)
-self._not_empty = threading.Condition(self._lock)
+class Clock(Protocol):
+    def nanos(self) -> int: ...
+    def wait(self, condition: threading.Condition, nanos: int) -> None: ...
+
+
+class SystemClock:
+    def nanos(self) -> int:
+        return time.monotonic_ns()
+
+    def wait(self, condition: threading.Condition, nanos: int) -> None:
+        condition.wait(nanos / 1_000_000_000)
+
+
+class FakeClock:
+    """No real waiting: the clock jumps to the deadline, as if the wait timed out unsignalled."""
+
+    def __init__(self, start_nanos: int = 0) -> None:
+        self._now = start_nanos
+
+    def nanos(self) -> int:
+        return self._now
+
+    def wait(self, condition: threading.Condition, nanos: int) -> None:
+        self._now += max(0, nanos)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: State and the invariant
 
-- **Two `Condition` objects share one `Lock`** by passing the lock to each constructor; this is the direct equivalent of `lock.newCondition()` twice. `with self._lock:` is the `try/finally`.
-- **`Condition.wait(timeout)` takes seconds as a float**; the `Clock.wait` seam converts from nanoseconds so the queue's arithmetic stays in integers and matches Java and Go exactly.
-- **`poll` returns `T | None`** rather than `Optional`, which is why `put(None)` is rejected: a stored `None` would be indistinguishable from "empty".
-- **The GIL does not make this simpler.** `self._count == len(self._items)` followed by `self._items[self._tail] = item` is two bytecodes with a possible switch between them; the lock is what makes the check-then-act atomic, exactly as in Lesson 02.
-- **Yielding is `time.sleep(0)`.** There is no `onSpinWait`; `sleep(0)` releases the GIL and returns at the next opportunity. It is a yield, not a delay, and the spin loop still checks the queue's own counter.
+The ring is a pre-sized list of `None`s; `_head`, `_tail`, `_count`, and all five statistics are guarded by `_lock`. Both `Condition`s are constructed over that same lock, so waiting on either releases and re-acquires the one mutex the queue has. A missing clock defaults to `SystemClock()`, and capacity 0 is a `ValueError`.
+
+```python
+class BoundedBlockingQueue(Generic[T]):
+    def __init__(self, capacity: int, clock: Clock | None = None) -> None:
+        if capacity <= 0:
+            raise ValueError(f"capacity must be positive: {capacity}")
+        self._items: list[T | None] = [None] * capacity
+        self._head = 0  # next take
+        self._tail = 0  # next put
+        self._count = 0
+        self._lock = threading.Lock()
+        self._not_full = threading.Condition(self._lock)
+        self._not_empty = threading.Condition(self._lock)
+        self._clock: Clock = clock or SystemClock()
+        self._producer_waits = 0
+        self._consumer_waits = 0
+        self._high_water_mark = 0
+        self._waiting_producers = 0
+        self._waiting_consumers = 0
+```
+
+#### Step 3: Blocking put and take
+
+`with self._lock:` wraps the whole method, and the inner `try/finally` around `wait()` keeps `_waiting_producers` honest if the wait is interrupted (a `KeyboardInterrupt` lands inside `wait`). The `while`, not `if`, is kept for the same reason as in Java: `notify` can wake a thread whose slot is then taken by a newcomer. `None` is rejected because `poll` returns `None` for empty.
+
+```python
+    def put(self, item: T) -> None:
+        """Blocks while the queue is full. This is backpressure: the caller's thread is the buffer."""
+        if item is None:
+            raise ValueError("item must not be None")
+        with self._lock:
+            while self._count == len(self._items):   # while, not if: wakeups can be spurious or stolen
+                self._producer_waits += 1
+                self._waiting_producers += 1
+                try:
+                    self._not_full.wait()
+                finally:
+                    self._waiting_producers -= 1
+            self._enqueue(item)
+
+    def take(self) -> T:
+        """Blocks while the queue is empty."""
+        with self._lock:
+            while self._count == 0:
+                self._consumer_waits += 1
+                self._waiting_consumers += 1
+                try:
+                    self._not_empty.wait()
+                finally:
+                    self._waiting_consumers -= 1
+            return self._dequeue()
+```
+
+#### Step 4: Timed offer and poll
+
+The deadline is computed once from `self._clock.nanos()` and `remaining` is recomputed each iteration, all in integer nanoseconds. The wait goes through `self._clock.wait(...)` rather than `Condition.wait` directly, which is the seam that lets the fake clock stand in. `offer(item, 0)` returns `False` on the first check without touching the counters.
+
+```python
+    def offer(self, item: T, timeout_nanos: int) -> bool:
+        """Waits at most timeout_nanos for space; False means shed the load: tell the caller to retry later."""
+        if item is None:
+            raise ValueError("item must not be None")
+        with self._lock:
+            deadline = self._clock.nanos() + timeout_nanos
+            while self._count == len(self._items):
+                remaining = deadline - self._clock.nanos()
+                if remaining <= 0:
+                    return False
+                self._producer_waits += 1
+                self._waiting_producers += 1
+                try:
+                    self._clock.wait(self._not_full, remaining)
+                finally:
+                    self._waiting_producers -= 1
+            self._enqueue(item)
+            return True
+```
+
+#### Step 5: The two helpers that touch the ring
+
+`notify()` is `signal()`: one waiter on the opposite condition, because each helper moves `count` by exactly one. The dequeued slot is set to `None` so the object can be collected; the trailing `assert` documents that a `None` can never be read back, because `put` refused it.
+
+```python
+    def _enqueue(self, item: T) -> None:
+        self._items[self._tail] = item
+        self._tail = (self._tail + 1) % len(self._items)
+        self._count += 1
+        self._high_water_mark = max(self._high_water_mark, self._count)
+        self._not_empty.notify()                     # one waiting consumer is enough: one item arrived
+
+    def _dequeue(self) -> T:
+        item = self._items[self._head]
+        self._items[self._head] = None               # let the GC have it
+        self._head = (self._head + 1) % len(self._items)
+        self._count -= 1
+        self._not_full.notify()                      # one waiting producer is enough: one slot opened
+        assert item is not None
+        return item
+```
+
+#### Step 6: A producer, and how the demo waits without sleeping
+
+`Producer` subclasses `threading.Thread` and sets a `threading.Event` in a `finally` so the demo can wait for it without polling. `until_producer_waiting` spins on `stats().waiting_producers`, yielding with `time.sleep(0)` so the producer thread can actually run under the GIL, and gives up after five seconds with an exception rather than hanging.
+
+```python
+def until_producer_waiting(queue: BoundedBlockingQueue) -> None:
+    """Yield (never sleep for a duration) until the queue reports a waiting producer; bounded so a bug cannot hang."""
+    deadline = time.monotonic_ns() + 5_000_000_000
+    while queue.stats().waiting_producers == 0:
+        if time.monotonic_ns() > deadline:
+            raise RuntimeError("producer never blocked")
+        time.sleep(0)  # give up the GIL; this is a yield, not a delay
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/04-concurrency/05-producers-consumers-and-bounded-queues/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Same lines as Java, with Python's `False`/`True` spelling; the wait counts vary from run to run:
+
+```console
+== A full queue refuses, it does not grow ==
+offer auth-1 -> accepted  (size 1/3)
+offer auth-3 -> accepted  (size 3/3)
+offer auth-4 -> REFUSED: reply 429 Retry-After  (size 3/3)
+
+== A timed offer against a full queue, with a fake clock ==
+offer with 250 ms timeout -> False; clock advanced 250 ms; producer waits = 1
+poll(0) on the one-item queue -> auth-a; poll(0) again -> empty
+
+== Backpressure: a fast producer, a slow consumer, capacity 4 ==
+producer blocked with 4/4 items queued; it cannot run ahead of the ledger
+consumed 20 payments in FIFO order: True; posted 399.80 USD
+high-water mark 4 (never above capacity), producer waited 4 times, consumer waited 4 times
+
+== Without the bound, the backlog lives in your heap ==
+capacity 1000: all 20 queued, producer waited 0 times, high-water mark 20: nothing told the producer to slow down
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with four differences. **`sync.Cond` has no timed wait.** This is a deliberate omission by the Go team (the idiomatic answer is a channel plus `select` with `time.After`). The lesson keeps the condition-variable design to match the other languages and implements the timed wait with a timer that `Broadcast`s at the deadline. The callback takes the lock first so it cannot run in the gap between the caller's check and its `Wait`, which would be a lost wakeup; `Broadcast` rather than `Signal` because the timer does not know which waiter it is waking, and the `for` loops make the extra wakeups harmless. `TestSystemClockTimedOfferReallyTimesOut` is the one test that uses the real clock, with a 5 ms timeout, to prove the timer path works. **Generics.** `BoundedBlockingQueue[T any]` with a zero value written back on dequeue (`var zero T`), the equivalent of nulling the slot. `Poll` returns `(T, bool)`. **`-race` is the test command.** Every field is accessed under `mu`, including the stats; the race detector confirms it on every run. **Yielding is `runtime.Gosched()`.** A closed channel or `sync.WaitGroup` replaces `CountDownLatch`.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The clock seam
+
+`Clock` is an interface with `Nanos` and `Wait`. `SystemClock.Wait` is the interesting one: it arms `time.AfterFunc` to lock the condition's mutex and `Broadcast`, then calls the untimed `cond.Wait()`, and stops the timer on the way out. Because the callback locks `cond.L` first, it cannot broadcast between the caller's `for` check and the `Wait` that releases the lock. `FakeClock.Wait` advances its own time and returns.
+
 ```go
+type Clock interface {
+	Nanos() int64
+	Wait(cond *sync.Cond, nanos int64)
+}
+
+func (c *SystemClock) Nanos() int64 { return int64(time.Since(c.start)) }
+
+// Wait must be called with cond.L held, like cond.Wait. The timer callback takes the lock before
+// broadcasting so it cannot fire in the window between the caller's check and its Wait.
 func (c *SystemClock) Wait(cond *sync.Cond, nanos int64) {
-    timer := time.AfterFunc(time.Duration(nanos), func() {
-        cond.L.Lock()
-        cond.Broadcast()
-        cond.L.Unlock()
-    })
-    cond.Wait()
-    timer.Stop()
+	timer := time.AfterFunc(time.Duration(nanos), func() {
+		cond.L.Lock()
+		cond.Broadcast()
+		cond.L.Unlock()
+	})
+	cond.Wait()
+	timer.Stop()
+}
+
+type FakeClock struct{ now int64 }
+
+func (c *FakeClock) Nanos() int64 { return c.now }
+
+// Wait does no real waiting: the clock jumps to the deadline, as if the wait timed out unsignalled.
+func (c *FakeClock) Wait(cond *sync.Cond, nanos int64) {
+	if nanos > 0 {
+		c.now += nanos
+	}
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: State and the invariant
 
-- **`sync.Cond` has no timed wait.** This is a deliberate omission by the Go team (the idiomatic answer is a channel plus `select` with `time.After`). The lesson keeps the condition-variable design to match the other languages and implements the timed wait with a timer that `Broadcast`s at the deadline. The callback takes the lock first so it cannot run in the gap between the caller's check and its `Wait`, which would be a lost wakeup; `Broadcast` rather than `Signal` because the timer does not know which waiter it is waking, and the `for` loops make the extra wakeups harmless. `TestSystemClockTimedOfferReallyTimesOut` is the one test that uses the real clock, with a 5 ms timeout, to prove the timer path works.
-- **Generics.** `BoundedBlockingQueue[T any]` with a zero value written back on dequeue (`var zero T`), the equivalent of nulling the slot. `Poll` returns `(T, bool)`.
-- **`-race` is the test command.** Every field is accessed under `mu`, including the stats; the race detector confirms it on every run.
-- **Yielding is `runtime.Gosched()`.** A closed channel or `sync.WaitGroup` replaces `CountDownLatch`.
+The struct holds a `[]T` ring, the two cursors and the count, one `sync.Mutex`, and two `*sync.Cond` built over `&q.mu` by the constructor, which is `lock.newCondition()` twice. A non-positive capacity returns `ErrCapacity` rather than panicking; a `nil` clock means the system clock. Every field below `items` is written only with `mu` held, stats included.
+
+```go
+type BoundedBlockingQueue[T any] struct {
+	items            []T
+	head, tail       int // next take, next put
+	count            int
+	mu               sync.Mutex
+	notFull          *sync.Cond
+	notEmpty         *sync.Cond
+	clock            Clock
+	producerWaits    int64
+	consumerWaits    int64
+	highWaterMark    int
+	waitingProducers int
+	waitingConsumers int
+}
+
+func NewBoundedBlockingQueue[T any](capacity int, clock Clock) (*BoundedBlockingQueue[T], error) {
+	if capacity <= 0 {
+		return nil, fmt.Errorf("%w: %d", ErrCapacity, capacity)
+	}
+	if clock == nil {
+		clock = NewSystemClock()
+	}
+	q := &BoundedBlockingQueue[T]{items: make([]T, capacity), clock: clock}
+	q.notFull = sync.NewCond(&q.mu)
+	q.notEmpty = sync.NewCond(&q.mu)
+	return q, nil
+}
+```
+
+#### Step 3: Blocking put and take
+
+`defer q.mu.Unlock()` covers every exit. Go has no thread interruption, so `cond.Wait()` cannot throw and the inner `finally` disappears: `waitingProducers--` simply follows the `Wait`, which has re-acquired `mu` before returning. There is no `nil` check on `item` because a zero `T` is a legal element; `Poll` signals absence with its second return value instead.
+
+```go
+func (q *BoundedBlockingQueue[T]) Put(item T) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for q.count == len(q.items) { // for, not if: wakeups can be spurious or stolen
+		q.producerWaits++
+		q.waitingProducers++
+		q.notFull.Wait()
+		q.waitingProducers--
+	}
+	q.enqueue(item)
+}
+
+func (q *BoundedBlockingQueue[T]) Take() T {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for q.count == 0 {
+		q.consumerWaits++
+		q.waitingConsumers++
+		q.notEmpty.Wait()
+		q.waitingConsumers--
+	}
+	return q.dequeue()
+}
+```
+
+#### Step 4: Timed offer and poll
+
+Integer nanosecond arithmetic on `int64`, one deadline, a fresh `remaining` per iteration, and the wait routed through `q.clock.Wait` so the fake clock can substitute. With the system clock a spurious `Broadcast` from the timer simply loops back to the check; the `for` is what makes the broadcast safe.
+
+```go
+func (q *BoundedBlockingQueue[T]) Offer(item T, timeoutNanos int64) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	deadline := q.clock.Nanos() + timeoutNanos
+	for q.count == len(q.items) {
+		remaining := deadline - q.clock.Nanos()
+		if remaining <= 0 {
+			return false
+		}
+		q.producerWaits++
+		q.waitingProducers++
+		q.clock.Wait(q.notFull, remaining)
+		q.waitingProducers--
+	}
+	q.enqueue(item)
+	return true
+}
+```
+
+#### Step 5: The two helpers that touch the ring
+
+`Signal` wakes one waiter, as in Java. `dequeue` writes `var zero T` back into the slot, which for a pointer or struct-with-pointers element is what releases the old value to the garbage collector; for a plain `int64` it is harmless.
+
+```go
+func (q *BoundedBlockingQueue[T]) enqueue(item T) {
+	q.items[q.tail] = item
+	q.tail = (q.tail + 1) % len(q.items)
+	q.count++
+	if q.count > q.highWaterMark {
+		q.highWaterMark = q.count
+	}
+	q.notEmpty.Signal() // one waiting consumer is enough: one item arrived
+}
+
+func (q *BoundedBlockingQueue[T]) dequeue() T {
+	item := q.items[q.head]
+	var zero T
+	q.items[q.head] = zero // let the GC have it
+	q.head = (q.head + 1) % len(q.items)
+	q.count--
+	q.notFull.Signal() // one waiting producer is enough: one slot opened
+	return item
+}
+```
+
+#### Step 6: A producer, and how the demo waits without sleeping
+
+`Producer` is a plain function run as a goroutine that `Done()`s a `sync.WaitGroup` when its script is exhausted. `UntilProducerWaiting` spins on the queue's own `WaitingProducers` counter and yields with `runtime.Gosched()` between reads; the five-second bound turns a producer that never blocks into a panic instead of a hang.
+
+```go
+func Producer(queue *BoundedBlockingQueue[Payment], script []Payment, done *sync.WaitGroup) {
+	defer done.Done()
+	for _, p := range script {
+		queue.Put(p)
+	}
+}
+
+func UntilProducerWaiting[T any](queue *BoundedBlockingQueue[T]) {
+	deadline := time.Now().Add(5 * time.Second)
+	for queue.Stats().WaitingProducers == 0 {
+		if time.Now().After(deadline) {
+			panic("producer never blocked")
+		}
+		runtime.Gosched()
+	}
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/04-concurrency/05-producers-consumers-and-bounded-queues/code/go
+go run .
+go test -race ./...
+```
+
+The output is identical to the Java run (wait counts vary):
+
+```console
+== A timed offer against a full queue, with a fake clock ==
+offer with 250 ms timeout -> false; clock advanced 250 ms; producer waits = 1
+poll(0) on the one-item queue -> auth-a; poll(0) again -> empty
+
+== Backpressure: a fast producer, a slow consumer, capacity 4 ==
+producer blocked with 4/4 items queued; it cannot run ahead of the ledger
+consumed 20 payments in FIFO order: true; posted 399.80 USD
+high-water mark 4 (never above capacity), producer waited 4 times, consumer waited 4 times
+
+== Without the bound, the backlog lives in your heap ==
+capacity 1000: all 20 queued, producer waited 0 times, high-water mark 20: nothing told the producer to slow down
+```
 
 ## Use It
 

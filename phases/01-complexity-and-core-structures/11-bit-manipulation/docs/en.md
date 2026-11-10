@@ -371,25 +371,204 @@ Math.abs(Long.MIN_VALUE)      = -9223372036854775808  (still negative: there is 
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps `Bits`, `AccountFlags`, `Bitmap`, `Iso8583Bitmap`, and `SnowflakeId` with the same layouts. What differs: **Python ints have no width.** There is no sign bit to overflow into, no `>>>`, and a negative int has infinitely many leading ones (`-8 >> 100 == -1`). A Java `long` is represented as a Python int in `[LONG_MIN, LONG_MAX]`; every operation that can leave that range goes through `to_int64`, and every unsigned view masks with `MASK64` first. `popcount_kernighan` must mask before its loop, or `v &= v - 1` never reaches zero for a negative input. **The traps are emulated, not native:** `Math.abs(Long.MIN_VALUE)`, `(byte) 0x80`, `1 << 32` on an `int`, the int midpoint overflow, and `-7 / 2` all behave correctly in plain Python, which is the point: the demo calls `to_int64`, `to_int8`, `to_int32`, `urshift32`, `java_div`, and `java_rem` to show what Java and Go do, and `test_python_differs_from_java` pins the difference (`-7 // 2 == -4`, `-7 % 2 == 1`). **Bitmap words are unsigned:** `Bitmap` stores each word as an int in `0..2^64-1`, the honest type for a bit set, so `next_set_bit` finds the trailing zeros with `(word & -word).bit_length() - 1`. ISO 8583 hex parses with `int(hex, 16)`, which plays `Long.parseUnsignedLong`. **Names that are keywords:** `AccountFlags.with` and `Bitmap.and`/`or` become `with_`, `and_`, `or_`. Exceptions map to `ValueError` (`IllegalArgumentException`), `IndexError`, and `RuntimeError` for the backwards clock.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Masks, extract, insert
+
+`Bits` is a class of static methods. `mask(64)` returns `-1`, which as a Python int is all ones at every width, so it works as a mask after `& MASK64`. `extract` views `v` as unsigned (`v & MASK64`) before shifting, which is the `>>>`; `insert` checks the field against the mask before touching `v`, and both wrap the result with `to_int64` so it lands back in the Java `long` range.
+
 ```python
 MASK64 = (1 << 64) - 1
+
 
 def to_int64(v: int) -> int:
     """Wrap to a signed 64-bit value, exactly what a Java long does on overflow."""
     v &= MASK64
     return v - (1 << 64) if v >= (1 << 63) else v
-
-def urshift64(v: int, n: int) -> int:
-    """Java's >>> on a long: view the value as unsigned 64 bits, then shift in zeros."""
-    return to_int64((v & MASK64) >> n)
 ```
 
-`code/python/main.py` keeps `Bits`, `AccountFlags`, `Bitmap`, `Iso8583Bitmap`, and `SnowflakeId` with the same layouts. What differs:
+```python
+    @staticmethod
+    def mask(width: int) -> int:
+        """A mask of `width` low bits set: mask(3) = 0b111. mask(64) is all ones (-1); mask(0) is 0."""
+        if width < 0 or width > 64:
+            raise ValueError(f"width must be 0..64: {width}")
+        return -1 if width == 64 else (1 << width) - 1
 
-- **Python ints have no width.** There is no sign bit to overflow into, no `>>>`, and a negative int has infinitely many leading ones (`-8 >> 100 == -1`). A Java `long` is represented as a Python int in `[LONG_MIN, LONG_MAX]`; every operation that can leave that range goes through `to_int64`, and every unsigned view masks with `MASK64` first. `popcount_kernighan` must mask before its loop, or `v &= v - 1` never reaches zero for a negative input.
-- **The traps are emulated, not native.** `Math.abs(Long.MIN_VALUE)`, `(byte) 0x80`, `1 << 32` on an `int`, the int midpoint overflow, and `-7 / 2` all behave correctly in plain Python, which is the point: the demo calls `to_int64`, `to_int8`, `to_int32`, `urshift32`, `java_div`, and `java_rem` to show what Java and Go do, and `test_python_differs_from_java` pins the difference (`-7 // 2 == -4`, `-7 % 2 == 1`).
-- **Bitmap words are unsigned.** `Bitmap` stores each word as an int in `0..2^64-1`, the honest type for a bit set, so `next_set_bit` finds the trailing zeros with `(word & -word).bit_length() - 1`. ISO 8583 hex parses with `int(hex, 16)`, which plays `Long.parseUnsignedLong`.
-- **Names that are keywords.** `AccountFlags.with` and `Bitmap.and`/`or` become `with_`, `and_`, `or_`. Exceptions map to `ValueError` (`IllegalArgumentException`), `IndexError`, and `RuntimeError` for the backwards clock.
+    @staticmethod
+    def extract(v: int, shift: int, width: int) -> int:
+        """Read `width` bits starting at `shift` as an unsigned value."""
+        Bits._check_field(shift, width)
+        return to_int64(((v & MASK64) >> shift) & Bits.mask(width))
+
+    @staticmethod
+    def insert(v: int, shift: int, width: int, field: int) -> int:
+        """Write `field` into the `width` bits at `shift`, rejecting a field that does not fit."""
+        Bits._check_field(shift, width)
+        if (field & ~Bits.mask(width)) != 0:
+            raise ValueError(f"{field} does not fit in {width} bits")
+        hole = ~(Bits.mask(width) << shift)
+        return to_int64((v & hole) | (field << shift))
+```
+
+#### Step 2: Two popcounts
+
+Both functions mask to 64 bits first. Without it, Kernighan's loop on a negative Python int never terminates, because `-1` has infinitely many one bits. In the parallel version the intermediate values are non-negative so `>>` is already logical; the final multiply is masked because in Java it wraps at 64 bits and the answer lives in the top byte.
+
+```python
+    @staticmethod
+    def popcount_kernighan(v: int) -> int:
+        v &= MASK64
+        n = 0
+        while v != 0:
+            v &= v - 1
+            n += 1
+        return n
+
+    @staticmethod
+    def popcount_parallel(v: int) -> int:
+        """Number of one bits in constant time: add neighbours in 2-, 4-, 8-bit groups, then fold."""
+        v &= MASK64
+        v = v - ((v >> 1) & 0x5555555555555555)
+        v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333)
+        v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F
+        return ((v * 0x0101010101010101) & MASK64) >> 56  # the multiply wraps at 64 bits in Java
+```
+
+#### Step 3: Flags
+
+Class attributes play the role of the `static final` constants. The constructor rejects bits beyond the five known flags, `with_` carries a trailing underscore because `with` is a keyword, and every mutator returns a new object.
+
+```python
+class AccountFlags:
+    FROZEN = 1 << 0
+    KYC_VERIFIED = 1 << 1
+    PAYOUTS_ENABLED = 1 << 2
+    HIGH_RISK = 1 << 3
+    CHARGEBACK_HOLD = 1 << 4
+    _NAMES = ["FROZEN", "KYC_VERIFIED", "PAYOUTS_ENABLED", "HIGH_RISK", "CHARGEBACK_HOLD"]
+
+    def __init__(self, bits: int) -> None:
+        if (bits & ~Bits.mask(len(self._NAMES))) != 0:
+            raise ValueError(f"unknown flag bits in {bits:b}")
+        self._bits = bits
+
+    def has(self, flag: int) -> bool:
+        return (self._bits & flag) == flag
+
+    def has_any(self, flags: int) -> bool:
+        return (self._bits & flags) != 0
+
+    def with_(self, flag: int) -> AccountFlags:
+        return AccountFlags(self._bits | flag)
+
+    def without(self, flag: int) -> AccountFlags:
+        return AccountFlags(self._bits & ~flag)
+
+    def can_pay_out(self) -> bool:
+        """The business rule in one expression: may this account receive a payout right now?"""
+        return (self.has(AccountFlags.KYC_VERIFIED | AccountFlags.PAYOUTS_ENABLED)
+                and not self.has_any(AccountFlags.FROZEN | AccountFlags.CHARGEBACK_HOLD))
+```
+
+#### Step 4: The bitmap
+
+Words are unsigned ints in `0..2^64-1`, so `set` needs no wrapping and `>>` is logical. The "all ones from `frm` upward" mask is `(MASK64 << (frm & 63)) & MASK64`, since an unbounded int shifted left would otherwise grow past 64 bits. `(word & -word).bit_length() - 1` is `Long.numberOfTrailingZeros`.
+
+```python
+class Bitmap:
+    def __init__(self, capacity: int) -> None:
+        if capacity < 0:
+            raise ValueError("capacity must be >= 0")
+        self._capacity = capacity
+        self._words = [0] * ((capacity + 63) >> 6)
+
+    def set(self, i: int) -> None:
+        self._check_index(i)
+        self._words[i >> 6] |= 1 << (i & 63)
+
+    def get(self, i: int) -> bool:
+        self._check_index(i)
+        return (self._words[i >> 6] & (1 << (i & 63))) != 0
+
+    def next_set_bit(self, frm: int) -> int:
+        """Index of the first set bit at or after `frm`, or -1. Skips whole zero words."""
+        if frm < 0:
+            raise IndexError("from must be >= 0")
+        if frm >= self._capacity:
+            return -1
+        w = frm >> 6
+        word = self._words[w] & ((MASK64 << (frm & 63)) & MASK64)  # drop bits below `frm`
+        while True:
+            if word != 0:
+                idx = (w << 6) + ((word & -word).bit_length() - 1)  # Long.numberOfTrailingZeros
+                return idx if idx < self._capacity else -1
+            w += 1
+            if w == len(self._words):
+                return -1
+            word = self._words[w]
+```
+
+#### Step 5: ISO 8583 encode and decode
+
+The bitmaps are built as unsigned ints, so `1 << 63` for field 1 is a positive number rather than `Long.MIN_VALUE`. `to_hex` pads to 16 digits. The decoder (in the file) uses `int(hex_str[:16], 16)` for the unsigned parse and cross-checks bit 1 against the string length.
+
+```python
+    @staticmethod
+    def encode(fields: Iterable[int]) -> str:
+        """16 hex characters, or 32 when any field > 64 is present."""
+        primary, secondary = 0, 0
+        for f in fields:
+            if f < 2 or f > 128:
+                raise ValueError(f"field must be 2..128 (field 1 is derived): {f}")
+            if f <= 64:
+                primary |= 1 << (64 - f)
+            else:
+                secondary |= 1 << (128 - f)
+        if secondary != 0:
+            primary |= 1 << 63  # field 1: secondary bitmap present
+            return Bits.to_hex(primary, 16) + Bits.to_hex(secondary, 16)
+        return Bits.to_hex(primary, 16)
+```
+
+#### Step 6: Snowflake compose and the generator
+
+`compose` goes through `Bits.insert`, so an oversized worker or sequence raises `ValueError`. `Generator` is a nested class whose clock is any zero-argument callable; the demo passes a closure that advances every 5,000 reads. The backwards-clock case raises `RuntimeError`, and the `& MAX_SEQUENCE` wrap to zero is the signal to spin until the clock advances.
+
+```python
+    @staticmethod
+    def compose(timestamp_millis: int, worker: int, sequence: int) -> int:
+        delta = timestamp_millis - SnowflakeId.EPOCH_MILLIS
+        if delta < 0 or delta > SnowflakeId.MAX_TIMESTAMP:
+            raise ValueError("timestamp outside the 41-bit window")
+        i = 0
+        i = Bits.insert(i, SnowflakeId.TIMESTAMP_SHIFT, SnowflakeId.TIMESTAMP_BITS, delta)
+        i = Bits.insert(i, SnowflakeId.WORKER_SHIFT, SnowflakeId.WORKER_BITS, worker)
+        i = Bits.insert(i, 0, SnowflakeId.SEQUENCE_BITS, sequence)
+        return i
+```
+
+```python
+        def next(self) -> int:
+            now = self._clock()
+            if now < self._last_millis:
+                # Java: IllegalStateException
+                raise RuntimeError(f"clock moved backwards by {self._last_millis - now} ms; refusing to issue ids")
+            if now == self._last_millis:
+                self._sequence = (self._sequence + 1) & SnowflakeId.MAX_SEQUENCE
+                if self._sequence == 0:  # 4096 ids in one millisecond: wait for the clock to advance
+                    self._waits += 1
+                    while now <= self._last_millis:
+                        now = self._clock()
+            else:
+                self._sequence = 0
+            self._last_millis = now
+            return SnowflakeId.compose(now, self._worker, self._sequence)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/11-bit-manipulation/code/python
@@ -397,38 +576,278 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Bitmap: which of 1,000,000 merchants settled today ==
+memory: 15625 longs = 122 KB for 1000000 merchants (a boolean[] would be 976 KB, a HashSet<Integer> about 6696 KB)
+settled today: 142858, active this month: 200000, both: 28572
+
+== ISO 8583 bitmap ==
+0100 authorisation request fields [2, 3, 4, 7, 11, 12, 13, 22, 24, 25, 35, 41, 42, 49]
+primary bitmap hex   = 7238058020C08000
+adding field 102 (account id 1) sets field 1 and appends a secondary bitmap:
+bitmaps hex          = F238058020C080000000000004000000  (32 hex chars)
+
+== Snowflake-style ids: 41 + 10 + 12 bits ==
+first id = 362387865628672 = 0000000000000001010010011001011100000000000000000111000000000000
+  timestamp 1700086400000 ms, worker 7, sequence 0
+10,000 ids from one worker: strictly increasing = true, sequence overflows waited out = 2
+
+== Two's complement traps ==
+Math.abs(Long.MIN_VALUE)      = -9223372036854775808  (still negative: there is no +2^63)
+1 << 32  (int, shift mod 32)  = 1  (JLS 15.19: only the low 5 bits of the shift count are used)
+(lo + hi) / 2 with int        = -97483648  vs  lo + ((hi - lo) >>> 1) = 2050000000  (the binary-search midpoint bug)
+-7 / 2 = -3  -7 >> 1 = -4  (division truncates toward zero, shift floors)
+```
+
+Every line matches Java, including the traps section, which is the emulation layer doing its job: plain Python would print `9223372036854775808` for the first trap and `-4` for `-7 // 2`.
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps `Bits` (as package-level functions), `AccountFlags`, `Bitmap`, ISO 8583 encode/decode, and the Snowflake generator with the same layouts. What differs: **one shift operator, chosen by type.** Go has no `>>>`: `>>` on a signed integer is arithmetic and on an unsigned integer is logical, so every place Java writes `v >>> n` the port writes `uint64(v) >> n`. `Bitmap` words are `[]uint64`, the honest type for a bit set, and the ISO 8583 bitmaps are built as `uint64` and parsed with `strconv.ParseUint`, which plays `Long.parseUnsignedLong`. `math/bits` supplies `OnesCount64`, `TrailingZeros64`, and `Len64` where Java has `Long.bitCount`, `numberOfTrailingZeros`, and `highestOneBit`. **The shift-count trap is different, not absent:** Java reduces the count mod the width, so `1 << 32` on an `int` is `1`. Go does not: a shift by the width or more yields zero for an unsigned or positive value, and a constant shift that overflows is a compile error. The demo prints Go's answer (`0`) with a note, and the test pins it; every other row of the two's-complement section prints the same numbers as Java, including the `int8(0x80)` widening, the `int32` midpoint overflow, and `-7 / 2` versus `-7 >> 1`. **Errors are values, panics for programming errors:** `Extract`, `Insert`, `Compose`, `Decompose`, `Iso8583Encode`, `Iso8583Decode`, `NewAccountFlags`, `Bitmap.And`/`Or`, and `Generator.Next` return `error`, with sentinels such as `ErrFieldOverflow`, `ErrBadBitmapHex`, and `ErrClockBackwards`. `Mask` with a width outside 0..64 and a `Bitmap` index out of range panic, the same way Go treats an impossible shift count or a bad slice index. **Same random inputs:** the test file carries a `javaRandom` with `nextLong` and `nextBoolean`, so the 10,000 popcount inputs and the 2,000 bitmap operations are the ones the Java test draws; the reference bit set is a `[]bool`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Masks, extract, insert
+
+`Mask` panics on a bad width (a programming error) while `Extract` and `Insert` return errors for a bad field (a value a caller might compute). The `uint64(v) >> shift` conversion is Java's `>>>`, and `&^` is Go's and-not operator, which replaces `& ~mask` in the fit check.
+
 ```go
-// IsSet tests one bit; the uint64 view is Java's >>>.
-func IsSet(v int64, bit int) bool { return (uint64(v)>>bit)&1 != 0 }
+func Mask(width int) int64 {
+	if width < 0 || width > 64 {
+		panic(fmt.Sprintf("width must be 0..64: %d", width))
+	}
+	if width == 64 {
+		return -1
+	}
+	return int64(1)<<width - 1
+}
 
 // Extract reads width bits starting at shift as an unsigned value.
 func Extract(v int64, shift, width int) (int64, error) {
-    if err := checkField(shift, width); err != nil {
-        return 0, err
-    }
-    return int64(uint64(v)>>shift) & Mask(width), nil
+	if err := checkField(shift, width); err != nil {
+		return 0, err
+	}
+	return int64(uint64(v)>>shift) & Mask(width), nil
 }
 
-func (b *Bitmap) NextSetBit(from int) int {
-    // ...
-    word := b.words[w] & (math.MaxUint64 << (from & 63)) // drop bits below from
-    idx := (w << 6) + bits.TrailingZeros64(word)
+// Insert writes field into the width bits at shift, rejecting a field that does not fit.
+func Insert(v int64, shift, width int, field int64) (int64, error) {
+	if err := checkField(shift, width); err != nil {
+		return 0, err
+	}
+	if field&^Mask(width) != 0 {
+		return 0, fmt.Errorf("%w: %d in %d bits", ErrFieldOverflow, field, width)
+	}
+	hole := ^(Mask(width) << shift)
+	return (v & hole) | (field << shift), nil
+}
 ```
 
-`code/go/main.go` keeps `Bits` (as package-level functions), `AccountFlags`, `Bitmap`, ISO 8583 encode/decode, and the Snowflake generator with the same layouts. What differs:
+#### Step 2: Two popcounts
 
-- **One shift operator, chosen by type.** Go has no `>>>`: `>>` on a signed integer is arithmetic and on an unsigned integer is logical, so every place Java writes `v >>> n` the port writes `uint64(v) >> n`. `Bitmap` words are `[]uint64`, the honest type for a bit set, and the ISO 8583 bitmaps are built as `uint64` and parsed with `strconv.ParseUint`, which plays `Long.parseUnsignedLong`. `math/bits` supplies `OnesCount64`, `TrailingZeros64`, and `Len64` where Java has `Long.bitCount`, `numberOfTrailingZeros`, and `highestOneBit`.
-- **The shift-count trap is different, not absent.** Java reduces the count mod the width, so `1 << 32` on an `int` is `1`. Go does not: a shift by the width or more yields zero for an unsigned or positive value, and a constant shift that overflows is a compile error. The demo prints Go's answer (`0`) with a note, and the test pins it; every other row of the two's-complement section prints the same numbers as Java, including the `int8(0x80)` widening, the `int32` midpoint overflow, and `-7 / 2` versus `-7 >> 1`.
-- **Errors are values, panics for programming errors.** `Extract`, `Insert`, `Compose`, `Decompose`, `Iso8583Encode`, `Iso8583Decode`, `NewAccountFlags`, `Bitmap.And`/`Or`, and `Generator.Next` return `error`, with sentinels such as `ErrFieldOverflow`, `ErrBadBitmapHex`, and `ErrClockBackwards`. `Mask` with a width outside 0..64 and a `Bitmap` index out of range panic, the same way Go treats an impossible shift count or a bad slice index.
-- **Same random inputs.** The test file carries a `javaRandom` with `nextLong` and `nextBoolean`, so the 10,000 popcount inputs and the 2,000 bitmap operations are the ones the Java test draws; the reference bit set is a `[]bool`.
+Kernighan's loop works directly on the `int64` because `v - 1` wraps and the loop terminates for negative inputs too. The parallel version converts to `uint64` once at the top so every `>>` is logical and the final multiply wraps at 64 bits exactly as the Java `long` multiply does.
+
+```go
+// PopcountKernighan counts one bits by clearing the lowest set bit until nothing is left. O(popcount).
+func PopcountKernighan(v int64) int {
+	n := 0
+	for v != 0 {
+		v &= v - 1
+		n++
+	}
+	return n
+}
+
+// PopcountParallel counts one bits in constant time: add neighbours in 2-, 4-, 8-bit groups, then fold.
+func PopcountParallel(v int64) int {
+	u := uint64(v)
+	u = u - ((u >> 1) & 0x5555555555555555)
+	u = (u & 0x3333333333333333) + ((u >> 2) & 0x3333333333333333)
+	u = (u + (u >> 4)) & 0x0F0F0F0F0F0F0F0F
+	return int((u * 0x0101010101010101) >> 56)
+}
+```
+
+#### Step 3: Flags
+
+Typed `int32` constants and a one-field struct with value receivers, so `With` and `Without` return fresh values. `NewAccountFlags` is the validating constructor that returns `ErrUnknownFlag` for bits beyond the five defined ones.
+
+```go
+const (
+	Frozen         int32 = 1 << 0
+	KycVerified    int32 = 1 << 1
+	PayoutsEnabled int32 = 1 << 2
+	HighRisk       int32 = 1 << 3
+	ChargebackHold int32 = 1 << 4
+)
+
+// AccountFlags is account state as a set of flags in one int32.
+type AccountFlags struct {
+	bits int32
+}
+
+func (f AccountFlags) Has(flag int32) bool             { return f.bits&flag == flag }
+func (f AccountFlags) HasAny(flags int32) bool         { return f.bits&flags != 0 }
+func (f AccountFlags) With(flag int32) AccountFlags    { return AccountFlags{f.bits | flag} }
+func (f AccountFlags) Without(flag int32) AccountFlags { return AccountFlags{f.bits &^ flag} }
+
+// CanPayOut is the business rule in one expression: may this account receive a payout right now?
+func (f AccountFlags) CanPayOut() bool {
+	return f.Has(KycVerified|PayoutsEnabled) && !f.HasAny(Frozen|ChargebackHold)
+}
+```
+
+#### Step 4: The bitmap
+
+`[]uint64` words make every shift logical. `math.MaxUint64 << (from & 63)` is Java's `-1L << (from & 63)`, and `bits.TrailingZeros64` replaces `Long.numberOfTrailingZeros`. Index errors panic, like a slice index.
+
+```go
+type Bitmap struct {
+	words    []uint64
+	capacity int
+}
+
+// NewBitmap allocates ceil(capacity/64) words.
+func NewBitmap(capacity int) *Bitmap {
+	if capacity < 0 {
+		panic("capacity must be >= 0")
+	}
+	return &Bitmap{words: make([]uint64, (capacity+63)>>6), capacity: capacity}
+}
+
+func (b *Bitmap) Set(i int)   { b.checkIndex(i); b.words[i>>6] |= 1 << (i & 63) }
+func (b *Bitmap) Get(i int) bool {
+	b.checkIndex(i)
+	return b.words[i>>6]&(1<<(i&63)) != 0
+}
+
+// NextSetBit is the index of the first set bit at or after from, or -1. Skips whole zero words.
+func (b *Bitmap) NextSetBit(from int) int {
+	if from < 0 {
+		panic("from must be >= 0")
+	}
+	if from >= b.capacity {
+		return -1
+	}
+	w := from >> 6
+	word := b.words[w] & (math.MaxUint64 << (from & 63)) // drop bits below from
+	for {
+		if word != 0 {
+			idx := (w << 6) + bits.TrailingZeros64(word)
+			if idx < b.capacity {
+				return idx
+			}
+			return -1
+		}
+		w++
+		if w == len(b.words) {
+			return -1
+		}
+		word = b.words[w]
+	}
+}
+```
+
+#### Step 5: ISO 8583 encode and decode
+
+The two bitmaps are `uint64`, so `1 << 63` is an ordinary positive constant. A bad field number returns `ErrBadIsoField`; `ToHex` formats the unsigned view at a fixed width. The decoder (in the file) parses with `strconv.ParseUint(hex[:16], 16, 64)` and returns `ErrBadBitmapHex` when field 1 disagrees with the string length.
+
+```go
+func Iso8583Encode(fields []int) (string, error) {
+	var primary, secondary uint64
+	for _, f := range fields {
+		if f < 2 || f > 128 {
+			return "", fmt.Errorf("%w: %d", ErrBadIsoField, f)
+		}
+		if f <= 64 {
+			primary |= 1 << (64 - f)
+		} else {
+			secondary |= 1 << (128 - f)
+		}
+	}
+	if secondary != 0 {
+		primary |= 1 << 63 // field 1: secondary bitmap present
+		return ToHex(int64(primary), 16) + ToHex(int64(secondary), 16), nil
+	}
+	return ToHex(int64(primary), 16), nil
+}
+```
+
+#### Step 6: Snowflake compose and the generator
+
+`Compose` threads the `Insert` errors through, so an oversized worker surfaces as `ErrFieldOverflow`. `Generator.Next` returns `(int64, error)`; the backwards clock is `ErrClockBackwards`, and the wrap-to-zero spin loop is the same as in Java. The clock is a `func() int64`, injected so the demo and tests control time.
+
+```go
+// Compose packs the three fields.
+func Compose(timestampMillis, worker, sequence int64) (int64, error) {
+	delta := timestampMillis - EpochMillis
+	if delta < 0 || delta > MaxTimestamp {
+		return 0, ErrTimestampWindow
+	}
+	id, err := Insert(0, TimestampShift, TimestampBits, delta)
+	if err != nil {
+		return 0, err
+	}
+	if id, err = Insert(id, WorkerShift, WorkerBits, worker); err != nil {
+		return 0, err
+	}
+	return Insert(id, 0, SequenceBits, sequence)
+}
+```
+
+```go
+// Next issues the next id, refusing when the clock has moved backwards.
+func (g *Generator) Next() (int64, error) {
+	now := g.clock()
+	if now < g.lastMillis {
+		return 0, fmt.Errorf("%w: by %d ms", ErrClockBackwards, g.lastMillis-now)
+	}
+	if now == g.lastMillis {
+		g.sequence = (g.sequence + 1) & MaxSequence
+		if g.sequence == 0 { // 4096 ids in one millisecond: wait for the clock to advance
+			g.waits++
+			for now <= g.lastMillis {
+				now = g.clock()
+			}
+		}
+	} else {
+		g.sequence = 0
+	}
+	g.lastMillis = now
+	return Compose(now, g.worker, g.sequence)
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/11-bit-manipulation/code/go
 go run .
 go test ./...
 ```
+
+```console
+== Bitmap: which of 1,000,000 merchants settled today ==
+memory: 15625 words = 122 KB for 1000000 merchants (a []bool would be 976 KB, a map[int]struct{} several times that)
+settled today: 142858, active this month: 200000, both: 28572
+
+== ISO 8583 bitmap ==
+primary bitmap hex   = 7238058020C08000
+bitmaps hex          = F238058020C080000000000004000000  (32 hex chars)
+
+== Snowflake-style ids: 41 + 10 + 12 bits ==
+first id = 362387865628672 = 0000000000000001010010011001011100000000000000000111000000000000
+  timestamp 1700086400000 ms, worker 7, sequence 0
+10,000 ids from one worker: strictly increasing = true, sequence overflows waited out = 2
+
+== Two's complement traps ==
+-math.MinInt64                = -9223372036854775808  (still negative: there is no +2^63)
+1 << 32  (int32)              = 0  (Go does not reduce the shift count: a shift past the width is zero; Java gives 1)
+(lo + hi) / 2 with int32      = -97483648  vs  lo + int32(uint32(hi-lo)>>1) = 2050000000  (the binary-search midpoint bug)
+-7 / 2 = -3  -7 >> 1 = -4  (division truncates toward zero, shift floors)
+```
+
+The bitmap, ISO 8583, and Snowflake sections match Java exactly. The one deliberate difference is the `1 << 32` row: Go gives `0` where Java gives `1`, and the lesson prints Go's answer rather than pretending otherwise.
 
 ## Use It
 

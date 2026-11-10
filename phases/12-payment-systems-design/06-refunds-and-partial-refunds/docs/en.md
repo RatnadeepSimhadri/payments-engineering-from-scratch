@@ -359,25 +359,192 @@ The demo also prints the full journal for `cap_1`, entry by entry, which is the 
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **`synchronized` becomes one `threading.RLock`:** every public method runs under `with self._lock:`; it is re-entrant because `request_refund` calls `remaining_refundable`, which takes the same lock, exactly as a Java monitor re-enters. The race test starts ten `threading.Thread`s behind a `threading.Event` and still gets exactly 6 accepted and 4 refused; the GIL does not make the check-then-reserve atomic on its own, the lock does. **Dates are `datetime.date`:** `FakeClock.advance_days` adds a `timedelta`, the window deadline is `captured_on + timedelta(days=window_days)`, and `(today - captured_on).days` replaces `ChronoUnit.DAYS.between`. **Integer arithmetic needs no `multiplyExact`**, but the floor must stay a floor: the fee is `(amount * bps + 5_000) // 10_000` and the cumulative share is `(fee * after) // captured`, both on non-negative operands. **Exceptions:** `RefundError(RuntimeError)` with `OverRefundError`, `RefundWindowClosedError` and `RefundIdempotencyConflictError` as subclasses; argument problems (`IllegalArgumentException`) are `ValueError`, and `CurrencyMismatchError` is a `ValueError` too. `AccountType` members carry their normal side as a tuple value so `ASSET` and `EXPENSE` do not collapse into one `Enum` alias.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A balanced entry cannot be constructed unbalanced
+
+`JournalEntry` is a frozen dataclass whose `__post_init__` freezes the postings into a tuple, requires at least two, and sums debits minus credits with a generator expression; an imbalance raises `ValueError`. `reversal` flips every side and names the entry it reverses, which Step 6 relies on.
+
 ```python
-def request_refund(self, refund_id: str, capture_id: str, amount: Money, reason: str) -> RefundResult:
-    with self._lock:                       # one lock around check + reserve, like `synchronized`
-        ...
-        remaining = self.remaining_refundable(capture_id)
-        if amount.compare_to(remaining) > 0:
-            raise OverRefundError(...)
-        r = Refund(refund_id, capture_id, amount, reason, today)
-        self._ledger.post(JournalEntry(RefundService._reserve_entry_id(refund_id), ..., (
-            Posting.debit(RefundService.MERCHANT, amount),
-            Posting.credit(RefundService.REFUNDS, amount))))
+@dataclass(frozen=True)
+class JournalEntry:
+    id: str
+    description: str
+    postings: tuple[Posting, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "postings", tuple(self.postings))
+        if len(self.postings) < 2:
+            raise ValueError(f"entry {self.id} needs at least two postings")
+        net = sum(p.amount.minor_units if p.side is Side.DEBIT else -p.amount.minor_units for p in self.postings)
+        if net != 0:
+            raise ValueError(f"entry {self.id} is unbalanced by {net} minor units")
+
+    def reversal(self, new_id: str, why: str) -> "JournalEntry":
+        flipped = tuple(Posting(p.account, p.side.opposite(), p.amount) for p in self.postings)
+        return JournalEntry(new_id, f"{why} (reverses {self.id})", flipped)
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: The capture entry
 
-- **`synchronized` becomes one `threading.RLock`.** Every public method runs under `with self._lock:`; it is re-entrant because `request_refund` calls `remaining_refundable`, which takes the same lock, exactly as a Java monitor re-enters. The race test starts ten `threading.Thread`s behind a `threading.Event` and still gets exactly 6 accepted and 4 refused; the GIL does not make the check-then-reserve atomic on its own, the lock does.
-- **Dates are `datetime.date`.** `FakeClock.advance_days` adds a `timedelta`, the window deadline is `captured_on + timedelta(days=window_days)`, and `(today - captured_on).days` replaces `ChronoUnit.DAYS.between`.
-- **Integer arithmetic needs no `multiplyExact`**, but the floor must stay a floor: the fee is `(amount * bps + 5_000) // 10_000` and the cumulative share is `(fee * after) // captured`, both on non-negative operands.
-- **Exceptions:** `RefundError(RuntimeError)` with `OverRefundError`, `RefundWindowClosedError` and `RefundIdempotencyConflictError` as subclasses; argument problems (`IllegalArgumentException`) are `ValueError`, and `CurrencyMismatchError` is a `ValueError` too. `AccountType` members carry their normal side as a tuple value so `ASSET` and `EXPENSE` do not collapse into one `Enum` alias.
+`capture` holds the lock, computes the fee with `//` (a floor on non-negative operands, so half-up), and posts the three-posting entry: gross to the scheme asset, net to the merchant liability, fee to revenue. The capture date is `self._clock.today()`, a `datetime.date`.
+
+```python
+    def capture(self, capture_id: str, payment_id: str, amount: Money, fee_bps: int, fixed_fee_minor: int) -> Capture:
+        """Record a capture: the scheme owes us the gross, we owe the merchant the net, and we keep the fee."""
+        with self._lock:
+            if capture_id in self._captures:
+                raise RuntimeError(f"capture exists: {capture_id}")
+            if not amount.is_positive():
+                raise ValueError("capture amount must be positive")
+            variable = (amount.minor_units * fee_bps + 5_000) // 10_000
+            fee = Money.of_minor(variable + fixed_fee_minor, amount.currency)
+            c = Capture(capture_id, payment_id, amount, fee, self._clock.today())
+            self._ledger.post(JournalEntry(self._next_entry_id(), f"capture {capture_id}", (
+                Posting.debit(RefundService.SCHEME, amount),
+                Posting.credit(RefundService.MERCHANT, amount.minus(fee)),
+                Posting.credit(RefundService.FEES, fee))))
+            self._captures[capture_id] = c
+            self._refunds_by_capture[capture_id] = []
+            return c
+```
+
+#### Step 3: The remaining balance counts pending refunds
+
+The one line of the lesson: captured minus succeeded minus pending. `refunded` and `pending` each take the re-entrant lock and delegate to `_sum`, which filters refunds by state.
+
+```python
+    def remaining_refundable(self, capture_id: str) -> Money:
+        """captured - succeeded - pending. A pending refund already consumes balance: that is what stops the race."""
+        with self._lock:
+            c = self._capture(capture_id)
+            return c.amount.minus(self.refunded(capture_id)).minus(self.pending(capture_id))
+
+    def _sum(self, capture_id: str, state: RefundState) -> Money:
+        total = Money.zero(self._capture(capture_id).amount.currency)
+        for r in self._refunds_by_capture[capture_id]:
+            if r.state is state:
+                total = total.plus(r.amount)
+        return total
+```
+
+#### Step 4: Request: check everything, then change everything
+
+The checks run in the same order as Java: idempotent replay, positive amount, same currency, window, balance; each raises before anything changes. The window arithmetic uses `timedelta` and `date` comparison, and the over-refund message spells out captured, refunded, and pending.
+
+```python
+        with self._lock:
+            existing = self._refunds.get(refund_id)
+            if existing is not None:
+                if existing.capture_id == capture_id and existing.amount == amount:
+                    return RefundResult(existing, True)
+                raise RefundIdempotencyConflictError(
+                    f"refund id {refund_id} was already used for {existing.amount} on {existing.capture_id}")
+            c = self._capture(capture_id)
+            if not amount.is_positive():
+                raise ValueError(f"refund amount must be positive: {amount}")
+            if amount.currency != c.amount.currency:
+                raise CurrencyMismatchError(c.amount.currency, amount.currency)
+            deadline = c.captured_on + timedelta(days=self._policy.window_days)
+            today = self._clock.today()
+            if today > deadline:
+                raise RefundWindowClosedError(
+                    f"capture {capture_id} on {c.captured_on}: refund window of {self._policy.window_days} days closed on "
+                    f"{deadline} (today {today}, {(today - c.captured_on).days} days)")
+            remaining = self.remaining_refundable(capture_id)
+            if amount.compare_to(remaining) > 0:
+                raise OverRefundError(
+                    f"refund {amount} exceeds remaining refundable {remaining} on {capture_id} (captured {c.amount}, "
+                    f"refunded {self.refunded(capture_id)}, pending {self.pending(capture_id)})")
+            r = Refund(refund_id, capture_id, amount, reason, today)
+            self._ledger.post(JournalEntry(RefundService._reserve_entry_id(refund_id),
+                                           f"refund {refund_id} requested on {capture_id}", (
+                Posting.debit(RefundService.MERCHANT, amount),
+                Posting.credit(RefundService.REFUNDS, amount))))
+            self._refunds[refund_id] = r
+            self._refunds_by_capture[capture_id].append(r)
+            return RefundResult(r, False)
+```
+
+#### Step 5: Settle, with the fee share
+
+`succeed` returns `False` for a redelivered confirmation, raises `RefundError` for a `FAILED` refund, and builds a two- or four-posting entry. `_fee_share` is cumulative: `target(after) - returned_so_far`, with `after` computed while the refund is still `PENDING`, so the shares sum to exactly the fee when the capture is fully refunded.
+
+```python
+        with self._lock:
+            r = self.refund(refund_id)
+            if r.state is RefundState.SUCCEEDED:
+                return False
+            if r.state is not RefundState.PENDING:
+                raise RefundError(f"refund {refund_id} is {r.state.name}; cannot succeed")
+            c = self._capture(r.capture_id)
+            fee_back = (self._fee_share(c, r.amount) if self._policy.fee_policy is FeeRefundPolicy.PROPORTIONAL
+                        else Money.zero(r.amount.currency))
+            postings = [Posting.debit(RefundService.REFUNDS, r.amount), Posting.credit(RefundService.SCHEME, r.amount)]
+            if fee_back.is_positive():
+                postings.append(Posting.debit(RefundService.FEES, fee_back))
+                postings.append(Posting.credit(RefundService.MERCHANT, fee_back))
+            self._ledger.post(JournalEntry(self._next_entry_id(), f"refund {refund_id} settled", tuple(postings)))
+            r.state = RefundState.SUCCEEDED
+            r.fee_returned = fee_back
+            return True
+
+    def _fee_share(self, c: Capture, refund_amount: Money) -> Money:
+        """Fee to return for a refund that is about to succeed, computed cumulatively so the rounding never
+        drifts: target(after) - returned(so far), where target(x) = floor(fee * x / captured). When the
+        capture is fully refunded, target is exactly the fee, so the sum of the shares is exactly the fee."""
+        after = self.refunded(c.id).plus(refund_amount).minor_units
+        target = (c.fee.minor_units * after) // c.amount.minor_units
+        return Money.of_minor(target, c.fee.currency).minus(self.fee_returned(c.id))
+```
+
+#### Step 6: Failure is a reversal, not a delete
+
+`fail` finds the reservation entry by its deterministic id with `next(...)` over the journal and posts its `reversal`. The refund stays in the journal as promised-then-withdrawn, with the reason.
+
+```python
+    def fail(self, refund_id: str, why: str) -> None:
+        """The processor refused the refund: the reservation is reversed and the balance becomes refundable again."""
+        with self._lock:
+            r = self.refund(refund_id)
+            if r.state is not RefundState.PENDING:
+                raise RefundError(f"refund {refund_id} is {r.state.name}; cannot fail")
+            reserve = next(e for e in self._ledger.journal() if e.id == RefundService._reserve_entry_id(refund_id))
+            self._ledger.post(reserve.reversal(self._next_entry_id(), f"refund {refund_id} failed: {why}"))
+            r.state = RefundState.FAILED
+            r.failure_reason = why
+```
+
+#### Step 7: Invariants as code
+
+`check_invariants` ties the refund records to `refunds_payable`: the ledger balances, no capture is over-refunded, no fee is over-returned, a fully refunded capture under `PROPORTIONAL` has its whole fee back, and the liability equals the pending total.
+
+```python
+    def check_invariants(self) -> list[str]:
+        """The invariants the tests assert after every operation. Returns an empty list when all hold."""
+        with self._lock:
+            broken: list[str] = []
+            if not self._ledger.balances():
+                broken.append("ledger does not balance")
+            pending_total = Money.zero(self._ledger.balance(RefundService.REFUNDS).currency)
+            for c in self._captures.values():
+                refunded_and_pending = self.refunded(c.id).plus(self.pending(c.id))
+                if refunded_and_pending.compare_to(c.amount) > 0:
+                    broken.append(f"{c.id}: refunded + pending exceeds captured")
+                if self.fee_returned(c.id).compare_to(c.fee) > 0:
+                    broken.append(f"{c.id}: fee returned exceeds fee charged")
+                if (self.refunded(c.id) == c.amount and self._policy.fee_policy is FeeRefundPolicy.PROPORTIONAL
+                        and self.fee_returned(c.id) != c.fee):
+                    broken.append(f"{c.id}: fully refunded but fee not fully returned")
+                pending_total = pending_total.plus(self.pending(c.id))
+            if self._ledger.balance(RefundService.REFUNDS) != pending_total:
+                broken.append(f"refunds_payable {self._ledger.balance(RefundService.REFUNDS)} != pending {pending_total}")
+            return broken
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/06-refunds-and-partial-refunds/code/python
@@ -385,36 +552,297 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output matches the Java run line for line:
+
+```console
+== Capture 100.00 USD at 2.90% + 0.30 ==
+fee 3.20 USD, merchant owed 96.80 USD
+   scheme_settlement    100.00 USD
+   merchant_payable      96.80 USD
+   refunds_payable        0.00 USD
+   fee_revenue            3.20 USD
+   ledger balances: true
+```
+
 ### In Go
+
+The Go port (`code/go/main.go`, `money.go`, tests in `main_test.go`) keeps the design with five differences. **`synchronized` becomes a `sync.Mutex`, and the mutex is not re-entrant:** every exported method does `s.mu.Lock(); defer s.mu.Unlock()` and then calls unexported `*Locked` helpers (`remainingLocked`, `sumLocked`, `feeReturnedLocked`) that assume the lock is held. A Java monitor would let `requestRefund` call the public `remainingRefundable`; in Go that is a deadlock, so the split is the lesson. The race test starts ten goroutines behind a closed channel, counts with `atomic.Int32`, and still gets exactly 6 accepted and 4 refused under `go test -race`. **One error type, four sentinels:** `refundError` carries the full message and implements `Is` so that `errors.Is(err, ErrOverRefund)` and `errors.Is(err, ErrRefund)` are both true, which is how the Java subclass hierarchy is expressed with values; argument problems wrap `ErrInvalidArgument`, the wrong currency wraps `ErrCurrencyMismatch`, and `Succeed` returns `(bool, error)`: `false, nil` for a redelivered confirmation, an error for a `FAILED` refund. **Dates are `time.Time` at midnight UTC:** `Date(2026, time.January, 10)` stands in for `LocalDate.of`, `AddDate(0, 0, days)` for `plusDays`, `After` for `isAfter`, and the window message formats with `"2006-01-02"`. **Integer arithmetic is explicit about floors and overflow:** `floorDiv` reproduces `Math.floorDiv` (Go's `/` truncates toward zero), the cumulative fee share uses `mulChecked` so `fee * after` cannot wrap silently, and same-currency aggregates inside the service use `mustPlus`/`mustMinus` because a mismatch there is a bug, not a request error. **`JournalEntry` validates in a constructor function:** `NewJournalEntry` returns `(JournalEntry, error)` for fewer than two postings, a non-positive posting, or an imbalance; `Debit`/`Credit` are plain struct literals, so the entry is the unit that is checked.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: A balanced entry cannot be constructed unbalanced
+
+`NewJournalEntry` does what the Java compact constructor did and returns an error wrapping `ErrInvalidArgument`; the postings slice is copied so the caller cannot mutate the entry afterwards. `Reversal` builds the mirror-image entry.
+
+```go
+func NewJournalEntry(id, description string, postings []Posting) (JournalEntry, error) {
+	if len(postings) < 2 {
+		return JournalEntry{}, fmt.Errorf("%w: entry %s needs at least two postings", ErrInvalidArgument, id)
+	}
+	var net int64
+	for _, p := range postings {
+		if !p.Amount.IsPositive() {
+			return JournalEntry{}, fmt.Errorf("%w: posting amount must be positive: %v", ErrInvalidArgument, p.Amount)
+		}
+		if p.Side == DEBIT {
+			net += p.Amount.MinorUnits
+		} else {
+			net -= p.Amount.MinorUnits
+		}
+	}
+	if net != 0 {
+		return JournalEntry{}, fmt.Errorf("%w: entry %s is unbalanced by %d minor units", ErrInvalidArgument, id, net)
+	}
+	return JournalEntry{id, description, append([]Posting(nil), postings...)}, nil
+}
+
+func (e JournalEntry) Reversal(newID, why string) JournalEntry {
+	flipped := make([]Posting, len(e.Postings))
+	for i, p := range e.Postings {
+		flipped[i] = Posting{p.Account, p.Side.Opposite(), p.Amount}
+	}
+	return JournalEntry{newID, why + " (reverses " + e.ID + ")", flipped}
+}
+```
+
+#### Step 2: The capture entry
+
+`Capture` locks, refuses a duplicate id or a non-positive amount, computes the fee with `floorDiv`, and posts through the `s.post` helper (which calls `NewJournalEntry` and then `ledger.Post`). It also appends to `captureOrder`, so `CheckInvariants` iterates captures deterministically.
+
+```go
+func (s *RefundService) Capture(captureID, paymentID string, amount Money, feeBps, fixedFeeMinor int64) (*Capture, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.captures[captureID]; exists {
+		return nil, fmt.Errorf("%w: capture exists: %s", ErrIllegalState, captureID)
+	}
+	if !amount.IsPositive() {
+		return nil, fmt.Errorf("%w: capture amount must be positive", ErrInvalidArgument)
+	}
+	variable := floorDiv(amount.MinorUnits*feeBps+5_000, 10_000)
+	fee := OfMinor(variable+fixedFeeMinor, amount.Currency)
+	c := &Capture{captureID, paymentID, amount, fee, s.clock.Today()}
+	if err := s.post(s.nextEntryID(), "capture "+captureID,
+		Debit(SCHEME, amount), Credit(MERCHANT, mustMinus(amount, fee)), Credit(FEES, fee)); err != nil {
+		return nil, err
+	}
+	s.captures[captureID] = c
+	s.captureOrder = append(s.captureOrder, captureID)
+	s.refundsByCapture[captureID] = []*Refund{}
+	return c, nil
+}
+```
+
+#### Step 3: The remaining balance counts pending refunds
+
+`RemainingRefundable` takes the lock and delegates to `remainingLocked`, which is what the request path calls while already holding the mutex. `mustMinus` is safe because every amount on a capture shares its currency.
+
+```go
+func (s *RefundService) RemainingRefundable(captureID string) (Money, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.remainingLocked(captureID)
+}
+
+func (s *RefundService) remainingLocked(captureID string) (Money, error) {
+	c, err := s.captureLocked(captureID)
+	if err != nil {
+		return Money{}, err
+	}
+	refunded, _ := s.sumLocked(captureID, SUCCEEDED)
+	pending, _ := s.sumLocked(captureID, PENDING)
+	return mustMinus(mustMinus(c.Amount, refunded), pending), nil
+}
+```
+
+#### Step 4: Request: check everything, then change everything
+
+The same ordered checks, each returning an error before any mutation: replay or `ErrIdempotencyConflict`, `ErrInvalidArgument`, `ErrCurrencyMismatch`, `ErrWindowClosed` with the formatted dates, `ErrOverRefund` with the captured/refunded/pending breakdown. Only then are the refund and reservation entry written.
 
 ```go
 func (s *RefundService) RequestRefund(refundID, captureID string, amount Money, reason string) (RefundResult, error) {
-    s.mu.Lock()                            // one mutex around check + reserve, like `synchronized`
-    defer s.mu.Unlock()
-    ...
-    remaining, _ := s.remainingLocked(captureID)
-    if amount.Compare(remaining) > 0 {
-        return RefundResult{}, newRefundError(ErrOverRefund, fmt.Sprintf("refund %v exceeds remaining refundable %v ...", amount, remaining))
-    }
-    r := NewRefund(refundID, captureID, amount, reason, today)
-    if err := s.post(reserveEntryID(refundID), "refund "+refundID+" requested on "+captureID,
-        Debit(MERCHANT, amount), Credit(REFUNDS, amount)); err != nil {
-        return RefundResult{}, err
-    }
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.refunds[refundID]; ok {
+		if existing.CaptureID == captureID && existing.Amount == amount {
+			return RefundResult{existing, true}, nil
+		}
+		return RefundResult{}, newRefundError(ErrIdempotencyConflict, fmt.Sprintf("refund id %s was already used for %v on %s", refundID, existing.Amount, existing.CaptureID))
+	}
+	c, err := s.captureLocked(captureID)
+	if err != nil {
+		return RefundResult{}, err
+	}
+	if !amount.IsPositive() {
+		return RefundResult{}, fmt.Errorf("%w: refund amount must be positive: %v", ErrInvalidArgument, amount)
+	}
+	if amount.Currency != c.Amount.Currency {
+		return RefundResult{}, fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, c.Amount.Currency.Code, amount.Currency.Code)
+	}
+	today := s.clock.Today()
+	deadline := c.CapturedOn.AddDate(0, 0, s.policy.WindowDays)
+	if today.After(deadline) {
+		return RefundResult{}, newRefundError(ErrWindowClosed, fmt.Sprintf("capture %s on %s: refund window of %d days closed on %s (today %s, %d days)",
+			captureID, fmtDate(c.CapturedOn), s.policy.WindowDays, fmtDate(deadline), fmtDate(today), daysBetween(c.CapturedOn, today)))
+	}
+	remaining, _ := s.remainingLocked(captureID)
+	if amount.Compare(remaining) > 0 {
+		refunded, _ := s.sumLocked(captureID, SUCCEEDED)
+		pending, _ := s.sumLocked(captureID, PENDING)
+		return RefundResult{}, newRefundError(ErrOverRefund, fmt.Sprintf("refund %v exceeds remaining refundable %v on %s (captured %v, refunded %v, pending %v)",
+			amount, remaining, captureID, c.Amount, refunded, pending))
+	}
+	r := NewRefund(refundID, captureID, amount, reason, today)
+	if err := s.post(reserveEntryID(refundID), "refund "+refundID+" requested on "+captureID,
+		Debit(MERCHANT, amount), Credit(REFUNDS, amount)); err != nil {
+		return RefundResult{}, err
+	}
+	s.refunds[refundID] = r
+	s.refundsByCapture[captureID] = append(s.refundsByCapture[captureID], r)
+	return RefundResult{r, false}, nil
+}
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+#### Step 5: Settle, with the fee share
 
-- **`synchronized` becomes a `sync.Mutex`, and the mutex is not re-entrant.** Every exported method does `s.mu.Lock(); defer s.mu.Unlock()` and then calls unexported `*Locked` helpers (`remainingLocked`, `sumLocked`, `feeReturnedLocked`) that assume the lock is held. A Java monitor would let `requestRefund` call the public `remainingRefundable`; in Go that is a deadlock, so the split is the lesson. The race test starts ten goroutines behind a closed channel, counts with `atomic.Int32`, and still gets exactly 6 accepted and 4 refused under `go test -race`.
-- **One error type, four sentinels.** `refundError` carries the full message and implements `Is` so that `errors.Is(err, ErrOverRefund)` and `errors.Is(err, ErrRefund)` are both true, which is how the Java subclass hierarchy (`OverRefundException extends RefundException`) is expressed with values. Argument problems wrap `ErrInvalidArgument`, the wrong currency wraps `ErrCurrencyMismatch`, and `Succeed` returns `(bool, error)`: `false, nil` for a redelivered confirmation, an error for a `FAILED` refund.
-- **Dates are `time.Time` at midnight UTC.** `Date(2026, time.January, 10)` stands in for `LocalDate.of`, `AddDate(0, 0, days)` for `plusDays`, `After` for `isAfter`, and the window message formats with `"2006-01-02"` so the demo prints the same text as Java.
-- **Integer arithmetic is explicit about floors and overflow.** `floorDiv` reproduces `Math.floorDiv` (Go's `/` truncates toward zero), and the cumulative fee share uses `mulChecked` so `fee * after` cannot wrap silently where Java's `multiplyExact` would throw. Same-currency aggregates inside the service use `mustPlus`/`mustMinus`, because a mismatch there is a bug, not a request error.
-- **`JournalEntry` validates in a constructor function.** `NewJournalEntry` returns `(JournalEntry, error)` for fewer than two postings, a non-positive posting, or an imbalance; `Debit`/`Credit` are plain struct literals, so the entry is the unit that is checked.
+`Succeed` returns `(false, nil)` on a redelivery and `(false, err)` for a `FAILED` refund. `feeShareLocked` computes the cumulative target with `mulChecked` and `floorDiv` and subtracts what has already been returned, so the rounding never drifts.
+
+```go
+func (s *RefundService) Succeed(refundID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, err := s.refundLocked(refundID)
+	if err != nil {
+		return false, err
+	}
+	if r.State == SUCCEEDED {
+		return false, nil
+	}
+	if r.State != PENDING {
+		return false, newRefundError(ErrRefund, fmt.Sprintf("refund %s is %v; cannot succeed", refundID, r.State))
+	}
+	c, _ := s.captureLocked(r.CaptureID)
+	feeBack := Zero(r.Amount.Currency)
+	if s.policy.FeePolicy == PROPORTIONAL {
+		if feeBack, err = s.feeShareLocked(c, r.Amount); err != nil {
+			return false, err
+		}
+	}
+	postings := []Posting{Debit(REFUNDS, r.Amount), Credit(SCHEME, r.Amount)}
+	if feeBack.IsPositive() {
+		postings = append(postings, Debit(FEES, feeBack), Credit(MERCHANT, feeBack))
+	}
+	if err := s.post(s.nextEntryID(), "refund "+refundID+" settled", postings...); err != nil {
+		return false, err
+	}
+	r.State = SUCCEEDED
+	r.FeeReturned = feeBack
+	return true, nil
+}
+
+// feeShareLocked: fee to return for a refund that is about to succeed, computed cumulatively so the rounding
+// never drifts: target(after) - returned(so far), where target(x) = floor(fee * x / captured). When the
+// capture is fully refunded, target is exactly the fee, so the sum of the shares is exactly the fee.
+func (s *RefundService) feeShareLocked(c *Capture, refundAmount Money) (Money, error) {
+	refunded, _ := s.sumLocked(c.ID, SUCCEEDED)
+	after := mustPlus(refunded, refundAmount).MinorUnits
+	scaled, err := mulChecked(c.Fee.MinorUnits, after)
+	if err != nil {
+		return Money{}, err
+	}
+	target := floorDiv(scaled, c.Amount.MinorUnits)
+	returned, _ := s.feeReturnedLocked(c.ID)
+	return mustMinus(OfMinor(target, c.Fee.Currency), returned), nil
+}
+```
+
+#### Step 6: Failure is a reversal, not a delete
+
+`Fail` scans the ledger's journal for the reservation entry by its deterministic id, posts `Reversal`, and marks the refund `FAILED`; a missing reservation is an `ErrIllegalState`, which can only mean a bug.
+
+```go
+func (s *RefundService) Fail(refundID, why string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, err := s.refundLocked(refundID)
+	if err != nil {
+		return err
+	}
+	if r.State != PENDING {
+		return newRefundError(ErrRefund, fmt.Sprintf("refund %s is %v; cannot fail", refundID, r.State))
+	}
+	var reserve *JournalEntry
+	for i := range s.ledger.journal {
+		if s.ledger.journal[i].ID == reserveEntryID(refundID) {
+			reserve = &s.ledger.journal[i]
+			break
+		}
+	}
+	if reserve == nil {
+		return fmt.Errorf("%w: no reservation entry for %s", ErrIllegalState, refundID)
+	}
+	if err := s.ledger.Post(reserve.Reversal(s.nextEntryID(), "refund "+refundID+" failed: "+why)); err != nil {
+		return err
+	}
+	r.State = FAILED
+	r.FailureReason = why
+	return nil
+}
+```
+
+#### Step 7: Invariants as code
+
+`CheckInvariants` holds the lock and uses the `*Locked` helpers for every sum; the checks are the same five as Java, and the function returns an empty (non-nil) slice when all hold.
+
+```go
+func (s *RefundService) CheckInvariants() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	broken := []string{}
+	if !s.ledger.Balances() {
+		broken = append(broken, "ledger does not balance")
+	}
+	pendingTotal := Zero(s.ledger.Balance(REFUNDS).Currency)
+	for _, id := range s.captureOrder {
+		c := s.captures[id]
+		refunded, _ := s.sumLocked(c.ID, SUCCEEDED)
+		pending, _ := s.sumLocked(c.ID, PENDING)
+		feeReturned, _ := s.feeReturnedLocked(c.ID)
+		if mustPlus(refunded, pending).Compare(c.Amount) > 0 {
+			broken = append(broken, c.ID+": refunded + pending exceeds captured")
+		}
+		if feeReturned.Compare(c.Fee) > 0 {
+			broken = append(broken, c.ID+": fee returned exceeds fee charged")
+		}
+		if refunded == c.Amount && s.policy.FeePolicy == PROPORTIONAL && feeReturned != c.Fee {
+			broken = append(broken, c.ID+": fully refunded but fee not fully returned")
+		}
+		pendingTotal = mustPlus(pendingTotal, pending)
+	}
+	if s.ledger.Balance(REFUNDS) != pendingTotal {
+		broken = append(broken, fmt.Sprintf("refunds_payable %v != pending %v", s.ledger.Balance(REFUNDS), pendingTotal))
+	}
+	return broken
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/06-refunds-and-partial-refunds/code/go
 go run .
 go test -race ./...
+```
+
+The output is identical to the Java run; the last sections read:
+
+```console
+== Rounding: 10.00 USD capture, fee 0.59, refunded as 3.33 + 3.33 + 3.34 ==
+shares: [0.19 USD, 0.20 USD, 0.20 USD] sum 0.59 USD (fee 0.59 USD; per-refund floor would give 0.57)
+
+== The refund window: 180 days ==
+day 180: accepted, remaining 20.00 USD
+refused: capture cap_3 on 2026-01-15: refund window of 180 days closed on 2026-07-14 (today 2026-07-15, 181 days)
 ```
 
 ## Use It

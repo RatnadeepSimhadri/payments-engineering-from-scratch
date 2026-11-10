@@ -360,43 +360,463 @@ T2 requests lock:A -> deadlock: T1 -> T2 -> T1
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`threading.Lock` is not reentrant**, so unlike `ReentrantLock` a thread that locks the same account twice deadlocks with itself. The transfer methods never do that (`_require_distinct` rejects same-account transfers before any lock is taken), and the tracker's reentrancy rule is kept so the design matches; `threading.RLock` is the reentrant alternative. **`acquire(blocking=False)`** is `tryLock`; `threading.Barrier(2).wait` is the barrier hook, passed as a bound method. **Yielding is `time.sleep(0)`**, a syscall under the GIL, which makes each backoff pause more expensive than Java's `onSpinWait`/`yield`. The try-lock demo and test therefore run 200 transfers per thread instead of 500; the invariant checks are identical. **Exceptions:** `DeadlockDetectedError` carries `.cycle`; `InsufficientFundsError` and `ValueError` replace the Java exception types. The `run_all` helper joins each thread with a 10-second timeout and raises if one is still alive, so a real deadlock fails the test rather than hanging it.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The graph and the cycle search
+
+Python dicts and sets are unordered for this purpose, so `nodes()` and `successors()` return `sorted(...)` lists; that is what `TreeMap`/`TreeSet` gave Java and it keeps the reported cycle identical on every run. The iterative DFS uses a plain list as the stack: `stack[-1]` peeks, `append` pushes, `pop` turns a finished node black.
+
 ```python
-def try_lock(self, owner: str) -> bool:
-    if not self._lock.acquire(blocking=False):
-        return False
-    if self._tracker is not None:
-        self._tracker.acquired(owner, self.id)
-    return True
+    def find_cycle(self) -> list[str]:
+        colour: dict[str, int] = {}          # absent = white, 1 = grey, 2 = black
+        parent: dict[str, str] = {}
+        for start in self.nodes():
+            if start in colour:
+                continue
+            stack = [start]
+            while stack:
+                node = stack[-1]
+                if node not in colour:
+                    colour[node] = 1
+                    for nxt in self.successors(node):
+                        c = colour.get(nxt)
+                        if c is None:
+                            parent[nxt] = node
+                            stack.append(nxt)
+                        elif c == 1:
+                            return self._path_of_cycle(parent, node, nxt)   # back edge: nxt is on the current path
+                else:
+                    stack.pop()
+                    colour[node] = 2
+        return []
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The tracker that refuses
 
-- **`threading.Lock` is not reentrant**, so unlike `ReentrantLock` a thread that locks the same account twice deadlocks with itself. The transfer methods never do that (`requireDistinct` rejects same-account transfers before any lock is taken), and the tracker's reentrancy rule is kept so the design matches; `threading.RLock` is the reentrant alternative.
-- **`acquire(blocking=False)`** is `tryLock`; `threading.Barrier(2).wait` is the barrier hook, passed as a bound method.
-- **Yielding is `time.sleep(0)`**, a syscall under the GIL, which makes each backoff pause more expensive than Java's `onSpinWait`/`yield`. The try-lock demo and test therefore run 200 transfers per thread instead of 500; the invariant checks are identical.
-- **Exceptions:** `DeadlockDetectedError` carries `.cycle`; `InsufficientFundsError` and `ValueError` replace the Java exception types. The `run_all` helper joins each thread with a 10-second timeout and raises if one is still alive, so a real deadlock fails the test rather than hanging it.
+`requesting` records the wait, rebuilds the graph from `_waiting` and `_holders` under the tracker's own mutex, and raises `DeadlockDetectedError` only if the requester is on the cycle. `_graph_locked` draws no edge when the holder is the requester, which is where the reentrancy rule lives even though `threading.Lock` itself would not allow a re-entry.
+
+```python
+    def requesting(self, owner: str, lock_id: str) -> None:
+        with self._mutex:
+            self._waiting[owner] = lock_id
+            self._events.append(f"{owner} requests {lock_id}")
+            cycle = self._graph_locked().find_cycle()
+            if owner in cycle:
+                del self._waiting[owner]
+                self._events.append(f"{owner} aborted: deadlock {cycle}")
+                raise DeadlockDetectedError(cycle)
+
+    def _graph_locked(self) -> WaitForGraph:
+        """One edge per waiting owner: waiter -> whoever holds the lock it wants (if anyone does)."""
+        g = WaitForGraph()
+        for waiter, lock_id in self._waiting.items():
+            holder = self._holders.get(lock_id)
+            if holder is not None and holder != waiter:
+                g.add_edge(waiter, holder)
+        return g
+```
+
+#### Step 3: A lock that reports
+
+The three calls bracket the real `threading.Lock` in the same order as Java: `requesting` before `acquire()`, `acquired` after it, `released` before `release()`. `try_lock` is `acquire(blocking=False)` and skips `requesting`, because a try never waits and so can never close a cycle. A `None` tracker leaves a plain lock for the benchmarks.
+
+```python
+class TrackedLock:
+    def __init__(self, lock_id: str, tracker: LockTracker | None) -> None:
+        self.id = lock_id
+        self._lock = threading.Lock()
+        self._tracker = tracker                          # None = untracked, plain lock
+
+    def lock(self, owner: str) -> None:
+        if self._tracker is not None:
+            self._tracker.requesting(owner, self.id)   # raises instead of blocking into a cycle
+        self._lock.acquire()
+        if self._tracker is not None:
+            self._tracker.acquired(owner, self.id)
+
+    def try_lock(self, owner: str) -> bool:
+        if not self._lock.acquire(blocking=False):
+            return False
+        if self._tracker is not None:
+            self._tracker.acquired(owner, self.id)
+        return True
+
+    def unlock(self, owner: str) -> None:
+        if self._tracker is not None:
+            self._tracker.released(owner, self.id)
+        self._lock.release()
+```
+
+#### Step 4: The transfer, three ways
+
+The nested `try/finally` is written out rather than using `with`, because `TrackedLock` needs the owner name on both `lock` and `unlock`. The second lock's `try` opens only after the second `lock()` returned, so a `DeadlockDetectedError` raised by `requesting` unwinds through the outer `finally` alone and releases only what was actually held.
+
+```python
+    def naive_transfer(self, frm: Account, to: Account, amount: Money, owner: str) -> None:
+        self._require_distinct(frm, to)
+        frm.lock.lock(owner)
+        try:
+            self._between_locks()
+            to.lock.lock(owner)
+            try:
+                self._move(frm, to, amount)
+            finally:
+                to.lock.unlock(owner)
+        finally:
+            frm.lock.unlock(owner)
+```
+
+The ordered version picks `first, second` with one tuple expression comparing account ids as strings; `_move` still debits `frm` and credits `to`.
+
+```python
+    def ordered_transfer(self, frm: Account, to: Account, amount: Money, owner: str) -> None:
+        self._require_distinct(frm, to)
+        first, second = (frm, to) if frm.id < to.id else (to, frm)
+        first.lock.lock(owner)
+        try:
+            self._between_locks()
+            second.lock.lock(owner)
+            try:
+                self._move(frm, to, amount)
+            finally:
+                second.lock.unlock(owner)
+        finally:
+            first.lock.unlock(owner)
+```
+
+The try-lock version releases `frm` in the `finally` before `pause` runs, so the thread holds nothing while backing off. Giving up raises a `RuntimeError` in place of `IllegalStateException`.
+
+```python
+    def try_lock_transfer(self, frm: Account, to: Account, amount: Money, owner: str) -> None:
+        self._require_distinct(frm, to)
+        for attempt in range(1, self._max_attempts + 1):
+            if frm.lock.try_lock(owner):
+                try:
+                    self._between_locks()
+                    if to.lock.try_lock(owner):
+                        try:
+                            self._move(frm, to, amount)
+                            return
+                        finally:
+                            to.lock.unlock(owner)
+                finally:
+                    frm.lock.unlock(owner)           # release before backing off: hold nothing while waiting
+            self._backoff.pause(attempt)
+        raise RuntimeError(f"transfer {frm.id} -> {to.id} gave up after {self._max_attempts} attempts")
+```
+
+#### Step 5: Backoff that never sleeps
+
+A seeded `random.Random` under a mutex (the generator is not thread-safe), the same `1 << min(attempt, 10)` cap, an empty spin loop, then `time.sleep(0)`, which releases the GIL and lets another thread run. It is a yield, not a delay, but it is a system call, which is why the Python try-lock demo runs fewer transfers.
+
+```python
+class Backoff:
+    def __init__(self, seed: int) -> None:
+        self._random = random.Random(seed)
+        self._pauses = 0
+        self._mutex = threading.Lock()
+
+    def pause(self, attempt: int) -> None:
+        with self._mutex:
+            self._pauses += 1
+            spins = self._random.randrange(1 << min(attempt, 10))   # exponential cap at 1024
+        for _ in range(spins):
+            pass
+        time.sleep(0)                                    # yield the GIL; a yield, not a delay
+
+    def pauses(self) -> int:
+        with self._mutex:
+            return self._pauses
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/04-concurrency/07-deadlocks-and-lock-ordering/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Cycles print as Python lists; which of T1/T2 is aborted depends on which thread reaches its second lock first, and the pause count varies:
+
+```console
+== A wait-for graph, by hand ==
+edges T1->T2, T2->T3, T3->T1, T4->T1: cycle = ['T1', 'T2', 'T3']
+edges T1->T2, T2->T3: cycle = [] (a chain waits, it does not deadlock)
+
+== The classic: A->B while B->A, replayed from recorded lock requests ==
+after T1 requests lock:B: cycle = []
+T2 requests lock:A -> deadlock: T1 -> T2 -> T1
+
+== Live: two naive transfers, forced to interleave, caught by the detector ==
+  T1 A->B aborted: deadlock: T1 -> T2 -> T1
+  T2 B->A 10.00 committed
+  balances A=110.00 USD B=90.00 USD (sum 200.00 USD)
+
+== Fix 1: lock ordering, 8 threads x 500 transfers each way ==
+  completed; C=1000.00 USD D=1000.00 USD sum 2000.00 USD
+
+== Fix 2: try-lock with backoff, 8 threads x 200 transfers each way ==
+  completed; E=1000.00 USD F=1000.00 USD sum 2000.00 USD; backoff pauses: 27135 (varies)
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with five differences. **`sync.Mutex.TryLock`** exists since Go 1.18, with a documentation note that its use is "rare" and usually a sign of a design problem; this lesson is one of the legitimate cases. `sync.Mutex` is not reentrant and has no `IsLocked`, so `TrackedLock` keeps a flag beside it for the tests. **Errors, not exceptions.** `Lock` returns `error`; a `*DeadlockDetectedError` is matched with `errors.As`, and `ErrInsufficientFunds`, `ErrSameAccount`, `ErrGaveUp` are sentinels for `errors.Is`. `defer` replaces `finally`, which is why the try-lock body is split into `tryBoth`: a `defer` runs at function exit, so releasing `from` before the backoff needs its own function. **`runtime.Gosched()`** is the yield; `math/rand` is seeded with `rand.NewSource` and guarded by a mutex because the generator is not goroutine-safe. **Go's runtime has its own detector**: if every goroutine is blocked, the program dies with `fatal error: all goroutines are asleep - deadlock!`. It does not fire here because `main` is alive, which is the usual case in a server, and it is why the `RunAll` helper has a ten-second timeout of its own. **`-race` is the test command**, and the tracker, the lock flags, and the balances are all guarded, so it passes clean.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The graph and the cycle search
+
+Go map iteration order is randomized, so `Nodes()` and `Successors()` sort before returning; without that the cycle reported would differ between runs. The DFS stack is a slice, with `stack[len(stack)-1]` as peek and reslicing as pop; `FindCycle` returns `nil` for "no cycle", which prints as `[]`.
+
 ```go
-func (s *TransferService) tryBoth(from, to *Account, amount Money, owner string) (done bool, err error) {
-    defer from.Lock.Unlock(owner)
-    s.betweenLocks()
-    if !to.Lock.TryLock(owner) {
-        return false, nil
-    }
-    defer to.Lock.Unlock(owner)
-    return true, move(from, to, amount)
+func (g *WaitForGraph) FindCycle() []string {
+	colour := map[string]int{} // absent = white, 1 = grey, 2 = black
+	parent := map[string]string{}
+	for _, start := range g.Nodes() {
+		if _, seen := colour[start]; seen {
+			continue
+		}
+		stack := []string{start}
+		for len(stack) > 0 {
+			node := stack[len(stack)-1]
+			if _, seen := colour[node]; !seen {
+				colour[node] = 1
+				for _, next := range g.Successors(node) {
+					c, visited := colour[next]
+					if !visited {
+						parent[next] = node
+						stack = append(stack, next)
+					} else if c == 1 {
+						return pathOfCycle(parent, node, next) // back edge: next is on the current path
+					}
+				}
+			} else {
+				stack = stack[:len(stack)-1]
+				colour[node] = 2
+			}
+		}
+	}
+	return nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The tracker that refuses
 
-- **`sync.Mutex.TryLock`** exists since Go 1.18, with a documentation note that its use is "rare" and usually a sign of a design problem; this lesson is one of the legitimate cases. `sync.Mutex` is not reentrant and has no `IsLocked`, so `TrackedLock` keeps a flag beside it for the tests.
-- **Errors, not exceptions.** `Lock` returns `error`; a `*DeadlockDetectedError` is matched with `errors.As`, and `ErrInsufficientFunds`, `ErrSameAccount`, `ErrGaveUp` are sentinels for `errors.Is`. `defer` replaces `finally`, which is why the try-lock body is split into `tryBoth`: a `defer` runs at function exit, so releasing `from` before the backoff needs its own function.
-- **`runtime.Gosched()`** is the yield; `math/rand` is seeded with `rand.NewSource` and guarded by a mutex because the generator is not goroutine-safe.
-- **Go's runtime has its own detector**: if every goroutine is blocked, the program dies with `fatal error: all goroutines are asleep - deadlock!`. It does not fire here because `main` is alive, which is the usual case in a server, and it is why the `RunAll` helper has a ten-second timeout of its own.
-- **`-race` is the test command**, and the tracker, the lock flags, and the balances are all guarded, so it passes clean.
+`Requesting` returns a `*DeadlockDetectedError` instead of throwing; the caller decides whether to unwind. Everything runs under `t.mu` with a `defer`, and `graphLocked` rebuilds the graph from the two maps each time, skipping the edge where the holder is the requester.
+
+```go
+func (t *LockTracker) Requesting(owner, lockID string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.waiting[owner] = lockID
+	t.events = append(t.events, owner+" requests "+lockID)
+	cycle := t.graphLocked().FindCycle()
+	for _, n := range cycle {
+		if n == owner {
+			delete(t.waiting, owner)
+			t.events = append(t.events, fmt.Sprintf("%s aborted: deadlock %v", owner, cycle))
+			return &DeadlockDetectedError{Cycle: cycle}
+		}
+	}
+	return nil
+}
+
+func (t *LockTracker) graphLocked() *WaitForGraph {
+	g := NewWaitForGraph()
+	for waiter, lockID := range t.waiting {
+		if holder, held := t.holders[lockID]; held && holder != waiter {
+			g.AddEdge(waiter, holder)
+		}
+	}
+	return g
+}
+```
+
+#### Step 3: A lock that reports
+
+`Lock` returns the tracker's error before touching `mu`, so a refused request never holds anything. `TryLock` wraps `sync.Mutex.TryLock` and skips `Requesting`. Because `sync.Mutex` cannot be queried, a second tiny mutex guards a `locked` flag that `IsLocked` reads for the tests; the flag is set after `mu.Lock()` and cleared before `mu.Unlock()`.
+
+```go
+type TrackedLock struct {
+	ID      string
+	mu      sync.Mutex
+	tracker *LockTracker // nil = untracked, plain lock
+	held    sync.Mutex   // guards the locked flag below
+	locked  bool
+}
+
+func (l *TrackedLock) Lock(owner string) error {
+	if l.tracker != nil {
+		if err := l.tracker.Requesting(owner, l.ID); err != nil {
+			return err // refuse instead of blocking into a cycle
+		}
+	}
+	l.mu.Lock()
+	l.setLocked(true)
+	if l.tracker != nil {
+		l.tracker.Acquired(owner, l.ID)
+	}
+	return nil
+}
+
+func (l *TrackedLock) TryLock(owner string) bool {
+	if !l.mu.TryLock() {
+		return false
+	}
+	l.setLocked(true)
+	if l.tracker != nil {
+		l.tracker.Acquired(owner, l.ID)
+	}
+	return true
+}
+
+func (l *TrackedLock) Unlock(owner string) {
+	if l.tracker != nil {
+		l.tracker.Released(owner, l.ID)
+	}
+	l.setLocked(false)
+	l.mu.Unlock()
+}
+```
+
+#### Step 4: The transfer, three ways
+
+`defer` is registered only after each `Lock` has returned `nil`, which gives the same guarantee as the nested `try`: a refused second lock returns the error with only the first lock deferred for release. The ordered variant swaps `first, second` when `to.ID < from.ID`.
+
+```go
+func (s *TransferService) NaiveTransfer(from, to *Account, amount Money, owner string) error {
+	if err := requireDistinct(from, to); err != nil {
+		return err
+	}
+	if err := from.Lock.Lock(owner); err != nil {
+		return err
+	}
+	defer from.Lock.Unlock(owner)
+	s.betweenLocks()
+	if err := to.Lock.Lock(owner); err != nil {
+		return err
+	}
+	defer to.Lock.Unlock(owner)
+	return move(from, to, amount)
+}
+```
+
+```go
+func (s *TransferService) OrderedTransfer(from, to *Account, amount Money, owner string) error {
+	if err := requireDistinct(from, to); err != nil {
+		return err
+	}
+	first, second := from, to
+	if to.ID < from.ID {
+		first, second = to, from
+	}
+	if err := first.Lock.Lock(owner); err != nil {
+		return err
+	}
+	defer first.Lock.Unlock(owner)
+	s.betweenLocks()
+	if err := second.Lock.Lock(owner); err != nil {
+		return err
+	}
+	defer second.Lock.Unlock(owner)
+	return move(from, to, amount)
+}
+```
+
+Because a `defer` fires only at function exit, the try-lock loop delegates to `tryBoth`, whose deferred `Unlock` of `from` has run by the time `Pause` is called. That split is the Go spelling of "release in `finally` before backing off"; the retry loop itself holds nothing. Exhaustion is `ErrGaveUp`, wrapped with `%w`.
+
+```go
+func (s *TransferService) TryLockTransfer(from, to *Account, amount Money, owner string) error {
+	if err := requireDistinct(from, to); err != nil {
+		return err
+	}
+	for attempt := 1; attempt <= s.maxAttempts; attempt++ {
+		if from.Lock.TryLock(owner) {
+			done, err := s.tryBoth(from, to, amount, owner)
+			if done {
+				return err
+			}
+		}
+		s.backoff.Pause(attempt)
+	}
+	return fmt.Errorf("%w: %s -> %s after %d attempts", ErrGaveUp, from.ID, to.ID, s.maxAttempts)
+}
+
+// tryBoth runs with from locked and always releases it before returning, so nothing is held while backing off.
+func (s *TransferService) tryBoth(from, to *Account, amount Money, owner string) (done bool, err error) {
+	defer from.Lock.Unlock(owner)
+	s.betweenLocks()
+	if !to.Lock.TryLock(owner) {
+		return false, nil
+	}
+	defer to.Lock.Unlock(owner)
+	return true, move(from, to, amount)
+}
+```
+
+#### Step 5: Backoff that never sleeps
+
+`rand.New(rand.NewSource(seed))` gives a reproducible generator that must be guarded by a mutex; the count and the draw happen under it, the spin and the `runtime.Gosched()` outside it. The cap is written as an explicit `if shift > 10` because Go has no `Math.min` for `int`.
+
+```go
+type Backoff struct {
+	mu     sync.Mutex
+	random *rand.Rand
+	pauses int64
+}
+
+func NewBackoff(seed int64) *Backoff { return &Backoff{random: rand.New(rand.NewSource(seed))} }
+
+func (b *Backoff) Pause(attempt int) {
+	b.mu.Lock()
+	b.pauses++
+	shift := attempt
+	if shift > 10 {
+		shift = 10 // exponential cap at 1024
+	}
+	spins := b.random.Intn(1 << shift)
+	b.mu.Unlock()
+	for i := 0; i < spins; i++ {
+		// spin
+	}
+	runtime.Gosched()
+}
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/04-concurrency/07-deadlocks-and-lock-ordering/code/go
+go run .
+go test -race ./...
+```
+
+Cycles print with Go's slice formatting. In the live section the goroutine that is aborted is whichever one requests its second lock last, so T1 or T2 may be the one that commits:
+
+```console
+== A wait-for graph, by hand ==
+edges T1->T2, T2->T3, T3->T1, T4->T1: cycle = [T1 T2 T3]
+edges T1->T2, T2->T3: cycle = [] (a chain waits, it does not deadlock)
+
+== The classic: A->B while B->A, replayed from recorded lock requests ==
+after T1 requests lock:B: cycle = []
+T2 requests lock:A -> deadlock: T1 -> T2 -> T1
+
+== Live: two naive transfers, forced to interleave, caught by the detector ==
+  T1 A->B 25.00 committed
+  T2 B->A aborted: deadlock: T1 -> T2 -> T1
+  balances A=75.00 USD B=125.00 USD (sum 200.00 USD)
+
+== Fix 1: lock ordering, 8 goroutines x 500 transfers each way ==
+  completed; C=1000.00 USD D=1000.00 USD sum 2000.00 USD
+
+== Fix 2: try-lock with backoff, same load ==
+  completed; E=1000.00 USD F=1000.00 USD sum 2000.00 USD; backoff pauses: 46899 (varies)
+```
 
 ## Use It
 

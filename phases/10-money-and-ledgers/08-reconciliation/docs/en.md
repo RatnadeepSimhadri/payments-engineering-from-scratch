@@ -356,23 +356,227 @@ The test harness prints `42 passed, 0 failed`. The determinism test shuffles bot
 
 ### In Python
 
-The full port is `code/python/main.py` (same `Reconciler` with three passes, `ReconciliationReport`, `Match`, `Break`, `BreakKind`; tests in `code/python/test_main.py`). Three things differ:
+The Python port has the same `Reconciler` with three passes, `ReconciliationReport`, `Match`, `Break`, and `BreakKind`, with three differences. **Ordering is a key tuple, not a `Comparator`:** `list.sort` is stable like `Collections.sort`, so `ours.sort(key=lambda p: (p.date, p.reference, p.amount.minor_units))` keeps input order for equal keys exactly as the Java does; `BreakKind` carries its report position as the enum value, and the final `breaks.sort` keys on `(kind.value, date, reference)` because Python enums are not ordered by declaration the way Java's `compareTo` is. **Dates and grouping:** `datetime.date` replaces `LocalDate`, and the distance in pass 2 is `abs((l.date - p.date).days)` instead of `ChronoUnit.DAYS.between`; grouping uses a plain `dict` and iterates `sorted(ours_by_ref)`, which visits references in the same order as Java's `TreeMap` (the output would be identical with insertion order as well, since both inputs are sorted first, but the explicit sort keeps the parity obvious). **Shape checks live in `__post_init__`:** `Match` and `Break` are frozen dataclasses whose `__post_init__` raises `ValueError` (Java's `IllegalArgumentException`) when the amounts differ or the wrong side is present; the tie-out failure raises `RuntimeError` (Java's `IllegalStateException`). `Money` here has no overflow checks because `int` cannot overflow, and the determinism test shuffles with `random.Random(7)` rather than Java's `Random`, since the assertion is that any input order renders the same report.
 
-- **Ordering is a key tuple, not a `Comparator`.** `list.sort` is stable like `Collections.sort`, so `ours.sort(key=lambda p: (p.date, p.reference, p.amount.minor_units))` keeps input order for equal keys exactly as the Java does. `BreakKind` carries its report position as the enum value, and the final `breaks.sort` keys on `(kind.value, date, reference)` because Python enums are not ordered by declaration the way Java's `compareTo` is:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The two sides and their records
+
+Two frozen dataclasses with the same four fields each, differing only in the fourth (`account` versus `description`). Dataclasses cannot hold a missing positional field, so the Java null checks are unnecessary; the `date` field is a `datetime.date`.
+
+```python
+@dataclass(frozen=True)
+class LedgerPosting:
+    """One line from OUR ledger: a posting against the settlement account that we expect the processor to confirm."""
+
+    reference: str
+    date: date
+    amount: Money
+    account: str
+
+
+@dataclass(frozen=True)
+class StatementLine:
+    """One line from THEIR statement: what the processor or bank says happened."""
+
+    reference: str
+    date: date
+    amount: Money
+    description: str
+```
+
+#### Step 2: Matches carry their evidence
+
+`MatchRule` is a two-member `Enum`. `Match.__post_init__` refuses unequal amounts with `ValueError`, so the invariant that `matched_total()` relies on is enforced at construction.
+
+```python
+class MatchRule(Enum):
+    EXACT_REFERENCE = "exact_reference"
+    AMOUNT_DATE = "amount_date"
+
+
+@dataclass(frozen=True)
+class Match:
+    """A posting of ours paired with a line of theirs. Amounts are equal by construction."""
+
+    ours: LedgerPosting
+    theirs: StatementLine
+    rule: MatchRule
+
+    def __post_init__(self) -> None:
+        if self.ours.amount != self.theirs.amount:
+            raise ValueError(f"a Match must have equal amounts; got {self.ours.amount} vs {self.theirs.amount}")
+```
+
+#### Step 3: Breaks are five kinds, each with a shape
+
+The enum value doubles as the report order. `__post_init__` replays the Java `switch` as an `if`/`elif` chain over the kind, and the three amount accessors return `Money.zero(currency)` for an absent side. `reference()` and `date()` read whichever side is present, which the final sort needs.
 
 ```python
 class BreakKind(Enum):
-    MISSING_OURS = 0
-    MISSING_THEIRS = 1
-    AMOUNT_MISMATCH = 2
-    DUPLICATE_OURS = 3
-    DUPLICATE_THEIRS = 4
+    MISSING_OURS = 0      # on their statement, nowhere in our ledger
+    MISSING_THEIRS = 1    # in our ledger, nowhere on their statement
+    AMOUNT_MISMATCH = 2   # same reference on both sides, different amount
+    DUPLICATE_OURS = 3    # our ledger has more copies of a reference than their statement
+    DUPLICATE_THEIRS = 4  # their statement has more copies of a reference than our ledger
 
-breaks.sort(key=lambda b: (b.kind.value, b.date(), b.reference()))
+
+@dataclass(frozen=True)
+class Break:
+    kind: BreakKind
+    ours: Optional[LedgerPosting]
+    theirs: Optional[StatementLine]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, BreakKind):
+            raise TypeError("kind")
+        if self.kind in (BreakKind.MISSING_OURS, BreakKind.DUPLICATE_THEIRS):
+            if self.ours is not None or self.theirs is None:
+                raise ValueError(f"{self.kind.name} needs theirs only")
+        elif self.kind in (BreakKind.MISSING_THEIRS, BreakKind.DUPLICATE_OURS):
+            if self.ours is None or self.theirs is not None:
+                raise ValueError(f"{self.kind.name} needs ours only")
+        elif self.ours is None or self.theirs is None:
+            raise ValueError(f"{self.kind.name} needs both sides")
+
+    def ours_amount(self, currency: Currency) -> Money:
+        return Money.zero(currency) if self.ours is None else self.ours.amount
+
+    def theirs_amount(self, currency: Currency) -> Money:
+        return Money.zero(currency) if self.theirs is None else self.theirs.amount
+
+    def difference(self, currency: Currency) -> Money:
+        """ours - theirs: positive means we recorded more than they did."""
+        return self.ours_amount(currency).minus(self.theirs_amount(currency))
 ```
 
-- **Dates and grouping.** `datetime.date` replaces `LocalDate`, and the distance in pass 2 is `abs((l.date - p.date).days)` instead of `ChronoUnit.DAYS.between`. Grouping uses a plain `dict` and iterates `sorted(ours_by_ref)`, which visits references in the same order as Java's `TreeMap`; the output would be identical with insertion order as well, since both inputs are sorted first, but the explicit sort keeps the parity obvious.
-- **Shape checks live in `__post_init__`.** `Match` and `Break` are frozen dataclasses whose `__post_init__` raises `ValueError` (Java's `IllegalArgumentException`) when the amounts differ or the wrong side is present; the tie-out failure raises `RuntimeError` (Java's `IllegalStateException`). `Money` here has no overflow checks because `int` cannot overflow, and the determinism test shuffles with `random.Random(7)` rather than Java's `Random`, since the assertion is that any input order renders the same report.
+#### Step 4: The report and the identities it must satisfy
+
+The report freezes its two lists into tuples in `__post_init__`. The three derived totals are plain loops over the output, `net_difference` comes from the two input totals, and `ties_out` checks the three identities with dataclass equality on `Money`.
+
+```python
+    def matched_total(self) -> Money:
+        total = Money.zero(self.currency)
+        for m in self.matches:
+            total = total.plus(m.ours.amount)
+        return total
+
+    def ours_unmatched(self) -> Money:
+        total = Money.zero(self.currency)
+        for b in self.breaks:
+            total = total.plus(b.ours_amount(self.currency))
+        return total
+
+    def theirs_unmatched(self) -> Money:
+        total = Money.zero(self.currency)
+        for b in self.breaks:
+            total = total.plus(b.theirs_amount(self.currency))
+        return total
+
+    def net_difference(self) -> Money:
+        """ledger_total - statement_total, which must equal ours_unmatched - theirs_unmatched."""
+        return self.ledger_total.minus(self.statement_total)
+
+    def ties_out(self) -> bool:
+        """The tie-out: the only number a controller signs."""
+        return (self.ledger_total == self.matched_total().plus(self.ours_unmatched())
+                and self.statement_total == self.matched_total().plus(self.theirs_unmatched())
+                and self.net_difference() == self.ours_unmatched().minus(self.theirs_unmatched()))
+```
+
+#### Step 5: Pass 1, grouping by reference
+
+`dict.setdefault(ref, []).append(...)` is `computeIfAbsent`, and `for ref in sorted(ours_by_ref)` reproduces `TreeMap` iteration. The pairing rule is the same: the first `min(k, m)` copies are compared, the excess on the longer side becomes a duplicate, and a reference known to one side only is handed to pass 2. The leftovers are re-sorted so pass 2 sees them in `(date, reference, amount)` order.
+
+```python
+        for ref in sorted(ours_by_ref):
+            o = ours_by_ref[ref]
+            t = theirs_by_ref.get(ref, [])
+            if not t:
+                ours_left.extend(o)  # nothing to pair with: try pass 2
+                continue
+            pairs = min(len(o), len(t))
+            for i in range(pairs):
+                if o[i].amount == t[i].amount:
+                    matches.append(Match(o[i], t[i], MatchRule.EXACT_REFERENCE))
+                else:
+                    breaks.append(Break(BreakKind.AMOUNT_MISMATCH, o[i], t[i]))
+            for i in range(pairs, len(o)):
+                breaks.append(Break(BreakKind.DUPLICATE_OURS, o[i], None))
+            for i in range(pairs, len(t)):
+                breaks.append(Break(BreakKind.DUPLICATE_THEIRS, None, t[i]))
+        for ref in sorted(theirs_by_ref):
+            if ref not in ours_by_ref:
+                theirs_left.extend(theirs_by_ref[ref])
+        ours_left.sort(key=_ours_order)
+        theirs_left.sort(key=_theirs_order)
+```
+
+#### Step 6: Pass 2, equal amount within a date window
+
+Amount equality is exact; the tolerance applies to `abs((l.date - p.date).days)` only. `best_distance` starts as `None` instead of `Long.MAX_VALUE`, strict `<` keeps the first candidate in sorted order on ties, and `theirs_left.pop(best)` removes the matched line so the output stays a partition. `ours_left[:] = still_ours` replaces the list in place, mirroring the Java `clear` plus `addAll`.
+
+```python
+    def _match_by_amount_and_date(self, ours_left: List[LedgerPosting], theirs_left: List[StatementLine],
+                                  matches: List[Match]) -> None:
+        """Pass 2: greedy nearest-date match on equal amounts. Removes matched items from both leftover lists."""
+        still_ours: List[LedgerPosting] = []
+        for p in ours_left:
+            best = -1
+            best_distance = None
+            for j, l in enumerate(theirs_left):
+                if l.amount != p.amount:
+                    continue
+                distance = abs((l.date - p.date).days)
+                if distance > self._tolerance_days:
+                    continue
+                if best_distance is None or distance < best_distance:  # strict <: first in sorted order wins ties
+                    best, best_distance = j, distance
+            if best >= 0:
+                matches.append(Match(p, theirs_left.pop(best), MatchRule.AMOUNT_DATE))
+            else:
+                still_ours.append(p)
+        ours_left[:] = still_ours
+```
+
+#### Step 7: Assemble, sort, verify
+
+The totals are summed from the raw input first (`plus` raises `CurrencyMismatchError` on a foreign posting), then both lists are stably sorted by key, the three passes run, and the output is sorted: matches by `(date, reference, amount)`, breaks by `(kind.value, date, reference)`. A report that fails `ties_out()` raises `RuntimeError`.
+
+```python
+    def reconcile(self, ledger: Sequence[LedgerPosting], statement: Sequence[StatementLine]) -> ReconciliationReport:
+        ours = list(ledger)
+        theirs = list(statement)
+        ledger_total = Money.zero(self._currency)
+        for p in ours:
+            ledger_total = ledger_total.plus(p.amount)  # raises on a foreign currency
+        statement_total = Money.zero(self._currency)
+        for l in theirs:
+            statement_total = statement_total.plus(l.amount)
+        ours.sort(key=_ours_order)  # stable: equal keys keep input order
+        theirs.sort(key=_theirs_order)
+
+        matches: List[Match] = []
+        breaks: List[Break] = []
+        ours_left: List[LedgerPosting] = []
+        theirs_left: List[StatementLine] = []
+
+        self._match_by_reference(ours, theirs, matches, breaks, ours_left, theirs_left)
+        self._match_by_amount_and_date(ours_left, theirs_left, matches)
+        for p in ours_left:
+            breaks.append(Break(BreakKind.MISSING_THEIRS, p, None))
+        for l in theirs_left:
+            breaks.append(Break(BreakKind.MISSING_OURS, None, l))
+
+        matches.sort(key=lambda m: (m.ours.date, m.ours.reference, m.ours.amount.minor_units))
+        breaks.sort(key=lambda b: (b.kind.value, b.date(), b.reference()))
+        report = ReconciliationReport(self._currency, tuple(matches), tuple(breaks), ledger_total, statement_total)
+        if not report.ties_out():
+            raise RuntimeError("reconciliation report does not tie out; this is a bug in the matcher")
+        return report
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/08-reconciliation/code/python
@@ -380,31 +584,296 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The rendered report is identical to the Java run, and the demo closes with the analyst's reading of each break:
+
+```console
+  net difference         41.78 USD  (ours unmatched - theirs unmatched = 41.78 USD)
+  ties out          YES
+
+== Reading the breaks ==
+MISSING_OURS ch_1011 5.00: they settled something we never recorded; look for a lost webhook.
+MISSING_THEIRS ch_1009 88.88: we recorded a settlement they never sent; still in transit or declined.
+AMOUNT_MISMATCH ch_1010 12.00 vs 21.00: a transposed digit on one side; the diff of -9.00 is the classic sign.
+DUPLICATE_THEIRS ch_1007: their file double-posted; dispute it, do not book it.
+net difference 41.78 USD = 100.88 USD - 59.10 USD
+```
+
 ### In Go
 
-The full port is `code/go/main.go` (same `Reconciler`, `Match`, `Break`, `BreakKind`, `ReconciliationReport`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go` for the shuffled-input determinism test. Tests are in `code/go/main_test.go`. Three things differ:
+The Go port is `code/go/main.go` (same `Reconciler`, `Match`, `Break`, `BreakKind`, `ReconciliationReport`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go` for the shuffled-input determinism test. Three things differ. **A foreign currency is an error value, not an exception:** `Reconcile` returns `(ReconciliationReport, error)`; the only error it can produce is `Money.Plus` refusing to add a EUR posting into the USD ledger total, and the test checks it with `errors.Is(err, ErrCurrencyMismatch)`. The tie-out check at the end stays a `panic`: a report that does not tie out is a bug in the matcher, not a condition a caller can handle. `NewMatch`, `NewBreak`, and `NewReconciler` carry the record constructors' validation and return errors the same way. **Map order is explicit:** Java groups by reference in a `TreeMap`; Go's map iterates in random order, so pass 1 walks `sortedKeys(oursByRef)`. Every sort is `sort.SliceStable`, which matters: the input sort is by `(date, reference, amount)` and equal keys must keep their input position for duplicates to pair up in the same order they arrived. **Nullable sides are pointers:** a `Break` has exactly one of `Ours *LedgerPosting` / `Theirs *StatementLine` set for the missing and duplicate kinds and both for `AmountMismatch`; `NewBreak` enforces that. Dates are `time.Time` at UTC midnight (a `Date` alias), and `daysBetween` divides the duration by 24 hours, which is exact for civil dates with no time zone.
 
-- **A foreign currency is an error value, not an exception.** `Reconcile` returns `(ReconciliationReport, error)`; the only error it can produce is `Money.Plus` refusing to add a EUR posting into the USD ledger total, and the test checks it with `errors.Is(err, ErrCurrencyMismatch)`. The tie-out check at the end stays a `panic`: a report that does not tie out is a bug in the matcher, not a condition a caller can handle. `NewMatch`, `NewBreak`, and `NewReconciler` carry the record constructors' validation and return errors the same way.
-- **Map order is explicit.** Java groups by reference in a `TreeMap`; Go's map iterates in random order, so pass 1 walks `sortedKeys(oursByRef)`. Every sort is `sort.SliceStable`, which matters: the input sort is by `(date, reference, amount)` and equal keys must keep their input position for duplicates to pair up in the same order they arrived.
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The two sides and their records
+
+Two value structs. `Date` is an alias for `time.Time` holding UTC midnight, and because every field is comparable, `Money` and the records themselves can be compared with `==`.
 
 ```go
-for _, ref := range sortedKeys(oursByRef) {          // TreeMap order
-    o, t := oursByRef[ref], theirsByRef[ref]
-    if len(t) == 0 {                                 // nothing to pair with: try pass 2
-        *oursLeft = append(*oursLeft, o...)
-        continue
-    }
-    pairs := min(len(o), len(t))
-    ...
+type LedgerPosting struct {
+	Reference string
+	Date      Date
+	Amount    Money
+	Account   string
+}
+
+// StatementLine is one line from THEIR statement: what the processor or bank says happened.
+type StatementLine struct {
+	Reference   string
+	Date        Date
+	Amount      Money
+	Description string
 }
 ```
 
-- **Nullable sides are pointers.** A `Break` has exactly one of `Ours *LedgerPosting` / `Theirs *StatementLine` set for the missing and duplicate kinds and both for `AmountMismatch`; `NewBreak` enforces that. Dates are `time.Time` at UTC midnight (a `Date` alias), and `daysBetween` divides the duration by 24 hours, which is exact for civil dates with no time zone.
+#### Step 2: Matches carry their evidence
+
+`NewMatch` is the validating constructor and returns an error for unequal amounts. The matcher itself builds `Match{...}` literals directly in the two places where equality was just checked.
+
+```go
+type Match struct {
+	Ours   LedgerPosting
+	Theirs StatementLine
+	Rule   MatchRule
+}
+
+func NewMatch(ours LedgerPosting, theirs StatementLine, rule MatchRule) (Match, error) {
+	if ours.Amount != theirs.Amount {
+		return Match{}, fmt.Errorf("a Match must have equal amounts; got %v vs %v", ours.Amount, theirs.Amount)
+	}
+	return Match{ours, theirs, rule}, nil
+}
+```
+
+#### Step 3: Breaks are five kinds, each with a shape
+
+`BreakKind` is an `iota` enum whose declaration order is the report order, so `a.Kind < b.Kind` sorts correctly. The two sides are pointers, `nil` standing in for Java's `null`, and `NewBreak` carries the shape `switch`. `Difference` panics on a currency error because both sides were already summed in the report currency.
+
+```go
+type Break struct {
+	Kind   BreakKind
+	Ours   *LedgerPosting
+	Theirs *StatementLine
+}
+
+func NewBreak(kind BreakKind, ours *LedgerPosting, theirs *StatementLine) (Break, error) {
+	switch kind {
+	case MissingOurs, DuplicateTheirs:
+		if ours != nil || theirs == nil {
+			return Break{}, fmt.Errorf("%v needs theirs only", kind)
+		}
+	case MissingTheirs, DuplicateOurs:
+		if ours == nil || theirs != nil {
+			return Break{}, fmt.Errorf("%v needs ours only", kind)
+		}
+	case AmountMismatch:
+		if ours == nil || theirs == nil {
+			return Break{}, fmt.Errorf("%v needs both sides", kind)
+		}
+	}
+	return Break{kind, ours, theirs}, nil
+}
+
+// OursAmount is our side's amount in this break, or zero.
+func (b Break) OursAmount(currency Currency) Money {
+	if b.Ours == nil {
+		return Zero(currency)
+	}
+	return b.Ours.Amount
+}
+
+// TheirsAmount is their side's amount in this break, or zero.
+func (b Break) TheirsAmount(currency Currency) Money {
+	if b.Theirs == nil {
+		return Zero(currency)
+	}
+	return b.Theirs.Amount
+}
+```
+
+#### Step 4: The report and the identities it must satisfy
+
+The three sums share a small `sumMoney` helper that takes an accessor; it panics rather than returns an error because every amount was already checked against the report currency when the input totals were built. `TiesOut` discards the `Plus`/`Minus` errors for the same reason and compares `Money` values with `==`.
+
+```go
+func sumMoney(currency Currency, n int, at func(int) Money) Money {
+	total := Zero(currency)
+	for i := 0; i < n; i++ {
+		var err error
+		if total, err = total.Plus(at(i)); err != nil {
+			panic(err) // every amount was already checked against the report currency
+		}
+	}
+	return total
+}
+
+func (r ReconciliationReport) MatchedTotal() Money {
+	return sumMoney(r.Currency, len(r.Matches), func(i int) Money { return r.Matches[i].Ours.Amount })
+}
+
+func (r ReconciliationReport) OursUnmatched() Money {
+	return sumMoney(r.Currency, len(r.Breaks), func(i int) Money { return r.Breaks[i].OursAmount(r.Currency) })
+}
+
+func (r ReconciliationReport) TheirsUnmatched() Money {
+	return sumMoney(r.Currency, len(r.Breaks), func(i int) Money { return r.Breaks[i].TheirsAmount(r.Currency) })
+}
+
+func (r ReconciliationReport) NetDifference() Money {
+	d, _ := r.LedgerTotal.Minus(r.StatementTotal)
+	return d
+}
+
+func (r ReconciliationReport) TiesOut() bool {
+	matched := r.MatchedTotal()
+	a, _ := matched.Plus(r.OursUnmatched())
+	b, _ := matched.Plus(r.TheirsUnmatched())
+	c, _ := r.OursUnmatched().Minus(r.TheirsUnmatched())
+	return r.LedgerTotal == a && r.StatementTotal == b && r.NetDifference() == c
+}
+```
+
+#### Step 5: Pass 1, grouping by reference
+
+The output slices are passed by pointer so the function can append to them. `sortedKeys` gives `TreeMap` order over a Go map; the pairing rule is unchanged. Breaks take the address of the grouped element (`&o[i]`, `&t[i]`), which is safe because the grouped slices are never appended to afterwards.
+
+```go
+	for _, ref := range sortedKeys(oursByRef) {
+		o, t := oursByRef[ref], theirsByRef[ref]
+		if len(t) == 0 { // nothing to pair with: try pass 2
+			*oursLeft = append(*oursLeft, o...)
+			continue
+		}
+		pairs := min(len(o), len(t))
+		for i := 0; i < pairs; i++ {
+			if o[i].Amount == t[i].Amount {
+				*matches = append(*matches, Match{o[i], t[i], ExactReference})
+			} else {
+				*breaks = append(*breaks, Break{AmountMismatch, &o[i], &t[i]})
+			}
+		}
+		for i := pairs; i < len(o); i++ {
+			*breaks = append(*breaks, Break{DuplicateOurs, &o[i], nil})
+		}
+		for i := pairs; i < len(t); i++ {
+			*breaks = append(*breaks, Break{DuplicateTheirs, nil, &t[i]})
+		}
+	}
+	for _, ref := range sortedKeys(theirsByRef) {
+		if _, shared := oursByRef[ref]; !shared {
+			*theirsLeft = append(*theirsLeft, theirsByRef[ref]...)
+		}
+	}
+	sort.SliceStable(*oursLeft, func(i, j int) bool { return oursLess((*oursLeft)[i], (*oursLeft)[j]) })
+	sort.SliceStable(*theirsLeft, func(i, j int) bool { return theirsLess((*theirsLeft)[i], (*theirsLeft)[j]) })
+```
+
+#### Step 6: Pass 2, equal amount within a date window
+
+`daysBetween` replaces `ChronoUnit.DAYS.between` and `abs64` takes the magnitude. The matched statement line is removed with the slice-splice idiom `append(s[:best], s[best+1:]...)`, Go's `ArrayList.remove(best)`, and the surviving postings replace `*oursLeft` wholesale.
+
+```go
+func (r *Reconciler) matchByAmountAndDate(oursLeft *[]LedgerPosting, theirsLeft *[]StatementLine, matches *[]Match) {
+	var stillOurs []LedgerPosting
+	for _, p := range *oursLeft {
+		best, bestDistance := -1, int64(1<<62)
+		for j, l := range *theirsLeft {
+			if l.Amount != p.Amount {
+				continue
+			}
+			distance := abs64(daysBetween(p.Date, l.Date))
+			if distance > int64(r.toleranceDays) {
+				continue
+			}
+			if distance < bestDistance { // strict <: first in sorted order wins ties
+				best, bestDistance = j, distance
+			}
+		}
+		if best >= 0 {
+			*matches = append(*matches, Match{p, (*theirsLeft)[best], AmountDate})
+			*theirsLeft = append((*theirsLeft)[:best], (*theirsLeft)[best+1:]...)
+		} else {
+			stillOurs = append(stillOurs, p)
+		}
+	}
+	*oursLeft = stillOurs
+}
+```
+
+#### Step 7: Assemble, sort, verify
+
+The input is copied, the totals are summed with `Plus` (a foreign currency returns the error immediately), both sides are stably sorted, the passes run, and the leftovers become breaks whose pointers address the leftover slices. The break sort compares kind, then date with `Before`, then reference; the tie-out failure is a `panic`.
+
+```go
+func (r *Reconciler) Reconcile(ledger []LedgerPosting, statement []StatementLine) (ReconciliationReport, error) {
+	ours := append([]LedgerPosting(nil), ledger...)
+	theirs := append([]StatementLine(nil), statement...)
+	ledgerTotal := Zero(r.currency)
+	for _, p := range ours {
+		var err error
+		if ledgerTotal, err = ledgerTotal.Plus(p.Amount); err != nil { // a foreign currency is an error, never summed
+			return ReconciliationReport{}, err
+		}
+	}
+	statementTotal := Zero(r.currency)
+	for _, l := range theirs {
+		var err error
+		if statementTotal, err = statementTotal.Plus(l.Amount); err != nil {
+			return ReconciliationReport{}, err
+		}
+	}
+	sort.SliceStable(ours, func(i, j int) bool { return oursLess(ours[i], ours[j]) }) // stable: equal keys keep input order
+	sort.SliceStable(theirs, func(i, j int) bool { return theirsLess(theirs[i], theirs[j]) })
+
+	var matches []Match
+	var breaks []Break
+	var oursLeft []LedgerPosting
+	var theirsLeft []StatementLine
+
+	matchByReference(ours, theirs, &matches, &breaks, &oursLeft, &theirsLeft)
+	r.matchByAmountAndDate(&oursLeft, &theirsLeft, &matches)
+	for i := range oursLeft {
+		breaks = append(breaks, Break{MissingTheirs, &oursLeft[i], nil})
+	}
+	for i := range theirsLeft {
+		breaks = append(breaks, Break{MissingOurs, nil, &theirsLeft[i]})
+	}
+
+	sort.SliceStable(matches, func(i, j int) bool { return oursLess(matches[i].Ours, matches[j].Ours) })
+	sort.SliceStable(breaks, func(i, j int) bool {
+		a, b := breaks[i], breaks[j]
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		if !a.Date().Equal(b.Date()) {
+			return a.Date().Before(b.Date())
+		}
+		return a.Reference() < b.Reference()
+	})
+	report := ReconciliationReport{r.currency, matches, breaks, ledgerTotal, statementTotal}
+	if !report.TiesOut() {
+		panic("reconciliation report does not tie out; this is a bug in the matcher")
+	}
+	return report, nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/08-reconciliation/code/go
 go run .
 go test ./...
+```
+
+The report and the closing commentary are identical to the Java and Python runs:
+
+```console
+== Reading the breaks ==
+MISSING_OURS ch_1011 5.00: they settled something we never recorded; look for a lost webhook.
+MISSING_THEIRS ch_1009 88.88: we recorded a settlement they never sent; still in transit or declined.
+AMOUNT_MISMATCH ch_1010 12.00 vs 21.00: a transposed digit on one side; the diff of -9.00 is the classic sign.
+DUPLICATE_THEIRS ch_1007: their file double-posted; dispute it, do not book it.
+net difference 41.78 USD = 100.88 USD - 59.10 USD
 ```
 
 ## Use It

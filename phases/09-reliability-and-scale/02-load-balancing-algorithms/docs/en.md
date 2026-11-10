@@ -325,38 +325,400 @@ Read the `assigned` column against the `p99` column. Round robin assigns the mos
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **No fixed-width integers:** every multiplication and addition in `Rng` and the hash functions is masked with `& MASK64` to emulate 64-bit wraparound, and `next_long` converts to a signed value at the end so the test can assert the same `-4767286540954276203` as Java. **No unsigned comparison problem:** ring hashes are kept as non-negative Python ints, so `bisect.bisect_left` on the sorted list does the binary search directly. **`NoHealthyBackends`** is a `RuntimeError` subclass instead of `IllegalStateException`; `Pool.route` returns `None` for the shed case, and `Backend` is a mutable dataclass whose `__post_init__` raises `ValueError` for a non-positive weight or speed.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A generator that is identical in three languages
+
+SplitMix64 with a `& MASK64` after every operation that could exceed 64 bits, and a final two's-complement conversion so `next_long` returns the Java `long`. `next_double` re-masks to unsigned before the shift, which is Java's `>>> 11`; the rest is the same inverse-transform sampling.
+
 ```python
-def next_long(self) -> int:
-    self.state = (self.state + 0x9E3779B97F4A7C15) & MASK64
-    z = self.state
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
-    z ^= z >> 31
-    return z - (1 << 64) if z >= 1 << 63 else z
+class Rng:
+    def __init__(self, seed: int) -> None:
+        self.state = seed & MASK64
+
+    def next_long(self) -> int:
+        self.state = (self.state + 0x9E3779B97F4A7C15) & MASK64
+        z = self.state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        z ^= z >> 31
+        return z - (1 << 64) if z >= 1 << 63 else z
+
+    def next_double(self) -> float:
+        return ((self.next_long() & MASK64) >> 11) * (2.0 ** -53)
+
+    def next_int(self, bound: int) -> int:
+        return int(self.next_double() * bound)
+
+    def next_exponential(self, mean: float) -> float:
+        return -mean * math.log(1.0 - self.next_double())
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: Backends and the balancer interface
 
-- **No fixed-width integers.** Every multiplication and addition in `Rng` and the hash functions is masked with `& MASK64` to emulate 64-bit wraparound, and `next_long` converts to a signed value at the end so the test can assert the same `-4767286540954276203` as Java.
-- **No unsigned comparison problem.** Ring hashes are kept as non-negative Python ints, so `bisect.bisect_left` on the sorted list does the binary search directly.
-- **`NoHealthyBackends`** is a `RuntimeError` subclass instead of `IllegalStateException`; `Pool.route` returns `None` for the shed case.
+`Backend` is a plain (non-frozen) dataclass because its load changes with every routed request; `weight` is what the operator declares and `speed` is what only the simulation knows. `Balancer` is a base class with a `name` attribute and a `pick` that raises `NotImplementedError`.
+
+```python
+class Backend:
+    id: str
+    weight: int = 1          # relative capacity for weighted strategies
+    speed: float = 1.0       # service-time divisor: 2.0 finishes work twice as fast as 1.0
+    active_connections: int = 0
+    total_assigned: int = 0
+    healthy: bool = True     # flipped by the HealthChecker, never by a strategy
+
+    def __post_init__(self) -> None:
+        if self.weight <= 0:
+            raise ValueError(f"weight must be positive: {self.id}")
+        if self.speed <= 0:
+            raise ValueError(f"speed must be positive: {self.id}")
+
+
+class Balancer:
+    name = "balancer"
+
+    def pick(self, healthy: list[Backend], request: Request) -> Backend:
+        raise NotImplementedError
+```
+
+#### Step 3: Round robin and the smooth weighted form
+
+Round robin indexes by `counter % len(healthy)`, so an eviction shifts the cycle rather than leaving a gap. The smooth weighted form keeps `current` keyed by backend id in a dict; `-(1 << 62)` stands in for `Long.MIN_VALUE` as the initial best score, and the `assert` tells the type checker that a non-empty list always yields a winner.
+
+```python
+    def pick(self, healthy: list[Backend], request: Request) -> Backend:
+        if not healthy:
+            raise NoHealthyBackends("no healthy backends")
+        b = healthy[self.counter % len(healthy)]
+        self.counter += 1
+        return b
+```
+
+```python
+    def pick(self, healthy: list[Backend], request: Request) -> Backend:
+        if not healthy:
+            raise NoHealthyBackends("no healthy backends")
+        total = 0
+        best: Backend | None = None
+        best_score = -(1 << 62)
+        for b in healthy:
+            score = self.current.get(b.id, 0) + b.weight
+            self.current[b.id] = score
+            total += b.weight
+            if score > best_score:
+                best_score, best = score, b
+        assert best is not None
+        self.current[best.id] = best_score - total
+        return best
+```
+
+#### Step 4: Least connections and power of two choices
+
+Strict `<` in least connections resolves ties to the earliest backend. P2C draws the second index from `n - 1` values and bumps it past the first, so the two samples are always distinct; the tie goes to `a`, the first (uniformly random) sample.
+
+```python
+    def pick(self, healthy: list[Backend], request: Request) -> Backend:
+        if not healthy:
+            raise NoHealthyBackends("no healthy backends")
+        best = healthy[0]
+        for b in healthy:
+            if b.active_connections < best.active_connections:
+                best = b
+        return best
+```
+
+```python
+    def pick(self, healthy: list[Backend], request: Request) -> Backend:
+        if not healthy:
+            raise NoHealthyBackends("no healthy backends")
+        if len(healthy) == 1:
+            return healthy[0]
+        i = self.rng.next_int(len(healthy))
+        j = self.rng.next_int(len(healthy) - 1)
+        if j >= i:
+            j += 1  # distinct second sample
+        a, b = healthy[i], healthy[j]
+        return b if b.active_connections < a.active_connections else a
+```
+
+#### Step 5: The ring
+
+`hash64` composes `fnv1a64` and `fmix64`, both masked to 64 bits, and returns a non-negative int, so the ring positions compare correctly with ordinary `<`. `bisect.bisect_left` is the "first position `>= h`" binary search; an index equal to the length wraps to 0. The ring is rebuilt only when the list of healthy ids changes.
+
+```python
+def hash64(s: str) -> int:
+    return fmix64(fnv1a64(s))
+```
+
+```python
+    def pick(self, healthy: list[Backend], request: Request) -> Backend:
+        if not healthy:
+            raise NoHealthyBackends("no healthy backends")
+        if [b.id for b in healthy] != self._built_for:
+            self._rebuild(healthy)
+        h = hash64(request.key)
+        i = bisect.bisect_left(self._ring_hashes, h)  # first ring position >= h, wrapping to 0
+        if i == len(self._ring_hashes):
+            i = 0
+        return self._ring_owners[i]
+```
+
+#### Step 6: Health checking
+
+Two dicts of streaks keyed by backend id; each observation resets the opposite streak, and the return value says whether the health flag flipped. `dict.get(key, 0) + 1` replaces Java's `merge(..., Integer::sum)`.
+
+```python
+    def record(self, b: Backend, success: bool) -> bool:
+        if success:
+            self._failures[b.id] = 0
+            s = self._successes.get(b.id, 0) + 1
+            self._successes[b.id] = s
+            if not b.healthy and s >= self.success_threshold:
+                b.healthy = True
+                return True
+        else:
+            self._successes[b.id] = 0
+            f = self._failures.get(b.id, 0) + 1
+            self._failures[b.id] = f
+            if b.healthy and f >= self.fail_threshold:
+                b.healthy = False
+                return True
+        return False
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/09-reliability-and-scale/02-load-balancing-algorithms/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Because the generator and the hashes are bit-identical, every number matches the Java run, including the fleet table and the key-movement count:
+
+```console
+== Same fleet, auth-3 dies from t=5s to t=8s; health checker evicts after 3 failures ==
+least-connections      mean    26.69  p50   15.70  p99    202.00  max-queue   23  assigned 1707..4086  failed 5  shed 0
+power-of-two-choices   mean    36.35  p50   23.50  p99    217.17  max-queue   26  assigned 2032..3696  failed 5  shed 0
+
+== Smooth weighted round robin, weights a=5 b=1 c=1 ==
+a a b a c a a
+
+== Consistent hashing: remove one of 6 backends, how many of 1,000 keys move? ==
+moved 182 of 1000 keys (ideal 1/6 = 167); modulo hashing would move ~833
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design with three differences. **Errors are values:** `Pick` returns `(*Backend, error)` with a sentinel `ErrNoHealthyBackends`; `main` uses a `mustPick` helper where an error would be a programming mistake, and `NewBackend` panics on a non-positive weight or speed for the same reason. **`uint64` throughout the hash and ring:** Go has unsigned integers, so `Hash64` returns `uint64` and `sort.Search` compares them directly; no `compareUnsigned` is needed, and `NextLong` casts to `int64` only at the boundary so the seed-42 assertion matches. **Constant folding:** `1.0 / (1 << 53)` is evaluated exactly at compile time, which is what you want here; it is the same property that hid the float bug in Phase 10, Lesson 01.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A generator that is identical in three languages
+
+The state is a `uint64`, so the additions and multiplications wrap by definition and the shifts are logical; the only conversion is the final `int64(...)`, which reinterprets the bits as Java's `long`. `NextDouble` converts back to `uint64` for the `>> 11`, which is the `>>>` in Java.
+
 ```go
-func (p *PowerOfTwoChoices) Pick(healthy []*Backend, _ Request) (*Backend, error) {
-    if len(healthy) == 0 {
-        return nil, ErrNoHealthyBackends
-    }
-    ...
+type Rng struct{ state uint64 }
+
+func NewRng(seed int64) *Rng { return &Rng{state: uint64(seed)} }
+
+func (r *Rng) NextLong() int64 {
+	r.state += 0x9E3779B97F4A7C15
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return int64(z ^ (z >> 31))
+}
+
+func (r *Rng) NextDouble() float64 { return float64(uint64(r.NextLong())>>11) * (1.0 / (1 << 53)) }
+
+func (r *Rng) NextInt(bound int) int { return int(r.NextDouble() * float64(bound)) }
+
+func (r *Rng) NextExponential(mean float64) float64 { return -mean * math.Log(1.0-r.NextDouble()) }
+```
+
+#### Step 2: Backends and the balancer interface
+
+`Backend` is a struct always handled through a pointer, since every strategy and the pool mutate its counters. `NewBackend` is the validating constructor. The `Balancer` interface carries `Pick`'s error return so a strategy can refuse an empty list without panicking.
+
+```go
+type Backend struct {
+	ID                string
+	Weight            int     // relative capacity for weighted strategies
+	Speed             float64 // service-time divisor: 2.0 finishes work twice as fast as 1.0
+	ActiveConnections int
+	TotalAssigned     int64
+	Healthy           bool // flipped by the HealthChecker, never by a strategy
+}
+
+func NewBackend(id string, weight int, speed float64) *Backend {
+	if weight <= 0 {
+		panic("weight must be positive: " + id)
+	}
+	if speed <= 0 {
+		panic("speed must be positive: " + id)
+	}
+	return &Backend{ID: id, Weight: weight, Speed: speed, Healthy: true}
+}
+
+var ErrNoHealthyBackends = errors.New("no healthy backends")
+
+type Balancer interface {
+	Name() string
+	Pick(healthy []*Backend, request Request) (*Backend, error)
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: Round robin and the smooth weighted form
 
-- **Errors are values.** `Pick` returns `(*Backend, error)` with a sentinel `ErrNoHealthyBackends`; `main` uses a `mustPick` helper where an error would be a programming mistake.
-- **`uint64` throughout the hash and ring.** Go has unsigned integers, so `Hash64` returns `uint64` and `sort.Search` compares them directly; no `compareUnsigned` is needed. `NextLong` casts to `int64` only at the boundary so the seed-42 assertion matches.
-- **Constant folding.** `1.0 / (1 << 53)` is evaluated exactly at compile time, which is what you want here; it is the same property that hid the float bug in Phase 10, Lesson 01.
+Round robin is the same modulo-the-current-size index. The smooth weighted form reads `w.current[b.ID]`, which yields 0 for a backend not yet in the map, so there is no `getOrDefault`; `math.MinInt64` is the initial best score.
+
+```go
+func (rr *RoundRobin) Pick(healthy []*Backend, _ Request) (*Backend, error) {
+	if len(healthy) == 0 {
+		return nil, ErrNoHealthyBackends
+	}
+	b := healthy[int(rr.counter%int64(len(healthy)))]
+	rr.counter++
+	return b, nil
+}
+```
+
+```go
+func (w *WeightedRoundRobin) Pick(healthy []*Backend, _ Request) (*Backend, error) {
+	if len(healthy) == 0 {
+		return nil, ErrNoHealthyBackends
+	}
+	var total int64
+	var best *Backend
+	bestScore := int64(math.MinInt64)
+	for _, b := range healthy {
+		score := w.current[b.ID] + int64(b.Weight)
+		w.current[b.ID] = score
+		total += int64(b.Weight)
+		if score > bestScore {
+			bestScore, best = score, b
+		}
+	}
+	w.current[best.ID] = bestScore - total
+	return best, nil
+}
+```
+
+#### Step 4: Least connections and power of two choices
+
+`LeastConnections` is an empty struct with value receivers. P2C's distinct-second-sample trick and the tie-to-`a` rule are unchanged; the ternary becomes an `if`.
+
+```go
+func (LeastConnections) Pick(healthy []*Backend, _ Request) (*Backend, error) {
+	if len(healthy) == 0 {
+		return nil, ErrNoHealthyBackends
+	}
+	best := healthy[0]
+	for _, b := range healthy {
+		if b.ActiveConnections < best.ActiveConnections {
+			best = b
+		}
+	}
+	return best, nil
+}
+```
+
+```go
+func (p *PowerOfTwoChoices) Pick(healthy []*Backend, _ Request) (*Backend, error) {
+	if len(healthy) == 0 {
+		return nil, ErrNoHealthyBackends
+	}
+	if len(healthy) == 1 {
+		return healthy[0], nil
+	}
+	i := p.rng.NextInt(len(healthy))
+	j := p.rng.NextInt(len(healthy) - 1)
+	if j >= i {
+		j++ // distinct second sample
+	}
+	a, b := healthy[i], healthy[j]
+	if b.ActiveConnections < a.ActiveConnections {
+		return b, nil
+	}
+	return a, nil
+}
+```
+
+#### Step 5: The ring
+
+`Hash64` returns `uint64`, so `sort.Search` with `>= h` is the first-position binary search with no unsigned-comparison helper. `idsOf` joins the healthy ids into a string that is compared against `builtFor` to decide whether to rebuild.
+
+```go
+func Hash64(s string) uint64 { return fmix64(fnv1a64(s)) }
+
+func (c *ConsistentHash) Pick(healthy []*Backend, request Request) (*Backend, error) {
+	if len(healthy) == 0 {
+		return nil, ErrNoHealthyBackends
+	}
+	if ids := idsOf(healthy); ids != c.builtFor {
+		c.rebuild(healthy)
+	}
+	h := Hash64(request.Key)
+	i := sort.Search(len(c.ringHashes), func(k int) bool { return c.ringHashes[k] >= h }) // first position >= h
+	if i == len(c.ringHashes) {
+		i = 0 // wrap around the ring
+	}
+	return c.ringOwners[i], nil
+}
+```
+
+#### Step 6: Health checking
+
+Go maps return 0 for a missing key, so `h.successes[b.ID]++` is the whole `merge`. Everything else is the Java method: reset the opposite streak, flip the flag at the threshold, report whether it flipped.
+
+```go
+func (h *HealthChecker) Record(b *Backend, success bool) bool {
+	if success {
+		h.failures[b.ID] = 0
+		h.successes[b.ID]++
+		if !b.Healthy && h.successes[b.ID] >= h.SuccessThreshold {
+			b.Healthy = true
+			return true
+		}
+	} else {
+		h.successes[b.ID] = 0
+		h.failures[b.ID]++
+		if b.Healthy && h.failures[b.ID] >= h.FailThreshold {
+			b.Healthy = false
+			return true
+		}
+	}
+	return false
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/09-reliability-and-scale/02-load-balancing-algorithms/code/go
+go run .
+go test ./...
+```
+
+Every number matches the Java run:
+
+```console
+== Balls into bins: 10,000 balls, 10,000 bins ==
+1 choice(s): max load 6
+2 choice(s): max load 3
+3 choice(s): max load 3
+
+== Authorization fleet: 5 fast servers + 1 at half speed, 20,000 requests, ~83% utilisation ==
+round-robin            mean  1880.07  p50   23.59  p99  20674.94  max-queue 1141  assigned 3333..3334  failed 0  shed 0
+weighted-round-robin   mean    42.01  p50   26.80  p99    249.10  max-queue   23  assigned 1818..3637  failed 0  shed 0
+least-connections      mean    19.08  p50   14.00  p99     84.04  max-queue    7  assigned 1697..4032  failed 0  shed 0
+power-of-two-choices   mean    28.00  p50   20.88  p99    127.43  max-queue    9  assigned 2002..3622  failed 0  shed 0
+consistent-hash        mean  3341.28  p50   39.83  p99  32619.17  max-queue 1721  assigned 2898..3844  failed 0  shed 0
+```
 
 ## Use It
 

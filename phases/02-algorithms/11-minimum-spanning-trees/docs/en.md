@@ -343,21 +343,146 @@ The test file has 36 assertions: the union-find invariants, the exact Kruskal tr
 
 ### In Python
 
+`WeightedEdge`, `WeightedGraph`, `UnionFind`, `SpanningForest`, and `Mst` keep their names and algorithms in `code/python/main.py`; three things differ. **Value equality versus identity:** `WeightedEdge` is a frozen dataclass, so `==` and `in` compare by value, as a Java record's `equals` and `List.contains` do; the cut-property checker's "every edge except this one" loop uses `is not`, because the Java uses `!=` on references there, and with value comparison two parallel edges of equal weight would both be skipped. **Stable sort and tuple heap:** `sorted(..., key=lambda e: e.weight)` is stable like `List.sort`, so Kruskal keeps insertion order among equal weights (the square test pins it), and Prim's frontier holds `(weight, insertion index)` tuples in `heapq`, the same tie-break as the Java's `long[]` comparator. **Totals are checked by hand:** Python integers do not overflow, so `add_exact` raises `ArithmeticError` outside the signed 64-bit range wherever the Java calls `Math.addExact`; one extra test sums two `2**62` edges to pin it. Argument errors raise `ValueError`; a `None` node raises `TypeError`, the `requireNonNull` mapping. The test file carries a port of `java.util.Random` so the 30 random graphs are the ones the Java test checks.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo output is identical to the Java run; the suite covers the Java's 36 checks plus the overflow test.
+
+#### Step 1: Edges and the graph
+
+The record's compact constructor becomes `__post_init__` on a frozen dataclass: a self-loop or a negative weight raises `ValueError` before the edge exists. `other` and `same_endpoints` are straight ports. `WeightedGraph` is a `dict` of adjacency lists (insertion-ordered for free) plus the flat `_edges` list that Kruskal sorts; `edges()` and `incident()` hand back tuples so callers cannot mutate the graph.
+
 ```python
-for removed in f.edges:
-    without = UnionFind(g.nodes())
-    for e in f.edges:
-        if e is not removed:  # identity, like Java's != on references: parallel equal edges stay distinct
-            without.union(e.u, e.v)
+@dataclass(frozen=True)
+class WeightedEdge:
+    u: str
+    v: str
+    weight: int
+
+    def __post_init__(self) -> None:
+        if self.u is None:
+            raise TypeError("u")
+        if self.v is None:
+            raise TypeError("v")
+        if self.u == self.v:
+            raise ValueError(f"self-loop {self.u} can never be in a spanning tree")
+        if self.weight < 0:
+            raise ValueError(f"weight must be non-negative: {self.weight}")
+
+    def other(self, node: str) -> str:
+        """The endpoint that is not `node`."""
+        if node == self.u:
+            return self.v
+        if node == self.v:
+            return self.u
+        raise ValueError(f"{node} is not an endpoint of {self}")
+
+    def same_endpoints(self, o: WeightedEdge) -> bool:
+        return (self.u == o.u and self.v == o.v) or (self.u == o.v and self.v == o.u)
 ```
 
-`WeightedEdge`, `WeightedGraph`, `UnionFind`, `SpanningForest`, and `Mst` keep their names and algorithms; three things differ, all in `code/python/main.py`:
+#### Step 2: Union-find with both optimizations
 
-- **Value equality versus identity.** `WeightedEdge` is a frozen dataclass, so `==` and `in` compare by value, as a Java record's `equals` and `List.contains` do. The cut-property checker's "every edge except this one" loop uses `is not`, because the Java uses `!=` on references there; with value comparison, two parallel edges of equal weight would both be skipped.
-- **Stable sort and tuple heap.** `sorted(..., key=lambda e: e.weight)` is stable like `List.sort`, so Kruskal keeps insertion order among equal weights (the square test pins it). Prim's frontier holds `(weight, insertion index)` tuples in `heapq`, the same tie-break as the Java's `long[]` comparator, so equal-weight edges pop in the same order and the edge lists match.
-- **Totals are checked by hand.** Python integers do not overflow, so `add_exact` raises `ArithmeticError` outside the signed 64-bit range wherever the Java calls `Math.addExact`; one extra test sums two `2**62` edges to pin it. Argument errors raise `ValueError`; a `None` node raises `TypeError`, the `requireNonNull` mapping.
+Two dicts, `_parent` and `_rank`, replace the Java maps. `find` is the two-pass version: climb to the root, then re-point every node on the way. `union` returns `False` when the roots already match, which is the entire cycle test Kruskal needs.
 
-The test file carries a port of `java.util.Random` so the 30 random graphs are the ones the Java test checks.
+```python
+    def find(self, e: str) -> str:
+        """Representative of e's set. Path compression: every node on the way up is re-pointed at the root."""
+        root = e
+        while self._parent[root] != root:
+            root = self._parent[root]
+        while self._parent[e] != root:
+            nxt = self._parent[e]
+            self._parent[e] = root
+            e = nxt
+        return root
+
+    def union(self, a: str, b: str) -> bool:
+        """Merges the sets of a and b. False if they were already one set (an edge would close a cycle)."""
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        rka, rkb = self._rank[ra], self._rank[rb]
+        if rka < rkb:
+            self._parent[ra] = rb
+        elif rka > rkb:
+            self._parent[rb] = ra
+        else:
+            self._parent[rb] = ra
+            self._rank[ra] = rka + 1
+        self._components -= 1
+        return True
+```
+
+#### Step 3: Kruskal
+
+`sorted()` is Timsort and therefore stable, which is the property the Java relies on from `List.sort`: equal weights keep insertion order and the demo's trace is reproducible. The early `break` and the `add_exact` on the running total are unchanged.
+
+```python
+    @staticmethod
+    def kruskal(g: WeightedGraph) -> SpanningForest:
+        sorted_ = sorted(g.edges(), key=lambda e: e.weight)  # sorted() is a stable Timsort, like List.sort
+        uf = UnionFind(g.nodes())
+        chosen: list[WeightedEdge] = []
+        total = 0
+        for e in sorted_:
+            if len(chosen) == g.node_count() - 1:
+                break  # a tree on V nodes has V-1 edges
+            if uf.union(e.u, e.v):
+                chosen.append(e)
+                total = add_exact(total, e.weight)
+        return SpanningForest(chosen, total, uf.components())
+```
+
+#### Step 4: Prim with lazy deletion
+
+`heapq` works on a plain list of `(weight, index)` tuples; tuple comparison gives the weight-then-insertion-order tie-break without a comparator object. The nested conditional expression computes which endpoint is still outside the tree (`None` when both are in, so the entry is stale). `_push_frontier` appends the edge to `by_index` and pushes its position.
+
+```python
+            heap: list[tuple[int, int]] = []  # (weight, insertion index) so equal weights pop reproducibly
+            by_index: list[WeightedEdge] = []
+            Mst._push_frontier(g, root, in_tree, heap, by_index)
+            while heap:
+                _, idx = heapq.heappop(heap)
+                e = by_index[idx]
+                nxt = (None if e.v in in_tree else e.v) if e.u in in_tree else e.u
+                if nxt is None:
+                    continue  # stale: both ends already in the tree
+                in_tree.add(nxt)
+                chosen.append(e)
+                total = add_exact(total, e.weight)
+                Mst._push_frontier(g, nxt, in_tree, heap, by_index)
+        return SpanningForest(chosen, total, components)
+
+    @staticmethod
+    def _push_frontier(g: WeightedGraph, node: str, in_tree: set[str],
+                       heap: list[tuple[int, int]], by_index: list[WeightedEdge]) -> None:
+        for e in g.incident(node):
+            if e.other(node) in in_tree:
+                continue
+            by_index.append(e)
+            heapq.heappush(heap, (e.weight, len(by_index) - 1))
+```
+
+#### Step 5: The cut-property checker
+
+The one place identity matters: `e is not removed` skips exactly the edge object being tested, where `e != removed` would also skip a parallel edge with the same endpoints and weight. `!=` between two booleans is XOR, as in Java, so `crosses` is true when exactly one endpoint is on `removed.u`'s side.
+
+```python
+        # cut property: removing edge e splits its tree in two; no edge of g across that split is lighter
+        for removed in f.edges:
+            without = UnionFind(g.nodes())
+            for e in f.edges:
+                if e is not removed:  # identity, like Java's != on references: parallel equal edges stay distinct
+                    without.union(e.u, e.v)
+            for e in g_edges:
+                side = without.find(removed.u)
+                crosses = (without.find(e.u) == side) != (without.find(e.v) == side)
+                if crosses and e.weight < removed.weight:
+                    return False
+        return True
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/02-algorithms/11-minimum-spanning-trees/code/python
@@ -365,31 +490,197 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 36 checks plus the overflow test.
+```console
+== Site network: 8 sites, 12 feasible lines ==
+cost of leasing every line: 119
+
+== Kruskal: lightest edges first, skip any that closes a cycle ==
+  take london    - frankfurt   2
+  take phoenix   - sanjose     3
+  take ashburn   - newyork     4
+  take dallas    - phoenix     5
+  take chicago   - dallas      6
+  take ashburn   - chicago     7
+  take newyork   - london     12
+total 39, tree: true, verified minimum: true
+```
+
+The remaining sections (Prim, the disconnected forest, the three clusters) print the same lines as the Java run.
 
 ### In Go
 
+`WeightedEdge`, `WeightedGraph`, `UnionFind`, `SpanningForest`, `Kruskal`, and `Prim` keep their names and algorithms in `code/go/main.go`; three things differ. **Order is kept by hand, and the sort must be stable:** Go maps iterate in randomized order, so `WeightedGraph` holds the nodes in a `[]string` beside the adjacency map, and `Clusters` records the order in which roots first appear. Kruskal sorts with `slices.SortStableFunc`; the plain `slices.SortFunc` is pattern-defeating quicksort and not stable, and the "ties: kruskal keeps insertion order" test would fail on it. Prim's frontier is `container/heap` over a slice type whose `Less` compares `(weight, index)`. **Value equality, with positions where Java uses identity:** `WeightedEdge` is a struct, so `==` and `slices.Contains` compare by value; the cut-property checker skips by *position* in the slice, because skipping by value would drop both of two parallel equal-weight edges. Totals are added with `addChecked`, which returns `ErrOverflow` where `Math.addExact` throws; two tests sum a pair of `1 << 62` edges to see it fire in both algorithms. **Errors are values, with one deliberate panic:** `NewWeightedEdge`, `Prim`, `Kruskal`, `Incident`, and `Clusters` return `(T, error)` with the sentinels `ErrSelfLoop`, `ErrNegativeWeight`, `ErrUnknownNode`, `ErrBadK`, and `ErrOverflow`. `AddEdge` stays chainable and therefore panics on a self-loop or negative weight: a bad edge in a graph literal is a programming error, and untrusted input goes through `NewWeightedEdge` first. `Other` panics for the same reason. The test file replays `java.util.Random(42)` through `javarandom.go`, so the 30 random graphs are the ones the Java test checks.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo output is identical to the Java run; the suite covers the Java's 36 checks plus 5 for the unknown-node error, Prim's exact order, and the overflow guards.
+
+#### Step 1: Edges and the graph
+
+A struct literal cannot validate itself, so `NewWeightedEdge` is the checked constructor and `AddEdge` calls it, panicking on failure to stay chainable. `Other` uses a `switch` on the node and panics for a non-endpoint, mirroring the Java exception. `WeightedGraph` carries the `order` slice that a map cannot provide.
+
 ```go
-// frontierEntry is (weight, insertion index) so equal weights pop in a reproducible order.
+type WeightedEdge struct {
+	U, V   string
+	Weight int64
+}
+
+func NewWeightedEdge(u, v string, weight int64) (WeightedEdge, error) {
+	if u == v {
+		return WeightedEdge{}, fmt.Errorf("%w: %s", ErrSelfLoop, u)
+	}
+	if weight < 0 {
+		return WeightedEdge{}, fmt.Errorf("%w: %d", ErrNegativeWeight, weight)
+	}
+	return WeightedEdge{u, v, weight}, nil
+}
+
+func (e WeightedEdge) Other(node string) string {
+	switch node {
+	case e.U:
+		return e.V
+	case e.V:
+		return e.U
+	}
+	panic(node + " is not an endpoint of " + e.String())
+}
+
+type WeightedGraph struct {
+	order     []string
+	adjacency map[string][]WeightedEdge
+	edges     []WeightedEdge
+}
+```
+
+#### Step 2: Union-find with both optimizations
+
+The same two-pass `Find` and rank-based `Union`, with a tagless `switch` standing in for the if/else chain. The `components` counter is decremented on every successful merge so `Kruskal` can report the forest size without a second pass.
+
+```go
+func (uf *UnionFind) Find(e string) string {
+	root := e
+	for uf.parent[root] != root {
+		root = uf.parent[root]
+	}
+	for uf.parent[e] != root {
+		next := uf.parent[e]
+		uf.parent[e] = root
+		e = next
+	}
+	return root
+}
+
+func (uf *UnionFind) Union(a, b string) bool {
+	ra, rb := uf.Find(a), uf.Find(b)
+	if ra == rb {
+		return false
+	}
+	rka, rkb := uf.rank[ra], uf.rank[rb]
+	switch {
+	case rka < rkb:
+		uf.parent[ra] = rb
+	case rka > rkb:
+		uf.parent[rb] = ra
+	default:
+		uf.parent[rb] = ra
+		uf.rank[ra] = rka + 1
+	}
+	uf.components--
+	return true
+}
+```
+
+#### Step 3: Kruskal
+
+`g.Edges()` returns a clone, so sorting it does not disturb the graph. `slices.SortStableFunc` with `cmp.Compare` on the weight is the stable sort the tie test requires. The total goes through `addChecked`, and the `if total, err = ...; err != nil` form assigns and tests in one statement.
+
+```go
+func Kruskal(g *WeightedGraph) (SpanningForest, error) {
+	sorted := g.Edges()
+	slices.SortStableFunc(sorted, func(a, b WeightedEdge) int { return cmp.Compare(a.Weight, b.Weight) })
+	uf := NewUnionFind(g.order)
+	chosen := []WeightedEdge{}
+	var total int64
+	for _, e := range sorted {
+		if len(chosen) == g.NodeCount()-1 { // a tree on V nodes has V-1 edges
+			break
+		}
+		if uf.Union(e.U, e.V) {
+			chosen = append(chosen, e)
+			var err error
+			if total, err = addChecked(total, e.Weight); err != nil {
+				return SpanningForest{}, err
+			}
+		}
+	}
+	return SpanningForest{chosen, total, uf.Components()}, nil
+}
+```
+
+#### Step 4: Prim with lazy deletion
+
+`container/heap` needs a type with `Len`, `Less`, `Swap`, `Push`, and `Pop`; `frontierHeap` is that type over `(weight, index)` entries, and `cmp.Or` chains the two comparisons. Inside `Prim`, a tagless `switch` picks the endpoint not yet in the tree and `continue`s on a stale entry. `pushFrontier` returns the grown `byIndex` slice because `append` may reallocate.
+
+```go
 type frontierEntry struct {
-    weight int64
-    index  int
+	weight int64
+	index  int
 }
 
 type frontierHeap []frontierEntry
 
+func (h frontierHeap) Len() int { return len(h) }
 func (h frontierHeap) Less(i, j int) bool {
-    return cmp.Or(cmp.Compare(h[i].weight, h[j].weight), cmp.Compare(h[i].index, h[j].index)) < 0
+	return cmp.Or(cmp.Compare(h[i].weight, h[j].weight), cmp.Compare(h[i].index, h[j].index)) < 0
 }
 ```
 
-`WeightedEdge`, `WeightedGraph`, `UnionFind`, `SpanningForest`, `Kruskal`, and `Prim` keep their names and algorithms; three things differ, all in `code/go/main.go`:
+```go
+		byIndex = pushFrontier(g, root, inTree, h, byIndex)
+		for h.Len() > 0 {
+			top := heap.Pop(h).(frontierEntry)
+			e := byIndex[top.index]
+			var next string
+			switch {
+			case !inTree[e.U]:
+				next = e.U
+			case !inTree[e.V]:
+				next = e.V
+			default:
+				continue // stale: both ends already in the tree
+			}
+			inTree[next] = true
+			chosen = append(chosen, e)
+			var err error
+			if total, err = addChecked(total, e.Weight); err != nil {
+				return SpanningForest{}, err
+			}
+			byIndex = pushFrontier(g, next, inTree, h, byIndex)
+		}
+```
 
-- **Order is kept by hand, and the sort must be stable.** Go maps iterate in randomized order, so `WeightedGraph` holds the nodes in a `[]string` beside the adjacency map, and `Clusters` records the order in which roots first appear instead of relying on a `LinkedHashMap`. Kruskal sorts with `slices.SortStableFunc`; the plain `slices.SortFunc` is pattern-defeating quicksort and not stable, and the "ties: kruskal keeps insertion order" test would fail on it. Prim's frontier is `container/heap` over a slice type whose `Less` compares `(weight, index)`, the same tie-break as the Java's `long[]` comparator, so the demo's edge order matches bit for bit.
-- **Value equality, with positions where Java uses identity.** `WeightedEdge` is a struct, so `==` and `slices.Contains` compare by value, like a record's `equals`. The cut-property checker's "every edge except this one" loop skips by *position* in the slice, because the Java compares references there; skipping by value would drop both of two parallel equal-weight edges. Totals are added with `addChecked`, which returns `ErrOverflow` where `Math.addExact` throws; two tests sum a pair of `1 << 62` edges to see it fire in both algorithms.
-- **Errors are values, with one deliberate panic.** `NewWeightedEdge`, `Prim`, `Kruskal`, `Incident`, and `Clusters` return `(T, error)` with the sentinels `ErrSelfLoop`, `ErrNegativeWeight`, `ErrUnknownNode`, `ErrBadK`, and `ErrOverflow`. `AddEdge` stays chainable (`NewWeightedGraph().AddEdge(...).AddEdge(...)`) and therefore panics on a self-loop or negative weight: a bad edge in a graph literal is a programming error, and untrusted input goes through `NewWeightedEdge` first. `Other` panics for the same reason.
+#### Step 5: The cut-property checker
 
-The test file replays `java.util.Random(42)` through `javarandom.go`, so the 30 random graphs are the ones the Java test checks.
+Go structs compare by value, so "every edge except this one" is expressed with the slice index `i != ri` rather than `!=` on the edges; that keeps two parallel equal-weight edges distinct, which is what Java's reference comparison achieves. `side` is hoisted out of the inner loop; the XOR on two booleans is the crossing test.
+
+```go
+	for ri, removed := range f.Edges {
+		without := NewUnionFind(g.order)
+		for i, e := range f.Edges {
+			if i != ri {
+				without.Union(e.U, e.V)
+			}
+		}
+		side := without.Find(removed.U)
+		for _, e := range g.edges {
+			crosses := (without.Find(e.U) == side) != (without.Find(e.V) == side)
+			if crosses && e.Weight < removed.Weight {
+				return false
+			}
+		}
+	}
+	return true
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/02-algorithms/11-minimum-spanning-trees/code/go
@@ -397,7 +688,15 @@ go run .
 go test ./...
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 36 checks plus 5 for the unknown-node error, Prim's exact order, and the overflow guards.
+```console
+== Disconnected: drop the four transatlantic lines ==
+components: 2, edges: 6, total 27
+
+== Single-linkage clustering: cut the 2 heaviest MST edges for 3 clusters ==
+[[ashburn, newyork], [chicago, dallas, phoenix, sanjose], [london, frankfurt]]
+```
+
+The Kruskal and Prim sections above this print the same seven `take` lines and `total 39` as the Java run; the cluster order is the node insertion order because `Clusters` records roots as it first meets them.
 
 ## Use It
 

@@ -340,21 +340,167 @@ The 39 tests are mostly statistical: the generator's uniformity over 70,000 draw
 
 ### In Python
 
+Every class keeps its name and algorithm in `code/python/main.py`, and every number in the demo matches the Java run. Four things differ. **SplitMix64 needs explicit 64-bit wraparound:** Python integers never wrap, so the state and both multiplies are masked with `MASK64`. The state is held unsigned, which makes `>>` a logical shift (Java's `>>>`); `next_long` converts to a signed value with `to_int64` so it returns exactly what Java's `nextLong()` returns (the reference output `0xE220A8397B1DCDAF` is negative as a Java `long`, and a test checks that). `random.Random` must not be substituted: it is a Mersenne Twister and the reference test would fail. **The heap's array order is part of the output:** `WeightedReservoirSampler.sample()` iterates the heap's backing array, as the Java iterates `PriorityQueue`. `heapq.heappop` sifts differently from `PriorityQueue.poll` (hole to a leaf, then back up), which can arrange equal keys differently, so the port includes `JavaPriorityQueue`, a short transcription of the JDK's `siftUp`/`siftDown`. `math.pow` and Java's `Math.pow` are each within one ulp of the exact result and agree on every key in the demo. **Truncating division in `Money.__str__`:** this lesson's Java `toString` uses `/` and `%` directly; for a negative amount those truncate toward zero, where Python's `//` and `%` floor. `trunc_div` and `java_rem` reproduce the Java result (`-150` prints `-1.50 USD`), and a test pins it. **The `2^31` guard stays:** in Python `x * x` cannot overflow, so `MillerRabin` would be correct without the `n < 2^31` restriction; it is kept so both languages accept and reject the same inputs. `pow(base, exp, mod)` is the built-in equivalent of `pow_mod`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo output is identical to the Java run; the suite covers the Java's 39 checks plus 2 for the signed and truncating conversions.
+
+#### Step 1: SplitMix64
+
+`_next_u64` is the generator proper, working on an unsigned state so that `>>` is a logical shift; every `+` and `*` is followed by `& MASK64` to emulate 64-bit wraparound. `next_long` reinterprets the result as a signed Java `long`, and `next_double` takes the top 53 bits and scales by `2^-53`.
+
 ```python
-def _next_u64(self) -> int:
-    self._state = (self._state + 0x9E3779B97F4A7C15) & MASK64
-    z = self._state
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64  # >> on a masked value is Java's >>>
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
-    return z ^ (z >> 31)
+    def __init__(self, seed: int) -> None:
+        self._state = seed & MASK64
+
+    def _next_u64(self) -> int:
+        self._state = (self._state + 0x9E3779B97F4A7C15) & MASK64
+        z = self._state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64  # >> on a masked value is Java's >>>
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        return z ^ (z >> 31)
+
+    def next_long(self) -> int:
+        """The next value as a signed 64-bit integer, exactly what Java's nextLong() returns."""
+        return to_int64(self._next_u64())
+
+    def next_double(self) -> float:
+        """Uniform double in [0, 1) with 53 bits of randomness."""
+        return (self._next_u64() >> 11) * (1.0 / (1 << 53))
 ```
 
-Every class keeps its name and algorithm, and every number in the demo matches the Java run. Four things differ, all in `code/python/main.py`:
+#### Step 2: Uniform integers by rejection
 
-- **SplitMix64 needs explicit 64-bit wraparound.** Python integers never wrap, so the state and both multiplies are masked with `MASK64`. The state is held unsigned, which makes `>>` a logical shift (Java's `>>>`); `next_long` converts to a signed value with `to_int64` so it returns exactly what Java's `nextLong()` returns (the reference output `0xE220A8397B1DCDAF` is negative as a Java `long`, and a test checks that). `random.Random` must not be substituted: it is a Mersenne Twister and the reference test would fail.
-- **The heap's array order is part of the output.** `WeightedReservoirSampler.sample()` iterates the heap's backing array, as the Java iterates `PriorityQueue`. `heapq.heappop` sifts differently from `PriorityQueue.poll` (hole to a leaf, then back up), which can arrange equal keys differently, so the port includes `JavaPriorityQueue`, a short transcription of the JDK's `siftUp`/`siftDown`. The weighted sample prints in the same order as the Java run. `math.pow` and Java's `Math.pow` are each within one ulp of the exact result and agree on every key in the demo; a disagreement could only swap two keys that differ in the last bit.
-- **Truncating division in `Money.__str__`.** This lesson's Java `toString` uses `/` and `%` directly; for a negative amount those truncate toward zero, where Python's `//` and `%` floor. `trunc_div` and `java_rem` reproduce the Java result (`-150` prints `-1.50 USD`), and a test pins it.
-- **The `2^31` guard stays.** In Python `x * x` cannot overflow, so `MillerRabin` would be correct without the `n < 2^31` restriction; it is kept so both languages accept and reject the same inputs. `pow(base, exp, mod)` is the built-in equivalent of `pow_mod`.
+`bound.bit_length()` gives the position of the highest set bit, so `(1 << bit_length) - 1` is the same mask as `Long.highestOneBit(bound) * 2 - 1`. The candidate is masked from the unsigned stream, which keeps it non-negative without a sign check.
+
+```python
+    def next_int(self, bound: int) -> int:
+        """Uniform integer in [0, bound) by rejection sampling; `% bound` would bias small residues."""
+        if bound <= 0:
+            raise ValueError(f"bound must be positive: {bound}")
+        mask = (1 << bound.bit_length()) - 1  # Long.highestOneBit(bound) * 2 - 1
+        while True:
+            candidate = self._next_u64() & mask
+            if candidate < bound:
+                return candidate
+```
+
+#### Step 3: Algorithm R
+
+The same one-draw decision: `slot` is drawn from `[0, seen)`, and it both decides entry (`slot < k`) and names the slot. `_next_long` switches to a 64-bit rejection loop once `seen` exceeds `INT_MAX`, mirroring the Java helper.
+
+```python
+    def offer(self, item: T) -> None:
+        self._seen += 1
+        if len(self._reservoir) < self._k:
+            self._reservoir.append(item)
+            return
+        # item number `seen` is kept with probability k / seen: pick a slot in [0, seen); keep if it is < k
+        slot = self._next_long(self._seen)
+        if slot < self._k:
+            self._reservoir[slot] = item
+
+    def _next_long(self, bound: int) -> int:
+        if bound <= INT_MAX:
+            return self._rng.next_int(bound)
+        mask = (1 << bound.bit_length()) - 1
+        while True:
+            c = self._rng.next_long() & mask
+            if 0 <= c < bound:
+                return c
+```
+
+#### Step 4: Weighted keys
+
+`DOUBLE_MIN_NORMAL` is `sys.float_info.min`, the same `2^-1022` as `Double.MIN_NORMAL`. The heap is the `JavaPriorityQueue` transcription with a comparator on `key`, so `peek`, `poll`, and `add` arrange the backing list exactly as the JDK would and `sample()` returns the items in the same order as the Java run.
+
+```python
+    def offer(self, item: T, weight: int) -> None:
+        if weight <= 0:
+            raise ValueError(f"weight must be positive: {weight}")
+        u = self._rng.next_double()
+        if u == 0.0:
+            u = DOUBLE_MIN_NORMAL
+        key = math.pow(u, 1.0 / weight)
+        if len(self._heap) < self._k:
+            self._heap.add(_Entry(key, item))
+        elif key > self._heap.peek().key:
+            self._heap.poll()
+            self._heap.add(_Entry(key, item))
+
+    def sample(self) -> list[T]:
+        return [e.item for e in self._heap]
+```
+
+#### Step 5: Fisher-Yates, and its evil twin for the test
+
+`range(len(a) - 1, 0, -1)` counts down to 1, and the tuple swap replaces `Collections.swap`. The naive version draws from the whole list on every step. `permutation_counts` runs either one and tallies the six outcomes for the demo table and the test.
+
+```python
+    @staticmethod
+    def fisher_yates(a: list, rng: Rng) -> None:
+        """For i from n-1 down to 1, swap a[i] with a[j], j uniform in [0, i]. Every permutation equally likely."""
+        for i in range(len(a) - 1, 0, -1):
+            j = rng.next_int(i + 1)
+            a[i], a[j] = a[j], a[i]
+
+    @staticmethod
+    def naive_shuffle(a: list, rng: Rng) -> None:
+        """Swap every position with a random position in the WHOLE list: n^n outcomes cannot split evenly over n!."""
+        for i in range(len(a)):
+            j = rng.next_int(len(a))
+            a[i], a[j] = a[j], a[i]
+```
+
+#### Step 6: Quickselect with a random pivot
+
+The iterative loop and the Lomuto partition are unchanged; Python's tuple swap makes `swap(a, i, store++)` two lines. `select` mutates the list it is given, as the Java mutates its array, so the demo passes copies.
+
+```python
+        lo, hi = 0, len(a) - 1
+        while lo < hi:
+            pivot_index = lo + rng.next_int(hi - lo + 1)
+            p = Quickselect.partition(a, lo, hi, pivot_index)
+            if k == p:
+                return a[k]
+            if k < p:
+                hi = p - 1
+            else:
+                lo = p + 1
+        return a[lo]
+
+    @staticmethod
+    def partition(a: list[int], lo: int, hi: int, pivot_index: int) -> int:
+        """Lomuto partition around a[pivot_index]; returns the pivot's final position."""
+        pivot = a[pivot_index]
+        a[pivot_index], a[hi] = a[hi], a[pivot_index]
+        store = lo
+        for i in range(lo, hi):
+            if a[i] < pivot:
+                a[i], a[store] = a[store], a[i]
+                store += 1
+        a[store], a[hi] = a[hi], a[store]
+        return store
+```
+
+#### Step 7: Miller-Rabin
+
+`is_witness` is the Java method with `range(1, s)` for the squaring loop. `pow_mod` is written out as square-and-multiply even though the built-in three-argument `pow` computes the same thing, so the arithmetic is visible. The `x * x` cannot overflow here, but the `n < 2^31` guard in `is_probable_prime` is kept for parity.
+
+```python
+    @staticmethod
+    def is_witness(a: int, d: int, s: int, n: int) -> bool:
+        """True if a is a witness to n's compositeness: a^d != 1 and a^(2^i d) != -1 for all i < s."""
+        x = MillerRabin.pow_mod(a, d, n)
+        if x == 1 or x == n - 1:
+            return False
+        for _ in range(1, s):
+            x = (x * x) % n
+            if x == n - 1:
+                return False
+        return True
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/02-algorithms/14-randomized-algorithms/code/python
@@ -362,26 +508,216 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 39 checks plus 2 for the signed and truncating conversions.
+```console
+== Reservoir sampling: 5 of 10,000 transactions for audit, one pass, O(k) memory ==
+seen 10000, sample: [txn-08296, txn-04614, txn-02380, txn-08666, txn-09728]
+
+== Quickselect: median and p99 amount without sorting 10,000 values ==
+median 110.90 USD (sorted says 110.90 USD)
+```
+
+Every section, including the weighted sample order and the shuffle counts, matches the Java run because the generator and the heap are bit-for-bit transcriptions.
 
 ### In Go
 
+Every type keeps its name and algorithm in `code/go/`, and every number in the demo matches the Java run. Four things differ. **SplitMix64 is a direct transcription:** the state is a `uint64`, so multiplication wraps and `>>` is the logical shift Java spells `>>>`; the only conversion is the final `int64(...)` so `NextLong` returns the same signed value as Java (the reference output `0xE220A8397B1DCDAF` is negative, and a test checks that). `NextDouble` shifts the unsigned value right by 11 and scales by `2^-53`. `math/rand` must not be substituted: it is a different generator and the reference test would fail. **The heap's array order is part of the output:** `WeightedReservoirSampler.Sample()` returns the heap's backing array, as the Java iterates `PriorityQueue`. `container/heap` sifts differently from the JDK, so `javapq.go` is a short transcription of `PriorityQueue.offer`/`poll` with the JDK's `siftUp`/`siftDown`; the weighted sample prints in the same order as the Java run and a test pins it. `math.Pow` and `Math.pow` agree on every key in the demo. **Generics and errors:** `ReservoirSampler[T any]` and `WeightedReservoirSampler[T any]` take the element type as a parameter, `FisherYates[T any]` shuffles any slice, and constructors and `Select`, `Percentile`, `IsProbablePrime`, and `Rng.NextInt` return `(T, error)` with the sentinels `ErrBadK`, `ErrBadWeight`, `ErrEmpty`, `ErrKRange`, `ErrBadQ`, `ErrBadBound`, and `ErrTooLarge`. Inside the algorithms the generator is called through the unexported `nextInt`, which panics on a non-positive bound because every caller has already validated it. **Integer semantics match without help:** Go's `/` and `%` truncate toward zero like Java's, so `Money.String` prints `-150` as `-1.50 USD` with no helper, `int64` multiplication wraps like `long`, and the `n < 2^31` guard in Miller-Rabin is doing the same job as in Java. `math/big`'s `ProbablyPrime` is the production version.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo output is identical to the Java run; the suite covers the Java's 39 checks plus 7 that pin the sign of the reference value, the demo's samples and shuffle counts, the `q = 0` sentinel, and the truncating `String`.
+
+#### Step 1: SplitMix64
+
+With a `uint64` state the Java lines transcribe almost character for character: unsigned arithmetic wraps and `>>` is logical. `NextDouble` converts back to unsigned before shifting so the sign bit of the `int64` does not smear.
+
 ```go
+func NewRng(seed int64) *Rng { return &Rng{uint64(seed)} }
+
 func (r *Rng) NextLong() int64 {
-    r.state += 0x9E3779B97F4A7C15
-    z := r.state
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 // uint64 wraps and >> is logical: Java's >>>
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return int64(z ^ (z >> 31))
+	r.state += 0x9E3779B97F4A7C15
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 // uint64 wraps and >> is logical: Java's >>>
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return int64(z ^ (z >> 31))
+}
+
+func (r *Rng) NextDouble() float64 { return float64(uint64(r.NextLong())>>11) * (1.0 / (1 << 53)) }
+```
+
+#### Step 2: Uniform integers by rejection
+
+`highestOneBit` is built from `bits.LeadingZeros64`, giving the same mask as the Java. The exported `NextInt` returns `ErrBadBound`; the unexported `nextInt` wraps it in a panic for the algorithms, whose bounds are already validated.
+
+```go
+func (r *Rng) NextInt(bound int) (int, error) {
+	if bound <= 0 {
+		return 0, fmt.Errorf("%w: %d", ErrBadBound, bound)
+	}
+	mask := int64(highestOneBit(uint64(bound))*2 - 1) // smallest 2^k - 1 >= bound - 1
+	for {
+		candidate := r.NextLong() & mask
+		if candidate < int64(bound) {
+			return int(candidate), nil
+		}
+	}
+}
+
+func (r *Rng) nextInt(bound int) int {
+	v, err := r.NextInt(bound)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+func highestOneBit(v uint64) uint64 { return uint64(1) << (63 - bits.LeadingZeros64(v)) }
+```
+
+#### Step 3: Algorithm R
+
+The sampler is generic over the element type. `Offer` is the single-draw rule, and `nextLong` falls back to a 64-bit rejection loop past `math.MaxInt32`, where the `c >= 0` test guards against the masked `int64` being negative when the mask covers bit 63.
+
+```go
+func (s *ReservoirSampler[T]) Offer(item T) {
+	s.seen++
+	if len(s.reservoir) < s.k {
+		s.reservoir = append(s.reservoir, item)
+		return
+	}
+	slot := s.nextLong(s.seen)
+	if slot < int64(s.k) {
+		s.reservoir[slot] = item
+	}
+}
+
+func (s *ReservoirSampler[T]) nextLong(bound int64) int64 {
+	if bound <= math.MaxInt32 {
+		return int64(s.rng.nextInt(int(bound)))
+	}
+	mask := int64(highestOneBit(uint64(bound))*2 - 1)
+	for {
+		c := s.rng.NextLong() & mask
+		if c >= 0 && c < bound {
+			return c
+		}
+	}
 }
 ```
 
-Every type keeps its name and algorithm, and every number in the demo matches the Java run. Four things differ, all in `code/go/`:
+#### Step 4: Weighted keys
 
-- **SplitMix64 is a direct transcription.** The state is a `uint64`, so multiplication wraps and `>>` is the logical shift Java spells `>>>`; the only conversion is the final `int64(...)` so `NextLong` returns the same signed value as Java (the reference output `0xE220A8397B1DCDAF` is negative, and a test checks that). `NextDouble` shifts the unsigned value right by 11 and scales by `2^-53`. `math/rand` must not be substituted: it is a different generator and the reference test would fail.
-- **The heap's array order is part of the output.** `WeightedReservoirSampler.Sample()` returns the heap's backing array, as the Java iterates `PriorityQueue`. `container/heap` sifts differently from the JDK (hole to a leaf, then back up), which can arrange keys differently, so `javapq.go` is a short transcription of `PriorityQueue.offer`/`poll` with the JDK's `siftUp`/`siftDown`; the weighted sample prints in the same order as the Java run and a test pins it. `math.Pow` and `Math.pow` agree on every key in the demo.
-- **Generics and errors.** `ReservoirSampler[T any]` and `WeightedReservoirSampler[T any]` take the element type as a parameter, `FisherYates[T any]` shuffles any slice, and constructors and `Select`, `Percentile`, `IsProbablePrime`, and `Rng.NextInt` return `(T, error)` with the sentinels `ErrBadK`, `ErrBadWeight`, `ErrEmpty`, `ErrKRange`, `ErrBadQ`, `ErrBadBound`, and `ErrTooLarge`. Inside the algorithms the generator is called through `nextInt`, which panics on a non-positive bound because every caller has already validated it; a bad bound there is a programming error, not an input.
-- **Integer semantics match without help.** Go's `/` and `%` truncate toward zero like Java's, so `Money.String` prints `-150` as `-1.50 USD` with no helper (a test pins it), `int64` multiplication wraps like `long`, and the `n < 2^31` guard in Miller-Rabin is doing the same job as in Java: keeping `x * x` inside 63 bits. `math/big`'s `ProbablyPrime` is the production version.
+`0x1p-1022` is Go's hexadecimal float literal for `Double.MIN_NORMAL`. The heap is the `javaPriorityQueue` from `javapq.go`, so `Peek`, `Poll`, and `Add` keep the JDK's array layout and `Sample` (which reads `Items()`) returns the same order as Java. A bad weight is `ErrBadWeight` rather than an exception.
+
+```go
+func (w *WeightedReservoirSampler[T]) Offer(item T, weight int64) error {
+	if weight <= 0 {
+		return fmt.Errorf("%w: %d", ErrBadWeight, weight)
+	}
+	u := w.rng.NextDouble()
+	if u == 0.0 {
+		u = 0x1p-1022 // Double.MIN_NORMAL
+	}
+	key := math.Pow(u, 1.0/float64(weight))
+	if w.heap.Len() < w.k {
+		w.heap.Add(weightedEntry[T]{key, item})
+	} else if key > w.heap.Peek().key {
+		w.heap.Poll()
+		w.heap.Add(weightedEntry[T]{key, item})
+	}
+	return nil
+}
+```
+
+#### Step 5: Fisher-Yates, and its evil twin for the test
+
+Both shuffles are generic functions over any slice, with the parallel-assignment swap. `PermutationCounts` shuffles a `[]byte{'a','b','c'}` and indexes the result into the `Permutations` table.
+
+```go
+func FisherYates[T any](a []T, rng *Rng) {
+	for i := len(a) - 1; i > 0; i-- {
+		j := rng.nextInt(i + 1)
+		a[i], a[j] = a[j], a[i]
+	}
+}
+
+func NaiveShuffle[T any](a []T, rng *Rng) {
+	for i := range a {
+		j := rng.nextInt(len(a))
+		a[i], a[j] = a[j], a[i]
+	}
+}
+```
+
+#### Step 6: Quickselect with a random pivot
+
+`Select` validates and returns `ErrEmpty` or `ErrKRange`, then runs the same iterative loop. `Partition` is exported so the tests can exercise it directly; the swaps are parallel assignments.
+
+```go
+	lo, hi := 0, len(a)-1
+	for lo < hi {
+		pivotIndex := lo + rng.nextInt(hi-lo+1)
+		p := Partition(a, lo, hi, pivotIndex)
+		if k == p {
+			return a[k], nil
+		}
+		if k < p {
+			hi = p - 1
+		} else {
+			lo = p + 1
+		}
+	}
+	return a[lo], nil
+}
+
+func Partition(a []int64, lo, hi, pivotIndex int) int {
+	pivot := a[pivotIndex]
+	a[pivotIndex], a[hi] = a[hi], a[pivotIndex]
+	store := lo
+	for i := lo; i < hi; i++ {
+		if a[i] < pivot {
+			a[i], a[store] = a[store], a[i]
+			store++
+		}
+	}
+	a[store], a[hi] = a[hi], a[store]
+	return store
+}
+```
+
+#### Step 7: Miller-Rabin
+
+`IsProbablePrime` returns `ErrTooLarge` above `2^31`, which is what keeps `x * x` inside an `int64` in `IsWitness`, exactly the Java constraint. The witness loop is unchanged.
+
+```go
+	d := n - 1
+	s := 0
+	for d%2 == 0 { // n - 1 = 2^s * d with d odd
+		d /= 2
+		s++
+	}
+	for r := 0; r < rounds; r++ {
+		a := 2 + int64(rng.nextInt(int(n-3))) // witness candidate in [2, n-2]
+		if IsWitness(a, d, s, n) {            // a proves n composite
+			return false, nil
+		}
+	}
+	return true, nil // no witness found in `rounds` tries
+}
+
+func IsWitness(a, d int64, s int, n int64) bool {
+	x := PowMod(a, d, n)
+	if x == 1 || x == n-1 {
+		return false
+	}
+	for i := 1; i < s; i++ {
+		x = (x * x) % n
+		if x == n-1 {
+			return false
+		}
+	}
+	return true
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/02-algorithms/14-randomized-algorithms/code/go
@@ -389,7 +725,16 @@ go run .
 go test ./...
 ```
 
-The demo output is identical to the Java run; the suite covers the Java's 39 checks plus 7 that pin the sign of the reference value, the demo's samples and shuffle counts, the `q = 0` sentinel, and the truncating `String`.
+```console
+== Miller-Rabin: Monte Carlo primality, 561 is a Carmichael number that fools Fermat ==
+         561  probable prime after 10 rounds: false  trial division: false
+     1000003  probable prime after 10 rounds: true   trial division: true
+  2147483647  probable prime after 10 rounds: true   trial division: true
+     1000001  probable prime after 10 rounds: false  trial division: false
+    62773913  probable prime after 10 rounds: false  trial division: false
+```
+
+The reservoir sample, the weighted sample, the shuffle table, and the quickselect answers are identical to the Java run.
 
 ## Use It
 

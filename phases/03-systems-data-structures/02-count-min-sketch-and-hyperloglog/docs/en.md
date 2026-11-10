@@ -352,21 +352,182 @@ The test suite asserts the never-underestimate invariant over 100,000 events, th
 
 ### In Python
 
-The full port is `code/python/main.py`; it is the same three classes (`Hashing`, `CountMinSketch`, `HyperLogLog`) with the same method names in snake_case. Three things differ:
+The full port is `code/python/main.py`: the same three classes (`Hashing`, `CountMinSketch`, `HyperLogLog`) with the same method names in snake_case. Three things differ. **64-bit wraparound is explicit:** Python integers never overflow, so FNV-1a would grow without bound and every column index would disagree with Java; every multiply is masked back to 64 bits, which makes the Python hashes bit-identical to the Java `long`s read as unsigned. **Unsigned arithmetic is free; leading zeros are not:** because the masked hash is already non-negative, `column` is a plain `% width` (Java needs `Long.remainderUnsigned`), and `index` is `h >> (64 - p)` with no `>>>`. There is no `numberOfLeadingZeros`, so `rho` uses `bit_length()`: `64 - rest.bit_length() + 1`. **Same random stream, same rounding:** the demo drives the sketches from `JavaRandom`, a bit-exact port of `java.util.Random` (48-bit LCG, `next_int`, `next_long`, polar-method `next_gaussian`), so seed 42 produces the same merchants and card tokens and the output matches Java line for line. `cardinality` uses `math.floor(x + 0.5)` because Python's `round` is banker's rounding and `Math.round` is not, and `fmt_fixed` reproduces Java's half-up `%.2f`.
 
-- **64-bit wraparound is explicit.** Python integers never overflow, so FNV-1a would grow without bound and every column index would disagree with Java. Every multiply is masked back to 64 bits, which makes the Python hashes bit-identical to the Java `long`s read as unsigned:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: One hash, one mixer, shared by both sketches
+
+`Hashing` is a class of static methods so the call sites read like the Java. Iterating `key.encode("utf-8")` yields unsigned byte values, so no `& 0xff`; the `& MASK64` after each multiply is the Python-specific line, and it keeps `h` unsigned so `>>` in `mix64` is a logical shift.
 
 ```python
-@staticmethod
-def fnv1a64(key: str) -> int:
-    h = Hashing.FNV_OFFSET
-    for b in key.encode("utf-8"):
-        h = ((h ^ b) * Hashing.FNV_PRIME) & MASK64
-    return h
+class Hashing:
+    FNV_OFFSET = 0xCBF29CE484222325
+    FNV_PRIME = 0x100000001B3
+
+    @staticmethod
+    def fnv1a64(key: str) -> int:
+        """FNV-1a over the UTF-8 bytes; masked after every multiply so it wraps like a Java long."""
+        h = Hashing.FNV_OFFSET
+        for b in key.encode("utf-8"):
+            h = ((h ^ b) * Hashing.FNV_PRIME) & MASK64
+        return h
+
+    @staticmethod
+    def mix64(h: int) -> int:
+        h &= MASK64
+        h ^= h >> 33
+        h = (h * 0xFF51AFD7ED558CCD) & MASK64
+        h ^= h >> 33
+        h = (h * 0xC4CEB9FE1A85EC53) & MASK64
+        h ^= h >> 33
+        return h
+
+    @staticmethod
+    def hash64(key: str) -> int:
+        return Hashing.mix64(Hashing.fnv1a64(key))
 ```
 
-- **Unsigned arithmetic is free; leading zeros are not.** Because the masked hash is already non-negative, `column` is a plain `% width` (Java needs `Long.remainderUnsigned`), and `index` is `h >> (64 - p)` with no `>>>`. There is no `numberOfLeadingZeros`, so `rho` uses `bit_length()`: `64 - rest.bit_length() + 1`.
-- **Same random stream, same rounding.** The demo drives the sketches from `JavaRandom`, a bit-exact port of `java.util.Random` (48-bit LCG, `nextInt`, `nextLong`, polar-method `nextGaussian`), so seed 42 produces the same merchants and card tokens and the output matches Java line for line. `cardinality` uses `math.floor(x + 0.5)` because Python's `round` is banker's rounding and `Math.round` is not, and `fmt_fixed` reproduces Java's half-up `%.2f`.
+#### Step 2: The Count-Min table and its sizing
+
+The table is a list of `depth` lists built with a comprehension (not `[[0] * width] * depth`, which would alias one row). Python ints cannot overflow, so the "long counters" concern disappears, but the never-underestimate invariant still depends on counts being non-negative. The chained comparisons in `for_error_bounds` reject `NaN` like the Java's `!(x > 0 && x < 1)`.
+
+```python
+class CountMinSketch:
+    def __init__(self, width: int, depth: int) -> None:
+        if width <= 0:
+            raise ValueError(f"width must be positive: {width}")
+        if depth <= 0:
+            raise ValueError(f"depth must be positive: {depth}")
+        self.width = width
+        self.depth = depth
+        self._table = [[0] * width for _ in range(depth)]
+        self._total = 0
+
+    @staticmethod
+    def for_error_bounds(epsilon: float, delta: float) -> "CountMinSketch":
+        if not 0 < epsilon < 1:
+            raise ValueError(f"epsilon must be in (0,1): {epsilon}")
+        if not 0 < delta < 1:
+            raise ValueError(f"delta must be in (0,1): {delta}")
+        return CountMinSketch(math.ceil(math.e / epsilon), math.ceil(math.log(1.0 / delta)))
+```
+
+#### Step 3: Add and estimate
+
+`column` masks the double-hash sum to 64 bits and then takes a plain `%`, which on a non-negative int is exactly `Long.remainderUnsigned`. `count` defaults to 1 so `add(key)` works as in the Java overload; `estimate` is `min` over a generator.
+
+```python
+    def column(self, h1: int, h2: int, row: int) -> int:
+        """Double hashing h1 + i*h2, wrapped to 64 bits, unsigned remainder (Long.remainderUnsigned)."""
+        return ((h1 + row * h2) & MASK64) % self.width
+
+    def add(self, key: str, count: int = 1) -> None:
+        if count < 0:
+            raise ValueError(f"count must be non-negative: {count}")
+        h1 = Hashing.hash64(key)
+        h2 = Hashing.mix64(h1)
+        for row in range(self.depth):
+            self._table[row][self.column(h1, h2, row)] += count
+        self._total += count
+
+    def estimate(self, key: str) -> int:
+        h1 = Hashing.hash64(key)
+        h2 = Hashing.mix64(h1)
+        return min(self._table[row][self.column(h1, h2, row)] for row in range(self.depth))
+```
+
+#### Step 4: Merge and the bound accessors
+
+`merge` adds rows with `zip`; the shape check raises `ValueError`. `error_bound` and `failure_probability` are the paper's two numbers from `width` and `depth`.
+
+```python
+    def error_bound(self) -> float:
+        return math.e / self.width * self._total
+
+    def failure_probability(self) -> float:
+        return math.exp(-self.depth)
+
+    def merge(self, other: "CountMinSketch") -> "CountMinSketch":
+        if other.width != self.width or other.depth != self.depth:
+            raise ValueError("cannot merge sketches of different shape")
+        out = CountMinSketch(self.width, self.depth)
+        for r in range(self.depth):
+            out._table[r] = [a + b for a, b in zip(self._table[r], other._table[r])]
+        out._total = self._total + other._total
+        return out
+```
+
+#### Step 5: HyperLogLog registers and the leading-zero count
+
+The registers are a `bytearray`, one byte each like the Java `byte[]`. `rho` left-shifts and masks to drop the index bits, then uses `bit_length()` in place of `numberOfLeadingZeros`: a 64-bit value with `b` significant bits has `64 - b` leading zeros. The register index is `h >> (64 - p)`, a logical shift because `h` is non-negative.
+
+```python
+class HyperLogLog:
+    def __init__(self, precision: int) -> None:
+        if precision < 4 or precision > 16:
+            raise ValueError(f"precision must be 4..16: {precision}")
+        self.precision = precision
+        self.registers = 1 << precision
+        self._register = bytearray(self.registers)
+
+    @staticmethod
+    def rho(hash_: int, precision: int) -> int:
+        """Position of the first 1-bit after the index bits, from 1; all-zero gives 65 - p."""
+        rest = (hash_ << precision) & MASK64
+        if rest == 0:
+            return 64 - precision + 1
+        return 64 - rest.bit_length() + 1  # numberOfLeadingZeros + 1
+
+    def add(self, key: str) -> None:
+        h = Hashing.hash64(key)
+        index = h >> (64 - self.precision)
+        r = HyperLogLog.rho(h, self.precision)
+        if r > self._register[index]:
+            self._register[index] = r
+```
+
+#### Step 6: The estimate and its correction
+
+`alpha` is a dict lookup with the general formula as the default. `cardinality` applies the same small-range correction and rounds with `math.floor(estimate + 0.5)`, which is `Math.round`'s half-up rule rather than Python's banker's `round`; `bytearray.count(0)` counts the empty registers.
+
+```python
+    @staticmethod
+    def alpha(m: int) -> float:
+        return {16: 0.673, 32: 0.697, 64: 0.709}.get(m, 0.7213 / (1.0 + 1.079 / m))
+
+    def raw_estimate(self) -> float:
+        s = 0.0
+        for r in self._register:
+            s += 2.0 ** -r
+        return HyperLogLog.alpha(self.registers) * self.registers * float(self.registers) / s
+
+    def zero_registers(self) -> int:
+        return self._register.count(0)
+
+    def cardinality(self) -> int:
+        estimate = self.raw_estimate()
+        if estimate <= 2.5 * self.registers:
+            zeros = self.zero_registers()
+            if zeros > 0:
+                estimate = self.registers * math.log(self.registers / zeros)
+        return math.floor(estimate + 0.5)  # Math.round, not banker's rounding
+```
+
+#### Step 7: Merge as register-wise maximum
+
+A `bytearray` built from `max` over `zip` of the two register arrays; the precision check raises `ValueError`.
+
+```python
+    def merge(self, other: "HyperLogLog") -> "HyperLogLog":
+        if other.precision != self.precision:
+            raise ValueError("cannot merge different precisions")
+        out = HyperLogLog(self.precision)
+        out._register = bytearray(max(a, b) for a, b in zip(self._register, other._register))
+        return out
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/03-systems-data-structures/02-count-min-sketch-and-hyperloglog/code/python
@@ -374,30 +535,245 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Count-Min Sketch: authorizations per merchant, 11 KB instead of a hash map ==
+width=272 depth=5 bytes=10880 (epsilon=0.01, delta=0.01)
+total events = 200000, error bound = 1999
+merchant_0     true=  1320  estimate=  1320  over by 0
+```
+
+Every count and estimate matches the Java run because `JavaRandom` reproduces seed 42's stream exactly; `fmt_fixed` keeps the `1.63%` standard error Java prints.
+
 ### In Go
 
-The full port is `code/go/main.go`; it is the same three parts (`Hashing` as package-level functions, `CountMinSketch`, `HyperLogLog`) with the same method names in exported CamelCase. Three things differ:
+The full port is `code/go/main.go`: the same three parts (`Hashing` as package-level functions, `CountMinSketch`, `HyperLogLog`) with the same method names in exported CamelCase. Three things differ. **Unsigned hashes, no helpers:** the hash functions return `uint64`, so FNV-1a's multiply wraps exactly like Java's `long`, `Column` is a plain `%` (Java needs `Long.remainderUnsigned`), the register index is `hash >> (64 - p)` with no `>>>`, and `Rho` is `bits.LeadingZeros64`. **Errors are values:** every `IllegalArgumentException` in the Java (bad width, epsilon outside (0,1), negative count, precision outside 4..16, merging different shapes) becomes an `error` wrapping the sentinel `ErrInvalidArgument`, so constructors are `NewCountMinSketch(width, depth) (*CountMinSketch, error)` and `Merge` returns `(*HyperLogLog, error)`; the tests check with `errors.Is`. `Add(key)` cannot fail, so it has no error return; `AddCount(key, n)` does. **Same random stream, same rounding:** `javarandom.go` is a bit-exact port of `java.util.Random` (48-bit LCG, `NextIntN`, `NextLong`, polar-method `NextGaussian`), so seed 42 produces the same merchants and card tokens and every count in the demo matches Java. `Cardinality` uses `math.Floor(x + 0.5)` because `Math.round` is half-up and Go's `math.Round` is half-away-from-zero. Only `%.2f` of the standard error prints differently (`1.62` vs Java's half-up `1.63` for 1.625).
 
-- **Unsigned hashes, no helpers.** The hash functions return `uint64`, so FNV-1a's multiply wraps exactly like Java's `long`, `Column` is a plain `%` (Java needs `Long.remainderUnsigned`), the register index is `hash >> (64 - p)` with no `>>>`, and `Rho` is `bits.LeadingZeros64`:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: One hash, one mixer, shared by both sketches
+
+Package-level functions over `uint64`. `[]byte(key)` is the UTF-8 encoding, a Go `byte` is unsigned so there is no sign extension, and `*=` wraps modulo 2^64. The constants are typed `uint64` so the arithmetic needs no conversions.
 
 ```go
-func Rho(hash uint64, precision int) int {
-    rest := hash << precision // discard the index bits; the rest now leads
-    if rest == 0 {
-        return 64 - precision + 1 // all remaining bits were zero
-    }
-    return bits.LeadingZeros64(rest) + 1
+const (
+	fnvOffset uint64 = 0xcbf29ce484222325
+	fnvPrime  uint64 = 0x100000001b3
+)
+
+func Fnv1a64(key string) uint64 {
+	h := fnvOffset
+	for _, b := range []byte(key) {
+		h ^= uint64(b)
+		h *= fnvPrime
+	}
+	return h
+}
+
+func Mix64(h uint64) uint64 {
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return h
+}
+
+func Hash64(key string) uint64 { return Mix64(Fnv1a64(key)) }
+```
+
+#### Step 2: The Count-Min table and its sizing
+
+`[][]int64` is allocated row by row. Both constructors return an error wrapping `ErrInvalidArgument` instead of throwing, and `ForErrorBounds` keeps the `!(x > 0 && x < 1)` form so `NaN` is rejected. Counters are `int64`, which wraps like a Java `long`; the non-negative-count rule at `AddCount` is what protects the invariant.
+
+```go
+type CountMinSketch struct {
+	Width int // counters per row; controls epsilon = e / width
+	Depth int // rows; controls delta = e^(-depth)
+	table [][]int64
+	total int64
+}
+
+func NewCountMinSketch(width, depth int) (*CountMinSketch, error) {
+	if width <= 0 {
+		return nil, fmt.Errorf("%w: width must be positive: %d", ErrInvalidArgument, width)
+	}
+	if depth <= 0 {
+		return nil, fmt.Errorf("%w: depth must be positive: %d", ErrInvalidArgument, depth)
+	}
+	table := make([][]int64, depth)
+	for r := range table {
+		table[r] = make([]int64, width)
+	}
+	return &CountMinSketch{Width: width, Depth: depth, table: table}, nil
+}
+
+func ForErrorBounds(epsilon, delta float64) (*CountMinSketch, error) {
+	if !(epsilon > 0 && epsilon < 1) {
+		return nil, fmt.Errorf("%w: epsilon must be in (0,1): %g", ErrInvalidArgument, epsilon)
+	}
+	if !(delta > 0 && delta < 1) {
+		return nil, fmt.Errorf("%w: delta must be in (0,1): %g", ErrInvalidArgument, delta)
+	}
+	width := int(math.Ceil(math.E / epsilon))
+	depth := int(math.Ceil(math.Log(1.0 / delta)))
+	return NewCountMinSketch(width, depth)
 }
 ```
 
-- **Errors are values.** Every `IllegalArgumentException` in the Java (bad width, epsilon outside (0,1), negative count, precision outside 4..16, merging different shapes) becomes an `error` wrapping the sentinel `ErrInvalidArgument`, so constructors are `NewCountMinSketch(width, depth) (*CountMinSketch, error)` and `Merge` returns `(*HyperLogLog, error)`. The tests check with `errors.Is`. `Add(key)` cannot fail, so it has no error return; `AddCount(key, n)` does.
-- **Same random stream, same rounding.** `javarandom.go` is a bit-exact port of `java.util.Random` (48-bit LCG, `NextIntN`, `NextLong`, polar-method `NextGaussian`), so seed 42 produces the same merchants and card tokens and every count in the demo matches Java. `Cardinality` uses `math.Floor(x + 0.5)` because `Math.round` is half-up and Go's `math.Round` is half-away-from-zero. Only `%.2f` of the standard error prints differently (`1.62` vs Java's half-up `1.63` for 1.625).
+#### Step 3: Add and estimate
+
+`Column` is the whole point of using `uint64`: `combined % uint64(c.Width)` is already the unsigned remainder. `AddCount` returns an error for a negative count; `Add` is the one-count convenience that discards the error it knows cannot happen. `Estimate` starts from `math.MaxInt64` and keeps the minimum.
+
+```go
+func (c *CountMinSketch) Column(h1, h2 uint64, row int) int {
+	combined := h1 + uint64(row)*h2
+	return int(combined % uint64(c.Width))
+}
+
+func (c *CountMinSketch) AddCount(key string, count int64) error {
+	if count < 0 {
+		return fmt.Errorf("%w: count must be non-negative: %d", ErrInvalidArgument, count)
+	}
+	h1 := Hash64(key)
+	h2 := Mix64(h1)
+	for row := 0; row < c.Depth; row++ {
+		c.table[row][c.Column(h1, h2, row)] += count
+	}
+	c.total += count
+	return nil
+}
+
+func (c *CountMinSketch) Add(key string) { _ = c.AddCount(key, 1) }
+
+func (c *CountMinSketch) Estimate(key string) int64 {
+	h1 := Hash64(key)
+	h2 := Mix64(h1)
+	best := int64(math.MaxInt64)
+	for row := 0; row < c.Depth; row++ {
+		if v := c.table[row][c.Column(h1, h2, row)]; v < best {
+			best = v
+		}
+	}
+	return best
+}
+```
+
+#### Step 4: Merge and the bound accessors
+
+`Merge` returns `(*CountMinSketch, error)`; the result is built through `NewCountMinSketch` with the error discarded because the receiver's own shape is known to be valid. The two accessors are one-liners.
+
+```go
+func (c *CountMinSketch) ErrorBound() float64 { return math.E / float64(c.Width) * float64(c.total) }
+
+func (c *CountMinSketch) FailureProbability() float64 { return math.Exp(-float64(c.Depth)) }
+
+func (c *CountMinSketch) Merge(other *CountMinSketch) (*CountMinSketch, error) {
+	if other.Width != c.Width || other.Depth != c.Depth {
+		return nil, fmt.Errorf("%w: cannot merge sketches of different shape", ErrInvalidArgument)
+	}
+	out, _ := NewCountMinSketch(c.Width, c.Depth)
+	for r := 0; r < c.Depth; r++ {
+		for col := 0; col < c.Width; col++ {
+			out.table[r][col] = c.table[r][col] + other.table[r][col]
+		}
+	}
+	out.total = c.total + other.total
+	return out, nil
+}
+```
+
+#### Step 5: HyperLogLog registers and the leading-zero count
+
+Registers are a `[]byte`. `Rho` is `bits.LeadingZeros64` on the left-shifted hash, and the register index is an unsigned right shift by `64 - p`; both are natural on `uint64`. The constructor returns `ErrInvalidArgument` for a precision outside 4..16.
+
+```go
+func NewHyperLogLog(precision int) (*HyperLogLog, error) {
+	if precision < 4 || precision > 16 {
+		return nil, fmt.Errorf("%w: precision must be 4..16: %d", ErrInvalidArgument, precision)
+	}
+	m := 1 << precision
+	return &HyperLogLog{Precision: precision, Registers: m, register: make([]byte, m)}, nil
+}
+
+func Rho(hash uint64, precision int) int {
+	rest := hash << precision // discard the index bits; the rest now leads
+	if rest == 0 {
+		return 64 - precision + 1 // all remaining bits were zero
+	}
+	return bits.LeadingZeros64(rest) + 1
+}
+
+func (h *HyperLogLog) Add(key string) {
+	hash := Hash64(key)
+	index := int(hash >> (64 - h.Precision)) // top p bits pick the register
+	r := Rho(hash, h.Precision)
+	if r > int(h.register[index]) {
+		h.register[index] = byte(r)
+	}
+}
+```
+
+#### Step 6: The estimate and its correction
+
+`Alpha` is a `switch`, `RawEstimate` the paper's harmonic mean, and `Cardinality` the same small-range handoff. `javaRound` is `math.Floor(x + 0.5)` because `math.Round` rounds half away from zero and `Math.round` rounds half up; they differ only for negative halves, but the point is to match the reference exactly.
+
+```go
+func (h *HyperLogLog) RawEstimate() float64 {
+	sum := 0.0
+	for _, r := range h.register {
+		sum += math.Pow(2.0, -float64(r))
+	}
+	m := float64(h.Registers)
+	return Alpha(h.Registers) * m * m / sum
+}
+
+func (h *HyperLogLog) Cardinality() int64 {
+	estimate := h.RawEstimate()
+	if estimate <= 2.5*float64(h.Registers) {
+		zeros := h.ZeroRegisters()
+		if zeros > 0 {
+			estimate = float64(h.Registers) * math.Log(float64(h.Registers)/float64(zeros))
+		}
+	}
+	return javaRound(estimate)
+}
+
+func javaRound(x float64) int64 { return int64(math.Floor(x + 0.5)) }
+```
+
+#### Step 7: Merge as register-wise maximum
+
+The built-in generic `max` works on `byte`. The precision mismatch is an `ErrInvalidArgument` error rather than an exception.
+
+```go
+func (h *HyperLogLog) Merge(other *HyperLogLog) (*HyperLogLog, error) {
+	if other.Precision != h.Precision {
+		return nil, fmt.Errorf("%w: cannot merge different precisions", ErrInvalidArgument)
+	}
+	out, _ := NewHyperLogLog(h.Precision)
+	for i := 0; i < h.Registers; i++ {
+		out.register[i] = max(h.register[i], other.register[i])
+	}
+	return out, nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/03-systems-data-structures/02-count-min-sketch-and-hyperloglog/code/go
 go run .
 go test ./...
 ```
+
+```console
+100 distinct cards -> raw 3001.3, corrected 100
+
+== Merging two merchants' sketches is the union, not the sum ==
+a=20193 b=19987 merged=30083 (true union 30000, sum would say 40180)
+```
+
+Every count matches the Java run; the one visible difference is the standard error line, where Go's `%.2f` prints `1.62%` for 1.625 and Java's half-up formatting prints `1.63%`.
 
 ## Use It
 

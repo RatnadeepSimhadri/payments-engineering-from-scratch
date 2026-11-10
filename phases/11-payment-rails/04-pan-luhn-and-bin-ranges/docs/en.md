@@ -337,16 +337,77 @@ The test harness prints `65 passed, 0 failed`.
 
 ### In Python
 
-The full port is `code/python/main.py` (same `Luhn`, `Pan`, `BinRange`, `BinTable`, `CardRouter`; tests in `code/python/test_main.py`). Three things differ:
+The Python port has the same `Luhn`, `Pan`, `BinRange`, `BinTable`, and `CardRouter`, with three differences. **The mask has to cover `repr`, not just `str`:** Java has one `toString`; Python has two rendering paths. A `@dataclass(frozen=True)` generates a `__repr__` that prints every field, so `print([pan])`, an f-string with `!r`, a debugger, or a failing `assertEqual` would all leak the digits even with `__str__` masked. The port overrides both, and the tests assert that `repr(pan)` and a list containing a `Pan` print the mask. **Keys are plain `int`s and the search is written out:** `int(digits[:8])` replaces `Long.parseLong`, and normalisation is `int(prefix.ljust(8, "0"))`. `bisect.bisect_right` on a list of low bounds would find the same candidate, but the hand-written loop is kept so the lesson's binary search (and the "last range whose low <= key, then check high" argument) reads the same in every language; the 10,000-key comparison against a linear scan replays Java's `Random(7)` sequence, `nextLong(bound)` included, through a small `JavaRandom` in the test file. **`Optional` becomes `None`, overloads become one method:** `BinTable.lookup` accepts either an `int` key or a `Pan` and returns `Optional[BinRange]`; `detect_network` maps a `None` to `Network.UNKNOWN`. `IllegalArgumentException` is `ValueError` throughout, and `RoutingDecision.describe` prints `network.name` so the output matches Java's enum rendering.
 
-- **The mask has to cover `repr`, not just `str`.** Java has one `toString`; Python has two rendering paths. A `@dataclass(frozen=True)` generates a `__repr__` that prints every field, so `print([pan])`, an f-string with `!r`, a debugger, or a failing `assertEqual` would all leak the digits even with `__str__` masked. The port overrides both, and the tests assert that `repr(pan)` and a list containing a `Pan` print the mask:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Luhn, both directions
+
+`Luhn` is a class of static methods so the call sites read `Luhn.is_valid(...)` as in Java. `sum` walks `reversed(digits)` with the same doubling flag; `_require_digits` raises `ValueError` for anything outside `0`-`9`, position included.
+
+```python
+    @staticmethod
+    def sum(digits: str, rightmost_is_check_digit: bool) -> int:
+        total = 0
+        dbl = not rightmost_is_check_digit
+        for c in reversed(digits):
+            d = ord(c) - 48
+            if dbl:
+                d *= 2
+                if d > 9:
+                    d -= 9
+            total += d
+            dbl = not dbl
+        return total
+
+    @staticmethod
+    def is_valid(digits: str) -> bool:
+        """True when the full number (including its check digit) satisfies sum mod 10 == 0."""
+        Luhn._require_digits(digits)
+        if len(digits) < 2:
+            return False
+        return Luhn.sum(digits, True) % 10 == 0
+
+    @staticmethod
+    def check_digit(partial: str) -> int:
+        """The check digit that makes partial + digit Luhn-valid."""
+        Luhn._require_digits(partial)
+        return (10 - Luhn.sum(partial, False) % 10) % 10
+```
+
+#### Step 2: The `Pan` type
+
+`__post_init__` is the compact constructor: length 12-19 and Luhn-valid, or the object never exists. `parse` keeps digits, skips spaces and hyphens, and rejects anything else. `masked` builds the PCI mask, and both `__str__` and `__repr__` are bound to it so no rendering path shows the digits.
 
 ```python
 @dataclass(frozen=True)
 class Pan:
     digits: str
 
+    MIN_LENGTH = 12
+    MAX_LENGTH = 19
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.digits, str):
+            raise TypeError("digits")
+        if len(self.digits) < Pan.MIN_LENGTH or len(self.digits) > Pan.MAX_LENGTH:
+            raise ValueError(f"PAN must be {Pan.MIN_LENGTH}-{Pan.MAX_LENGTH} digits, got {len(self.digits)}")
+        if not Luhn.is_valid(self.digits):
+            raise ValueError("PAN fails the Luhn check")
+
+    @staticmethod
+    def parse(text: str) -> "Pan":
+        """Parses a PAN that may contain spaces or hyphens (as typed on a form). Rejects anything else."""
+        out = []
+        for c in text:
+            if "0" <= c <= "9":
+                out.append(c)
+            elif c not in (" ", "-"):
+                raise ValueError("PAN contains a non-digit character")
+        return Pan("".join(out))
+
     def masked(self, prefix: int = 6) -> str:
+        """PCI DSS masking: the first prefix digits and the last four, everything else '*'. prefix is at most 8."""
         if prefix < 0 or prefix > 8:
             raise ValueError("may show at most 8 leading digits")
         if prefix + 4 >= len(self.digits):
@@ -354,13 +415,138 @@ class Pan:
         return self.digits[:prefix] + "*" * (len(self.digits) - 4 - prefix) + self.last_four()
 
     def __str__(self) -> str:
+        """str() is the mask on purpose: a Pan that ends up in a log line is masked."""
         return self.masked()
 
+    # f-strings, debuggers, and containers call repr(), which a dataclass would otherwise generate with the digits.
     __repr__ = __str__
 ```
 
-- **Keys are plain `int`s and the search is written out.** `int(digits[:8])` replaces `Long.parseLong`, and normalisation is `int(prefix.ljust(8, "0"))`. `bisect.bisect_right` on a list of low bounds would find the same candidate, but the hand-written loop is kept so the lesson's binary search (and the "last range whose low <= key, then check high" argument) reads the same in every language; the 10,000-key comparison against a linear scan replays Java's `Random(7)` sequence, `nextLong(bound)` included, through a small `JavaRandom` in the test file.
-- **`Optional` becomes `None`, overloads become one method.** `BinTable.lookup` accepts either an `int` key or a `Pan` and returns `Optional[BinRange]`; `detect_network` maps a `None` to `Network.UNKNOWN`. `IllegalArgumentException` is `ValueError` throughout, and `RoutingDecision.describe` prints `network.name` so the output matches Java's enum rendering.
+#### Step 3: Ranges normalized to one width
+
+`_pad` does the normalisation with `str.ljust` and `int(...)`; `of_prefix_range` enforces equal-length bounds; `key_of` slices the first eight digits. `contains` uses Python's chained comparison.
+
+```python
+    @staticmethod
+    def of_prefix_range(from_prefix: str, to_prefix: str, network: Network, issuer: str, product: str) -> "BinRange":
+        """Builds a range from from_prefix through to_prefix inclusive, both of the same length (e.g. "2221" to "2720")."""
+        if len(from_prefix) != len(to_prefix):
+            raise ValueError("prefix range bounds must have the same length")
+        return BinRange(BinRange.normalize_low(from_prefix), BinRange.normalize_high(to_prefix), network, issuer, product)
+
+    @staticmethod
+    def normalize_low(prefix: str) -> int:
+        return BinRange._pad(prefix, "0")
+
+    @staticmethod
+    def normalize_high(prefix: str) -> int:
+        return BinRange._pad(prefix, "9")
+
+    @staticmethod
+    def _pad(prefix: str, fill: str) -> int:
+        if not prefix or len(prefix) > BinRange.WIDTH:
+            raise ValueError(f"prefix must be 1-{BinRange.WIDTH} digits")
+        if not prefix.isdigit():
+            raise ValueError(f"prefix must be digits: {prefix}")
+        return int(prefix.ljust(BinRange.WIDTH, fill))
+
+    @staticmethod
+    def key_of(pan: Pan) -> int:
+        """The lookup key of a PAN: its first WIDTH digits as a number."""
+        return int(pan.digits[:BinRange.WIDTH])
+
+    def contains(self, key: int) -> bool:
+        return self.low <= key <= self.high
+
+    def overlaps(self, other: "BinRange") -> bool:
+        return self.low <= other.high and other.low <= self.high
+```
+
+#### Step 4: The table and its binary search
+
+The constructor sorts by `(low, high)`, checks adjacent pairs with `zip`, and freezes the result into a tuple. `lookup` accepts a key or a `Pan`, runs the same "last `low <= key`" search with `>> 1` for the midpoint, and returns `None` where Java returns `Optional.empty()`.
+
+```python
+class BinTable:
+    def __init__(self, ranges: Sequence[BinRange]) -> None:
+        ordered = sorted(ranges, key=lambda r: (r.low, r.high))
+        for prev, cur in zip(ordered, ordered[1:]):
+            if prev.overlaps(cur):
+                raise ValueError(f"overlapping BIN ranges: {prev} and {cur}")
+        self._ranges: tuple = tuple(ordered)
+
+    def lookup(self, key_or_pan: Union[int, Pan]) -> Optional[BinRange]:
+        """Binary search for the last range whose low <= key, then check key <= high. Accepts a key or a Pan."""
+        key = BinRange.key_of(key_or_pan) if isinstance(key_or_pan, Pan) else key_or_pan
+        ranges = self._ranges
+        lo, hi, candidate = 0, len(ranges) - 1, -1
+        while lo <= hi:
+            mid = (lo + hi) >> 1
+            if ranges[mid].low <= key:
+                candidate = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if candidate >= 0 and ranges[candidate].contains(key):
+            return ranges[candidate]
+        return None
+```
+
+#### Step 5: Network detection as a table lookup
+
+The same eight rows as data; `detect_network` turns a `None` lookup into `Network.UNKNOWN`.
+
+```python
+    @staticmethod
+    def network_ranges() -> "BinTable":
+        return BinTable([
+            BinRange.of_prefix("4", Network.VISA, "network", "Visa"),
+            BinRange.of_prefix_range("51", "55", Network.MASTERCARD, "network", "Mastercard 5-series"),
+            BinRange.of_prefix_range("2221", "2720", Network.MASTERCARD, "network", "Mastercard 2-series"),
+            BinRange.of_prefix("34", Network.AMEX, "network", "American Express"),
+            BinRange.of_prefix("37", Network.AMEX, "network", "American Express"),
+            BinRange.of_prefix("6011", Network.DISCOVER, "network", "Discover"),
+            BinRange.of_prefix_range("644", "649", Network.DISCOVER, "network", "Discover"),
+            BinRange.of_prefix("65", Network.DISCOVER, "network", "Discover"),
+        ])
+
+    @staticmethod
+    def detect_network(pan: Pan) -> Network:
+        """Network detection is a lookup in the network table."""
+        hit = BinTable.network_ranges().lookup(pan)
+        return hit.network if hit is not None else Network.UNKNOWN
+```
+
+#### Step 6: Routing
+
+`RoutingDecision` holds an `Optional[BinRange]`; `describe` prints the mask and `network.name`. `CardRouter.route` is parse, detect, look up, check length, in that order.
+
+```python
+@dataclass(frozen=True)
+class RoutingDecision:
+    pan: Pan
+    network: Network
+    issuer_range: Optional[BinRange]
+    length_ok: bool
+
+    def describe(self) -> str:
+        issuer = (f"  issuer={self.issuer_range.issuer} product={self.issuer_range.product}"
+                  if self.issuer_range is not None else "  issuer=unknown BIN")
+        return (f"{self.pan.masked()}  len={self.pan.length()}  {self.network.name}"
+                f"{'' if self.length_ok else ' (length not issued by this network)'}{issuer}")
+
+
+class CardRouter:
+    def __init__(self, issuer_table: BinTable) -> None:
+        self._issuer_table = issuer_table
+
+    def route(self, raw_pan: str) -> RoutingDecision:
+        pan = Pan.parse(raw_pan)
+        network = BinTable.detect_network(pan)
+        return RoutingDecision(pan, network, self._issuer_table.lookup(pan), BinTable.length_allowed(network, pan.length()))
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/11-payment-rails/04-pan-luhn-and-bin-ranges/code/python
@@ -368,28 +554,301 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run:
+
+```console
+== Luhn by hand: 4111 1111 1111 111? ==
+sum of weighted digits (no check digit) = 29
+check digit = (10 - 9) mod 10 = 1
+complete PAN = 4111111111111111  valid=true
+single-digit typo 4111111111111112 valid=false
+adjacent transposition 4242424242424242 -> 4422424242424242 valid=false
+09 <-> 90 transposition is the one Luhn misses: 091 valid=true, 901 valid=true
+
+== BIN table normalized to 8 digits ==
+411111 (6-digit)   -> [41111100, 41111199]
+55555555 (8-digit) -> [55555555, 55555555]
+2221-2720 (network) -> [22210000, 27209999]
+6 issuer ranges, 8 network ranges, binary search on both
+```
+
 ### In Go
 
-The full port is `code/go/main.go` (same `Luhn*` functions, `Pan`, `BinRange`, `BinTable`, `CardRouter`; tests in `code/go/main_test.go`). Three things differ:
+The Go port has the same `Luhn*` functions, `Pan`, `BinRange`, `BinTable`, and `CardRouter`, with three differences. **The digits live in an unexported field:** `fmt.Stringer` covers `%v` and `%s`, but `%+v` on a struct with an exported `Digits` field would still print it. The port keeps `digits` unexported, reaches it through `Digits()`, and the test asserts that `%v`, `%s` and `%+v` all render the mask. **`IllegalArgumentException` becomes an `error` return:** `ParsePan`, `NewPan`, `LuhnValid`, `MaskedPrefix`, `BinRangeOfPrefixRange` and `NewBinTable` return `(T, error)`; `Masked()` (the 6+4 default) cannot fail for a 12-19 digit PAN, so it panics on the impossible branch instead of forcing an error check at every log site. `Optional<BinRange>` becomes the `(BinRange, bool)` pair from `Lookup`, and a `*BinRange` that is `nil` when the issuer is unknown on `RoutingDecision`. **The binary search is written out, not `sort.Search`:** `sort.Search` would find the same candidate, but the loop stays so the "last range whose low <= key, then check high" argument reads identically in all three languages; `int(uint(lo+hi) >> 1)` is Java's `>>> 1`. The 10,000-key comparison against a linear scan replays Java's `Random(7)`, `nextLong(bound)` included, through `javarandom.go`.
 
-- **The digits live in an unexported field.** `fmt.Stringer` covers `%v` and `%s`, but `%+v` on a struct with an exported `Digits` field would still print it. The port keeps `digits` unexported, reaches it through `Digits()`, and the test asserts that `%v`, `%s` and `%+v` all render the mask:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Luhn, both directions
+
+Package-level functions with a `Luhn` prefix. `LuhnSum` indexes bytes from the right; `LuhnValid` and `LuhnCheckDigit` return the `requireDigits` error instead of throwing.
+
+```go
+func LuhnSum(digits string, rightmostIsCheckDigit bool) int {
+	total := 0
+	dbl := !rightmostIsCheckDigit
+	for i := len(digits) - 1; i >= 0; i-- {
+		d := int(digits[i] - '0')
+		if dbl {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		total += d
+		dbl = !dbl
+	}
+	return total
+}
+
+// LuhnValid is true when the full number (including its check digit) satisfies sum mod 10 == 0.
+func LuhnValid(digits string) (bool, error) {
+	if err := requireDigits(digits); err != nil {
+		return false, err
+	}
+	if len(digits) < 2 {
+		return false, nil
+	}
+	return LuhnSum(digits, true)%10 == 0, nil
+}
+
+// LuhnCheckDigit is the check digit that makes partial + digit Luhn-valid.
+func LuhnCheckDigit(partial string) (int, error) {
+	if err := requireDigits(partial); err != nil {
+		return 0, err
+	}
+	return (10 - LuhnSum(partial, false)%10) % 10, nil
+}
+```
+
+#### Step 2: The `Pan` type
+
+`NewPan` is the validating constructor and `ParsePan` the separator-tolerant parser. `MaskedPrefix` returns an error for a bad prefix; `Masked` is the 6+4 default and `String` delegates to it, so every `fmt` verb prints the mask because the field is unexported.
 
 ```go
 type Pan struct {
-	digits string // unexported: %+v cannot reach it, so every fmt verb prints the mask
+	digits string
+}
+
+// NewPan validates length and Luhn (the Java compact constructor).
+func NewPan(digits string) (Pan, error) {
+	if len(digits) < PanMinLength || len(digits) > PanMaxLength {
+		return Pan{}, fmt.Errorf("PAN must be %d-%d digits, got %d", PanMinLength, PanMaxLength, len(digits))
+	}
+	valid, err := LuhnValid(digits)
+	if err != nil {
+		return Pan{}, err
+	}
+	if !valid {
+		return Pan{}, errors.New("PAN fails the Luhn check")
+	}
+	return Pan{digits}, nil
+}
+
+// ParsePan parses a PAN that may contain spaces or hyphens (as typed on a form). Rejects anything else.
+func ParsePan(text string) (Pan, error) {
+	var sb strings.Builder
+	for _, c := range text {
+		switch {
+		case c >= '0' && c <= '9':
+			sb.WriteRune(c)
+		case c != ' ' && c != '-':
+			return Pan{}, errors.New("PAN contains a non-digit character")
+		}
+	}
+	return NewPan(sb.String())
+}
+
+func (p Pan) MaskedPrefix(prefix int) (string, error) {
+	if prefix < 0 || prefix > 8 {
+		return "", errors.New("may show at most 8 leading digits")
+	}
+	if prefix+4 >= len(p.digits) {
+		return "", errors.New("mask would reveal the whole PAN")
+	}
+	return p.digits[:prefix] + strings.Repeat("*", len(p.digits)-4-prefix) + p.LastFour(), nil
+}
+
+// Masked is the default mask: six leading digits plus the last four.
+func (p Pan) Masked() string {
+	m, err := p.MaskedPrefix(6)
+	if err != nil {
+		panic(err) // impossible for a 12..19-digit PAN
+	}
+	return m
 }
 
 // String is the mask on purpose: a Pan that ends up in a log line is masked.
 func (p Pan) String() string { return p.Masked() }
 ```
 
-- **`IllegalArgumentException` becomes an `error` return.** `ParsePan`, `NewPan`, `LuhnValid`, `MaskedPrefix`, `BinRangeOfPrefixRange` and `NewBinTable` return `(T, error)`; `Masked()` (the 6+4 default) cannot fail for a 12-19 digit PAN, so it panics on the impossible branch instead of forcing an error check at every log site. `Optional<BinRange>` becomes the `(BinRange, bool)` pair from `Lookup`, and a `*BinRange` that is `nil` when the issuer is unknown on `RoutingDecision`.
-- **The binary search is written out, not `sort.Search`.** `sort.Search` would find the same candidate, but the loop stays so the "last range whose low <= key, then check high" argument reads identically in all three languages; `int(uint(lo+hi) >> 1)` is Java's `>>> 1`. The 10,000-key comparison against a linear scan replays Java's `Random(7)`, `nextLong(bound)` included, through `javarandom.go`.
+#### Step 3: Ranges normalized to one width
+
+`pad` appends the fill character with `strings.Repeat` and parses with `strconv.ParseInt`; `BinRangeOfPrefixRange` enforces equal-length bounds and threads the two normalisation errors. `KeyOf` ignores the parse error because the digits were validated at construction.
+
+```go
+func BinRangeOfPrefixRange(fromPrefix, toPrefix string, network Network, issuer, product string) (BinRange, error) {
+	if len(fromPrefix) != len(toPrefix) {
+		return BinRange{}, errors.New("prefix range bounds must have the same length")
+	}
+	low, err := NormalizeLow(fromPrefix)
+	if err != nil {
+		return BinRange{}, err
+	}
+	high, err := NormalizeHigh(toPrefix)
+	if err != nil {
+		return BinRange{}, err
+	}
+	return NewBinRange(low, high, network, issuer, product)
+}
+
+func NormalizeLow(prefix string) (int64, error)  { return pad(prefix, "0") }
+func NormalizeHigh(prefix string) (int64, error) { return pad(prefix, "9") }
+
+func pad(prefix, fill string) (int64, error) {
+	if prefix == "" || len(prefix) > BinWidth {
+		return 0, fmt.Errorf("prefix must be 1-%d digits", BinWidth)
+	}
+	if err := requireDigits(prefix); err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(prefix+strings.Repeat(fill, BinWidth-len(prefix)), 10, 64)
+}
+
+// KeyOf is the lookup key of a PAN: its first BinWidth digits as a number.
+func KeyOf(pan Pan) int64 {
+	key, _ := strconv.ParseInt(pan.digits[:BinWidth], 10, 64) // digits are validated, so this cannot fail
+	return key
+}
+
+func (r BinRange) Contains(key int64) bool { return r.Low <= key && key <= r.High }
+
+func (r BinRange) Overlaps(other BinRange) bool { return r.Low <= other.High && other.Low <= r.High }
+```
+
+#### Step 4: The table and its binary search
+
+`NewBinTable` copies, sorts with `sort.SliceStable` on `(Low, High)`, and returns an error on the first overlapping pair. `Lookup` returns `(BinRange, bool)`, the Go idiom for `Optional`; `LookupPan` (not shown) is the `Pan` overload.
+
+```go
+func NewBinTable(input []BinRange) (*BinTable, error) {
+	sorted := append([]BinRange(nil), input...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Low != sorted[j].Low {
+			return sorted[i].Low < sorted[j].Low
+		}
+		return sorted[i].High < sorted[j].High
+	})
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i-1].Overlaps(sorted[i]) {
+			return nil, fmt.Errorf("overlapping BIN ranges: %v and %v", sorted[i-1], sorted[i])
+		}
+	}
+	return &BinTable{sorted}, nil
+}
+
+// Lookup binary-searches for the last range whose Low <= key, then checks key <= High. The bool is Java's Optional.
+func (t *BinTable) Lookup(key int64) (BinRange, bool) {
+	lo, hi, candidate := 0, len(t.ranges)-1, -1
+	for lo <= hi {
+		mid := int(uint(lo+hi) >> 1)
+		if t.ranges[mid].Low <= key {
+			candidate = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if candidate >= 0 && t.ranges[candidate].Contains(key) {
+		return t.ranges[candidate], true
+	}
+	return BinRange{}, false
+}
+```
+
+#### Step 5: Network detection as a table lookup
+
+The rows are literals wrapped in `mustRange` because the constructors return errors; a malformed built-in rule is a programming error and panics at start-up. `DetectNetwork` uses the `ok` bool.
+
+```go
+func NetworkRanges() *BinTable {
+	t, err := NewBinTable([]BinRange{
+		mustRange(BinRangeOfPrefix("4", Visa, "network", "Visa")),
+		mustRange(BinRangeOfPrefixRange("51", "55", Mastercard, "network", "Mastercard 5-series")),
+		mustRange(BinRangeOfPrefixRange("2221", "2720", Mastercard, "network", "Mastercard 2-series")),
+		mustRange(BinRangeOfPrefix("34", Amex, "network", "American Express")),
+		mustRange(BinRangeOfPrefix("37", Amex, "network", "American Express")),
+		mustRange(BinRangeOfPrefix("6011", Discover, "network", "Discover")),
+		mustRange(BinRangeOfPrefixRange("644", "649", Discover, "network", "Discover")),
+		mustRange(BinRangeOfPrefix("65", Discover, "network", "Discover")),
+	})
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+// DetectNetwork: network detection is a lookup in the network table.
+func DetectNetwork(pan Pan) Network {
+	if r, ok := NetworkRanges().LookupPan(pan); ok {
+		return r.Network
+	}
+	return Unknown
+}
+```
+
+#### Step 6: Routing
+
+`IssuerRange` is a `*BinRange`, nil for an unknown BIN. `Route` returns the parse error for a bad PAN and otherwise builds the decision in the same four moves; `Describe` prints the mask via `Masked()`.
+
+```go
+type RoutingDecision struct {
+	Pan         Pan
+	Network     Network
+	IssuerRange *BinRange
+	LengthOk    bool
+}
+
+func (d RoutingDecision) Describe() string {
+	s := fmt.Sprintf("%s  len=%d  %v", d.Pan.Masked(), d.Pan.Length(), d.Network)
+	if !d.LengthOk {
+		s += " (length not issued by this network)"
+	}
+	if d.IssuerRange != nil {
+		return s + fmt.Sprintf("  issuer=%s product=%s", d.IssuerRange.Issuer, d.IssuerRange.Product)
+	}
+	return s + "  issuer=unknown BIN"
+}
+
+func (c *CardRouter) Route(rawPan string) (RoutingDecision, error) {
+	pan, err := ParsePan(rawPan)
+	if err != nil {
+		return RoutingDecision{}, err
+	}
+	network := DetectNetwork(pan)
+	var issuer *BinRange
+	if r, ok := c.issuerTable.LookupPan(pan); ok {
+		issuer = &r
+	}
+	return RoutingDecision{pan, network, issuer, LengthAllowed(network, pan.Length())}, nil
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/11-payment-rails/04-pan-luhn-and-bin-ranges/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run, ending with the masking demonstration and the three rejections:
+
+```console
+toString() is the mask, so a stray log line prints 378282*****0005
+
+rejected: PAN fails the Luhn check
+rejected: PAN must be 12-19 digits, got 4
+rejected: PAN contains a non-digit character
 ```
 
 ## Use It

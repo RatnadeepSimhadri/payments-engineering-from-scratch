@@ -385,26 +385,188 @@ The `cust_alice` line is the one to keep. Five rows across four shards means the
 
 ### In Python
 
-```python
-@staticmethod
-def fnv1a64(key: str) -> int:
-    h = Hashing.FNV_OFFSET
-    for b in key.encode("utf-8"):
-        h ^= b
-        h = (h * Hashing.FNV_PRIME) & MASK64
-    return to_int64(h)
+The Python port (`code/python/main.py`) is the same design with four differences. **The hash is made signed on purpose:** Python ints never wrap, so every multiply is masked with `MASK64`, and `to_int64` reinterprets the result as the signed `long` Java holds; that matters for routing, because Java uses `Math.floorMod` on the signed value and Python's `%` with a positive divisor is exactly `floorMod`, while taking `%` of the *unsigned* value would send some keys to a different shard (for `n = 3` every negative hash moves, because `2**64 % 3 == 1`), and a Python-only test pins the difference. Python's built-in `hash()` is randomised per process and is never used. **Ordered containers are sorted at read time:** `TreeMap` and `TreeSet` become `dict` and `set`, and `lookup_customer`, `lookup`, `scan` and `all_entries` call `sorted(...)`; `Locator` is a `@dataclass(frozen=True, order=True)` whose field order `(shard_id, payment_id)` gives the same ordering as the Java `compareTo`, and `find_by_customer_global` groups by shard in an insertion-ordered `dict`, standing in for `LinkedHashMap`. **Errors:** constructor guards raise `ValueError` (Java `IllegalArgumentException`), a `Payment` with a `None` field raises `TypeError` where Java's `requireNonNull` throws `NullPointerException`, and `QueryResult.payments` is a tuple, the read-only list `Collections.unmodifiableList` returns. **Same bills:** request counters move on the same calls (including the `lookup_customer` calls `placement` makes), so every count in the demo matches Java line for line.
 
-@staticmethod
-def partition_for(key: str, partitions: int) -> int:
-    return Hashing.fnv1a64(key) % partitions
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Money, Payment, and a deterministic hash
+
+`Payment` is a frozen dataclass whose `__post_init__` is the `requireNonNull` guard. `Locator` is ordered by field order. `Hashing.fnv1a64` masks after each multiply and converts to signed with `to_int64`; `partition_for` is a plain `%`, which floors like `Math.floorMod` because the divisor is positive.
+
+```python
+@dataclass(frozen=True)
+class Payment:
+    id: str
+    customer_id: str
+    merchant_id: str
+    amount: Money
+    created_at: int
+
+    def __post_init__(self) -> None:
+        for name in ("id", "customer_id", "merchant_id", "amount"):
+            if getattr(self, name) is None:
+                raise TypeError(name)  # Java: Objects.requireNonNull -> NullPointerException
+
+
+@dataclass(frozen=True, order=True)
+class Locator:
+    shard_id: int
+    payment_id: str
+
+
+@dataclass(frozen=True)
+class Hashing:
+    FNV_OFFSET = 0xCBF29CE484222325
+    FNV_PRIME = 0x100000001B3
+
+    @staticmethod
+    def fnv1a64(key: str) -> int:
+        h = Hashing.FNV_OFFSET
+        for b in key.encode("utf-8"):
+            h ^= b
+            h = (h * Hashing.FNV_PRIME) & MASK64
+        return to_int64(h)
+
+    @staticmethod
+    def partition_for(key: str, partitions: int) -> int:
+        # Math.floorMod on the signed long: Python's % with a positive divisor already floors.
+        return Hashing.fnv1a64(key) % partitions
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: A shard with a local index
 
-- **The hash is made signed on purpose.** Python ints never wrap, so every multiply is masked with `MASK64`, and `to_int64` reinterprets the result as the signed `long` Java holds. That matters for routing: Java uses `Math.floorMod` on the signed value, and Python's `%` with a positive divisor is exactly `floorMod`. Taking `%` of the *unsigned* value would send some keys to a different shard (for `n = 3` every negative hash moves, because `2**64 % 3 == 1`); a Python-only test pins the difference. Python's built-in `hash()` is randomised per process and is never used.
-- **Ordered containers are sorted at read time.** `TreeMap` and `TreeSet` become `dict` and `set`, and `lookup_customer`, `lookup`, `scan` and `all_entries` call `sorted(...)`. `Locator` is a `@dataclass(frozen=True, order=True)`, whose field order `(shard_id, payment_id)` gives the same ordering as the Java `compareTo`. `find_by_customer_global` groups by shard in an insertion-ordered `dict`, standing in for `LinkedHashMap`.
-- **Errors.** Constructor guards raise `ValueError` (Java `IllegalArgumentException`); a `Payment` with a `None` field raises `TypeError` where Java's `requireNonNull` throws `NullPointerException`. `QueryResult.payments` is a tuple, the read-only list `Collections.unmodifiableList` returns.
-- **Same bills.** Request counters move on the same calls (including the `lookup_customer` calls `placement` makes), so every count in the demo matches Java line for line.
+`put` bumps the request counter, replaces the row, unindexes the previous row if its customer changed, and adds the id to the customer's set via `setdefault`. `lookup_customer` sorts the ids before resolving them, which is the `TreeSet` iteration order.
+
+```python
+    def put(self, p: Payment) -> Payment | None:
+        self._requests += 1
+        previous = self._rows.get(p.id)
+        self._rows[p.id] = p
+        if previous is not None and previous.customer_id != p.customer_id:
+            self._unindex(previous)
+        self._by_customer.setdefault(p.customer_id, set()).add(p.id)
+        return previous
+
+    def lookup_customer(self, customer_id: str) -> list[Payment]:
+        self._requests += 1
+        return [self._rows[i] for i in sorted(self._by_customer.get(customer_id, ()))]
+```
+
+#### Step 3: The global index, partitioned by customer
+
+Each partition is a `dict[str, set[Locator]]`; `Locator` is hashable because it is frozen. `apply` uses `set.discard` for the delete path and drops the customer's key when its set empties; `lookup` returns the sorted locators from one counted partition. `IndexUpdate` is the frozen dataclass with the sequence number.
+
+```python
+@dataclass(frozen=True)
+class IndexUpdate:
+    seq: int
+    customer_id: str
+    locator: Locator
+    delete: bool
+```
+
+```python
+    def apply(self, u: IndexUpdate) -> None:
+        p = self.partition_for(u.customer_id)
+        self._requests[p] += 1
+        part = self._partitions[p]
+        if u.delete:
+            s = part.get(u.customer_id)
+            if s is not None:
+                s.discard(u.locator)
+                if not s:
+                    del part[u.customer_id]
+        else:
+            part.setdefault(u.customer_id, set()).add(u.locator)
+
+    def lookup(self, customer_id: str) -> list[Locator]:
+        p = self.partition_for(customer_id)
+        self._requests[p] += 1
+        return sorted(self._partitions[p].get(customer_id, ()))
+```
+
+#### Step 4: The store and its two write modes
+
+`put` writes the shard and emits the delete-then-insert or insert that the index needs. `_emit` applies immediately in `SYNC` or appends to a `deque` in `ASYNC`; `drain_index_updates` pops from the left up to `max`.
+
+```python
+    def put(self, p: Payment) -> None:
+        shard_id = self.shard_for(p.id)
+        previous = self._shards[shard_id].put(p)
+        if previous is not None and previous.customer_id != p.customer_id:
+            self._emit(IndexUpdate(self._seq(), previous.customer_id, Locator(shard_id, p.id), True))
+        if previous is None or previous.customer_id != p.customer_id:
+            self._emit(IndexUpdate(self._seq(), p.customer_id, Locator(shard_id, p.id), False))
+
+    def _emit(self, u: IndexUpdate) -> None:
+        if self._mode is IndexMode.SYNC:
+            self._global_index.apply(u)
+        else:
+            self._pending.append(u)
+
+    def drain_index_updates(self, max: int) -> int:
+        applied = 0
+        while applied < max and self._pending:
+            self._global_index.apply(self._pending.popleft())
+            applied += 1
+        return applied
+```
+
+#### Step 5: The two query strategies, with their bills
+
+Scatter-gather extends from every shard and bills `len(self._shards)` shard requests. The global strategy groups locators by shard in an insertion-ordered dict and bills one shard request per distinct shard plus one index request. Both sort with a `(created_at, id)` key, and `QueryResult` holds a tuple.
+
+```python
+    def find_by_customer_scatter_gather(self, customer_id: str) -> QueryResult:
+        merged: list[Payment] = []
+        for s in self._shards:
+            merged.extend(s.lookup_customer(customer_id))
+        merged.sort(key=lambda p: (p.created_at, p.id))
+        return QueryResult(tuple(merged), len(self._shards), 0)
+
+    def find_by_customer_global(self, customer_id: str) -> QueryResult:
+        by_shard: dict[int, list[str]] = {}
+        for loc in self._global_index.lookup(customer_id):
+            by_shard.setdefault(loc.shard_id, []).append(loc.payment_id)
+        merged: list[Payment] = []
+        for shard_id, ids in by_shard.items():
+            merged.extend(self._shards[shard_id].get_many(ids))
+        merged.sort(key=lambda p: (p.created_at, p.id))
+        return QueryResult(tuple(merged), len(by_shard), 1)
+```
+
+#### Step 6: Rebuild and audit
+
+`rebuild_global_index` clears the index and the queue and re-applies an insert per scanned row. `audit_global_index` runs the two nested checks; `indexed.get(loc)` returns `None` for an unindexed row, which is never equal to a customer id, so the row is reported missing.
+
+```python
+    def rebuild_global_index(self) -> int:
+        self._global_index.clear()
+        self._pending.clear()
+        entries = 0
+        for s in self._shards:
+            for p in s.scan():
+                self._global_index.apply(IndexUpdate(self._seq(), p.customer_id, Locator(s.id, p.id), False))
+                entries += 1
+        return entries
+
+    def audit_global_index(self) -> IndexAudit:
+        indexed = self._global_index.all_entries()
+        dangling: list[Locator] = []
+        missing: list[Locator] = []
+        for loc, cust in indexed.items():
+            row = self._shards[loc.shard_id].get(loc.payment_id)
+            if row is None or row.customer_id != cust:
+                dangling.append(loc)
+        for s in self._shards:
+            for p in s.scan():
+                loc = Locator(s.id, p.id)
+                if p.customer_id != indexed.get(loc):
+                    missing.append(loc)
+        return IndexAudit(len(indexed), dangling, missing)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/10-secondary-indexes/code/python
@@ -412,39 +574,240 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The placement, bills and audits are the Java output:
+
+```console
+== Placement: payments hash to shards by payment id, not by customer ==
+shard 0 holds 3 rows
+shard 1 holds 4 rows
+shard 2 holds 2 rows
+shard 3 holds 3 rows
+cust_alice rows by shard: {0=[pay_011], 1=[pay_001, pay_005], 2=[pay_008], 3=[pay_003]}
+cust_erin rows by shard:  {3=[pay_010]}
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **The hash is made signed on purpose, and the remainder is `floorMod`:** the multiply runs in `uint64` so the wrap is free, but the result is converted to `int64` and the shard is `floorMod(hash, n)`, exactly `Math.floorMod` on Java's signed `long`; taking `uint64(hash) % uint64(n)` instead looks natural and is wrong, because for `n = 3` every negative hash lands on a different shard than Java (`2**64 % 3 == 1`), so `cust_alice` would move from index partition 1 to 2, and a Go-only test pins the difference. The two agree only when `n` is a power of two, which is why the four-shard demo cannot reveal the bug. **Errors are values; absence is a `bool`:** `NewPartitionedStore`, `NewGlobalIndex` and `NewPayment` return `(T, error)` with sentinels `ErrNoShards`, `ErrNoIndexPartition` and `ErrMissingField` (the `NullPointerException` from the record constructor); `Shard.Get`, `Shard.Put` and `PartitionedStore.Get` return `(Payment, bool)` in place of a nullable row, `Money.Plus` returns `(Money, error)` so `Total` does too, and `GetMany` skipping missing ids is a filter, not an error, in all three languages. **Ordered sets by hand:** `TreeSet<Locator>` and `TreeMap` become maps plus `sortedKeys`/`sortedLocators`, with `Locator.Less` as the comparator, so `Lookup`, `Scan`, `LookupCustomer` and the audit visit entries in the same order Java does, and `FindByCustomerGlobal` keeps a `shardOrder` slice beside its map to mirror the `LinkedHashMap`; never rely on Go's randomised map iteration. **Concurrency:** this lesson is single-threaded by design, so there is no mutex and `go test -race` passes trivially; a port that drains the queue from a goroutine must guard the index partitions with a mutex, and the staleness tests then need the drain to be externally triggered, exactly as here, or they become timing-dependent.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same placement, request counts and audits as the Java version, line for line.
+
+#### Step 1: Money, Payment, and a deterministic hash
+
+`NewPayment` is the validating constructor, returning `ErrMissingField` for an empty string where Java throws `NullPointerException`. `Locator.Less` is the comparator the sort helpers use. `Fnv1a64` computes in `uint64` and returns `int64`; `floorMod` fixes up the sign so a negative hash lands in `[0, n)`.
+
 ```go
-// Fnv1a64 returns the hash as a signed int64, the same bits Java's long holds.
-func Fnv1a64(key string) int64 {
-    h := fnvOffset
-    for i := 0; i < len(key); i++ {
-        h ^= uint64(key[i])
-        h *= fnvPrime
-    }
-    return int64(h)
+func NewPayment(id, customerID, merchantID string, amount Money, createdAt int64) (Payment, error) {
+	for name, v := range map[string]string{"id": id, "customerId": customerID, "merchantId": merchantID} {
+		if v == "" {
+			return Payment{}, fmt.Errorf("%w: %s", ErrMissingField, name)
+		}
+	}
+	return Payment{id, customerID, merchantID, amount, createdAt}, nil
 }
 
-// floorMod is Java's Math.floorMod: the result has the sign of the divisor.
+type Locator struct {
+	ShardID   int
+	PaymentID string
+}
+
+func (l Locator) Less(o Locator) bool {
+	if l.ShardID != o.ShardID {
+		return l.ShardID < o.ShardID
+	}
+	return l.PaymentID < o.PaymentID
+}
+
+func Fnv1a64(key string) int64 {
+	h := fnvOffset
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= fnvPrime
+	}
+	return int64(h)
+}
+
 func floorMod(x int64, n int64) int {
-    r := x % n
-    if r < 0 {
-        r += n
-    }
-    return int(r)
+	r := x % n
+	if r < 0 {
+		r += n
+	}
+	return int(r)
 }
 
 func PartitionFor(key string, partitions int) int {
-    return floorMod(Fnv1a64(key), int64(partitions))
+	return floorMod(Fnv1a64(key), int64(partitions))
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: A shard with a local index
 
-- **The hash is made signed on purpose, and the remainder is `floorMod`.** The multiply runs in `uint64` so the wrap is free, but the result is converted to `int64` and the shard is `floorMod(hash, n)`, exactly `Math.floorMod` on Java's signed `long`. Taking `uint64(hash) % uint64(n)` instead looks natural and is wrong: for `n = 3` every negative hash lands on a different shard than Java (`2**64 % 3 == 1`), so `cust_alice` would move from index partition 1 to 2. A Go-only test pins the difference. The two agree only when `n` is a power of two, which is why the four-shard demo cannot reveal the bug.
-- **Errors are values; absence is a `bool`.** `NewPartitionedStore`, `NewGlobalIndex` and `NewPayment` return `(T, error)` with sentinels `ErrNoShards`, `ErrNoIndexPartition` and `ErrMissingField` (the `NullPointerException` from the record constructor). `Shard.Get`, `Shard.Put` and `PartitionedStore.Get` return `(Payment, bool)` in place of a nullable row. `Money.Plus` returns `(Money, error)`, so `Total` does too. `GetMany` skipping missing ids is a filter, not an error, in all three languages.
-- **Ordered sets by hand.** `TreeSet<Locator>` and `TreeMap` become maps plus `sortedKeys`/`sortedLocators`, with `Locator.Less` as the comparator, so `Lookup`, `Scan`, `LookupCustomer` and the audit visit entries in the same order Java does. `FindByCustomerGlobal` keeps a `shardOrder` slice beside its map to mirror the `LinkedHashMap`. Never rely on Go's randomised map iteration.
-- **Concurrency.** This lesson is single-threaded by design, so there is no mutex and `go test -race` passes trivially. A port that drains the queue from a goroutine must guard the index partitions with a mutex; the staleness tests then need the drain to be externally triggered, exactly as here, or they become timing-dependent.
+`Put` returns `(previous, had)` in place of a nullable row, creates the per-customer set lazily, and otherwise follows the Java. `LookupCustomer` resolves ids in `sortedKeys` order.
+
+```go
+func (s *Shard) Put(p Payment) (Payment, bool) {
+	s.requests++
+	previous, had := s.rows[p.ID]
+	s.rows[p.ID] = p
+	if had && previous.CustomerID != p.CustomerID {
+		s.unindex(previous)
+	}
+	if s.byCustomer[p.CustomerID] == nil {
+		s.byCustomer[p.CustomerID] = map[string]bool{}
+	}
+	s.byCustomer[p.CustomerID][p.ID] = true
+	return previous, had
+}
+
+func (s *Shard) LookupCustomer(customerID string) []Payment {
+	s.requests++
+	out := []Payment{}
+	for _, id := range sortedKeys(s.byCustomer[customerID]) {
+		out = append(out, s.rows[id])
+	}
+	return out
+}
+```
+
+#### Step 3: The global index, partitioned by customer
+
+Each partition is a `map[string]map[Locator]bool`; `Locator` is a comparable struct, so it can be a map key. `Apply` deletes from a nil inner map harmlessly and removes an emptied customer; `Lookup` returns `sortedLocators` of one counted partition.
+
+```go
+func (g *GlobalIndex) Apply(u IndexUpdate) {
+	p := g.PartitionFor(u.CustomerID)
+	g.requests[p]++
+	part := g.partitions[p]
+	if u.Delete {
+		if set := part[u.CustomerID]; set != nil {
+			delete(set, u.Locator)
+			if len(set) == 0 {
+				delete(part, u.CustomerID)
+			}
+		}
+	} else {
+		if part[u.CustomerID] == nil {
+			part[u.CustomerID] = map[Locator]bool{}
+		}
+		part[u.CustomerID][u.Locator] = true
+	}
+}
+
+func (g *GlobalIndex) Lookup(customerID string) []Locator {
+	p := g.PartitionFor(customerID)
+	g.requests[p]++
+	return sortedLocators(g.partitions[p][customerID])
+}
+```
+
+#### Step 4: The store and its two write modes
+
+`Put` reads the `had` flag from the shard and emits through `newUpdate`, which assigns the sequence number. The pending queue is a slice; `DrainIndexUpdates` reslices from the front.
+
+```go
+func (s *PartitionedStore) Put(p Payment) {
+	shardID := s.ShardFor(p.ID)
+	previous, had := s.shards[shardID].Put(p)
+	if had && previous.CustomerID != p.CustomerID {
+		s.emit(s.newUpdate(previous.CustomerID, Locator{shardID, p.ID}, true))
+	}
+	if !had || previous.CustomerID != p.CustomerID {
+		s.emit(s.newUpdate(p.CustomerID, Locator{shardID, p.ID}, false))
+	}
+}
+
+func (s *PartitionedStore) emit(u IndexUpdate) {
+	if s.mode == Sync {
+		s.globalIndex.Apply(u)
+	} else {
+		s.pending = append(s.pending, u)
+	}
+}
+
+func (s *PartitionedStore) DrainIndexUpdates(max int) int {
+	applied := 0
+	for applied < max && len(s.pending) > 0 {
+		s.globalIndex.Apply(s.pending[0])
+		s.pending = s.pending[1:]
+		applied++
+	}
+	return applied
+}
+```
+
+#### Step 5: The two query strategies, with their bills
+
+`FindByCustomerGlobal` keeps `shardOrder` beside `byShard` so shards are fetched in first-seen order (the `LinkedHashMap`), and bills `len(shardOrder)` shard requests. Both strategies call `sortPayments`, which sorts by `CreatedAt` then `ID`.
+
+```go
+func (s *PartitionedStore) FindByCustomerScatterGather(customerID string) QueryResult {
+	merged := []Payment{}
+	for _, sh := range s.shards {
+		merged = append(merged, sh.LookupCustomer(customerID)...)
+	}
+	sortPayments(merged)
+	return QueryResult{merged, len(s.shards), 0}
+}
+
+func (s *PartitionedStore) FindByCustomerGlobal(customerID string) QueryResult {
+	locators := s.globalIndex.Lookup(customerID)
+	shardOrder := []int{} // LinkedHashMap: first-seen order of shards (locators are sorted, so ascending)
+	byShard := map[int][]string{}
+	for _, l := range locators {
+		if _, seen := byShard[l.ShardID]; !seen {
+			shardOrder = append(shardOrder, l.ShardID)
+		}
+		byShard[l.ShardID] = append(byShard[l.ShardID], l.PaymentID)
+	}
+	merged := []Payment{}
+	for _, shardID := range shardOrder {
+		merged = append(merged, s.shards[shardID].GetMany(byShard[shardID])...)
+	}
+	sortPayments(merged)
+	return QueryResult{merged, len(shardOrder), 1}
+}
+```
+
+#### Step 6: Rebuild and audit
+
+`RebuildGlobalIndex` sets `pending` to nil and re-inserts every scanned row. `AuditGlobalIndex` walks the indexed entries in `sortedLocatorKeys` order so the dangling list is deterministic; a missing map entry reads as `""`, which never equals a customer id, so an unindexed row is reported missing.
+
+```go
+func (s *PartitionedStore) RebuildGlobalIndex() int {
+	s.globalIndex.Clear()
+	s.pending = nil
+	entries := 0
+	for _, sh := range s.shards {
+		for _, p := range sh.Scan() {
+			s.globalIndex.Apply(s.newUpdate(p.CustomerID, Locator{sh.ID, p.ID}, false))
+			entries++
+		}
+	}
+	return entries
+}
+
+func (s *PartitionedStore) AuditGlobalIndex() IndexAudit {
+	indexed := s.globalIndex.AllEntries()
+	dangling, missing := []Locator{}, []Locator{}
+	for _, l := range sortedLocatorKeys(indexed) {
+		row, ok := s.shards[l.ShardID].Get(l.PaymentID)
+		if !ok || row.CustomerID != indexed[l] {
+			dangling = append(dangling, l)
+		}
+	}
+	for _, sh := range s.shards {
+		for _, p := range sh.Scan() {
+			l := Locator{sh.ID, p.ID}
+			if p.CustomerID != indexed[l] {
+				missing = append(missing, l)
+			}
+		}
+	}
+	return IndexAudit{len(indexed), dangling, missing}
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/10-secondary-indexes/code/go
@@ -452,7 +815,14 @@ go run .
 go test ./...
 ```
 
-The demo prints the same placement, request counts and audits as the Java version, line for line.
+```console
+after drain: 0 dangling, 0 missing, consistent=true
+
+== Bootstrap: rebuild the global index from a scan of every shard ==
+rebuilt 12 entries from 4 shards; consistent=true
+```
+
+Every section above these lines, placement included, matches the Java output.
 
 ## Use It
 

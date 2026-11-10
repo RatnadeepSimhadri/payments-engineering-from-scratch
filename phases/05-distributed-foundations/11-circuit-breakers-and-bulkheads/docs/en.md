@@ -380,51 +380,582 @@ The test files assert those exact totals in all three languages. If you change t
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **A `threading.Lock` instead of `synchronized`, and it is not reentrant.** Java's monitor lets `tryAcquire` call itself while holding the lock; a Python `Lock` would deadlock. The public `try_acquire` takes the lock once and delegates to `_try_acquire_locked`, which recurses without touching the lock. Go has the same split for the same reason. **`%` already floors.** Java needs `Math.floorMod` because `%` on a negative `long` is negative; Python's `%` always returns a non-negative result for a positive divisor, so `now_ms % self.bucket_ms` is the floor-mod directly. **The empty bucket is `None`, not `Long.MIN_VALUE`.** Python has no sentinel integer that is cheaper than `None`, and `None` reads as "never used" without a comment. **The GIL does not make this correct for free.** `self._in_flight += 1` is a read, an add, and a write, and a thread switch can land between them. The lock is still required, and `threading.BoundedSemaphore` is the standard-library equivalent of the hand-rolled bulkhead.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The clock and the vocabulary
+
+`Clock` is a `Protocol`, `FakeClock` the only implementation the lesson needs. The three vocabularies are `Enum`s and `Transition` is a frozen dataclass; `from_state`/`to_state` avoid the `from` keyword.
+
 ```python
-def _try_acquire_locked(self) -> bool:
-    now = self.clock.now_ms()
-    if self._state is State.CLOSED:
-        return True
-    if self._state is State.OPEN:
-        if now - self._opened_at_ms < self.config.open_duration_ms:
-            self._rejected += 1
-            return False
-        self._transition_to(State.HALF_OPEN)
-        self._probes_issued = 0
-        self._probe_successes = 0
-        return self._try_acquire_locked()
-    ...
+class FakeClock:
+    def __init__(self, start_ms: int = 0) -> None:
+        self._now = start_ms
+
+    def now_ms(self) -> int:
+        return self._now
+
+    def advance(self, ms: int) -> None:
+        if ms < 0:
+            raise ValueError("cannot advance a negative duration")
+        self._now += ms
+
+
+class State(Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+
+class Admission(Enum):
+    ADMITTED = "ADMITTED"
+    REJECTED_OPEN = "REJECTED_OPEN"
+    REJECTED_BULKHEAD = "REJECTED_BULKHEAD"
+
+
+class CallOutcome(Enum):
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+    REJECTED_OPEN = "REJECTED_OPEN"
+    REJECTED_BULKHEAD = "REJECTED_BULKHEAD"
+
+
+@dataclass(frozen=True)
+class Transition:
+    from_state: State
+    to_state: State
+    at_ms: int
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The configuration, validated once
 
-- **A `threading.Lock` instead of `synchronized`, and it is not reentrant.** Java's monitor lets `tryAcquire` call itself while holding the lock; a Python `Lock` would deadlock. The public `try_acquire` takes the lock once and delegates to `_try_acquire_locked`, which recurses without touching the lock. Go has the same split for the same reason.
-- **`%` already floors.** Java needs `Math.floorMod` because `%` on a negative `long` is negative; Python's `%` always returns a non-negative result for a positive divisor, so `now_ms % self.bucket_ms` is the floor-mod directly.
-- **The empty bucket is `None`, not `Long.MIN_VALUE`.** Python has no sentinel integer that is cheaper than `None`, and `None` reads as "never used" without a comment.
-- **The GIL does not make this correct for free.** `self._in_flight += 1` is a read, an add, and a write, and a thread switch can land between them. The lock is still required, and `threading.BoundedSemaphore` is the standard-library equivalent of the hand-rolled bulkhead.
+A frozen dataclass with the five checks in `__post_init__`, each raising `ValueError` with the Java message.
+
+```python
+class BreakerConfig:
+    failure_rate_threshold_percent: int
+    minimum_calls: int
+    window_ms: int
+    bucket_ms: int
+    open_duration_ms: int
+    half_open_permits: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.failure_rate_threshold_percent <= 100:
+            raise ValueError("threshold must be 1..100")
+        if self.minimum_calls < 1:
+            raise ValueError("minimum_calls must be >= 1")
+        if self.bucket_ms <= 0 or self.window_ms < self.bucket_ms or self.window_ms % self.bucket_ms != 0:
+            raise ValueError("window_ms must be a positive multiple of bucket_ms")
+        if self.open_duration_ms <= 0:
+            raise ValueError("open_duration_ms must be positive")
+        if self.half_open_permits < 1:
+            raise ValueError("half_open_permits must be >= 1")
+```
+
+#### Step 3: The sliding window as a ring of buckets
+
+Three parallel lists; `_bucket_start` holds `None` for a never-used slot. `record` relabels a stale slot before counting into it, `_live` is the one expiry rule, and the rate uses `//` on non-negative values, so every language gets the same integer percent.
+
+```python
+    def record(self, now_ms: int, success: bool) -> None:
+        start = now_ms - (now_ms % self.bucket_ms)          # Python % already floors like Math.floorMod
+        i = (start // self.bucket_ms) % len(self._bucket_start)
+        if self._bucket_start[i] != start:                 # the slot belongs to an older period: reuse it
+            self._bucket_start[i] = start
+            self._successes[i] = 0
+            self._failures[i] = 0
+        if success:
+            self._successes[i] += 1
+        else:
+            self._failures[i] += 1
+
+    def _live(self, i: int, now_ms: int) -> bool:
+        start = self._bucket_start[i]
+        return start is not None and now_ms - start < self.window_ms
+
+    def total(self, now_ms: int) -> int:
+        return sum(self._successes[i] + self._failures[i]
+                   for i in range(len(self._bucket_start)) if self._live(i, now_ms))
+
+    def failures(self, now_ms: int) -> int:
+        return sum(self._failures[i] for i in range(len(self._bucket_start)) if self._live(i, now_ms))
+
+    def failure_rate_percent(self, now_ms: int) -> int:
+        """Integer percent, 0 when the window is empty. Integer arithmetic so every language agrees."""
+        t = self.total(now_ms)
+        return 0 if t == 0 else (100 * self.failures(now_ms)) // t
+```
+
+#### Step 4: The state machine, with the transition inside tryAcquire
+
+`try_acquire` takes the non-reentrant lock once; `_try_acquire_locked` holds the logic and recurses on the OPEN-to-HALF_OPEN edge without re-locking. The `if`/`elif` on `State` members with `is` replaces the Java `switch`.
+
+```python
+    def try_acquire(self) -> bool:
+        with self._lock:
+            return self._try_acquire_locked()
+
+    def _try_acquire_locked(self) -> bool:
+        now = self.clock.now_ms()
+        if self._state is State.CLOSED:
+            return True
+        if self._state is State.OPEN:
+            if now - self._opened_at_ms < self.config.open_duration_ms:
+                self._rejected += 1
+                return False
+            self._transition_to(State.HALF_OPEN)
+            self._probes_issued = 0
+            self._probe_successes = 0
+            return self._try_acquire_locked()
+        # HALF_OPEN
+        if self._probes_issued >= self.config.half_open_permits:
+            self._rejected += 1
+            return False
+        self._probes_issued += 1
+        return True
+```
+
+`on_success` and `on_failure` hold the lock for the whole update. The trip condition checks `minimum_calls` then the rate against the same `now`; a HALF_OPEN failure restarts the open timer; closing resets the window.
+
+```python
+    def on_success(self) -> None:
+        with self._lock:
+            now = self.clock.now_ms()
+            if self._state is State.CLOSED:
+                self._window.record(now, True)
+            elif self._state is State.HALF_OPEN:
+                self._probe_successes += 1
+                if self._probe_successes >= self.config.half_open_permits:
+                    self._window.reset()
+                    self._transition_to(State.CLOSED)
+            # OPEN: a late result from before the trip; it says nothing about the dependency now
+
+    def on_failure(self) -> None:
+        with self._lock:
+            now = self.clock.now_ms()
+            if self._state is State.CLOSED:
+                self._window.record(now, False)
+                if (self._window.total(now) >= self.config.minimum_calls
+                        and self._window.failure_rate_percent(now) >= self.config.failure_rate_threshold_percent):
+                    self._opened_at_ms = now
+                    self._transition_to(State.OPEN)
+            elif self._state is State.HALF_OPEN:
+                self._opened_at_ms = now
+                self._transition_to(State.OPEN)
+            # OPEN: late result; already open
+```
+
+#### Step 5: The bulkhead
+
+A counter under a lock; `release` without a matching acquire raises `RuntimeError` instead of letting the count go negative.
+
+```python
+class Bulkhead:
+    def __init__(self, max_concurrent: int) -> None:
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be >= 1")
+        self.max_concurrent = max_concurrent
+        self._in_flight = 0
+        self._rejected = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._in_flight >= self.max_concurrent:
+                self._rejected += 1
+                return False
+            self._in_flight += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            if self._in_flight == 0:
+                raise RuntimeError("release without acquire")
+            self._in_flight -= 1
+```
+
+#### Step 6: Composition, bulkhead first
+
+`begin` asks the bulkhead first and gives the permit back if the breaker refuses; `call` catches any `Exception` from the operation and counts it as a failure, so a dependency's exception can never escape as the caller's crash.
+
+```python
+    def begin(self) -> Admission:
+        if not self.bulkhead.try_acquire():
+            return Admission.REJECTED_BULKHEAD
+        if not self.breaker.try_acquire():
+            self.bulkhead.release()
+            return Admission.REJECTED_OPEN
+        return Admission.ADMITTED
+
+    def complete(self, success: bool) -> None:
+        self.bulkhead.release()
+        if success:
+            self.breaker.on_success()
+        else:
+            self.breaker.on_failure()
+
+    def call(self, op: Callable[[], bool]) -> CallOutcome:
+        a = self.begin()
+        if a is Admission.REJECTED_BULKHEAD:
+            return CallOutcome.REJECTED_BULKHEAD
+        if a is Admission.REJECTED_OPEN:
+            return CallOutcome.REJECTED_OPEN
+        try:
+            ok = bool(op())
+        except Exception:      # the dependency's exception is a failure, never a crash of the caller
+            ok = False
+        self.complete(ok)
+        return CallOutcome.SUCCESS if ok else CallOutcome.FAILURE
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/05-distributed-foundations/11-circuit-breakers-and-bulkheads/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The transitions and totals are identical to Java; only the Python method names and `True`/`False` differ in the hand-driven section:
+
+```console
+== Breaker by hand: 50% of at least 10 calls, open 3 s, 3 probes ==
+5 ok + 4 fail: rate=44% state=CLOSED (9 calls, below minimum_calls=10)
+5 ok + 5 fail: rate=50% state=OPEN
+t=0 try_acquire=False (fail fast, no call made)
+t=2999 try_acquire=False state=OPEN
+t=3000 try_acquire=True state=HALF_OPEN (first caller after the open duration performs the transition)
+probe failed: state=OPEN, open timer restarted at t=3000
+t=6000 three probes succeeded: state=CLOSED
+
+== Card processor outage: 20 auth/s, bulkhead 10, 2 s timeout, processor dead from t=5 s to t=15 s ==
+transitions:
+  t=  9000 ms  CLOSED -> OPEN
+  t= 12000 ms  OPEN -> HALF_OPEN
+  t= 14000 ms  HALF_OPEN -> OPEN
+  t= 17000 ms  OPEN -> HALF_OPEN
+  t= 17100 ms  HALF_OPEN -> CLOSED
+totals: ok=260 fail=23 rejected_open=157 rejected_bulkhead=60
+calls that waited 2 s for a dead processor: 23 of 200 calls during the outage
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with four differences. **Errors are values; invalid configuration is an error, not a panic.** `NewBreakerConfig`, `NewSlidingWindow`, and `NewBulkhead` return `(T, error)` wrapping the sentinel `ErrConfig`, and `Bulkhead.Release` returns `ErrReleaseWithoutAcquire` instead of throwing. The tests use `errors.Is`. **A `sync.Mutex` with `defer Unlock`.** Every public method locks on entry and unlocks on return; `tryAcquireLocked` carries the recursion as in Python. `go test -race ./...` must pass, and the test file includes 64 goroutines hammering one bulkhead to prove the counter never exceeds its limit. **A panic inside the operation is recovered and counted as a failure.** Go has no checked exceptions; `runSafely` uses `defer`/`recover` so that a panicking dependency client cannot take the caller down and still releases the bulkhead permit. **The production bulkhead is a buffered channel.** `make(chan struct{}, n)` with a non-blocking `select` send is the idiomatic Go semaphore; `golang.org/x/sync/semaphore` is the weighted version. The hand-rolled counter here exists so the design matches Java and Python.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The clock and the vocabulary
+
+`FakeClock.Advance` panics on a negative duration, a caller bug. The three vocabularies are `int` types with `iota` constants (the outcome names carry an `Outcome` prefix to avoid colliding with `Admission`'s), and `Transition` is a plain struct.
+
 ```go
-func (g *GuardedCall) Call(op func() bool) CallOutcome {
-    switch g.Begin() {
-    case RejectedBulkhead:
-        return OutcomeRejectedBulkhead
-    case RejectedOpen:
-        return OutcomeRejectedOpen
-    }
-    ok := runSafely(op)      // recover() turns a panic in op into a failure
-    g.Complete(ok)
-    ...
+type Clock interface {
+	NowMs() int64
+}
+
+type FakeClock struct{ now int64 }
+
+func (c *FakeClock) NowMs() int64 { return c.now }
+
+func (c *FakeClock) Advance(ms int64) {
+	if ms < 0 {
+		panic("cannot advance a negative duration")
+	}
+	c.now += ms
+}
+
+type State int
+
+const (
+	Closed State = iota
+	Open
+	HalfOpen
+)
+
+type Admission int
+
+const (
+	Admitted Admission = iota
+	RejectedOpen
+	RejectedBulkhead
+)
+
+type CallOutcome int
+
+const (
+	OutcomeSuccess CallOutcome = iota
+	OutcomeFailure
+	OutcomeRejectedOpen
+	OutcomeRejectedBulkhead
+)
+
+type Transition struct {
+	From, To State
+	AtMs     int64
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The configuration, validated once
 
-- **Errors are values; invalid configuration is an error, not a panic.** `NewBreakerConfig`, `NewSlidingWindow`, and `NewBulkhead` return `(T, error)` wrapping the sentinel `ErrConfig`, and `Bulkhead.Release` returns `ErrReleaseWithoutAcquire` instead of throwing. The tests use `errors.Is`.
-- **A `sync.Mutex` with `defer Unlock`.** Every public method locks on entry and unlocks on return; `tryAcquireLocked` carries the recursion as in Python. `go test -race ./...` must pass, and the test file includes 64 goroutines hammering one bulkhead to prove the counter never exceeds its limit.
-- **A panic inside the operation is recovered and counted as a failure.** Go has no checked exceptions; `runSafely` uses `defer`/`recover` so that a panicking dependency client cannot take the caller down and still releases the bulkhead permit.
-- **The production bulkhead is a buffered channel.** `make(chan struct{}, n)` with a non-blocking `select` send is the idiomatic Go semaphore; `golang.org/x/sync/semaphore` is the weighted version. The hand-rolled counter here exists so the design matches Java and Python.
+`NewBreakerConfig` performs the five checks and returns an `ErrConfig`-wrapped error for each; `mustConfig` in the demo panics on the known-good constants.
+
+```go
+func NewBreakerConfig(thresholdPercent, minimumCalls int, windowMs, bucketMs, openDurationMs int64, halfOpenPermits int) (BreakerConfig, error) {
+	if thresholdPercent < 1 || thresholdPercent > 100 {
+		return BreakerConfig{}, fmt.Errorf("%w: threshold must be 1..100", ErrConfig)
+	}
+	if minimumCalls < 1 {
+		return BreakerConfig{}, fmt.Errorf("%w: minimumCalls must be >= 1", ErrConfig)
+	}
+	if bucketMs <= 0 || windowMs < bucketMs || windowMs%bucketMs != 0 {
+		return BreakerConfig{}, fmt.Errorf("%w: windowMs must be a positive multiple of bucketMs", ErrConfig)
+	}
+	if openDurationMs <= 0 {
+		return BreakerConfig{}, fmt.Errorf("%w: openDurationMs must be positive", ErrConfig)
+	}
+	if halfOpenPermits < 1 {
+		return BreakerConfig{}, fmt.Errorf("%w: halfOpenPermits must be >= 1", ErrConfig)
+	}
+	return BreakerConfig{thresholdPercent, minimumCalls, windowMs, bucketMs, openDurationMs, halfOpenPermits}, nil
+}
+```
+
+#### Step 3: The sliding window as a ring of buckets
+
+Go's `%` keeps the dividend's sign like Java's, so `floorMod` is written out. The never-used marker is a parallel `live []bool` rather than a sentinel value. The rate divides with `/`, truncating like Java.
+
+```go
+func floorMod(a, b int64) int64 {
+	m := a % b
+	if m < 0 {
+		m += b
+	}
+	return m
+}
+
+func (w *SlidingWindow) Record(nowMs int64, success bool) {
+	start := nowMs - floorMod(nowMs, w.bucketMs)
+	i := int(floorMod(start/w.bucketMs, int64(len(w.bucketStart))))
+	if !w.live[i] || w.bucketStart[i] != start { // the slot belongs to an older period: reuse it
+		w.bucketStart[i] = start
+		w.live[i] = true
+		w.successes[i] = 0
+		w.failures[i] = 0
+	}
+	if success {
+		w.successes[i]++
+	} else {
+		w.failures[i]++
+	}
+}
+
+func (w *SlidingWindow) isLive(i int, nowMs int64) bool {
+	return w.live[i] && nowMs-w.bucketStart[i] < w.windowMs
+}
+
+func (w *SlidingWindow) FailureRatePercent(nowMs int64) int {
+	t := w.Total(nowMs)
+	if t == 0 {
+		return 0
+	}
+	return 100 * w.Failures(nowMs) / t
+}
+```
+
+#### Step 4: The state machine, with the transition inside tryAcquire
+
+`TryAcquire` locks with `defer` and calls `tryAcquireLocked`, which recurses once from `Open` into the `HalfOpen` rule without re-locking (`sync.Mutex` is not reentrant). The `default` arm is `HalfOpen`.
+
+```go
+func (b *CircuitBreaker) TryAcquire() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.tryAcquireLocked()
+}
+
+func (b *CircuitBreaker) tryAcquireLocked() bool {
+	now := b.clock.NowMs()
+	switch b.state {
+	case Closed:
+		return true
+	case Open:
+		if now-b.openedAtMs < b.config.OpenDurationMs {
+			b.rejected++
+			return false
+		}
+		b.transitionTo(HalfOpen)
+		b.probesIssued = 0
+		b.probeSuccesses = 0
+		return b.tryAcquireLocked()
+	default: // HalfOpen
+		if b.probesIssued >= b.config.HalfOpenPermits {
+			b.rejected++
+			return false
+		}
+		b.probesIssued++
+		return true
+	}
+}
+```
+
+```go
+func (b *CircuitBreaker) OnSuccess() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.clock.NowMs()
+	switch b.state {
+	case Closed:
+		b.window.Record(now, true)
+	case HalfOpen:
+		b.probeSuccesses++
+		if b.probeSuccesses >= b.config.HalfOpenPermits {
+			b.window.Reset()
+			b.transitionTo(Closed)
+		}
+	case Open:
+		// a late result from before the trip; it says nothing about the dependency now
+	}
+}
+
+func (b *CircuitBreaker) OnFailure() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.clock.NowMs()
+	switch b.state {
+	case Closed:
+		b.window.Record(now, false)
+		if b.window.Total(now) >= b.config.MinimumCalls &&
+			b.window.FailureRatePercent(now) >= b.config.FailureRateThresholdPercent {
+			b.openedAtMs = now
+			b.transitionTo(Open)
+		}
+	case HalfOpen:
+		b.openedAtMs = now
+		b.transitionTo(Open)
+	case Open:
+		// late result; already open
+	}
+}
+```
+
+#### Step 5: The bulkhead
+
+A mutex-guarded counter; `Release` returns `ErrReleaseWithoutAcquire` rather than panicking, and `NewBulkhead` rejects a non-positive limit with `ErrConfig`.
+
+```go
+type Bulkhead struct {
+	mu            sync.Mutex
+	maxConcurrent int
+	inFlight      int
+	rejected      int64
+}
+
+var ErrReleaseWithoutAcquire = errors.New("release without acquire")
+
+func (h *Bulkhead) TryAcquire() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.inFlight >= h.maxConcurrent {
+		h.rejected++
+		return false
+	}
+	h.inFlight++
+	return true
+}
+
+func (h *Bulkhead) Release() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.inFlight == 0 {
+		return ErrReleaseWithoutAcquire
+	}
+	h.inFlight--
+	return nil
+}
+```
+
+#### Step 6: Composition, bulkhead first
+
+`Begin` and `Complete` discard `Release`'s error with `_ =` because the guard owns the pairing. `Call` runs the operation through `runSafely`, whose deferred `recover` turns a panic into `ok = false`, so the permit is still released and the breaker still hears about the failure.
+
+```go
+func (g *GuardedCall) Begin() Admission {
+	if !g.Bulkhead.TryAcquire() {
+		return RejectedBulkhead
+	}
+	if !g.Breaker.TryAcquire() {
+		_ = g.Bulkhead.Release()
+		return RejectedOpen
+	}
+	return Admitted
+}
+
+func (g *GuardedCall) Complete(success bool) {
+	_ = g.Bulkhead.Release()
+	if success {
+		g.Breaker.OnSuccess()
+	} else {
+		g.Breaker.OnFailure()
+	}
+}
+
+// Call runs op under the guard. A panic inside op is a failure of the dependency, not of the caller.
+func (g *GuardedCall) Call(op func() bool) CallOutcome {
+	switch g.Begin() {
+	case RejectedBulkhead:
+		return OutcomeRejectedBulkhead
+	case RejectedOpen:
+		return OutcomeRejectedOpen
+	}
+	ok := runSafely(op)
+	g.Complete(ok)
+	if ok {
+		return OutcomeSuccess
+	}
+	return OutcomeFailure
+}
+
+func runSafely(op func() bool) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
+	return op()
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/05-distributed-foundations/11-circuit-breakers-and-bulkheads/code/go
+go run .
+go test -race ./...
+```
+
+The simulation table, transitions, and totals are identical to the Java and Python runs:
+
+```console
+== Breaker by hand: 50% of at least 10 calls, open 3 s, 3 probes ==
+5 ok + 4 fail: rate=44% state=CLOSED (9 calls, below minimumCalls=10)
+5 ok + 5 fail: rate=50% state=OPEN
+t=0 tryAcquire=false (fail fast, no call made)
+t=2999 tryAcquire=false state=OPEN
+t=3000 tryAcquire=true state=HALF_OPEN (first caller after the open duration performs the transition)
+
+== Card processor outage: 20 auth/s, bulkhead 10, 2 s timeout, processor dead from t=5 s to t=15 s ==
+transitions:
+  t=  9000 ms  CLOSED -> OPEN
+  t= 12000 ms  OPEN -> HALF_OPEN
+  t= 14000 ms  HALF_OPEN -> OPEN
+  t= 17000 ms  OPEN -> HALF_OPEN
+  t= 17100 ms  HALF_OPEN -> CLOSED
+totals: ok=260 fail=23 rejected_open=157 rejected_bulkhead=60
+calls that waited 2 s for a dead processor: 23 of 200 calls during the outage
+```
 
 ## Use It
 

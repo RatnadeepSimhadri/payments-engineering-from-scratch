@@ -411,63 +411,597 @@ bundle with the review result changed: ok=false first bad=#5  entry #5 content d
 
 ### In Python
 
-```python
-def stamp(self, digest_hex: str) -> TimestampToken:
-    t = self._clock()
-    unsigned = TimestampToken(digest_hex, t, "")
-    mac = hmac.new(self._key, unsigned.signed_bytes(), hashlib.sha256).digest()
-    return TimestampToken(digest_hex, t, b64(mac))
+The Python port (`code/python/main.py`, tests in `test_main.py`) builds the same log: every entry hash, both Merkle roots, both head hashes, and every audit path are byte-identical to the Java output, because they use only SHA-256 and netstrings. One substitution changes the seal, and it changes what the seal proves. **The seal is HMAC-SHA256, not Ed25519:** the standard library has no Ed25519, so `TimestampAuthority` holds a 32-byte secret key and seals with `hmac.new(key, signed_bytes, sha256)`. The log operator never holds that key, so it still cannot move a seal's time, swap a root, or mint a seal of its own; every tamper test from the Java suite passes, plus one that tries exactly that with a different key. The difference is who can check: an Ed25519 public key lets anyone verify and nobody but the authority sign, while an HMAC key lets whoever holds it do both. The regulator must get the key from the authority out of band and must be trusted not to forge with it; for evidence that has to convince a third party, use an asymmetric signature (RFC 3161 tokens are RSA or ECDSA signed). **Names follow the substitution:** because the key is secret, the bundle carries `tsa-key-id` (a SHA-256 fingerprint of the key) where the Java bundle carries `tsa-public-key`, and the methods are `verification_key_base64()` and `tsa_verification_key()`; `verify_bundle` with no trusted key reports a problem rather than falling back to a key inside the bundle, since there is none. In the demo only the `tsa-signature` and `tsa-key-id` lines differ from the Java output. **The verifier is a separate entry point in the same file:** `Verifier` lives in `main.py` (one file per lesson), and the regulator runs it as `python3 main.py verify bundle.txt <trusted-key>`, which prints the decoded entries and `VERIFIED` (exit 0) or each problem and `FAILED` (exit 1). **Java string and time behaviour is ported where it matters:** `java_split` drops trailing empty strings like `String.split`; `instant_str` prints `2026-01-01T00:08:06.250Z` like `Instant.toString()`; netstring lengths count `len(s.encode("utf-8"))` bytes, and the parser rejects lengths that `Integer.parseInt` would reject even though `int()` accepts them. Comparisons of digests use `hmac.compare_digest`, the constant-time equivalent of `MessageDigest.isEqual`.
 
-@staticmethod
-def verify(key_base64: Optional[str], token: TimestampToken) -> bool:
-    ...
-    expected = hmac.new(key, token.signed_bytes(), hashlib.sha256).digest()
-    return hmac.compare_digest(expected, sig)
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Canonical bytes
+
+`netstrings` encodes each field to UTF-8 first and uses the byte length, never `len(f)`, which counts code points; the result is assembled in a `bytearray`.
+
+```python
+    @staticmethod
+    def netstrings(*fields: str) -> bytes:
+        """Netstrings: "5:hello,". Length-prefixing makes the encoding injective. Lengths count UTF-8 bytes."""
+        out = bytearray()
+        for f in fields:
+            utf8 = f.encode("utf-8")
+            out += str(len(utf8)).encode("ascii") + b":" + utf8 + b","
+        return bytes(out)
 ```
 
-`code/python/main.py` builds the same log: every entry hash, both Merkle roots, both head hashes, and every audit path are byte-identical to the Java output, because they use only SHA-256 and netstrings. One substitution changes the seal, and it changes what the seal proves:
+#### Step 2: The entry
 
-- **The seal is HMAC-SHA256, not Ed25519.** The standard library has no Ed25519, so `TimestampAuthority` holds a 32-byte secret key and seals with `hmac.new(key, signed_bytes, sha256)`. The log operator never holds that key, so it still cannot move a seal's time, swap a root, or mint a seal of its own; every tamper test from the Java suite passes, plus one that tries exactly that with a different key. The difference is who can check: an Ed25519 public key lets anyone verify and nobody but the authority sign, while an HMAC key lets whoever holds it do both. The regulator must get the key from the authority out of band and must be trusted not to forge with it. For evidence that has to convince a third party, use an asymmetric signature (RFC 3161 tokens are RSA or ECDSA signed).
-- **Names follow the substitution.** Because the key is secret, the bundle carries `tsa-key-id` (a SHA-256 fingerprint of the key) where the Java bundle carries `tsa-public-key`, and the methods are `verification_key_base64()` and `tsa_verification_key()`. `verify_bundle` with no trusted key reports a problem rather than falling back to a key inside the bundle, since there is none. In the demo only the `tsa-signature` and `tsa-key-id` lines differ from the Java output.
-- **The verifier is a separate entry point in the same file.** `Verifier` lives in `main.py` (one file per lesson), and the regulator runs it as `python3 main.py verify bundle.txt <trusted-key>`, which prints the decoded entries and `VERIFIED` (exit 0) or each problem and `FAILED` (exit 1).
-- **Java string and time behaviour is ported where it matters.** `java_split` drops trailing empty strings like `String.split`; `instant_str` prints `2026-01-01T00:08:06.250Z` like `Instant.toString()`; netstring lengths count `len(s.encode("utf-8"))` bytes, and the parser rejects lengths that `Integer.parseInt` would reject even though `int()` accepts them. Comparisons of digests use `hmac.compare_digest`, the constant-time equivalent of `MessageDigest.isEqual`.
+`create` sorts the payload into a new dict (Python dicts keep insertion order, so a sorted dict plays the `TreeMap`), hashes the canonical bytes, and builds the frozen `Entry`. `canonical_of` puts the payload count before the pairs and iterates `sorted(payload)` again, so the bytes never depend on the caller's key order.
 
-Run it from `code/python/`:
+```python
+    @staticmethod
+    def create(seq: int, ts: int, prev_hash: str, kind: str, subject: str, payload: dict) -> "Entry":
+        srt = dict(sorted(payload.items()))
+        h = Crypto.sha256_hex(Entry.canonical_of(seq, ts, prev_hash, kind, subject, srt))
+        return Entry(seq, ts, prev_hash, kind, subject, srt, h)
+
+    @staticmethod
+    def canonical_of(seq: int, ts: int, prev_hash: str, kind: str, subject: str, payload: dict) -> bytes:
+        """The exact bytes that are hashed. Field order is fixed; payload keys are sorted; every field is length-prefixed."""
+        fields = [Entry.VERSION, str(seq), str(ts), prev_hash, kind, subject, str(len(payload))]
+        for k in sorted(payload):
+            fields += [k, payload[k]]
+        return Crypto.netstrings(*fields)
+
+    def canonical(self) -> bytes:
+        return Entry.canonical_of(self.seq, self.timestamp_millis, self.prev_hash, self.kind, self.subject, self.payload)
+
+    def recompute_hash(self) -> str:
+        return Crypto.sha256_hex(self.canonical())
+```
+
+#### Step 3: Append-only with a monotonic clock
+
+`append` reads the injected clock (a callable), refuses a timestamp earlier than the last entry's with `RuntimeError` before anything is built, and chains `prev_hash` from the last entry or `ZERO_HASH`. Equal timestamps are allowed.
+
+```python
+    def append(self, kind: str, subject: str, payload: dict) -> Entry:
+        ts = self._clock()
+        last = self._entries[-1] if self._entries else None
+        if last is not None and ts < last.timestamp_millis:
+            raise RuntimeError(f"clock went backwards: {ts} < {last.timestamp_millis}")
+        e = Entry.create(len(self._entries), ts, Crypto.ZERO_HASH if last is None else last.hash, kind, subject, payload)
+        self._entries.append(e)
+        return e
+```
+
+#### Step 4: The Merkle root and audit path
+
+`root` and `_audit_path` are the RFC 6962 recursions with `split(n)` at the largest power of two below `n`; `audit_path` raises `IndexError` for a leaf the tree does not have.
+
+```python
+    def root(leaves: list, lo: int = 0, hi: Optional[int] = None) -> bytes:
+        """MTH(D[lo:hi]). Empty tree is SHA-256 of the empty string."""
+        if hi is None:
+            hi = len(leaves)
+        n = hi - lo
+        if n == 0:
+            return Crypto.sha256()
+        if n == 1:
+            return Merkle.leaf_hash(leaves[lo])
+        k = Merkle.split(n)
+        return Merkle.node_hash(Merkle.root(leaves, lo, lo + k), Merkle.root(leaves, lo + k, hi))
+
+    @staticmethod
+    def _audit_path(leaves: list, m: int, lo: int, hi: int) -> list[bytes]:
+        n = hi - lo
+        if n <= 1:
+            return []
+        k = Merkle.split(n)
+        if m < k:
+            path = Merkle._audit_path(leaves, m, lo, lo + k)
+            path.append(Merkle.root(leaves, lo + k, hi))
+        else:
+            path = Merkle._audit_path(leaves, m - k, lo + k, hi)
+            path.append(Merkle.root(leaves, lo, lo + k))
+        return path
+
+    @staticmethod
+    def audit_path(leaves: list, m: int) -> list[bytes]:
+        """PATH(m, D[0:n]): the sibling hashes from leaf m up to the root, bottom first."""
+        if m < 0 or m >= len(leaves):
+            raise IndexError(f"leaf {m} of {len(leaves)}")
+        return Merkle._audit_path(leaves, m, 0, len(leaves))
+```
+
+#### Step 5: Verifying inclusion
+
+`verify_inclusion` is RFC 9162 section 2.1.3.2 with the same `fn`/`sn` bookkeeping; the final comparison uses `hmac.compare_digest` for constant time.
+
+```python
+    @staticmethod
+    def verify_inclusion(leaf_data: bytes, index: int, tree_size: int, path: list[bytes], expected_root: bytes) -> bool:
+        """RFC 9162 section 2.1.3.2: recompute the root from one leaf and its path. O(log n) hashes."""
+        if index < 0 or index >= tree_size:
+            return False
+        fn, sn = index, tree_size - 1
+        r = Merkle.leaf_hash(leaf_data)
+        for p in path:
+            if sn == 0:
+                return False
+            if fn & 1 == 1 or fn == sn:
+                r = Merkle.node_hash(p, r)
+                if fn & 1 == 0:
+                    while fn & 1 == 0 and fn != 0:
+                        fn >>= 1
+                        sn >>= 1
+            else:
+                r = Merkle.node_hash(r, p)
+            fn >>= 1
+            sn >>= 1
+        return sn == 0 and hmac.compare_digest(r, expected_root)
+```
+
+#### Step 6: The anchor
+
+`stamp` reads the TSA's own clock and seals the netstring of version, digest, and time with HMAC-SHA256. `verify` decodes defensively and compares in constant time. `seal` computes the root and head and asks the TSA to stamp the statement digest.
+
+```python
+    def stamp(self, digest_hex: str) -> TimestampToken:
+        t = self._clock()
+        unsigned = TimestampToken(digest_hex, t, "")
+        mac = hmac.new(self._key, unsigned.signed_bytes(), hashlib.sha256).digest()
+        return TimestampToken(digest_hex, t, b64(mac))
+
+    @staticmethod
+    def verify(key_base64: Optional[str], token: TimestampToken) -> bool:
+        try:
+            key = unb64(key_base64)
+            sig = unb64(token.signature_base64)
+        except (binascii.Error, ValueError, TypeError):
+            return False
+        expected = hmac.new(key, token.signed_bytes(), hashlib.sha256).digest()
+        return hmac.compare_digest(expected, sig)
+
+    def seal(self) -> Checkpoint:
+        """Seal everything appended so far: compute the Merkle root and have the independent authority time-stamp it."""
+        if not self._entries:
+            raise RuntimeError("nothing to seal")
+        size = len(self._entries)
+        root = Merkle.root(DecisionLog.leaf_data(self._entries, size)).hex()
+        head = self._entries[-1].hash
+        cp = Checkpoint(size, root, head, self._tsa.stamp(Checkpoint.statement_digest(size, root, head)))
+        self._checkpoints.append(cp)
+        return cp
+```
+
+#### Step 7: The full-log verifier
+
+`verify_log` walks every entry (sequence, hash, link, time order) and then every checkpoint (signature, truncation, root, head, seal time), tracking `first_bad` with the same blame rules as Java: the entry before a broken link, or the last verified prefix for a pure root mismatch.
+
+```python
+    def verify_log(entries, checkpoints, trusted_key: str) -> Report:
+        """Verify a whole log against its checkpoints: hashes, links, sequence, time order, Merkle roots, seals."""
+        problems: list[str] = []
+        first_bad = LONG_MAX
+        for i, e in enumerate(entries):
+            if e.seq != i:
+                problems.append(f"position {i} holds seq {e.seq} (entry missing or reordered)")
+                first_bad = min(first_bad, i)
+            if e.recompute_hash() != e.hash:
+                problems.append(f"entry #{i} content does not match its hash")
+                first_bad = min(first_bad, i)
+            expected_prev = Crypto.ZERO_HASH if i == 0 else entries[i - 1].hash
+            if e.prev_hash != expected_prev:
+                problems.append(f"entry #{i} does not link to the entry before it")
+                first_bad = min(first_bad, i - 1 if e.seq == i and i > 0 else i)   # either side of a broken link may be the edit
+            if i > 0 and e.timestamp_millis < entries[i - 1].timestamp_millis:
+                problems.append(f"entry #{i} is timestamped before entry #{i - 1}")
+                first_bad = min(first_bad, i)
+        last_good_size = 0
+        root_failure_seen = False
+        for cp in checkpoints:
+            digest = Checkpoint.statement_digest(cp.size, cp.merkle_root_hex, cp.head_hash_hex)
+            if digest != cp.token.digest_hex or not TimestampAuthority.verify(trusted_key, cp.token):
+                problems.append(f"checkpoint size {cp.size}: time-stamp signature does not verify")
+                continue
+            if cp.size > len(entries):
+                problems.append(f"log truncated: checkpoint covers {cp.size} entries, log has {len(entries)}")
+                first_bad = min(first_bad, len(entries))
+                continue
+            root = Merkle.root(DecisionLog.leaf_data(entries, cp.size)).hex()
+            good = True
+            if root != cp.merkle_root_hex:
+                problems.append(f"checkpoint size {cp.size}: Merkle root differs from the sealed root (history rewritten)")
+                good = False
+            if entries[cp.size - 1].hash != cp.head_hash_hex:
+                problems.append(f"checkpoint size {cp.size}: head hash differs from the sealed head")
+                good = False
+            if entries[cp.size - 1].timestamp_millis > cp.token.time_millis:
+                problems.append(f"checkpoint size {cp.size}: an entry claims a time after its own seal")
+                good = False
+            if good and not root_failure_seen:
+                last_good_size = cp.size
+            if not good and not root_failure_seen:
+                root_failure_seen = True
+                # Entry-level evidence is more precise. Without it, the sealed prefix that still verifies bounds the change.
+                if first_bad == LONG_MAX:
+                    first_bad = last_good_size
+        return Report.of(problems, first_bad)
+```
+
+#### Step 8: Exporting and verifying a bundle
+
+`export` writes the header lines (with `tsa-key-id` in place of the public key), then one `entry` and one `proof` line per disclosed entry, encoding the canonical bytes in Base64 and the audit path in hex.
+
+```python
+    def export(log: DecisionLog, subject: str, cp: Checkpoint) -> str:
+        all_entries = log.entries()
+        leaves = DecisionLog.leaf_data(all_entries, cp.size)
+        lines = [EvidenceBundle.MAGIC,
+                 f"subject {subject}",
+                 f"tree-size {cp.size}",
+                 f"merkle-root {cp.merkle_root_hex}",
+                 f"head-hash {cp.head_hash_hex}",
+                 f"tsa-time {cp.token.time_millis}",
+                 f"tsa-signature {cp.token.signature_base64}",
+                 f"tsa-key-id {key_id(log.tsa_verification_key())}"]
+        for i in range(cp.size):
+            e = all_entries[i]
+            if e.subject != subject:
+                continue
+            lines.append(f"entry {e.seq} {b64(e.canonical())} {e.hash}")
+            hex_path = [p.hex() for p in Merkle.audit_path(leaves, i)]
+            lines.append(f"proof {e.seq} {','.join(hex_path) if hex_path else '-'}")
+        return "\n".join(lines) + "\n"
+```
+
+#### Step 9: Run it
 
 ```bash
+cd phases/13-risk-fraud-and-compliance/11-auditability-and-evidence/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+Every hash, root, and verdict matches the Java run; only the signature and key-id lines differ:
+
+```console
+== Full-log verification ==
+untouched log: ok=true
+edit #3 outcome DECLINE->APPROVE:      ok=false first bad=#3  entry #3 content does not match its hash
+edit #3 and recompute its hash:        ok=false first bad=#3  entry #4 does not link to the entry before it
+edit #3 and rewrite the whole chain:   ok=false first bad=#0  checkpoint size 5: Merkle root differs from the sealed root (history rewritten)
+delete #5 (the review of pay_0002):    ok=false first bad=#5  position 5 holds seq 6 (entry missing or reordered)
+```
+
 ### In Go
 
-```go
-func NewTimestampAuthority(seed int64, clock Clock) *TimestampAuthority {
-    keySeed := make([]byte, ed25519.SeedSize)
-    newSHA1PRNG(seed).nextBytes(keySeed)          // the JDK's SHA1PRNG, so the key is the Java key
-    private := ed25519.NewKeyFromSeed(keySeed)
-    return &TimestampAuthority{private, private.Public().(ed25519.PublicKey), clock}
-}
+The Go port (`code/go/main.go` and `code/go/verifier.go`, tests in `main_test.go`) keeps the Java design whole, Ed25519 seal included, and the demo output is byte for byte the Java output, down to the public key and the signatures. **`crypto/ed25519` is in the standard library**, so the seal stays an asymmetric signature: anyone with the published key can verify and nobody but the authority can sign; the Python port had to substitute HMAC, Go does not. Signatures are deterministic (RFC 8032), so matching the Java key is enough to match the Java signatures, and the key is matched by reproducing the JDK's `SHA1PRNG` (SHA-1 state, the 20-byte counter update, and `setSeed(long)`'s little-endian byte order) from which Java's key generator draws its 32-byte seed; `PublicKeyBase64` wraps the raw key in the X.509 `SubjectPublicKeyInfo` prefix so the `tsa-public-key` line is identical and the two verifiers accept each other's bundles. **Errors are values:** `ParseNetstrings`, `EntryFromCanonical`, `AuditPath`, `Append`, `Seal`, `ExportBundle` and `ParseBundle` return errors (`ErrBadNetstring`, `ErrBadEntry`, `ErrLeafOutOfRange`, `ErrClockWentBackwards`, `ErrNothingToSeal`, `ErrBadBundle`) that tests check with `errors.Is`; the verifier folds them into `Report.Problems` as the Java folds exceptions, `VerifyToken` returns `false` on any decoding failure, and digests are compared with a constant-time loop, the equivalent of `MessageDigest.isEqual`. **The verifier is a subcommand, not a second `main`:** one `package main` per lesson means `go run . verify bundle.txt [trusted-key]` runs `verifierMain` in `verifier.go`; it prints the decoded entries and `VERIFIED` (exit 0) or each problem and `FAILED` (exit 1), and an empty trusted key falls back to the key in the bundle and says so. **Java string and time behaviour is ported where it matters:** `javaSplit` drops trailing empty strings like `String.split`; `instantString` prints `2026-01-01T00:08:06.250Z` like `Instant.toString()`; netstring lengths count UTF-8 bytes; the payload is a `map[string]string` whose keys are sorted at hash time and print time, standing in for `TreeMap`.
 
-func (a *TimestampAuthority) Stamp(digestHex string) TimestampToken {
-    t := a.clock.Millis()
-    unsigned := TimestampToken{digestHex, t, ""}
-    return TimestampToken{digestHex, t, base64.StdEncoding.EncodeToString(ed25519.Sign(a.private, unsigned.SignedBytes()))}
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Canonical bytes
+
+Go's `len(string)` already counts UTF-8 bytes, so `Netstrings` needs no encoding step; a `strings.Builder` assembles `length:field,` per field.
+
+```go
+func Netstrings(fields ...string) []byte {
+	var sb strings.Builder
+	for _, f := range fields {
+		sb.WriteString(strconv.Itoa(len(f))) // len counts UTF-8 bytes, as getBytes(UTF_8).length does
+		sb.WriteByte(':')
+		sb.WriteString(f)
+		sb.WriteByte(',')
+	}
+	return []byte(sb.String())
 }
 ```
 
-`code/go/main.go` and `code/go/verifier.go` keep the Java design whole, Ed25519 seal included, and the demo output is byte for byte the Java output, down to the public key and the signatures. How:
+#### Step 2: The entry
 
-- **`crypto/ed25519` is in the standard library**, so the seal stays an asymmetric signature: anyone with the published key can verify and nobody but the authority can sign. The Python port had to substitute HMAC; Go does not. Signatures are deterministic (RFC 8032), so matching the Java key is enough to match the Java signatures, and the key is matched by reproducing the JDK's `SHA1PRNG` (SHA-1 state, the 20-byte counter update, and `setSeed(long)`'s little-endian byte order) from which Java's key generator draws its 32-byte seed. `PublicKeyBase64` wraps the raw key in the X.509 `SubjectPublicKeyInfo` prefix so the `tsa-public-key` line is identical and the two verifiers accept each other's bundles.
-- **Errors are values.** `ParseNetstrings`, `EntryFromCanonical`, `AuditPath`, `Append`, `Seal`, `ExportBundle` and `ParseBundle` return errors (`ErrBadNetstring`, `ErrBadEntry`, `ErrLeafOutOfRange`, `ErrClockWentBackwards`, `ErrNothingToSeal`, `ErrBadBundle`) that tests check with `errors.Is`; the verifier folds them into `Report.Problems` as the Java folds exceptions. `VerifyToken` returns `false` on any decoding failure. Digests are compared with a constant-time loop, the equivalent of `MessageDigest.isEqual`.
-- **The verifier is a subcommand, not a second `main`.** One `package main` per lesson means `go run . verify bundle.txt [trusted-key]` runs `verifierMain` in `verifier.go`; it prints the decoded entries and `VERIFIED` (exit 0) or each problem and `FAILED` (exit 1). An empty trusted key falls back to the key in the bundle and says so.
-- **Java string and time behaviour is ported where it matters.** `javaSplit` drops trailing empty strings like `String.split`; `instantString` prints `2026-01-01T00:08:06.250Z` like `Instant.toString()`; netstring lengths count UTF-8 bytes; the payload is a `map[string]string` whose keys are sorted at hash time and print time, standing in for `TreeMap`.
+`CreateEntry` copies the payload map and hashes `canonical(...)`, which walks `sortedKeys(payload)` so the map's random iteration order never reaches the bytes; the count precedes the pairs.
 
-Run it from `code/go/`:
+```go
+func CreateEntry(seq, ts int64, prevHash, kind, subject string, payload map[string]string) Entry {
+	p := copyPayload(payload)
+	return Entry{seq, ts, prevHash, kind, subject, p, Sha256Hex(canonical(seq, ts, prevHash, kind, subject, p))}
+}
+
+// canonical is the exact bytes that are hashed. Field order is fixed; payload keys are sorted; every field is length-prefixed.
+func canonical(seq, ts int64, prevHash, kind, subject string, payload map[string]string) []byte {
+	fields := []string{EntryVersion, strconv.FormatInt(seq, 10), strconv.FormatInt(ts, 10), prevHash, kind, subject, strconv.Itoa(len(payload))}
+	for _, k := range sortedKeys(payload) {
+		fields = append(fields, k, payload[k])
+	}
+	return Netstrings(fields...)
+}
+
+func (e Entry) Canonical() []byte {
+	return canonical(e.Seq, e.TimestampMillis, e.PrevHash, e.Kind, e.Subject, e.Payload)
+}
+
+func (e Entry) RecomputeHash() string { return Sha256Hex(e.Canonical()) }
+```
+
+#### Step 3: Append-only with a monotonic clock
+
+`Append` returns `(Entry, error)`: a clock step backwards is `ErrClockWentBackwards`, and the previous hash is `ZeroHash` for the first entry. `Seal` refuses an empty log with `ErrNothingToSeal`, then computes root and head and stamps the statement digest.
+
+```go
+func (l *DecisionLog) Append(kind, subject string, payload map[string]string) (Entry, error) {
+	ts := l.clock.Millis()
+	prev := ZeroHash
+	if n := len(l.entries); n > 0 {
+		last := l.entries[n-1]
+		if ts < last.TimestampMillis {
+			return Entry{}, fmt.Errorf("%w: %d < %d", ErrClockWentBackwards, ts, last.TimestampMillis)
+		}
+		prev = last.Hash
+	}
+	e := CreateEntry(int64(len(l.entries)), ts, prev, kind, subject, payload)
+	l.entries = append(l.entries, e)
+	return e, nil
+}
+
+// Seal everything appended so far: compute the Merkle root and have the independent authority time-stamp it.
+func (l *DecisionLog) Seal() (Checkpoint, error) {
+	if len(l.entries) == 0 {
+		return Checkpoint{}, ErrNothingToSeal
+	}
+	size := int64(len(l.entries))
+	root := hex.EncodeToString(MerkleRoot(LeafData(l.entries, size)))
+	head := l.entries[len(l.entries)-1].Hash
+	cp := Checkpoint{size, root, head, l.tsa.Stamp(StatementDigest(size, root, head))}
+	l.checkpoints = append(l.checkpoints, cp)
+	return cp, nil
+}
+```
+
+#### Step 4: The Merkle root and audit path
+
+`MerkleRootRange` and `auditPathRange` are the RFC 6962 recursions; `AuditPath` wraps the range version and returns `ErrLeafOutOfRange` for a bad index.
+
+```go
+func MerkleRootRange(leaves [][]byte, lo, hi int) []byte {
+	n := hi - lo
+	if n == 0 {
+		return Sha256()
+	}
+	if n == 1 {
+		return LeafHash(leaves[lo])
+	}
+	k := Split(n)
+	return NodeHash(MerkleRootRange(leaves, lo, lo+k), MerkleRootRange(leaves, lo+k, hi))
+}
+
+func MerkleRoot(leaves [][]byte) []byte { return MerkleRootRange(leaves, 0, len(leaves)) }
+
+// ErrLeafOutOfRange is returned by AuditPath for a leaf index the tree does not have.
+var ErrLeafOutOfRange = errors.New("leaf index out of range")
+
+func auditPathRange(leaves [][]byte, m, lo, hi int) [][]byte {
+	n := hi - lo
+	if n <= 1 {
+		return [][]byte{}
+	}
+	k := Split(n)
+	if m < k {
+		return append(auditPathRange(leaves, m, lo, lo+k), MerkleRootRange(leaves, lo+k, hi))
+	}
+	return append(auditPathRange(leaves, m-k, lo+k, hi), MerkleRootRange(leaves, lo, lo+k))
+}
+
+// AuditPath is PATH(m, D[0:n]): the sibling hashes from leaf m up to the root, bottom first.
+func AuditPath(leaves [][]byte, m int) ([][]byte, error) {
+	if m < 0 || m >= len(leaves) {
+		return nil, fmt.Errorf("%w: leaf %d of %d", ErrLeafOutOfRange, m, len(leaves))
+	}
+	return auditPathRange(leaves, m, 0, len(leaves)), nil
+}
+```
+
+#### Step 5: Verifying inclusion
+
+`VerifyInclusion` is RFC 9162 section 2.1.3.2 line for line, ending with `constantTimeEqual` against the expected root.
+
+```go
+func VerifyInclusion(leafData []byte, index, treeSize int64, path [][]byte, expectedRoot []byte) bool {
+	if index < 0 || index >= treeSize {
+		return false
+	}
+	fn, sn := index, treeSize-1
+	r := LeafHash(leafData)
+	for _, p := range path {
+		if sn == 0 {
+			return false
+		}
+		if fn&1 == 1 || fn == sn {
+			r = NodeHash(p, r)
+			if fn&1 == 0 {
+				for fn&1 == 0 && fn != 0 {
+					fn >>= 1
+					sn >>= 1
+				}
+			}
+		} else {
+			r = NodeHash(r, p)
+		}
+		fn >>= 1
+		sn >>= 1
+	}
+	return sn == 0 && constantTimeEqual(r, expectedRoot)
+}
+```
+
+#### Step 6: The anchor
+
+`NewTimestampAuthority` draws the Ed25519 seed from the ported `SHA1PRNG`, which is what makes the key, and therefore the deterministic signatures, identical to Java's. `Stamp` signs the netstring of version, digest, and time; `VerifyToken` checks the SPKI prefix and signature length before calling `ed25519.Verify`.
+
+```go
+func NewTimestampAuthority(seed int64, clock Clock) *TimestampAuthority {
+	keySeed := make([]byte, ed25519.SeedSize)
+	newSHA1PRNG(seed).nextBytes(keySeed)
+	private := ed25519.NewKeyFromSeed(keySeed)
+	return &TimestampAuthority{private, private.Public().(ed25519.PublicKey), clock}
+}
+
+func (a *TimestampAuthority) PublicKeyBase64() string {
+	return base64.StdEncoding.EncodeToString(append(append([]byte(nil), spkiPrefix...), a.public...))
+}
+
+func (a *TimestampAuthority) Stamp(digestHex string) TimestampToken {
+	t := a.clock.Millis()
+	unsigned := TimestampToken{digestHex, t, ""}
+	return TimestampToken{digestHex, t, base64.StdEncoding.EncodeToString(ed25519.Sign(a.private, unsigned.SignedBytes()))}
+}
+
+// VerifyToken checks the token against a Base64 SubjectPublicKeyInfo key. Any decoding failure is a verification failure.
+func VerifyToken(publicKeyBase64 string, token TimestampToken) bool {
+	spki, err := base64.StdEncoding.DecodeString(publicKeyBase64)
+	if err != nil || len(spki) != len(spkiPrefix)+ed25519.PublicKeySize || !constantTimeEqual(spki[:len(spkiPrefix)], spkiPrefix) {
+		return false
+	}
+	sig, err := base64.StdEncoding.DecodeString(token.SignatureBase64)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(spki[len(spkiPrefix):]), token.SignedBytes(), sig)
+}
+```
+
+#### Step 7: The full-log verifier
+
+`VerifyLog` in `verifier.go` walks entries and checkpoints in the same order as the Java with the same messages and the same `firstBad` blame rules, using the built-in `min` on `int64`.
+
+```go
+func VerifyLog(entries []Entry, checkpoints []Checkpoint, trustedKey string) Report {
+	problems := []string{}
+	firstBad := int64(math.MaxInt64)
+	for i, e := range entries {
+		idx := int64(i)
+		if e.Seq != idx {
+			problems = append(problems, fmt.Sprintf("position %d holds seq %d (entry missing or reordered)", i, e.Seq))
+			firstBad = min(firstBad, idx)
+		}
+		if e.RecomputeHash() != e.Hash {
+			problems = append(problems, fmt.Sprintf("entry #%d content does not match its hash", i))
+			firstBad = min(firstBad, idx)
+		}
+		expectedPrev := ZeroHash
+		if i > 0 {
+			expectedPrev = entries[i-1].Hash
+		}
+		if e.PrevHash != expectedPrev {
+			problems = append(problems, fmt.Sprintf("entry #%d does not link to the entry before it", i))
+			blamed := idx
+			if e.Seq == idx && i > 0 { // either side of a broken link may be the edit
+				blamed = idx - 1
+			}
+			firstBad = min(firstBad, blamed)
+		}
+		if i > 0 && e.TimestampMillis < entries[i-1].TimestampMillis {
+			problems = append(problems, fmt.Sprintf("entry #%d is timestamped before entry #%d", i, i-1))
+			firstBad = min(firstBad, idx)
+		}
+	}
+	lastGoodSize := int64(0)
+	rootFailureSeen := false
+	for _, cp := range checkpoints {
+		digest := StatementDigest(cp.Size, cp.MerkleRootHex, cp.HeadHashHex)
+		if digest != cp.Token.DigestHex || !VerifyToken(trustedKey, cp.Token) {
+			problems = append(problems, fmt.Sprintf("checkpoint size %d: time-stamp signature does not verify", cp.Size))
+			continue
+		}
+		if cp.Size > int64(len(entries)) {
+			problems = append(problems, fmt.Sprintf("log truncated: checkpoint covers %d entries, log has %d", cp.Size, len(entries)))
+			firstBad = min(firstBad, int64(len(entries)))
+			continue
+		}
+		root := hex.EncodeToString(MerkleRoot(LeafData(entries, cp.Size)))
+		good := true
+		if root != cp.MerkleRootHex {
+			problems = append(problems, fmt.Sprintf("checkpoint size %d: Merkle root differs from the sealed root (history rewritten)", cp.Size))
+			good = false
+		}
+		last := entries[cp.Size-1]
+		if last.Hash != cp.HeadHashHex {
+			problems = append(problems, fmt.Sprintf("checkpoint size %d: head hash differs from the sealed head", cp.Size))
+			good = false
+		}
+		if last.TimestampMillis > cp.Token.TimeMillis {
+			problems = append(problems, fmt.Sprintf("checkpoint size %d: an entry claims a time after its own seal", cp.Size))
+			good = false
+		}
+		if good && !rootFailureSeen {
+			lastGoodSize = cp.Size
+		}
+		if !good && !rootFailureSeen {
+			rootFailureSeen = true
+			// Entry-level evidence is more precise. Without it, the sealed prefix that still verifies bounds the change.
+			if firstBad == math.MaxInt64 {
+				firstBad = lastGoodSize
+			}
+		}
+	}
+	return ReportOf(problems, firstBad)
+}
+```
+
+#### Step 8: Exporting and verifying a bundle
+
+`ExportBundle` returns `(string, error)` because `AuditPath` can fail; the header carries `tsa-public-key`, and each disclosed entry gets an `entry` line (Base64 canonical bytes and hash) and a `proof` line (hex path or `-`).
+
+```go
+func ExportBundle(log *DecisionLog, subject string, cp Checkpoint) (string, error) {
+	all := log.Entries()
+	leaves := LeafData(all, cp.Size)
+	var sb strings.Builder
+	sb.WriteString(BundleMagic + "\n")
+	fmt.Fprintf(&sb, "subject %s\n", subject)
+	fmt.Fprintf(&sb, "tree-size %d\n", cp.Size)
+	fmt.Fprintf(&sb, "merkle-root %s\n", cp.MerkleRootHex)
+	fmt.Fprintf(&sb, "head-hash %s\n", cp.HeadHashHex)
+	fmt.Fprintf(&sb, "tsa-time %d\n", cp.Token.TimeMillis)
+	fmt.Fprintf(&sb, "tsa-signature %s\n", cp.Token.SignatureBase64)
+	fmt.Fprintf(&sb, "tsa-public-key %s\n", log.TsaPublicKey())
+	for i := int64(0); i < cp.Size; i++ {
+		e := all[i]
+		if e.Subject != subject {
+			continue
+		}
+		fmt.Fprintf(&sb, "entry %d %s %s\n", e.Seq, base64.StdEncoding.EncodeToString(e.Canonical()), e.Hash)
+		path, err := AuditPath(leaves, int(i))
+		if err != nil {
+			return "", err
+		}
+		hexPath := make([]string, 0, len(path))
+		for _, p := range path {
+			hexPath = append(hexPath, hex.EncodeToString(p))
+		}
+		proof := "-"
+		if len(hexPath) > 0 {
+			proof = strings.Join(hexPath, ",")
+		}
+		fmt.Fprintf(&sb, "proof %d %s\n", e.Seq, proof)
+	}
+	return sb.String(), nil
+}
+```
+
+#### Step 9: Run it
 
 ```bash
+cd phases/13-risk-fraud-and-compliance/11-auditability-and-evidence/code/go
 go run .
 go test ./...
+```
+
+The output is byte for byte the Java output:
+
+```console
+== Clock anchoring ==
+backdated append rejected: clock went backwards: 1767225605000 < 1767226026000
+entries 0..4 existed no later than t=+64s (signed by the TSA, not by us)
+
+== Evidence bundle for pay_0002 ==
+pefs-evidence-bundle v1
 ```
 
 ## Use It

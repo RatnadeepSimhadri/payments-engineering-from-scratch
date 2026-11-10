@@ -327,18 +327,129 @@ Every value above is reproducible because the clock and the randomness are injec
 
 ### In Python
 
-`code/python/main.py` keeps the Java design, including the two-half layout: `Uuid(msb, lsb)` and `Ulid(timestamp_millis, random_hi, random_lo)` are frozen, ordered dataclasses. The generators (`UuidV4Generator`, `UuidV7Generator`, `UlidGenerator`, `SnowflakeGenerator`) and `ClockMovedBackwardsException` keep their Java names. Three things differ:
+`code/python/main.py` keeps the Java design, including the two-half layout: `Uuid(msb, lsb)` and `Ulid(timestamp_millis, random_hi, random_lo)` are frozen, ordered dataclasses. The generators (`UuidV4Generator`, `UuidV7Generator`, `UlidGenerator`, `SnowflakeGenerator`) and `ClockMovedBackwardsException` keep their Java names. Three things differ. **Halves are unsigned, so ordering is free:** Python integers have no sign bit to misread, so each half is stored masked to 64 bits, and `order=True` compares `(msb, lsb)` as unsigned numbers. That is the comparison `Long.compareUnsigned` has to spell out in Java. Java's `-1L` (all ones) is accepted and normalised, which is how the ULID carry tests are written. **Wraparound is explicit where Java relies on it:** the monotonic ULID increment is `(random_lo + 1) & MASK64` with a carry into `random_hi` when the low word wraps to zero. Java gets the wrap for free from `long` overflow. `Ulid.parse` masks its shift registers the same way. `Uuid.parse` checks that every digit is hex, because `int(x, 16)` would also accept `_`, `+`, and whitespace, which `Long.parseUnsignedLong` rejects. **Same seed, same ids:** `random.Random(7)` would produce different bits, so `JavaRandom` ports `java.util.Random` exactly (48-bit LCG, `next_int`, signed `next_long`). The demo's UUIDv4, UUIDv7, ULID, and Snowflake values match Java's character for character, and a test pins the first three. Use `secrets` for real ids. `fmt_sci` reproduces Java's `%.1e` (half-up, two-digit exponent such as `e-07`), so the collision table also matches. `ValueError` replaces `IllegalArgumentException`.
 
-- **Halves are unsigned, so ordering is free.** Python integers have no sign bit to misread, so each half is stored masked to 64 bits, and `order=True` compares `(msb, lsb)` as unsigned numbers. That is the comparison `Long.compareUnsigned` has to spell out in Java. Java's `-1L` (all ones) is accepted and normalised, which is how the ULID carry tests are written:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: 128 bits with a text form
+
+`order=True` gives the field-by-field comparison, and `__post_init__` masks both halves to 64 bits (through `object.__setattr__`, because the dataclass is frozen) so the comparison is unsigned by construction. `version`, `variant`, and `timestamp_millis` use `>>`, which is a logical shift on a non-negative int.
 
 ```python
-def __post_init__(self) -> None:
-    object.__setattr__(self, "msb", self.msb & MASK64)
-    object.__setattr__(self, "lsb", self.lsb & MASK64)
+@dataclass(frozen=True, order=True)
+class Uuid:
+    """128 bits as two unsigned 64-bit halves, with the RFC 9562 text form. Ordering is unsigned, field by field."""
+
+    msb: int
+    lsb: int
+
+    def __post_init__(self) -> None:
+        # Normalise Java-style signed longs to unsigned 64-bit, so -1 and 0xFFFF...FF are the same half.
+        object.__setattr__(self, "msb", self.msb & MASK64)
+        object.__setattr__(self, "lsb", self.lsb & MASK64)
+
+    def version(self) -> int:
+        return (self.msb >> 12) & 0xF
+
+    def variant(self) -> int:
+        """2 for the RFC 9562 variant (bit pattern 10xx in the top of the low half)."""
+        return (self.lsb >> 62) & 0x3
+
+    def timestamp_millis(self) -> int:
+        """For version 7: the 48-bit Unix millisecond timestamp in the top of the high half."""
+        return self.msb >> 16
+
+    def compare_to(self, o: "Uuid") -> int:
+        return (self > o) - (self < o)
 ```
 
-- **Wraparound is explicit where Java relies on it.** The monotonic ULID increment is `(random_lo + 1) & MASK64` with a carry into `random_hi` when the low word wraps to zero. Java gets the wrap for free from `long` overflow. `Ulid.parse` masks its shift registers the same way. `Uuid.parse` checks that every digit is hex, because `int(x, 16)` would also accept `_`, `+`, and whitespace, which `Long.parseUnsignedLong` rejects.
-- **Same seed, same ids.** `random.Random(7)` would produce different bits, so `JavaRandom` ports `java.util.Random` exactly (48-bit LCG, `nextInt`, signed `nextLong`). The demo's UUIDv4, UUIDv7, ULID, and Snowflake values match Java's character for character, and a test pins the first three. Use `secrets` for real ids. `fmt_sci` reproduces Java's `%.1e` (half-up, two-digit exponent such as `e-07`), so the collision table also matches. `ValueError` replaces `IllegalArgumentException`.
+#### Step 2: UUIDv4, the baseline
+
+`next_long()` returns a signed value like Java's, so it is masked to unsigned before the bit surgery; `~0xF000 & MASK64` is the 64-bit complement that Java's `~0xF000L` produces on its own.
+
+```python
+class UuidV4Generator:
+    def __init__(self, rng: JavaRandom) -> None:
+        self._rng = rng
+
+    def next(self) -> Uuid:
+        msb, lsb = self._rng.next_long() & MASK64, self._rng.next_long() & MASK64
+        msb = (msb & ~0xF000 & MASK64) | 0x4000                              # version nibble = 4
+        lsb = (lsb & 0x3FFFFFFFFFFFFFFF) | 0x8000000000000000                # variant bits = 10
+        return Uuid(msb, lsb)
+```
+
+#### Step 3: UUIDv7 with a monotonic counter
+
+Line for line the Java: `<=` treats a frozen and a backwards clock the same, the counter borrows the next millisecond past `0xFFF`, and it is reseeded with 11 random bits so the top counter bit stays clear.
+
+```python
+    def next(self) -> Uuid:
+        now = self._clock.now_millis()
+        if now <= self._last_millis:  # same ms, or clock went backwards
+            self._counter += 1
+            if self._counter > 0xFFF:  # borrow the next ms
+                self._last_millis += 1
+                self._counter = self._rng.next_int(1 << 11)
+        else:
+            self._last_millis = now
+            self._counter = self._rng.next_int(1 << 11)  # leave the top counter bit clear: room to count
+        msb = (self._last_millis << 16) | 0x7000 | self._counter
+        lsb = (self._rng.next_long() & 0x3FFFFFFFFFFFFFFF) | 0x8000000000000000
+        return Uuid(msb, lsb)
+```
+
+#### Step 4: ULID encoding
+
+A list of 26 characters joined at the end. The 80 random bits are shifted as one value by peeling five bits off `random_lo` and feeding in five from `random_hi`; because both are kept non-negative, `>>` is the logical shift the Java spells `>>>`.
+
+```python
+ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O, U
+```
+
+```python
+    def __str__(self) -> str:
+        """10 chars of timestamp (50 bits, top two zero) + 16 chars of randomness (80 bits)."""
+        out = [""] * 26
+        t = self.timestamp_millis
+        for i in range(9, -1, -1):
+            out[i] = ALPHABET[t & 0x1F]
+            t >>= 5
+        lo, hi = self.random_lo, self.random_hi
+        for i in range(25, 9, -1):  # emit from the low end, 5 bits at a time
+            out[i] = ALPHABET[lo & 0x1F]
+            lo = (lo >> 5) | ((hi & 0x1F) << 59)
+            hi >>= 5
+        return "".join(out)
+```
+
+#### Step 5: Snowflake with sequence borrow and drift tolerance
+
+The same drift policy and sequence borrow, raising `ClockMovedBackwardsException` (a `RuntimeError`) past the tolerance. The Python adds an explicit `MAX_TIMESTAMP` guard because its ints would otherwise silently grow past 41 bits.
+
+```python
+    def next(self) -> int:
+        now = self._clock.now_millis() - self.EPOCH_MILLIS
+        if now < self._last_millis:
+            if self._last_millis - now > self._max_backwards_millis:
+                raise ClockMovedBackwardsException(self._last_millis - now)
+            now = self._last_millis  # small drift: keep issuing on the last timestamp
+        if now == self._last_millis:
+            self._sequence = (self._sequence + 1) & self.MAX_SEQUENCE
+            if self._sequence == 0:  # 4096 in one ms: borrow the next
+                self._last_millis += 1
+                self.borrowed_millis += 1
+                now = self._last_millis
+        else:
+            self._last_millis = now
+            self._sequence = 0
+        if self._last_millis > self.MAX_TIMESTAMP:
+            raise IllegalStateError("snowflake epoch exhausted")
+        return ((self._last_millis << (self.WORKER_BITS + self.SEQUENCE_BITS))
+                | (self._worker_id << self.SEQUENCE_BITS) | self._sequence)
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/03-systems-data-structures/13-unique-id-generation/code/python
@@ -346,26 +457,174 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== 1. Four ids for the same posting, four shapes ==
+  UUIDv4    bb0f1798-a377-4418-bfc9-945a02770b39  version=4 variant=2  (122 random bits)
+  UUIDv7    0199c82c-c000-72c9-bd98-4a5ce5b3f441  version=7 ts=1760000000000 (48-bit ms, 12-bit counter, 62 random)
+  ULID      01K742SG00QRDBAJRS0J8V7JJX  ts=1760000000000 (48-bit ms, 80 random, base32)
+  Snowflake 234599166771269632  ts=1760000000000 worker=17 seq=0 (63 bits)
+```
+
+All four ids are character for character the Java's because `JavaRandom(7)` yields the same bits; the sortability, monotonicity, and collision sections match too.
+
 ### In Go
 
-`code/go/main.go` keeps the Java design, including the two-half layout: `Uuid{Msb, Lsb uint64}` and `Ulid{TimestampMillis, RandomHi int64; RandomLo uint64}` are comparable structs. The generators (`UuidV4Generator`, `UuidV7Generator`, `UlidGenerator`, `SnowflakeGenerator`) keep their Java names, and `ClockMovedBackwardsError` is an error value that carries the drift. Three things differ:
+`code/go/main.go` keeps the Java design, including the two-half layout: `Uuid{Msb, Lsb uint64}` and `Ulid{TimestampMillis, RandomHi int64; RandomLo uint64}` are comparable structs. The generators (`UuidV4Generator`, `UuidV7Generator`, `UlidGenerator`, `SnowflakeGenerator`) keep their Java names, and `ClockMovedBackwardsError` is an error value that carries the drift. Three things differ. **Halves are unsigned, so ordering is free:** storing the UUID halves and the low ULID word as `uint64` makes plain `<` the unsigned comparison Java has to spell out with `Long.compareUnsigned`; an `int64` would reintroduce the `java.util.UUID` ordering bug. The ULID increment wraps naturally: `lo := last.RandomLo + 1` becomes 0 exactly where the Java `long` does, and the carry moves into `RandomHi`. Java's `-1L` in the carry tests is `math.MaxUint64` here. **Errors are values:** `ParseUuid`, `ParseUlid`, `NewUlid`, and `NewSnowflakeGenerator` return `(value, error)` with `ErrInvalidArgument`; `UlidGenerator.Next` returns `ErrIllegalState` on a randomness overflow; `SnowflakeGenerator.Next` returns a `*ClockMovedBackwardsError`, which satisfies both `errors.As` (to read `ByMillis`) and `errors.Is(err, ErrClockMovedBackwards)` through its `Is` method. **Same seed, same ids:** `math/rand` would produce different bits, so `javarandom.go` ports `java.util.Random` exactly (48-bit LCG, `NextIntN`, signed `NextLong`). The demo's UUIDv4, UUIDv7, ULID, and Snowflake values match Java's character for character, and a test pins the first three. Use `crypto/rand` for real ids. `strconv.ParseUint(s, 16, 64)` rejects `_` and signs like `Long.parseUnsignedLong`, and a test pins that too.
 
-- **Halves are unsigned, so ordering is free.** Storing the UUID halves and the low ULID word as `uint64` makes plain `<` the unsigned comparison Java has to spell out with `Long.compareUnsigned`; an `int64` would reintroduce the `java.util.UUID` ordering bug. The ULID increment wraps naturally: `lo := last.RandomLo + 1` becomes 0 exactly where the Java `long` does, and the carry moves into `RandomHi`. Java's `-1L` in the carry tests is `math.MaxUint64` here.
-- **Errors are values.** `ParseUuid`, `ParseUlid`, `NewUlid`, and `NewSnowflakeGenerator` return `(value, error)` with `ErrInvalidArgument`; `UlidGenerator.Next` returns `ErrIllegalState` on a randomness overflow; `SnowflakeGenerator.Next` returns a `*ClockMovedBackwardsError`, which satisfies both `errors.As` (to read `ByMillis`) and `errors.Is(err, ErrClockMovedBackwards)` through its `Is` method:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: 128 bits with a text form
+
+Two `uint64` fields, so `<` is unsigned and `>>` is logical with no helpers. `Compare` returns -1, 0, 1 field by field, which the sortability demo and the generic `IsStrictlyIncreasing` consume.
 
 ```go
-if g.lastMillis-now > g.maxBackwardsMillis {
-    return 0, &ClockMovedBackwardsError{ByMillis: g.lastMillis - now}
+type Uuid struct {
+	Msb, Lsb uint64
+}
+
+func (u Uuid) Version() int { return int((u.Msb >> 12) & 0xF) }
+
+// Variant is 2 for the RFC 9562 variant (bit pattern 10xx in the top of the low half).
+func (u Uuid) Variant() int { return int((u.Lsb >> 62) & 0x3) }
+
+// TimestampMillis is, for version 7, the 48-bit Unix millisecond timestamp in the top of the high half.
+func (u Uuid) TimestampMillis() int64 { return int64(u.Msb >> 16) }
+
+func (u Uuid) Compare(o Uuid) int {
+	if u.Msb != o.Msb {
+		if u.Msb < o.Msb {
+			return -1
+		}
+		return 1
+	}
+	if u.Lsb != o.Lsb {
+		if u.Lsb < o.Lsb {
+			return -1
+		}
+		return 1
+	}
+	return 0
 }
 ```
 
-- **Same seed, same ids.** `math/rand` would produce different bits, so `javarandom.go` ports `java.util.Random` exactly (48-bit LCG, `NextIntN`, signed `NextLong`). The demo's UUIDv4, UUIDv7, ULID, and Snowflake values match Java's character for character, and a test pins the first three. Use `crypto/rand` for real ids. `strconv.ParseUint(s, 16, 64)` rejects `_` and signs like `Long.parseUnsignedLong`, and a test pins that too.
+#### Step 2: UUIDv4, the baseline
+
+`NextLong` is signed like Java's, so it is converted to `uint64` first; Go's `&^` (bit clear) replaces `& ~0xF000L`.
+
+```go
+func (g *UuidV4Generator) Next() Uuid {
+	msb, lsb := uint64(g.rng.NextLong()), uint64(g.rng.NextLong())
+	msb = (msb &^ 0xF000) | 0x4000                        // version nibble = 4
+	lsb = (lsb & 0x3FFFFFFFFFFFFFFF) | 0x8000000000000000 // variant bits = 10
+	return Uuid{msb, lsb}
+}
+```
+
+#### Step 3: UUIDv7 with a monotonic counter
+
+The Java method with `uint64` conversions where the signed millisecond count and the `int` counter are packed into the high half.
+
+```go
+func (g *UuidV7Generator) Next() Uuid {
+	now := g.clock.NowMillis()
+	if now <= g.lastMillis { // same ms, or clock went backwards
+		g.counter++
+		if g.counter > 0xFFF { // borrow the next ms
+			g.lastMillis++
+			g.counter = int(g.rng.NextIntN(1 << 11))
+		}
+	} else {
+		g.lastMillis = now
+		g.counter = int(g.rng.NextIntN(1 << 11)) // leave the top counter bit clear: room to count
+	}
+	msb := (uint64(g.lastMillis) << 16) | 0x7000 | uint64(g.counter)
+	lsb := (uint64(g.rng.NextLong()) & 0x3FFFFFFFFFFFFFFF) | 0x8000000000000000
+	return Uuid{msb, lsb}
+}
+```
+
+#### Step 4: ULID encoding
+
+A 26-byte buffer indexed into `UlidAlphabet` (a string, so `UlidAlphabet[i]` is a byte). The 80-bit shift treats `RandomLo` (`uint64`) and `RandomHi` (converted) as one value, five bits at a time.
+
+```go
+func (u Ulid) String() string {
+	out := make([]byte, 26)
+	t := uint64(u.TimestampMillis)
+	for i := 9; i >= 0; i-- {
+		out[i] = UlidAlphabet[t&0x1F]
+		t >>= 5
+	}
+	// 80 random bits = RandomHi (16) followed by RandomLo (64): emit from the low end, 5 bits at a time
+	lo, hi := u.RandomLo, uint64(u.RandomHi)
+	for i := 25; i >= 10; i-- {
+		out[i] = UlidAlphabet[lo&0x1F]
+		lo = (lo >> 5) | ((hi & 0x1F) << 59)
+		hi >>= 5
+	}
+	return string(out)
+}
+```
+
+#### Step 5: Snowflake with sequence borrow and drift tolerance
+
+`Next` returns `(int64, error)`: a drift beyond tolerance is a `*ClockMovedBackwardsError` carrying the millisecond gap, and epoch exhaustion wraps `ErrIllegalState`. The `Is` method lets callers match the sentinel without knowing the drift.
+
+```go
+func (g *SnowflakeGenerator) Next() (int64, error) {
+	now := g.clock.NowMillis() - EpochMillis
+	if now < g.lastMillis {
+		if g.lastMillis-now > g.maxBackwardsMillis {
+			return 0, &ClockMovedBackwardsError{ByMillis: g.lastMillis - now}
+		}
+		now = g.lastMillis // small drift: keep issuing on the last timestamp
+	}
+	if now == g.lastMillis {
+		g.sequence = (g.sequence + 1) & MaxSequence
+		if g.sequence == 0 { // 4096 in one ms: borrow the next
+			g.lastMillis++
+			g.BorrowedMillis++
+		}
+	} else {
+		g.lastMillis = now
+		g.sequence = 0
+	}
+	if g.lastMillis > MaxTimestamp {
+		return 0, fmt.Errorf("%w: snowflake epoch exhausted", ErrIllegalState)
+	}
+	return (g.lastMillis << (WorkerBits + SequenceBits)) | (g.workerID << SequenceBits) | g.sequence, nil
+}
+
+// ClockMovedBackwardsError is the Java ClockMovedBackwardsException: an error value carrying the drift.
+type ClockMovedBackwardsError struct{ ByMillis int64 }
+
+func (e *ClockMovedBackwardsError) Error() string {
+	return fmt.Sprintf("clock moved backwards by %d ms; refusing to issue ids that could collide", e.ByMillis)
+}
+
+// Is lets errors.Is(err, ErrClockMovedBackwards) match any instance, whatever its drift.
+func (e *ClockMovedBackwardsError) Is(target error) bool { return target == ErrClockMovedBackwards }
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/03-systems-data-structures/13-unique-id-generation/code/go
 go run .
 go test ./...
 ```
+
+```console
+  a 32-bit random id: 10^5 ids -> p = 0.688 (50% at about 77,000 ids)
+  Snowflake: zero collision probability by construction, 4096 ids/ms/worker, 1024 workers, 69.7 years of 41-bit ms
+
+== 6. Round trips ==
+  Uuid.parse(toString) == original: true
+  Ulid.parse(toString) == original: true
+  Ulid lenient decode: parse accepts lowercase and maps I/L->1, O->0: true
+```
+
+Section 1 prints the same four ids as the Java run, and sections 2 through 4 the same sortability and monotonicity results.
 
 ## Use It
 

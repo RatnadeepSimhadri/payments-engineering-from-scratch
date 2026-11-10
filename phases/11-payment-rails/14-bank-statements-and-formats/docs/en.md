@@ -393,22 +393,214 @@ OFX [-150000, 325075, -1250] closing 1423825
 
 ### In Python
 
-`code/python/main.py` keeps the four parser classes, `Statement`, `StatementChain`, `Parse`, and `Samples`, and prints the same demo. What differs:
+The Python port keeps the four parser classes, `Statement`, `StatementChain`, `Parse`, and `Samples`, and prints the same demo. Five things differ. **Regexes use `fullmatch`, and the `:61:` match object is kept:** Java's `Matcher.matches()` anchors both ends; the Python port drops the `^`/`$` and calls `re.fullmatch` with `re.DOTALL`, then carries the `re.Match` for the pending line exactly as the Java carries the `Matcher`, so the group numbers in `_line` (1 value date, 2 entry date, 3 mark, 5 amount, 7 customer reference, 8 bank reference, 9 supplementary) are unchanged. **camt.053 is parsed with `xml.etree.ElementTree`, with the DOCTYPE refused up front:** ElementTree has no `disallow-doctype-decl` feature, so `_parse_root` rejects any input containing `<!DOCTYPE` before `ET.fromstring`, then checks the root's namespace by splitting the `{urn:...}Document` tag; `text()` joins `itertext()` to match `getTextContent()`. **`split` semantics:** Java's `line.split(",", -1)` keeps trailing empty fields, which Python's `str.split(",")` does by default; Java's `split(",", fixed + 1)` (a limit on the number of parts) becomes `split(",", fixed)` (a limit on the number of splits). Getting this one wrong shifts every BAI2 `16` field by one. **Amounts never pass through `float`:** `Parse.decimal` replaces the MT940 comma with a dot and hands the string to the same integer `Money.parse`; BAI2 amounts are `int(...)` directly. `Currency.of` raises `ValueError` for a code the lesson does not know rather than inventing an exponent, the same choice the Java makes with `IllegalArgumentException`. **Samples use `textwrap.dedent`** to reproduce the indentation stripping that Java text blocks do, so the camt.053 sample has the same eight-space indentation the reversal test relies on.
 
-- **Regexes use `fullmatch`, and the `:61:` match object is kept.** Java's `Matcher.matches()` anchors both ends; the Python port drops the `^`/`$` and calls `re.fullmatch` with `re.DOTALL`, then carries the `re.Match` for the pending line exactly as the Java carries the `Matcher`, so the group numbers in `_line` (1 value date, 2 entry date, 3 mark, 5 amount, 7 customer reference, 8 bank reference, 9 supplementary) are unchanged.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The Python tests port every Java check (55 assertions, the four-format loop running under `subTest`).
+
+#### Step 1: The model and its invariant
+
+`continuity_errors` returns a list; dataclass equality on `Money` does the comparison and `minus` prints the signed difference. A line booked after the closing date is the second check.
 
 ```python
-LINE = re.compile(r"(\d{6})(\d{4})?(RC|RD|C|D)([A-Z])?(\d+,\d{0,2})([NFS][A-Z0-9]{3})([^\n]*?)"
-                  r"(?://([^\n]{1,16}))?(?:\n(.*))?", re.DOTALL)
-pending_line = Mt940Parser.LINE.fullmatch(f.value)
-if pending_line is None:
-    raise StatementParseException(f"MT940: bad :61: {f.value}")
+    def movement(self) -> Money:
+        total = Money.of_minor(0, self.currency)
+        for line in self.lines:
+            total = total.plus(line.amount)
+        return total
+
+    def continuity_errors(self) -> list[str]:
+        """The continuity invariant: opening + sum(lines) == closing. Returns problems rather than raising."""
+        errors: list[str] = []
+        expected = self.opening.plus(self.movement())
+        if expected != self.closing:
+            errors.append(f"{self.statement_id}: opening {self.opening} + movements {self.movement()} = {expected}"
+                          f", but closing is {self.closing} (difference {self.closing.minus(expected)})")
+        for line in self.lines:
+            if line.booking_date > self.closing_date:
+                errors.append(f"{self.statement_id}: line {line.bank_reference} booked after closing date")
+        return errors
 ```
 
-- **camt.053 is parsed with `xml.etree.ElementTree`, with the DOCTYPE refused up front.** ElementTree has no `disallow-doctype-decl` feature, so `_parse_root` rejects any input containing `<!DOCTYPE` before `ET.fromstring`, then checks the root's namespace by splitting the `{urn:...}Document` tag. `text()` joins `itertext()` to match `getTextContent()`.
-- **`split` semantics.** Java's `line.split(",", -1)` keeps trailing empty fields, which Python's `str.split(",")` does by default; Java's `split(",", fixed + 1)` (a limit on the number of parts) becomes `split(",", fixed)` (a limit on the number of splits). Getting this one wrong shifts every BAI2 `16` field by one.
-- **Amounts never pass through `float`.** `Parse.decimal` replaces the MT940 comma with a dot and hands the string to the same integer `Money.parse`; BAI2 amounts are `int(...)` directly. `Currency.of` raises `ValueError` for a code the lesson does not know rather than inventing an exponent, the same choice the Java makes with `IllegalArgumentException`.
-- **Samples use `textwrap.dedent`** to reproduce the indentation stripping that Java text blocks do, so the camt.053 sample has the same eight-space indentation the reversal test relies on.
+#### Step 2: Chains across statements
+
+Consecutive pairs are compared by index; `date` objects compare directly, and the gap message carries the signed difference.
+
+```python
+class StatementChain:
+    @staticmethod
+    def gaps(statements: list[Statement]) -> list[str]:
+        """Across consecutive statements of one account: each closing balance must be the next opening balance."""
+        errors: list[str] = []
+        for i in range(1, len(statements)):
+            prev, nxt = statements[i - 1], statements[i]
+            if prev.account_id != nxt.account_id:
+                errors.append(f"account changed between {prev.statement_id} and {nxt.statement_id}")
+                continue
+            if not nxt.closing_date > prev.closing_date:
+                errors.append(f"{nxt.statement_id} closes on {nxt.closing_date}, not after {prev.statement_id}")
+            if prev.closing != nxt.opening:
+                errors.append(f"gap between {prev.statement_id} closing {prev.closing} and "
+                              f"{nxt.statement_id} opening {nxt.opening} (missing {nxt.opening.minus(prev.closing)})")
+        return errors
+```
+
+#### Step 3: MT940 fields and the `:61:` regex
+
+The patterns are class attributes; `LINE` has no anchors because it is applied with `fullmatch`. `fields` starts a new `Field` on every `:NN[A]:` line and appends continuation lines with a newline. `_line` reads the groups by number and applies the six-month rule for the entry date's missing year.
+
+```python
+    TAG = re.compile(r"^:(\d{2}[A-Z]?):(.*)$")
+    BALANCE = re.compile(r"([CD])(\d{6})([A-Z]{3})(\d+,\d{0,2})")
+    # :61: value date, [entry date], mark (C, D, RC, RD), [funds code], amount, type, customer ref, [//bank ref], [\n supplementary]
+    LINE = re.compile(r"(\d{6})(\d{4})?(RC|RD|C|D)([A-Z])?(\d+,\d{0,2})([NFS][A-Z0-9]{3})([^\n]*?)(?://([^\n]{1,16}))?(?:\n(.*))?",
+                      re.DOTALL)
+
+    @staticmethod
+    def fields(block: str) -> list[Field]:
+        out: list[Field] = []
+        tag: Optional[str] = None
+        value: list[str] = []
+        for line in block.split("\n"):
+            m = Mt940Parser.TAG.match(line)
+            if m:
+                if tag is not None:
+                    out.append(Field(tag, "".join(value)))
+                tag = m.group(1)
+                value = [m.group(2)]
+            elif tag is not None and line != "":
+                value.append("\n" + line)
+        if tag is not None:
+            out.append(Field(tag, "".join(value)))
+        return out
+```
+
+```python
+    @staticmethod
+    def _line(m: re.Match, info: Optional[str], currency: Currency) -> StatementLine:
+        value = Parse.yymmdd(m.group(1))
+        booking = value
+        if m.group(2) is not None:
+            month, day = int(m.group(2)[0:2]), int(m.group(2)[2:4])
+            year = value.year
+            if month - value.month > 6:
+                year -= 1  # value 2027-01-02, entry 1231 -> 2026-12-31
+            if value.month - month > 6:
+                year += 1  # value 2026-12-31, entry 0102 -> 2027-01-02
+            booking = date(year, month, day)
+        amount = Parse.decimal(m.group(5), currency)
+        # C credit, D debit, RC reversal of a credit (a debit), RD reversal of a debit (a credit)
+        credit = m.group(3) in ("C", "RD")
+```
+
+#### Step 4: MT940 envelopes and multiple statements
+
+Two compiled patterns strip the SWIFT envelope and the `-}` trailers; the stripped body is split into statements on `:20:`. `parse` insists on exactly one.
+
+```python
+    ENVELOPE = re.compile(r"\{1:[^}]*\}(\{2:[^}]*\})?(\{3:(\{[^}]*\})*\})?\{4:")
+    TRAILER = re.compile(r"^-\}.*$", re.MULTILINE)
+```
+
+```python
+    @staticmethod
+    def parse_all(text: str) -> list[Statement]:
+        # Strip SWIFT envelopes ({1:..}{2:..}[{3:..}]{4: ... -}); a file may concatenate several messages.
+        body = Mt940Parser.TRAILER.sub("", Mt940Parser.ENVELOPE.sub("", Parse.normalize_newlines(text)))
+        statements: list[Statement] = []
+        current: list[Field] = []
+        for f in Mt940Parser.fields(body):
+            if f.tag == "20" and current:
+                statements.append(Mt940Parser._build(current))
+                current = []
+            current.append(f)
+        if current:
+            statements.append(Mt940Parser._build(current))
+        if not statements:
+            raise StatementParseException("MT940: no :20: field found")
+        return statements
+
+    @staticmethod
+    def parse(text: str) -> Statement:
+        statements = Mt940Parser.parse_all(text)
+        if len(statements) != 1:
+            raise StatementParseException(f"MT940: expected one statement, found {len(statements)}")
+        return statements[0]
+```
+
+#### Step 5: camt.053 status, reversal, and currency
+
+The `Ntry` loop skips anything whose `Sts/Cd` is not `BOOK`, reads the amount through `_amount` (which checks `Ccy` against the account currency and applies `CdtDbtInd`), and negates on `RvslInd`. The child helpers accept `None` so optional paths read naturally.
+
+```python
+        lines: list[StatementLine] = []
+        for ntry in Camt053Parser.children(stmt, "Ntry"):
+            status = Camt053Parser.text(Camt053Parser.child(Camt053Parser.child(ntry, "Sts"), "Cd"))
+            if status != "BOOK":
+                continue  # PDNG and INFO entries are information, not balance movements
+            amount = Camt053Parser._amount(ntry, currency)
+            rvsl = Camt053Parser.opt_child(ntry, "RvslInd")
+            if rvsl is not None and Camt053Parser.text(rvsl) == "true":
+                amount = amount.negate()
+            tx_dtls = Camt053Parser.opt_child(Camt053Parser.opt_child(ntry, "NtryDtls"), "TxDtls")
+            refs = Camt053Parser.opt_child(tx_dtls, "Refs")
+```
+
+#### Step 6: BAI2 logical records and control totals
+
+`records` pops the previous record on an `88` and re-appends it merged, counting physical lines; a `16` record is split with `line.split(",", fixed)` (a limit on *splits*) so the text keeps its commas. The `49` trailer check raises `StatementParseException` on a total or record-count mismatch.
+
+```python
+            if rtype == "88":
+                if not out:
+                    raise StatementParseException("BAI2: 88 continuation with no previous record")
+                prev = out.pop()
+                rest = line[3:]
+                if prev.type == "16":
+                    out.append(LogicalRecord("16", prev.fields, (prev.text + " " + rest).strip(), prev.physical_lines + 1))
+                else:
+                    out.append(LogicalRecord(prev.type, prev.fields + tuple(Bai2Parser._split(rest)), None, prev.physical_lines + 1))
+                continue
+```
+
+```python
+            elif r.type == "49":
+                declared = Bai2Parser.amount(f[0])
+                declared_records = int(f[1])
+                if declared != account_total:
+                    raise StatementParseException(f"BAI2: account {account} control total {declared} != computed {account_total}")
+                if declared_records != account_records:
+                    raise StatementParseException(f"BAI2: account {account} record count {declared_records} != {account_records}")
+                if opening is None or closing is None:
+                    raise StatementParseException(f"BAI2: account {account} lacks 010 opening or 015 closing ledger")
+                out.append(Statement(StatementFormat.BAI2, account, currency, f"BAI2-{account}-{as_of}", as_of, opening, as_of, closing,
+                                     tuple(lines), True))
+```
+
+#### Step 7: OFX tokenizing
+
+The same stack walk with `str.find`: a closing tag pops to its matching ancestor if one exists and is otherwise ignored, text after a tag makes a leaf, and an empty value opens an aggregate.
+
+```python
+            tag = text[lt + 1:gt].strip()
+            nxt = text.find("<", gt)
+            value = text[gt + 1:len(text) if nxt < 0 else nxt].strip()
+            if tag.startswith("/"):
+                name = tag[1:]
+                # close an aggregate; a closing tag for a leaf (OFX 2.x XML) matches nothing on the stack and is ignored
+                if any(n.name == name for n in stack):
+                    while stack[-1].name != name:
+                        stack.pop()
+                    stack.pop()
+            elif value:
+                stack[-1].children.append(OfxNode(tag, value))  # leaf: <TRNAMT>-1500.00
+            else:
+                agg = OfxNode(tag, None)                        # aggregate: <STMTTRN>
+                stack[-1].children.append(agg)
+                stack.append(agg)
+            i = len(text) if nxt < 0 else nxt
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/14-bank-statements-and-formats/code/python
@@ -416,25 +608,269 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The Python tests port every Java check (55 assertions, the four-format loop running under `subTest`), and the demo output is identical to the Java run.
+The demo output is identical to the Java run:
+
+```console
+== Rejections ==
+   BAI2: account 0001234567 control total 3150151 != computed 3150150
+   MT940: bad :61: 2610121012D12,505NCHGNONREF//COBA0003
+   unrecognised statement format: Date,Description,Amo
+```
 
 ### In Go
 
-`code/go/main.go` keeps the four parsers (`Mt940Parser`, `Camt053Parser`, `Bai2Parser`, `OfxParser`), `Statement`, `StatementChain`, and `StatementParsers`; the samples live in `samples.go` and the Phase 10 `Money` in `money.go`. What differs:
+The Go port keeps the four parsers (`Mt940Parser`, `Camt053Parser`, `Bai2Parser`, `OfxParser`), `Statement`, `StatementChain`, and `StatementParsers`; the samples live in `samples.go` and the Phase 10 `Money` in `money.go`. Four things differ. **Structural errors are values, balance problems stay data:** every `Parse` returns `(Statement, error)`; the error is a `*StatementParseError` that `errors.Is(err, ErrStatementParse)` matches, with the same messages as the Java. `ContinuityErrors` and `StatementChain.Gaps` still return `[]string`, because a statement that does not add up is a finding, not a failure. Inside the camt and OFX parsers a `need(...)` helper panics and a deferred `catch` turns it back into the returned error, so forty nested field reads do not each need an `if err != nil`. **Regexes keep Java's groups:** Go's RE2 has no `matches()`, so the `:61:` pattern is anchored with `^...$` and `(?s)` stands in for `DOTALL`; the group numbers in `line` (1 value date, 2 entry date, 3 mark, 5 amount, 7 customer reference, 8 bank reference, 9 supplementary) are unchanged, and the `[]string` from `FindStringSubmatch` is carried as the pending line exactly as the Java carries the `Matcher`. **camt.053 is a token stream, not a DOM:** `encoding/xml` yields `StartElement`/`CharData` tokens, so `decodeXml` builds a small `Element` tree, appending text to every open ancestor to reproduce `getTextContent()`. There is no `disallow-doctype-decl`, so a `<!DOCTYPE` prescan refuses the input before decoding and `Strict = true` makes an undefined `&x;` a parse error. **`split` semantics:** `strings.Split(line, ",")` keeps trailing empty fields like Java's `split(",", -1)`, and Java's `split(",", fixed + 1)` is `strings.SplitN(line, ",", fixed+1)`, the same limit on the number of parts. Amounts never touch `float64`: `ParseHelpers.Decimal` swaps the MT940 comma for a dot and calls the integer `Parse`; BAI2 amounts are `strconv.ParseInt`. `CurrencyOf` returns an error for a code the lesson does not know rather than inventing an exponent.
 
-- **Structural errors are values, balance problems stay data.** Every `Parse` returns `(Statement, error)`; the error is a `*StatementParseError` that `errors.Is(err, ErrStatementParse)` matches, with the same messages as the Java (`BAI2: account 0001234567 control total 3150151 != computed 3150150`). `ContinuityErrors` and `StatementChain.Gaps` still return `[]string`, because a statement that does not add up is a finding, not a failure. Inside the camt and OFX parsers a `need(...)` helper panics and a deferred `catch` turns it back into the returned error, so forty nested field reads do not each need an `if err != nil`.
-- **Regexes keep Java's groups.** Go's RE2 has no `matches()`, so the `:61:` pattern is anchored with `^...$` and `(?s)` stands in for `DOTALL`; the group numbers in `line` (1 value date, 2 entry date, 3 mark, 5 amount, 7 customer reference, 8 bank reference, 9 supplementary) are unchanged. The `[]string` from `FindStringSubmatch` is carried as the pending line exactly as the Java carries the `Matcher`.
-- **camt.053 is a token stream, not a DOM.** `encoding/xml` yields `StartElement`/`CharData` tokens, so `decodeXml` builds a small `Element` tree, appending text to every open ancestor to reproduce `getTextContent()`. There is no `disallow-doctype-decl`, so a `<!DOCTYPE` prescan refuses the input before decoding and `Strict = true` makes an undefined `&x;` a parse error:
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The Go tests port every Java check (51 assertions, the four-format loop as subtests, plus Strict-mode and namespace cases).
+
+#### Step 1: The model and its invariant
+
+`Movement` and `Plus` can fail on a currency mismatch, so those errors are reported as findings in the same list; the comparison itself is `!=` on the `Money` value struct.
 
 ```go
-if doctype.MatchString(doc) {
-    return nil, errors.New("DOCTYPE is disallowed when processing a statement file")
+func (s Statement) ContinuityErrors() []string {
+	errs := []string{}
+	movement, err := s.Movement()
+	if err != nil {
+		return append(errs, s.StatementId+": "+err.Error())
+	}
+	expected, err := s.Opening.Plus(movement)
+	if err != nil {
+		return append(errs, s.StatementId+": "+err.Error())
+	}
+	if expected != s.Closing {
+		diff, _ := s.Closing.Minus(expected)
+		errs = append(errs, fmt.Sprintf("%s: opening %v + movements %v = %v, but closing is %v (difference %v)",
+			s.StatementId, s.Opening, movement, expected, s.Closing, diff))
+	}
+	for _, l := range s.Lines {
+		if l.BookingDate.After(s.ClosingDate) {
+			errs = append(errs, s.StatementId+": line "+l.BankReference+" booked after closing date")
+		}
+	}
+	return errs
 }
-d := xml.NewDecoder(strings.NewReader(doc))
-d.Strict = true
 ```
 
-- **`split` semantics.** `strings.Split(line, ",")` keeps trailing empty fields like Java's `split(",", -1)`, and Java's `split(",", fixed + 1)` is `strings.SplitN(line, ",", fixed+1)`, the same limit on the number of parts. Amounts never touch `float64`: `ParseHelpers.Decimal` swaps the MT940 comma for a dot and calls the integer `Parse`; BAI2 amounts are `strconv.ParseInt`. `CurrencyOf` returns an error for a code the lesson does not know rather than inventing an exponent.
+#### Step 2: Chains across statements
+
+`StatementChain` is a package-level value with a `Gaps` method. `time.Time.After` compares the closing dates, and a `Minus` error (two currencies) is folded into the gap message rather than aborting.
+
+```go
+func (statementChain) Gaps(statements []Statement) []string {
+	errs := []string{}
+	for i := 1; i < len(statements); i++ {
+		prev, next := statements[i-1], statements[i]
+		if prev.AccountId != next.AccountId {
+			errs = append(errs, "account changed between "+prev.StatementId+" and "+next.StatementId)
+			continue
+		}
+		if !next.ClosingDate.After(prev.ClosingDate) {
+			errs = append(errs, fmt.Sprintf("%s closes on %s, not after %s", next.StatementId, isoDate(next.ClosingDate), prev.StatementId))
+		}
+		if prev.Closing != next.Opening {
+			missing, err := next.Opening.Minus(prev.Closing)
+			detail := "missing " + missing.String()
+			if err != nil {
+				detail = err.Error()
+			}
+			errs = append(errs, fmt.Sprintf("gap between %s closing %v and %s opening %v (%s)",
+				prev.StatementId, prev.Closing, next.StatementId, next.Opening, detail))
+		}
+	}
+	return errs
+}
+```
+
+#### Step 3: MT940 fields and the `:61:` regex
+
+The patterns are package-level `regexp.MustCompile` values; `mt940Line` is anchored and prefixed with `(?s)`. `line` receives the `[]string` submatches, so `m[2] != ""` is the "entry date present" test, and the six-month rule uses `value.Month()`.
+
+```go
+var (
+	mt940Tag     = regexp.MustCompile(`^:(\d{2}[A-Z]?):(.*)$`)
+	mt940Balance = regexp.MustCompile(`^([CD])(\d{6})([A-Z]{3})(\d+,\d{0,2})$`)
+	// :61: value date, [entry date], mark (C, D, RC, RD), [funds code], amount, type, customer ref, [//bank ref], [\n supplementary].
+	mt940Line     = regexp.MustCompile(`(?s)^(\d{6})(\d{4})?(RC|RD|C|D)([A-Z])?(\d+,\d{0,2})([NFS][A-Z0-9]{3})([^\n]*?)(?://([^\n]{1,16}))?(?:\n(.*))?$`)
+	mt940Envelope = regexp.MustCompile(`\{1:[^}]*\}(\{2:[^}]*\})?(\{3:(\{[^}]*\})*\})?\{4:`)
+	mt940Trailer  = regexp.MustCompile(`(?m)^-\}.*$`)
+)
+```
+
+```go
+func (mt940Parser) line(m []string, info string, haveInfo bool, currency Currency) (StatementLine, error) {
+	value, err := ParseHelpers.Yymmdd(m[1])
+	if err != nil {
+		return StatementLine{}, err
+	}
+	booking := value
+	if m[2] != "" {
+		month, _ := strconv.Atoi(m[2][0:2])
+		day, _ := strconv.Atoi(m[2][2:4])
+		year := value.Year()
+		if month-int(value.Month()) > 6 { // value 2027-01-02, entry 1231 -> 2026-12-31
+			year--
+		}
+		if int(value.Month())-month > 6 { // value 2026-12-31, entry 0102 -> 2027-01-02
+			year++
+		}
+		booking = date(year, month, day)
+	}
+	amount, err := ParseHelpers.Decimal(m[5], currency)
+	if err != nil {
+		return StatementLine{}, err
+	}
+	// C credit, D debit, RC reversal of a credit (a debit), RD reversal of a debit (a credit)
+	credit := m[3] == "C" || m[3] == "RD"
+```
+
+#### Step 4: MT940 envelopes and multiple statements
+
+`ReplaceAllString` twice strips the envelope and trailers; the field list is split into statements on `:20:`, and `build` errors propagate.
+
+```go
+func (p mt940Parser) ParseAll(text string) ([]Statement, error) {
+	// Strip SWIFT envelopes ({1:..}{2:..}[{3:..}]{4: ... -}); a file may concatenate several messages.
+	body := mt940Trailer.ReplaceAllString(mt940Envelope.ReplaceAllString(ParseHelpers.NormalizeNewlines(text), ""), "")
+	statements := []Statement{}
+	current := []Field{}
+	for _, f := range p.Fields(body) {
+		if f.Tag == "20" && len(current) > 0 {
+			s, err := p.build(current)
+			if err != nil {
+				return nil, err
+			}
+			statements = append(statements, s)
+			current = []Field{}
+		}
+		current = append(current, f)
+	}
+	if len(current) > 0 {
+		s, err := p.build(current)
+		if err != nil {
+			return nil, err
+		}
+		statements = append(statements, s)
+	}
+	if len(statements) == 0 {
+		return nil, parseErr("MT940: no :20: field found")
+	}
+	return statements, nil
+}
+
+func (p mt940Parser) Parse(text string) (Statement, error) {
+	all, err := p.ParseAll(text)
+	if err != nil {
+		return Statement{}, err
+	}
+	if len(all) != 1 {
+		return Statement{}, parseErr("MT940: expected one statement, found %d", len(all))
+	}
+	return all[0], nil
+}
+```
+
+#### Step 5: camt.053 status, reversal, and currency
+
+`decodeXml` does the DOCTYPE prescan and strict token decode into the `Element` tree. The entry loop in `Parse` (running under `defer catch(&err)` with `need` on every mandatory read) skips non-`BOOK` entries, checks the currency through `p.amount`, and negates on `RvslInd`.
+
+```go
+func decodeXml(doc string) (*Element, error) {
+	if doctype.MatchString(doc) {
+		return nil, errors.New("DOCTYPE is disallowed when processing a statement file")
+	}
+	d := xml.NewDecoder(strings.NewReader(doc))
+	d.Strict = true
+```
+
+```go
+	lines := []StatementLine{}
+	for _, ntry := range p.Children(stmt, "Ntry") {
+		status := p.Text(need(p.Child(need(p.Child(ntry, "Sts")), "Cd")))
+		if status != "BOOK" {
+			continue // PDNG and INFO entries are information, not balance movements
+		}
+		amount := need(p.amount(ntry, currency))
+		if rvsl := p.OptChild(ntry, "RvslInd"); rvsl != nil && p.Text(rvsl) == "true" {
+			amount = amount.Negate()
+		}
+		txDtls := p.OptChild(p.OptChild(ntry, "NtryDtls"), "TxDtls")
+		refs := p.OptChild(txDtls, "Refs")
+```
+
+#### Step 6: BAI2 logical records and control totals
+
+`Records` reslices the output to drop the previous record on an `88`, merges, and counts physical lines; the `49` case in `ParseAll` recomputes the account total and record count and returns a `*StatementParseError` on either mismatch.
+
+```go
+		if typ == "88" {
+			if len(out) == 0 {
+				return nil, parseErr("BAI2: 88 continuation with no previous record")
+			}
+			prev := out[len(out)-1]
+			out = out[:len(out)-1]
+			rest := line[3:]
+			if prev.Type == "16" {
+				out = append(out, LogicalRecord{"16", prev.Fields, strings.TrimSpace(prev.Text + " " + rest), prev.PhysicalLines + 1})
+			} else {
+				merged := append(append([]string{}, prev.Fields...), p.split(rest)...)
+				out = append(out, LogicalRecord{prev.Type, merged, "", prev.PhysicalLines + 1})
+			}
+			continue
+		}
+```
+
+```go
+		case "49":
+			declared := need(p.Amount(field(f, 0)))
+			declaredRecords := atoi(field(f, 1))
+			if declared != accountTotal {
+				return nil, parseErr("BAI2: account %s control total %d != computed %d", account, declared, accountTotal)
+			}
+			if declaredRecords != accountRecords {
+				return nil, parseErr("BAI2: account %s record count %d != %d", account, declaredRecords, accountRecords)
+			}
+			if opening == nil || closing == nil {
+				return nil, parseErr("BAI2: account %s lacks 010 opening or 015 closing ledger", account)
+			}
+			out = append(out, Statement{BAI2, account, currency, "BAI2-" + account + "-" + isoDate(asOf), asOf, *opening, asOf, *closing, lines, true})
+			groupTotal += accountTotal
+			accounts++
+			lines = nil
+```
+
+#### Step 7: OFX tokenizing
+
+`strings.IndexByte` on subslices replaces `indexOf`; the closing-tag case scans the stack from the top and reslices to the matching ancestor, leaves carry `Leaf: true`, and an empty value opens an aggregate.
+
+```go
+		tag := strings.TrimSpace(text[lt+1 : gt])
+		next := strings.IndexByte(text[gt:], '<')
+		end := len(text)
+		if next >= 0 {
+			end = gt + next
+		}
+		value := strings.TrimSpace(text[gt+1 : end])
+		top := stack[len(stack)-1]
+		switch {
+		case strings.HasPrefix(tag, "/"):
+			name := tag[1:]
+			// close an aggregate; a closing tag for a leaf (OFX 2.x XML) matches nothing on the stack and is ignored
+			for k := len(stack) - 1; k >= 0; k-- {
+				if stack[k].Name == name {
+					stack = stack[:k]
+					break
+				}
+			}
+		case value != "":
+			top.Children = append(top.Children, &OfxNode{Name: tag, Value: value, Leaf: true}) // leaf: <TRNAMT>-1500.00
+		default:
+			agg := &OfxNode{Name: tag} // aggregate: <STMTTRN>
+			top.Children = append(top.Children, agg)
+			stack = append(stack, agg)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/14-bank-statements-and-formats/code/go
@@ -442,7 +878,14 @@ go run .
 go test ./...
 ```
 
-The Go tests port every Java check (51 assertions, the four-format loop as subtests, plus Strict-mode and namespace cases), and the demo output is identical to the Java run.
+The demo output is identical to the Java run:
+
+```console
+== Rejections ==
+   BAI2: account 0001234567 control total 3150151 != computed 3150150
+   MT940: bad :61: 2610121012D12,505NCHGNONREF//COBA0003
+   unrecognised statement format: Date,Description,Amo
+```
 
 ## Use It
 

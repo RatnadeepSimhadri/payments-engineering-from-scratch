@@ -378,20 +378,192 @@ The test harness prints `47 passed, 0 failed`.
 
 ### In Python
 
-`code/python/main.py` is the same design class for class: `Pkce`, `AuthorizationServer`, `FdxStyleBank`, `UkObStyleBank`, the two adapters, `Aggregator`, and `Connection`. Four things differ:
+The Python port is the same design class for class: `Pkce`, `AuthorizationServer`, `FdxStyleBank`, `UkObStyleBank`, the two adapters, `Aggregator`, and `Connection`. Four things differ. **The seeded generator is `java.util.Random`, reimplemented:** Python's `random.Random` is a Mersenne Twister, so `Random(2026)` would give different tokens and a different demo. The port carries a 20-line `JavaRandom` with the JDK's 48-bit LCG (`next(bits)` with the signed-int cast, `next_int(bound)` including its rejection loop, `next_bytes`), so the state, verifier, and `at_3_3RC4m...` token in the output are identical in both languages. In production you would use `secrets.token_urlsafe`; the lesson keeps the generator injectable so the tests stay deterministic. **PKCE is `hashlib` plus `hmac.compare_digest`:** `challenge_s256` is `base64.urlsafe_b64encode(sha256(verifier)).rstrip(b"=")`, and `Pkce.verify` compares with `hmac.compare_digest`, the constant-time equivalent of `MessageDigest.isEqual`; the RFC 7636 appendix B vector is in the tests. **Payloads are plain dicts:** what the Java casts out of `Map<String, Object>` is what a JSON parser hands you in Python, so the adapters read `r.body["Data"]["Transaction"]` directly and the `@SuppressWarnings("unchecked")` noise disappears; the money path is unchanged, the FDX amount string goes through `Money.parse`, never through `float`. **Scopes are a `frozenset` of an `Enum`:** `EnumSet` iterates in declaration order, so `authorization_url` sorts the set by `list(Scope).index` before joining it, which is what keeps the `scope=` query string byte-identical. `OAuthException` keeps the `.error` attribute the tests inspect, and `ReauthorizationRequiredException` is raised `from` the OAuth error so the cause survives.
 
-- **The seeded generator is `java.util.Random`, reimplemented.** Python's `random.Random` is a Mersenne Twister, so `Random(2026)` would give different tokens and a different demo. The port carries a 20-line `JavaRandom` with the JDK's 48-bit LCG (`next(bits)`, `next_int(bound)` including its rejection loop, `next_bytes`), so the state, verifier, and `at_3_3RC4m...` token in the output are identical in both languages. In production you would use `secrets.token_urlsafe`; the lesson keeps the generator injectable so the tests stay deterministic.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The Python tests port every Java check (64 assertions, including one that pins the `JavaRandom` sequence to values taken from the JDK).
+
+#### Step 1: PKCE
+
+Sixty-four draws from the 66-symbol unreserved alphabet, `hashlib.sha256` for the challenge (`b64url` strips the padding), and `hmac.compare_digest` on the ASCII bytes for a constant-time comparison after the 43..128 length check.
 
 ```python
-def next(self, bits: int) -> int:
-    self.seed = (self.seed * self.MULTIPLIER + self.ADDEND) & self.MASK
-    value = self.seed >> (48 - bits)
-    return value - (1 << 32) if value >= (1 << 31) else value  # Java's int is signed
+class Pkce:
+    """RFC 7636: Proof Key for Code Exchange."""
+
+    UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+
+    @staticmethod
+    def generate_verifier(random: JavaRandom) -> str:
+        """A 64-character verifier from the unreserved set (RFC 7636 section 4.1 requires 43..128)."""
+        return "".join(Pkce.UNRESERVED[random.next_int(len(Pkce.UNRESERVED))] for _ in range(64))
+
+    @staticmethod
+    def challenge_s256(verifier: str) -> str:
+        """code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier))), no padding (section 4.2)."""
+        return b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+
+    @staticmethod
+    def verify(verifier: Optional[str], challenge: str) -> bool:
+        if verifier is None or len(verifier) < 43 or len(verifier) > 128:
+            return False
+        return hmac.compare_digest(Pkce.challenge_s256(verifier).encode("ascii"), challenge.encode("ascii"))
 ```
 
-- **PKCE is `hashlib` plus `hmac.compare_digest`.** `challenge_s256` is `base64.urlsafe_b64encode(sha256(verifier)).rstrip(b"=")`, and `Pkce.verify` compares with `hmac.compare_digest`, the constant-time equivalent of `MessageDigest.isEqual`. The RFC 7636 appendix B vector is in the tests.
-- **Payloads are plain dicts.** What the Java casts out of `Map<String, Object>` is what a JSON parser hands you in Python, so the adapters read `r.body["Data"]["Transaction"]` directly and the `@SuppressWarnings("unchecked")` noise disappears. The money path is unchanged: the FDX amount string goes through `Money.parse`, never through `float`.
-- **Scopes are a `frozenset` of an `Enum`.** `EnumSet` iterates in declaration order, so `authorization_url` sorts the set by `list(Scope).index` before joining it, which is what keeps the `scope=` query string byte-identical. `OAuthException` keeps the `.error` attribute the tests inspect, and `ReauthorizationRequiredException` is raised `from` the OAuth error so the cause survives.
+#### Step 2: The authorization endpoint
+
+The same six checks in the same order, each raising `OAuthException` with the RFC 6749 error code; then the `Consent` (with a `frozenset` copy of the scopes) and the ten-minute `AuthorizationCode` are stored in two dicts.
+
+```python
+    def authorize(self, client_id: str, redirect_uri: str, requested_scopes: frozenset, code_challenge: Optional[str],
+                  code_challenge_method: str, user_id: str) -> str:
+        client = self.clients.get(client_id)
+        if client is None:
+            raise OAuthException("invalid_client", f"unknown client {client_id}")
+        if client.redirect_uri != redirect_uri:
+            raise OAuthException("invalid_request", "redirect_uri does not match registration")
+        if code_challenge_method != "S256":
+            raise OAuthException("invalid_request", "code_challenge_method must be S256")
+        if code_challenge is None or len(code_challenge) != 43:
+            raise OAuthException("invalid_request", "code_challenge must be a 43-char base64url SHA-256")
+        if not requested_scopes:
+            raise OAuthException("invalid_scope", "at least one scope is required")
+        if Scope.PAYMENTS_WRITE in requested_scopes:
+            raise OAuthException("invalid_scope", "this client is not registered for payments:write")
+
+        now = self.clock.now_epoch_seconds()
+        self.sequence += 1
+        consent_id = f"consent_{self.sequence}"
+        self.consents[consent_id] = Consent(consent_id, user_id, client_id, frozenset(requested_scopes), now,
+                                            now + self.CONSENT_TTL_SECONDS)
+        code = self._new_token("code")
+        self.codes[code] = AuthorizationCode(code, consent_id, client_id, redirect_uri, code_challenge, now + self.CODE_TTL_SECONDS)
+        return code
+```
+
+#### Step 3: The token endpoint, authorization-code grant
+
+`dict.pop(code, None)` is the single-use `remove`: the code is gone before any check runs. Every subsequent failure is `invalid_grant`, and `>=` on the expiry means the code is dead at exactly `expires_at`.
+
+```python
+    def exchange_code(self, client_id: str, code: str, redirect_uri: str, code_verifier: Optional[str]) -> TokenResponse:
+        """The /token endpoint, grant_type=authorization_code."""
+        stored = self.codes.pop(code, None)  # single use, whether or not the rest succeeds
+        if stored is None:
+            raise OAuthException("invalid_grant", "unknown or already used authorization code")
+        if stored.client_id != client_id:
+            raise OAuthException("invalid_grant", "code was issued to a different client")
+        if stored.redirect_uri != redirect_uri:
+            raise OAuthException("invalid_grant", "redirect_uri does not match the authorization request")
+        if self.clock.now_epoch_seconds() >= stored.expires_at:
+            raise OAuthException("invalid_grant", "authorization code expired")
+        if not Pkce.verify(code_verifier, stored.code_challenge):
+            raise OAuthException("invalid_grant", "PKCE verification failed")
+        return self._issue_tokens(self.consents[stored.consent_id])
+```
+
+#### Step 4: Refresh with rotation and replay detection
+
+Two dicts, live and retired. `pop` moves a token out of the live set; a miss that hits the retired set is a replay and revokes the whole consent. The consent-expiry check runs before the token is retired, as in Java.
+
+```python
+    def refresh(self, client_id: str, refresh_token: str) -> TokenResponse:
+        """The /token endpoint, grant_type=refresh_token, with rotation and replay detection."""
+        consent_id = self.refresh_tokens.pop(refresh_token, None)
+        if consent_id is None:
+            replayed_family = self.retired_refresh_tokens.get(refresh_token)
+            if replayed_family is not None:
+                self.revoke_consent(replayed_family)  # a replayed token means it leaked: kill the family
+                raise OAuthException("invalid_grant", "refresh token replay detected; consent revoked")
+            raise OAuthException("invalid_grant", "unknown refresh token")
+        consent = self.consents.get(consent_id)
+        if consent is None:
+            raise OAuthException("invalid_grant", "consent revoked")
+        if consent.client_id != client_id:
+            raise OAuthException("invalid_grant", "refresh token belongs to another client")
+        if consent.is_expired(self.clock.now_epoch_seconds()):
+            raise OAuthException("invalid_grant", "consent expired; user must re-authorize")
+        self.retired_refresh_tokens[refresh_token] = consent_id
+        return self._issue_tokens(consent)
+```
+
+#### Step 5: Two resource servers, one bearer-token check
+
+`require_scope` returns the 401 or 403 response, or `None` when the call may proceed, exactly as the Java returns `null`. Bank A's `_page_of` builds the offset-paged body as a dict literal.
+
+```python
+    def require_scope(self, access_token: str, scope: Scope) -> Optional[ApiResponse]:
+        grant = self.auth.introspect(access_token)
+        if grant is None:
+            return ApiResponse.unauthorized()
+        if scope not in grant.scopes:
+            return ApiResponse.forbidden()
+        return None
+```
+
+```python
+    def _page_of(self, key: str, all_items: list[dict], cursor: Optional[str]) -> ApiResponse:
+        offset = 0 if cursor is None else int(cursor)
+        items = self.page(all_items, offset, self.page_size)
+        page_info: dict = {}
+        if offset + self.page_size < len(all_items):
+            page_info["nextOffset"] = str(offset + self.page_size)
+        return ApiResponse.ok({key: items, "page": page_info})
+```
+
+#### Step 6: Adapters
+
+The UK OB adapter indexes the dict directly, parses the unsigned amount with `Money.parse`, negates on `Debit`, and reads the next cursor from `Links.Next` with `.get` so a last page yields `None`.
+
+```python
+    def transactions(self, r: ApiResponse, bank_id: str, account_id: str) -> Page:
+        out = []
+        for t in r.body["Data"]["Transaction"]:
+            amt = t["Amount"]
+            unsigned = Money.parse(amt["Amount"], Currency.of(amt["Currency"]))
+            signed = unsigned.negate() if t["CreditDebitIndicator"] == "Debit" else unsigned  # UK OB amounts are unsigned
+            out.append(Transaction(bank_id, account_id, t["TransactionId"], t["BookingDateTime"][:10],
+                                   signed, t["TransactionInformation"], t["Status"] == "Pending"))
+        return Page(out, r.body["Links"].get("Next"))
+```
+
+#### Step 7: The aggregator's fetch loop
+
+A `while True` with the cursor captured in `cur` for the lambda (Python closures capture variables, not values). `_call_with_refresh` refreshes once on 401, swaps both tokens, and converts a failed refresh into `ReauthorizationRequiredException` raised `from` the OAuth error; 403 is never retried.
+
+```python
+    def fetch_transactions(self, connection_id: str, account_id: str) -> list[Transaction]:
+        c = self.connections[connection_id]
+        out: list[Transaction] = []
+        cursor: Optional[str] = None
+        while True:
+            cur = cursor
+            r = self._call_with_refresh(c, lambda token: c.bank.transactions(token, account_id, cur))
+            page = c.adapter.transactions(r, c.bank.bank_id(), account_id)
+            out.extend(page.items)
+            cursor = page.next_cursor
+            if cursor is None:
+                return out
+
+    def _call_with_refresh(self, c: Connection, call: Callable[[str], ApiResponse]) -> ApiResponse:
+        """401 invalid_token -> refresh once and retry. 403 insufficient_scope -> never retry; the consent lacks the scope."""
+        r = call(c.access_token)
+        if r.status == 401:
+            try:
+                fresh = c.auth.refresh(self.CLIENT_ID, c.refresh_token)
+            except OAuthException as e:
+                raise ReauthorizationRequiredException(f"{c.connection_id}: {e}") from e
+            c.access_token = fresh.access_token
+            c.refresh_token = fresh.refresh_token  # rotation: store the new one, the old one is now dead
+            c.refresh_count += 1
+            r = call(c.access_token)
+        if r.status == 403:
+            raise OAuthException("insufficient_scope", "consent does not include the scope this call needs")
+        if r.status != 200:
+            raise RuntimeError(f"unexpected status {r.status}")
+        return r
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/13-open-banking-and-account-aggregation/code/python
@@ -399,37 +571,273 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The Python tests port every Java check (64 assertions, including one that pins the `JavaRandom` sequence to values taken from the JDK), and the demo output matches the Java run exactly.
+Because `JavaRandom` reproduces the JDK sequence, the state, verifier, codes, and tokens are the same as in the Java run:
+
+```console
+== Consent flow: authorization code + PKCE (RFC 6749 section 4.1, RFC 7636) ==
+1. aggregator redirects user to:
+   https://bank-a-fdx.example/authorize?response_type=code&client_id=aggregator-app&redirect_uri=https://aggregator.example/callback&scope=accounts:read%20transactions:read&state=77densXCpTK7yGXZ&code_challenge=KGHLRyiNm1c6z9nXaBZ66znBLJAAYeAWn15O3gdcqSU&code_challenge_method=S256
+   verifier stays server-side: G.Kpo_knpPGe... (64 chars)
+2. user authenticates at the bank, approves scopes; bank redirects back with code=code_2_zSY_v... state=77densXCpTK7yGXZ
+3. aggregator exchanges code + verifier for tokens: access=at_3_3RC4m... refresh=rt_4_EZdxj...
+
+== Things the bank refuses ==
+   wrong verifier: invalid_grant: PKCE verification failed
+   same code again (it was consumed by the failed attempt): invalid_grant: unknown or already used authorization code
+   unregistered redirect_uri: invalid_request: redirect_uri does not match registration
+   scope the client is not registered for: invalid_scope: this client is not registered for payments:write
+```
 
 ### In Go
 
-`code/go/main.go` is the same design type for type: `Pkce`, `AuthorizationServer`, `FdxStyleBank`, `UkObStyleBank`, the two adapters, `Aggregator`, and `Connection`, with `javarandom.go` carrying the JDK generator. Four things differ:
+The Go port is the same design type for type: `Pkce`, `AuthorizationServer`, `FdxStyleBank`, `UkObStyleBank`, the two adapters, `Aggregator`, and `Connection`, with `javarandom.go` carrying the JDK generator. Four things differ. **OAuth errors are a typed value:** every endpoint returns `(TokenResponse, error)`; the error is `*OAuthError{Code, Description}` and the tests pull the RFC 6749 code out with `errors.As`. The aggregator's "send the user back through consent" case is the sentinel `ErrReauthorizationRequired`, wrapped with `%w` around the connection id and the bank's reason, so `errors.Is` still matches it. **`java.util.Random` is ported, not replaced:** `math/rand` would give different tokens, so `JavaRandom` implements the 48-bit LCG (`next(bits)`, `NextIntBound` with its rejection loop, `NextBytes` four bytes per draw), and the demo prints the same `77densXCpTK7yGXZ` state and `at_3_3RC4m...` token as the Java run; a test pins four draws to values taken from the JDK. **PKCE is `crypto/sha256` plus `crypto/subtle`:** `ChallengeS256` is `base64.RawURLEncoding` of the digest (no padding by construction), and `Verify` compares with `subtle.ConstantTimeCompare`, the equivalent of `MessageDigest.isEqual`. **Scopes are a bitmask, payloads are `map[string]any`:** `ScopeSet` is a `uint8` with `Contains`, `ContainsAll`, and an `Each` that iterates in declaration order, which keeps the `scope=` query string identical and lets the tests compare consents with `==`. The bank bodies are what `encoding/json` would hand you, so the adapters read them through three small helpers (`str`, `obj`, `list`) instead of Java's unchecked casts; the FDX amount string still goes through `ParseMoney`, never `float64`.
 
-- **OAuth errors are a typed value.** Every endpoint returns `(TokenResponse, error)`; the error is `*OAuthError{Code, Description}` and the tests pull the RFC 6749 code out with `errors.As`. The aggregator's "send the user back through consent" case is the sentinel `ErrReauthorizationRequired`, wrapped with `%w` around the connection id and the bank's reason, so `errors.Is` still matches it.
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`. The Go tests port every Java check (52 assertions, including the pinned `JavaRandom` sequence).
+
+#### Step 1: PKCE
+
+`Pkce` is a package-level value of a method-only struct. `GenerateVerifier` draws bytes from the alphabet with `NextIntBound`; `ChallengeS256` uses `RawURLEncoding`, which never pads; `Verify` is a constant-time compare after the length check.
 
 ```go
-if r.Status == 401 {
-    fresh, err := c.Auth.Refresh(ClientId, c.RefreshToken)
-    if err != nil {
-        return ApiResponse{}, fmt.Errorf("%w: %s: %v", ErrReauthorizationRequired, c.ConnectionId, err)
-    }
-    c.AccessToken, c.RefreshToken = fresh.AccessToken, fresh.RefreshToken // rotation
-    c.RefreshCount++
-    r = call(c.AccessToken)
+type pkce struct{}
+
+const pkceUnreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+
+// GenerateVerifier draws a 64-character verifier from the unreserved set (RFC 7636 section 4.1 requires 43..128).
+func (pkce) GenerateVerifier(random *JavaRandom) string {
+	var sb strings.Builder
+	for i := 0; i < 64; i++ {
+		sb.WriteByte(pkceUnreserved[random.NextIntBound(int32(len(pkceUnreserved)))])
+	}
+	return sb.String()
+}
+
+// ChallengeS256 is BASE64URL-ENCODE(SHA256(ASCII(code_verifier))), no padding (section 4.2).
+func (pkce) ChallengeS256(verifier string) string {
+	digest := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(digest[:])
+}
+
+func (p pkce) Verify(verifier, challenge string) bool {
+	if len(verifier) < 43 || len(verifier) > 128 {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(p.ChallengeS256(verifier)), []byte(challenge)) == 1
 }
 ```
 
-- **`java.util.Random` is ported, not replaced.** `math/rand` would give different tokens, so `JavaRandom` implements the 48-bit LCG (`next(bits)`, `NextIntBound` with its rejection loop, `NextBytes` four bytes per draw), and the demo prints the same `77densXCpTK7yGXZ` state and `at_3_3RC4m...` token as the Java run. A test pins four draws to values taken from the JDK.
-- **PKCE is `crypto/sha256` plus `crypto/subtle`.** `ChallengeS256` is `base64.RawURLEncoding` of the digest (no padding by construction), and `Verify` compares with `subtle.ConstantTimeCompare`, the equivalent of `MessageDigest.isEqual`.
-- **Scopes are a bitmask, payloads are `map[string]any`.** `ScopeSet` is a `uint8` with `Contains`, `ContainsAll`, and an `Each` that iterates in declaration order, which keeps the `scope=` query string identical and lets the tests compare consents with `==`. The bank bodies are what `encoding/json` would hand you, so the adapters read them through three small helpers (`str`, `obj`, `list`) instead of Java's unchecked casts; the FDX amount string still goes through `ParseMoney`, never `float64`.
+#### Step 2: The authorization endpoint
+
+Each check returns a `*OAuthError` literal with the RFC code. `ScopeSet` is a value type, so the consent stores it directly, and `strconv.Itoa` builds the consent id.
+
+```go
+func (a *AuthorizationServer) Authorize(clientId, redirectUri string, requestedScopes ScopeSet, codeChallenge, codeChallengeMethod, userId string) (string, error) {
+	client, ok := a.clients[clientId]
+	if !ok {
+		return "", &OAuthError{"invalid_client", "unknown client " + clientId}
+	}
+	if client.RedirectUri != redirectUri {
+		return "", &OAuthError{"invalid_request", "redirect_uri does not match registration"}
+	}
+	if codeChallengeMethod != "S256" {
+		return "", &OAuthError{"invalid_request", "code_challenge_method must be S256"}
+	}
+	if len(codeChallenge) != 43 {
+		return "", &OAuthError{"invalid_request", "code_challenge must be a 43-char base64url SHA-256"}
+	}
+	if requestedScopes.IsEmpty() {
+		return "", &OAuthError{"invalid_scope", "at least one scope is required"}
+	}
+	if requestedScopes.Contains(PaymentsWrite) {
+		return "", &OAuthError{"invalid_scope", "this client is not registered for payments:write"}
+	}
+
+	now := a.clock.NowEpochSeconds()
+	a.sequence++
+	consentId := "consent_" + strconv.Itoa(a.sequence)
+	a.consents[consentId] = Consent{consentId, userId, clientId, requestedScopes, now, now + ConsentTTLSeconds}
+	code := a.newToken("code")
+	a.codes[code] = AuthorizationCode{code, consentId, clientId, redirectUri, codeChallenge, now + CodeTTLSeconds}
+	return code, nil
+}
+```
+
+#### Step 3: The token endpoint, authorization-code grant
+
+A comma-ok read followed by an unconditional `delete` is Go's `remove`: the code is consumed whether or not the checks pass. The rest mirrors the Java line for line with `invalid_grant` on every path.
+
+```go
+func (a *AuthorizationServer) ExchangeCode(clientId, code, redirectUri, codeVerifier string) (TokenResponse, error) {
+	stored, ok := a.codes[code]
+	delete(a.codes, code) // single use, whether or not the rest succeeds
+	if !ok {
+		return TokenResponse{}, &OAuthError{"invalid_grant", "unknown or already used authorization code"}
+	}
+	if stored.ClientId != clientId {
+		return TokenResponse{}, &OAuthError{"invalid_grant", "code was issued to a different client"}
+	}
+	if stored.RedirectUri != redirectUri {
+		return TokenResponse{}, &OAuthError{"invalid_grant", "redirect_uri does not match the authorization request"}
+	}
+	if a.clock.NowEpochSeconds() >= stored.ExpiresAt {
+		return TokenResponse{}, &OAuthError{"invalid_grant", "authorization code expired"}
+	}
+	if !Pkce.Verify(codeVerifier, stored.CodeChallenge) {
+		return TokenResponse{}, &OAuthError{"invalid_grant", "PKCE verification failed"}
+	}
+	return a.issueTokens(a.consents[stored.ConsentId]), nil
+}
+```
+
+#### Step 4: Refresh with rotation and replay detection
+
+The same read-then-delete idiom moves a token out of the live map; a hit in `retiredRefreshTokens` revokes the consent. Consent expiry is checked before the token is retired.
+
+```go
+func (a *AuthorizationServer) Refresh(clientId, refreshToken string) (TokenResponse, error) {
+	consentId, ok := a.refreshTokens[refreshToken]
+	delete(a.refreshTokens, refreshToken)
+	if !ok {
+		if replayedFamily, replayed := a.retiredRefreshTokens[refreshToken]; replayed {
+			a.RevokeConsent(replayedFamily) // a replayed token means it leaked: kill the family
+			return TokenResponse{}, &OAuthError{"invalid_grant", "refresh token replay detected; consent revoked"}
+		}
+		return TokenResponse{}, &OAuthError{"invalid_grant", "unknown refresh token"}
+	}
+	consent, ok := a.consents[consentId]
+	if !ok {
+		return TokenResponse{}, &OAuthError{"invalid_grant", "consent revoked"}
+	}
+	if consent.ClientId != clientId {
+		return TokenResponse{}, &OAuthError{"invalid_grant", "refresh token belongs to another client"}
+	}
+	if consent.IsExpired(a.clock.NowEpochSeconds()) {
+		return TokenResponse{}, &OAuthError{"invalid_grant", "consent expired; user must re-authorize"}
+	}
+	a.retiredRefreshTokens[refreshToken] = consentId
+	return a.issueTokens(consent), nil
+}
+```
+
+#### Step 5: Two resource servers, one bearer-token check
+
+`requireScope` returns `(response, ok)`: a false `ok` carries the 401 or 403 to send. Bank A's `pageOf` builds the offset-paged `map[string]any` body; an empty cursor string means "first page".
+
+```go
+func (b bankBase) requireScope(accessToken string, scope Scope) (ApiResponse, bool) {
+	grant := b.auth.Introspect(accessToken)
+	if grant == nil {
+		return ApiUnauthorized(), false
+	}
+	if !grant.Scopes.Contains(scope) {
+		return ApiForbidden(), false
+	}
+	return ApiResponse{}, true
+}
+
+func (b *FdxStyleBank) pageOf(key string, all []any, cursor string) ApiResponse {
+	offset := 0
+	if cursor != "" {
+		offset, _ = strconv.Atoi(cursor)
+	}
+	pageInfo := map[string]any{}
+	if offset+b.pageSize < len(all) {
+		pageInfo["nextOffset"] = strconv.Itoa(offset + b.pageSize)
+	}
+	return ApiOk(map[string]any{key: page(all, offset, b.pageSize), "page": pageInfo})
+}
+```
+
+#### Step 6: Adapters
+
+The `obj`, `list`, and `str` helpers read the untyped body; `ParseMoney` can fail, so the adapter returns `(Page, error)`. A missing `Links.Next` reads as `""`, the Go spelling of "no more pages".
+
+```go
+func (UkObAdapter) Transactions(r ApiResponse, bankId, accountId string) (Page[Transaction], error) {
+	out := []Transaction{}
+	for _, t := range list(obj(r.Body, "Data"), "Transaction") {
+		amt := obj(t, "Amount")
+		unsigned, err := ParseMoney(str(amt, "Amount"), CurrencyOf(str(amt, "Currency")))
+		if err != nil {
+			return Page[Transaction]{}, err
+		}
+		signed := unsigned // UK OB amounts are unsigned
+		if str(t, "CreditDebitIndicator") == "Debit" {
+			signed = unsigned.Negate()
+		}
+		out = append(out, Transaction{bankId, accountId, str(t, "TransactionId"), str(t, "BookingDateTime")[:10],
+			signed, str(t, "TransactionInformation"), str(t, "Status") == "Pending"})
+	}
+	return Page[Transaction]{out, str(obj(r.Body, "Links"), "Next")}, nil
+}
+```
+
+#### Step 7: The aggregator's fetch loop
+
+The page loop captures `cur` per iteration for the closure and stops on an empty cursor. `callWithRefresh` retries once on 401, wraps a failed refresh in `ErrReauthorizationRequired` with `%w`, and returns an `*OAuthError` for 403 without retrying.
+
+```go
+func (g *Aggregator) FetchTransactions(connectionId, accountId string) ([]Transaction, error) {
+	c := g.connections[connectionId]
+	all := []Transaction{}
+	cursor := ""
+	for {
+		cur := cursor
+		r, err := g.callWithRefresh(c, func(token string) ApiResponse { return c.Bank.Transactions(token, accountId, cur) })
+		if err != nil {
+			return nil, err
+		}
+		page, err := c.Adapter.Transactions(r, c.Bank.BankId(), accountId)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Items...)
+		cursor = page.NextCursor
+		if cursor == "" {
+			return all, nil
+		}
+	}
+}
+
+func (g *Aggregator) callWithRefresh(c *Connection, call Call) (ApiResponse, error) {
+	r := call(c.AccessToken)
+	if r.Status == 401 {
+		fresh, err := c.Auth.Refresh(ClientId, c.RefreshToken)
+		if err != nil {
+			return ApiResponse{}, fmt.Errorf("%w: %s: %v", ErrReauthorizationRequired, c.ConnectionId, err)
+		}
+		c.AccessToken = fresh.AccessToken
+		c.RefreshToken = fresh.RefreshToken // rotation: store the new one, the old one is now dead
+		c.RefreshCount++
+		r = call(c.AccessToken)
+	}
+	if r.Status == 403 {
+		return ApiResponse{}, &OAuthError{"insufficient_scope", "consent does not include the scope this call needs"}
+	}
+	if r.Status != 200 {
+		return ApiResponse{}, fmt.Errorf("unexpected status %d", r.Status)
+	}
+	return r, nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/13-open-banking-and-account-aggregation/code/go
 go run .
-go test ./...
+go test -race ./...
 ```
 
-The Go tests port every Java check (52 assertions, including the pinned `JavaRandom` sequence), pass under `go test -race`, and the demo output matches the Java run exactly.
+The demo output matches the Java run exactly, tokens included:
+
+```console
+== Things the bank refuses ==
+   wrong verifier: invalid_grant: PKCE verification failed
+   same code again (it was consumed by the failed attempt): invalid_grant: unknown or already used authorization code
+   unregistered redirect_uri: invalid_request: redirect_uri does not match registration
+   scope the client is not registered for: invalid_scope: this client is not registered for payments:write
+```
 
 ## Use It
 

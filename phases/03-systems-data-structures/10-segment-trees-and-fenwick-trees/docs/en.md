@@ -374,20 +374,199 @@ Section 5 is the one that earns trust: 257 positions (not a power of two), 20,00
 
 ### In Python
 
-`code/python/main.py` has the same classes (`FenwickTree`, `SegmentTree`, `LazySegmentTree`, `BalanceHistory`, plus `Currency` and `Money`) with the same methods in snake_case (`prefix_sum`, `range_sum`, `first_index_with_prefix_at_least`, `range_add`, `divide_half_even`). The 1-indexed Fenwick layout ports unchanged: `i & -i` isolates the lowest set bit of a Python `int` exactly as it does for a Java `int`. Three things differ:
+`code/python/main.py` has the same classes (`FenwickTree`, `SegmentTree`, `LazySegmentTree`, `BalanceHistory`, plus `Currency` and `Money`) with the same methods in snake_case (`prefix_sum`, `range_sum`, `first_index_with_prefix_at_least`, `range_add`, `divide_half_even`). The 1-indexed Fenwick layout ports unchanged: `i & -i` isolates the lowest set bit of a Python `int` exactly as it does for a Java `int`. Three things differ. **Overflow is checked by hand:** Python integers never overflow, so a sum past `Long.MAX_VALUE` would silently become a big number that no Java or Go service could store. `add_exact`, `subtract_exact`, and `multiply_exact` reproduce `Math.*Exact` and raise `OverflowError` (an `ArithmeticError`, like Java's `ArithmeticException`), and the overflow tests assert that error rather than a correct big sum. **Truncating division for half-even rounding:** `-25 // 10` is `-3` in Python, but `-25 / 10` is `-2` in Java. `divide_half_even` uses `java_div` and `java_rem`, which truncate toward zero, so `divide_half_even(-25, 10)` is `-2` in both languages; the test pins that case. **Explicit index checks:** a Python list accepts `-1` and returns the last element, which would let `fw.add(-1, x)` corrupt the last day without any error. `check_index` reproduces `Objects.checkIndex` and raises `IndexError`; `ValueError` replaces `IllegalArgumentException` for `lo > hi` and empty inputs. The randomized demo uses `JavaRandom` (a bit-exact `java.util.Random`, including `next_boolean`), so the 20,000 operations are the same as in Java. Recursion depth in the lazy tree is `log2 n`, far below Python's limit.
 
-- **Overflow is checked by hand.** Python integers never overflow, so a sum past `Long.MAX_VALUE` would silently become a big number that no Java or Go service could store. `add_exact`, `subtract_exact`, and `multiply_exact` reproduce `Math.*Exact` and raise `OverflowError` (an `ArithmeticError`, like Java's `ArithmeticException`), and the overflow tests assert that error rather than a correct big sum:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The Fenwick tree's two loops
+
+The `for` loops with a bit-trick stride become `while` loops. `add_exact` wraps every addition because a Python `int` would otherwise exceed 64 bits without complaint; `check_index` is the hand-written `Objects.checkIndex`.
 
 ```python
 def add_exact(a: int, b: int) -> int:
+    """Math.addExact: a long sum outside [-2^63, 2^63) is an error, never a silent wrap."""
     r = a + b
     if not LONG_MIN <= r <= LONG_MAX:
         raise OverflowError("long overflow")
     return r
 ```
 
-- **Truncating division for half-even rounding.** `-25 // 10` is `-3` in Python, but `-25 / 10` is `-2` in Java. `divide_half_even` uses `java_div` and `java_rem`, which truncate toward zero, so `divide_half_even(-25, 10)` is `-2` in both languages. The test pins that case.
-- **Explicit index checks.** A Python list accepts `-1` and returns the last element, which would let `fw.add(-1, x)` corrupt the last day without any error. `check_index` reproduces `Objects.checkIndex` and raises `IndexError`; `ValueError` replaces `IllegalArgumentException` for `lo > hi` and empty inputs. The randomized demo uses `JavaRandom` (a bit-exact `java.util.Random`, including `nextBoolean`), so the 20,000 operations are the same as in Java. Recursion depth in the lazy tree is `log2 n`, far below Python's limit.
+```python
+    def add(self, index: int, delta: int) -> None:
+        """values[index] += delta. Walks up: i += lowest set bit of i."""
+        check_index(index, self._n)
+        i = index + 1
+        while i <= self._n:
+            self._tree[i] = add_exact(self._tree[i], delta)
+            i += i & -i
+
+    def prefix_sum(self, index: int) -> int:
+        """Sum of values[0..index] inclusive. Walks down: i -= lowest set bit. Returns 0 for index -1."""
+        if index < -1 or index >= self._n:
+            raise IndexError(f"index {index} for size {self._n}")
+        s = 0
+        i = index + 1
+        while i > 0:
+            s = add_exact(s, self._tree[i])
+            i -= i & -i
+        return s
+
+    def range_sum(self, lo: int, hi: int) -> int:
+        if lo > hi:
+            raise ValueError(f"lo > hi: {lo} > {hi}")
+        check_index(lo, self._n)
+        check_index(hi, self._n)
+        return subtract_exact(self.prefix_sum(hi), self.prefix_sum(lo - 1))
+```
+
+#### Step 2: O(n) construction
+
+Slice assignment `f._tree[1:] = values` is the `System.arraycopy` into the 1-indexed layout; the single parent-push pass is unchanged.
+
+```python
+    @staticmethod
+    def build(values: list[int]) -> "FenwickTree":
+        """O(n) construction: each node pushes its total to its parent once."""
+        f = FenwickTree(len(values))
+        f._tree[1:] = values
+        for i in range(1, f._n + 1):
+            parent = i + (i & -i)
+            if parent <= f._n:
+                f._tree[parent] = add_exact(f._tree[parent], f._tree[i])
+        return f
+```
+
+#### Step 3: Descent for "which index crosses the target"
+
+`Integer.highestOneBit(n)` is `1 << (n.bit_length() - 1)`. The descent itself is unchanged, and `-1` still means the total never reaches the target.
+
+```python
+    def first_index_with_prefix_at_least(self, target: int) -> int:
+        """Smallest index whose prefix sum >= target, or -1. Requires values >= 0. Binary descent, O(log n)."""
+        if target <= 0:
+            return 0
+        pos = 0
+        remaining = target
+        step = 1 << (self._n.bit_length() - 1)  # Integer.highestOneBit(n)
+        while step > 0:
+            nxt = pos + step
+            if nxt <= self._n and self._tree[nxt] < remaining:
+                pos = nxt
+                remaining -= self._tree[nxt]
+            step >>= 1
+        return pos if pos < self._n else -1
+```
+
+#### Step 4: The array-backed segment tree
+
+The power-of-two layout, built with `[0] * (2 * s)` and a slice assignment for the leaves. `set` walks up with `>>= 1`; `range_sum` keeps `left` and `right` separate and tests the low bit with `l & 1`.
+
+```python
+    def __init__(self, values: list[int]) -> None:
+        if not values:
+            raise ValueError("size must be positive")
+        self._n = len(values)
+        s = 1
+        while s < self._n:
+            s <<= 1
+        self._size = s
+        self._sum = [0] * (2 * s)
+        self._sum[s:s + self._n] = values
+        for k in range(s - 1, 0, -1):
+            self._sum[k] = add_exact(self._sum[2 * k], self._sum[2 * k + 1])
+
+    def set(self, index: int, value: int) -> None:
+        """values[index] = value; recompute the log n ancestors."""
+        check_index(index, self._n)
+        k = index + self._size
+        self._sum[k] = value
+        k >>= 1
+        while k >= 1:
+            self._sum[k] = add_exact(self._sum[2 * k], self._sum[2 * k + 1])
+            k >>= 1
+
+    def range_sum(self, lo: int, hi: int) -> int:
+        if lo > hi:
+            raise ValueError(f"lo > hi: {lo} > {hi}")
+        check_index(lo, self._n)
+        check_index(hi, self._n)
+        left = right = 0
+        l, r = lo + self._size, hi + self._size + 1  # half-open [l, r)
+        while l < r:
+            if l & 1:
+                left = add_exact(left, self._sum[l])
+                l += 1
+            if r & 1:
+                r -= 1
+                right = add_exact(self._sum[r], right)
+            l >>= 1
+            r >>= 1
+        return add_exact(left, right)
+```
+
+#### Step 5: Lazy propagation
+
+`_apply`, `_push`, and `_range_add` are the Java methods with `multiply_exact` guarding `delta * count` and `>> 1` for the midpoint (safe because indexes are small non-negative ints).
+
+```python
+    def _apply(self, k: int, count: int, delta: int) -> None:
+        """Node k covers `count` values: its sum grows by count * delta."""
+        self._sum[k] = add_exact(self._sum[k], multiply_exact(delta, count))
+        self._pending[k] = add_exact(self._pending[k], delta)
+
+    def _push(self, k: int, lo: int, hi: int) -> None:
+        """Push k's pending addend one level down so its children are exact before we look at them."""
+        if self._pending[k] == 0:
+            return
+        mid = (lo + hi) >> 1
+        self._apply(2 * k, mid - lo + 1, self._pending[k])
+        self._apply(2 * k + 1, hi - mid, self._pending[k])
+        self._pending[k] = 0
+
+    def _range_add(self, k: int, node_lo: int, node_hi: int, lo: int, hi: int, delta: int) -> None:
+        if hi < node_lo or node_hi < lo:
+            return  # disjoint
+        if lo <= node_lo and node_hi <= hi:
+            self._apply(k, node_hi - node_lo + 1, delta)  # fully covered: stop here
+            return
+        self._push(k, node_lo, node_hi)
+        mid = (node_lo + node_hi) >> 1
+        self._range_add(2 * k, node_lo, mid, lo, hi, delta)
+        self._range_add(2 * k + 1, mid + 1, node_hi, lo, hi, delta)
+        self._sum[k] = add_exact(self._sum[2 * k], self._sum[2 * k + 1])
+```
+
+#### Step 6: The balance history
+
+`post` is a range add to the end of the period and `average_daily_balance` one range sum and one rounded division. `divide_half_even` is written over `java_div`/`java_rem` so negative averages round as Java's truncating `/` and `%` would.
+
+```python
+    def post(self, day: int, delta_minor: int) -> None:
+        self._balances.range_add(day, self._balances.size() - 1, delta_minor)
+
+    def balance_on(self, day: int) -> Money:
+        return Money.of_minor(self._balances.get(day), self._currency)
+
+    def average_daily_balance(self, from_day: int, to_day: int) -> Money:
+        """Average daily balance over [from_day, to_day], rounded half-even to a minor unit."""
+        total = self._balances.range_sum(from_day, to_day)
+        return Money.of_minor(BalanceHistory.divide_half_even(total, to_day - from_day + 1), self._currency)
+
+    @staticmethod
+    def divide_half_even(dividend: int, divisor: int) -> int:
+        q, r = java_div(dividend, divisor), java_rem(dividend, divisor)
+        if r == 0:
+            return q
+        sign = -1 if (dividend < 0) != (divisor < 0) else 1
+        twice, d = abs(r) * 2, abs(divisor)
+        if twice > d:
+            return q + sign
+        if twice < d:
+            return q
+        return q if java_rem(q, 2) == 0 else q + sign
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/03-systems-data-structures/10-segment-trees-and-fenwick-trees/code/python
@@ -395,30 +574,281 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== 1. Fenwick tree: daily net postings, balance by prefix sum ==
+  daily net   = [12500, -3200, 0, 4150, -900, 7000, -2250, 1000]
+  balances    = [12500, 9300, 9300, 13450, 12550, 19550, 17300, 18300]
+  net days 2..5 = 102.50 USD
+```
+
+Section 5 reports `mismatches = 0` over the same 20,000 operations as the Java run, because `JavaRandom` reproduces the seed's stream.
+
 ### In Go
 
-`code/go/main.go` has the same types (`FenwickTree`, `SegmentTree`, `LazySegmentTree`, `BalanceHistory`, plus `Currency` and `Money`) with the same methods in exported CamelCase (`PrefixSum`, `RangeSum`, `FirstIndexWithPrefixAtLeast`, `RangeAdd`, `DivideHalfEven`). The 1-indexed Fenwick layout ports unchanged: `i & -i` isolates the lowest set bit of a Go `int` exactly as it does for a Java `int`, and `/` and `%` truncate toward zero like Java's, so `DivideHalfEven(-25, 10)` is `-2` without any helper. Three things differ:
+`code/go/main.go` has the same types (`FenwickTree`, `SegmentTree`, `LazySegmentTree`, `BalanceHistory`, plus `Currency` and `Money`) with the same methods in exported CamelCase (`PrefixSum`, `RangeSum`, `FirstIndexWithPrefixAtLeast`, `RangeAdd`, `DivideHalfEven`). The 1-indexed Fenwick layout ports unchanged: `i & -i` isolates the lowest set bit of a Go `int` exactly as it does for a Java `int`, and `/` and `%` truncate toward zero like Java's, so `DivideHalfEven(-25, 10)` is `-2` without any helper. Three things differ. **Overflow is checked by hand:** Go's `int64` wraps silently and there is no `Math.addExact`, so `addChecked`, `subChecked`, and `mulChecked` reproduce the `Math.*Exact` family and return `ErrOverflow`. Every sum in every tree goes through them, which is why the overflow tests assert an error rather than a wrapped total. **Every range-checked method returns an error:** `Add`, `Set`, `RangeAdd`, and `Post` return `error`; `PrefixSum`, `RangeSum`, `Get`, `BalanceOn`, and the constructors return `(value, error)`. `checkIndex` reproduces `Objects.checkIndex` with `ErrIndexOutOfBounds`, `lo > hi` and empty inputs give `ErrInvalidArgument`, and the tests check each with `errors.Is`. The Java test that wraps three Fenwick calls in one `checkThrows` becomes an `errors.Join` of the three results, because in Go the overflow surfaces from whichever call hits it. **The bottom-up `RangeSum` keeps two accumulators:** `left` and `right` are added in order and only combined at the end, so the same loop serves a non-commutative operation later. The randomized demo uses `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random` including `NextBoolean`), so the 20,000 operations are the same as in Java and the demo output is identical.
 
-- **Overflow is checked by hand.** Go's `int64` wraps silently and there is no `Math.addExact`, so `addChecked`, `subChecked`, and `mulChecked` reproduce the `Math.*Exact` family and return `ErrOverflow`. Every sum in every tree goes through them, which is why the overflow tests assert an error rather than a wrapped total:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The Fenwick tree's two loops
+
+`addChecked` detects overflow by the sign rule. Every loop body assigns-and-checks in one `if` statement, and the methods return errors instead of throwing; `RangeSum` threads two `PrefixSum` results into `subChecked`.
 
 ```go
 func addChecked(a, b int64) (int64, error) {
-    r := a + b
-    if (a >= 0) == (b >= 0) && (r >= 0) != (a >= 0) {
-        return 0, ErrOverflow
-    }
-    return r, nil
+	r := a + b
+	if (a >= 0) == (b >= 0) && (r >= 0) != (a >= 0) {
+		return 0, ErrOverflow
+	}
+	return r, nil
+}
+
+func (f *FenwickTree) Add(index int, delta int64) error {
+	if err := checkIndex(index, f.n); err != nil {
+		return err
+	}
+	for i := index + 1; i <= f.n; i += i & -i {
+		var err error
+		if f.tree[i], err = addChecked(f.tree[i], delta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *FenwickTree) PrefixSum(index int) (int64, error) {
+	if index < -1 || index >= f.n {
+		return 0, fmt.Errorf("%w: index %d for size %d", ErrIndexOutOfBounds, index, f.n)
+	}
+	sum := int64(0)
+	for i := index + 1; i > 0; i -= i & -i {
+		var err error
+		if sum, err = addChecked(sum, f.tree[i]); err != nil {
+			return 0, err
+		}
+	}
+	return sum, nil
 }
 ```
 
-- **Every range-checked method returns an error.** `Add`, `Set`, `RangeAdd`, and `Post` return `error`; `PrefixSum`, `RangeSum`, `Get`, `BalanceOn`, and the constructors return `(value, error)`. `checkIndex` reproduces `Objects.checkIndex` with `ErrIndexOutOfBounds`, `lo > hi` and empty inputs give `ErrInvalidArgument`, and the tests check each with `errors.Is`. The Java test that wraps three Fenwick calls in one `checkThrows` becomes an `errors.Join` of the three results, because in Go the overflow surfaces from whichever call hits it.
-- **The bottom-up `RangeSum` keeps two accumulators.** `left` and `right` are added in order and only combined at the end, so the same loop serves a non-commutative operation later. The lazy tree's recursion is unchanged; its depth is `log2 n`. The randomized demo uses `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random` including `NextBoolean`), so the 20,000 operations are the same as in Java and the demo output is identical.
+#### Step 2: O(n) construction
+
+`copy(f.tree[1:], values)` is the `System.arraycopy`, and the parent push goes through `addChecked`.
+
+```go
+func BuildFenwick(values []int64) (*FenwickTree, error) {
+	f, err := NewFenwickTree(len(values))
+	if err != nil {
+		return nil, err
+	}
+	copy(f.tree[1:], values)
+	for i := 1; i <= f.n; i++ {
+		parent := i + (i & -i)
+		if parent <= f.n {
+			if f.tree[parent], err = addChecked(f.tree[parent], f.tree[i]); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return f, nil
+}
+```
+
+#### Step 3: Descent for "which index crosses the target"
+
+`highestOneBit` is built from `bits.Len`. The descent needs no error return: it only reads the tree.
+
+```go
+func (f *FenwickTree) FirstIndexWithPrefixAtLeast(target int64) int {
+	if target <= 0 {
+		return 0
+	}
+	pos := 0
+	remaining := target
+	for step := highestOneBit(f.n); step > 0; step >>= 1 {
+		next := pos + step
+		if next <= f.n && f.tree[next] < remaining {
+			pos = next
+			remaining -= f.tree[next]
+		}
+	}
+	if pos < f.n {
+		return pos // pos is the 1-indexed position of the last node that stayed below target
+	}
+	return -1
+}
+
+// highestOneBit is Integer.highestOneBit for a positive int.
+func highestOneBit(n int) int { return 1 << (bits.Len(uint(n)) - 1) }
+```
+
+#### Step 4: The array-backed segment tree
+
+The same power-of-two layout; `copy(t.sum[s:], values)` places the leaves. `Set` uses a three-clause `for` that starts by halving `k`, and `RangeSum` keeps the two accumulators with every addition checked.
+
+```go
+func (t *SegmentTree) Set(index int, value int64) error {
+	if err := checkIndex(index, t.n); err != nil {
+		return err
+	}
+	k := index + t.size
+	t.sum[k] = value
+	for k >>= 1; k >= 1; k >>= 1 {
+		var err error
+		if t.sum[k], err = addChecked(t.sum[2*k], t.sum[2*k+1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *SegmentTree) RangeSum(lo, hi int) (int64, error) {
+	if err := checkRange(lo, hi, t.n); err != nil {
+		return 0, err
+	}
+	var left, right int64
+	var err error
+	l, r := lo+t.size, hi+t.size+1 // half-open [l, r)
+	for l < r {
+		if l&1 == 1 {
+			if left, err = addChecked(left, t.sum[l]); err != nil {
+				return 0, err
+			}
+			l++
+		}
+		if r&1 == 1 {
+			r--
+			if right, err = addChecked(t.sum[r], right); err != nil {
+				return 0, err
+			}
+		}
+		l >>= 1
+		r >>= 1
+	}
+	return addChecked(left, right)
+}
+```
+
+#### Step 5: Lazy propagation
+
+`apply` chains `mulChecked` and two `addChecked`s; `push` and `rangeAdd` propagate any error upward. The midpoint uses `uint(lo+hi) >> 1`, Go's spelling of `>>> 1`.
+
+```go
+func (t *LazySegmentTree) apply(k, count int, delta int64) error {
+	grow, err := mulChecked(delta, int64(count))
+	if err != nil {
+		return err
+	}
+	if t.sum[k], err = addChecked(t.sum[k], grow); err != nil {
+		return err
+	}
+	t.pending[k], err = addChecked(t.pending[k], delta)
+	return err
+}
+
+func (t *LazySegmentTree) push(k, lo, hi int) error {
+	if t.pending[k] == 0 {
+		return nil
+	}
+	mid := int(uint(lo+hi) >> 1)
+	if err := t.apply(2*k, mid-lo+1, t.pending[k]); err != nil {
+		return err
+	}
+	if err := t.apply(2*k+1, hi-mid, t.pending[k]); err != nil {
+		return err
+	}
+	t.pending[k] = 0
+	return nil
+}
+
+func (t *LazySegmentTree) rangeAdd(k, nodeLo, nodeHi, lo, hi int, delta int64) error {
+	if hi < nodeLo || nodeHi < lo { // disjoint
+		return nil
+	}
+	if lo <= nodeLo && nodeHi <= hi { // fully covered: stop here
+		return t.apply(k, nodeHi-nodeLo+1, delta)
+	}
+	if err := t.push(k, nodeLo, nodeHi); err != nil {
+		return err
+	}
+	mid := int(uint(nodeLo+nodeHi) >> 1)
+	if err := t.rangeAdd(2*k, nodeLo, mid, lo, hi, delta); err != nil {
+		return err
+	}
+	if err := t.rangeAdd(2*k+1, mid+1, nodeHi, lo, hi, delta); err != nil {
+		return err
+	}
+	var err error
+	t.sum[k], err = addChecked(t.sum[2*k], t.sum[2*k+1])
+	return err
+}
+```
+
+#### Step 6: The balance history
+
+`Post` and `BalanceOn` forward to the lazy tree and return its errors. `DivideHalfEven` needs no helper because Go's `/` and `%` already truncate toward zero like Java's.
+
+```go
+func (h *BalanceHistory) Post(day int, deltaMinor int64) error {
+	return h.balances.RangeAdd(day, h.balances.Size()-1, deltaMinor)
+}
+
+func (h *BalanceHistory) BalanceOn(day int) (Money, error) {
+	v, err := h.balances.Get(day)
+	return OfMinor(v, h.currency), err
+}
+
+// AverageDailyBalance over [fromDay, toDay], rounded half-even to a minor unit.
+func (h *BalanceHistory) AverageDailyBalance(fromDay, toDay int) (Money, error) {
+	total, err := h.balances.RangeSum(fromDay, toDay)
+	if err != nil {
+		return Money{}, err
+	}
+	days := int64(toDay - fromDay + 1)
+	return OfMinor(DivideHalfEven(total, days), h.currency), nil
+}
+
+// DivideHalfEven rounds the quotient to the nearest integer, ties to even. Go's / and % truncate toward zero like Java's.
+func DivideHalfEven(dividend, divisor int64) int64 {
+	q, r := dividend/divisor, dividend%divisor
+	if r == 0 {
+		return q
+	}
+	sign := int64(1)
+	if (dividend < 0) != (divisor < 0) {
+		sign = -1
+	}
+	twice, d := abs64(r)*2, abs64(divisor)
+	if twice > d {
+		return q + sign
+	}
+	if twice < d {
+		return q
+	}
+	if q%2 == 0 {
+		return q
+	}
+	return q + sign
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/03-systems-data-structures/10-segment-trees-and-fenwick-trees/code/go
 go run .
 go test ./...
 ```
+
+```console
+== 5. Randomized agreement: 20000 mixed operations against the naive array ==
+  mismatches = 0
+
+== 6. Cost: 10 million days, one query ==
+  naive range sum: up to 10000000 additions; Fenwick: 2 * 24 node reads; segment tree: about 2 * 24 node reads
+  memory: Fenwick 10000001 longs; segment tree 33554432 longs; lazy tree 2 x 40000000 longs
+```
+
+Sections 1 through 4 print the same balances, averages, and descent index as the Java run.
 
 ## Use It
 

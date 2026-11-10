@@ -302,26 +302,207 @@ The last two lines are the business case. Eight systems in scope became three, a
 
 ### In Python
 
-The full port is `code/python/main.py` (same `Pan`, `Principal`, `TokenRecord`, `TokenVault`, `SystemInventory`; tests in `code/python/test_main.py`). One substitution and two smaller differences:
+The Python port has the same `Pan`, `Principal`, `TokenRecord`, `TokenVault`, and `SystemInventory`, with one substitution and two smaller differences. **The standard library has no AES, so the AEAD is built from HMAC-SHA256.** The course is stdlib-only and `cryptography` is not available, so `encrypt`/`decrypt` keep AES-GCM's *shape and properties* with a different primitive: two subkeys are derived from the data key by HMAC with labels; the plaintext is XORed with a PRF keystream `HMAC(enc_key, nonce || block)` (the same construction as CTR mode, with HMAC as the block function); and a 16-byte tag `HMAC(mac_key, nonce || len(aad) || aad || ciphertext)` is appended, encrypt-then-MAC. The stored record is still `nonce` (4 random bytes + counter, identical to Java's) plus `ciphertext || tag`, 32 bytes for a 16-digit PAN. Every property the lesson relies on is kept under test: the ciphertext does not contain the PAN, flipping one bit of the body or the tag fails authentication, the ciphertext is bound to its token through the AAD, a different data key fails, the same PAN under two nonces gives two ciphertexts, and revocation zeroes the bytes. The one visible difference is the ciphertext hex in the demo, which cannot match a real GCM output; tokens, nonces, audit lines and scope counts are byte-identical to Java. In production you would use a real AEAD (an HSM, a KMS, or `cryptography`'s `AESGCM`); the lesson's point is what the vault stores and who may unwrap it, not the block cipher. **`Pan` masks both `__str__` and `__repr__`**, because f-strings with `!r`, containers, debuggers and failing assertions call `repr`; the digits live in a slot reached only through `digits()`, and equality uses `hmac.compare_digest` like Java's `MessageDigest.isEqual`. `TokenRecord.ciphertext` is a `bytearray` so `revoke` can shred it in place, as `Arrays.fill` does. **Randomness is the JDK's:** `JavaRandom` ports `java.util.Random` including `nextBytes` and the unbounded `nextInt`, so `demo_key(seed)`, the minted tokens (`0384055893221111`) and the nonce (`5e688e99…`) match the Java demo exactly; the test asserts those values. Errors map to `AuthorizationError` and `TokenStateError` (both `RuntimeError`), `SecurityError` for authentication failures, and `ValueError` for bad arguments.
 
-- **The standard library has no AES, so the AEAD is built from HMAC-SHA256.** The course is stdlib-only and `cryptography` is not available, so `encrypt`/`decrypt` keep AES-GCM's *shape and properties* with a different primitive: two subkeys are derived from the data key by HMAC with labels; the plaintext is XORed with a PRF keystream `HMAC(enc_key, nonce || block)` (the same construction as CTR mode, with HMAC as the block function); and a 16-byte tag `HMAC(mac_key, nonce || len(aad) || aad || ciphertext)` is appended, encrypt-then-MAC. The stored record is still `nonce` (4 random bytes + counter, identical to Java's) plus `ciphertext || tag`, 32 bytes for a 16-digit PAN. Every property the lesson relies on is kept under test: the ciphertext does not contain the PAN, flipping one bit of the body or the tag fails authentication, the ciphertext is bound to its token through the AAD, a different data key fails, the same PAN under two nonces gives two ciphertexts, and revocation zeroes the bytes. The one visible difference is the ciphertext hex in the demo, which cannot match a real GCM output; tokens, nonces, audit lines and scope counts are byte-identical to Java. In production you would use a real AEAD (an HSM, a KMS, or `cryptography`'s `AESGCM`); the lesson's point is what the vault stores and who may unwrap it, not the block cipher.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A PAN that cannot be printed
+
+`__slots__` keeps the digits in one private attribute, `of` is the validating factory, and `digits()` is the only accessor. `__str__` returns the mask and `__repr__` is bound to the same method; `__eq__` compares in constant time.
 
 ```python
-def encrypt(self, plaintext: bytes, nonce: bytes, aad: str) -> bytearray:
-    stream = self._keystream(nonce, len(plaintext))            # HMAC(enc_key, nonce || block), concatenated
-    body = bytes(p ^ k for p, k in zip(plaintext, stream))
-    return bytearray(body + self._tag(nonce, aad.encode("ascii"), body))
+class Pan:
+    __slots__ = ("_digits",)
 
-def decrypt(self, ciphertext: bytes, nonce: bytes, aad: str) -> bytes:
-    body, tag = bytes(ciphertext[:-16]), bytes(ciphertext[-16:])
-    if not hmac.compare_digest(tag, self._tag(nonce, aad.encode("ascii"), body)):
-        raise SecurityError("ciphertext failed authentication: tampered record or wrong key")
-    stream = self._keystream(nonce, len(body))
-    return bytes(c ^ k for c, k in zip(body, stream))
+    def __init__(self, digits: str) -> None:
+        self._digits = digits
+
+    @staticmethod
+    def of(raw: str) -> "Pan":
+        s = raw.replace(" ", "").replace("-", "")
+        if len(s) < 12 or len(s) > 19 or not s.isdigit() or not s.isascii():
+            raise ValueError("PAN must be 12-19 digits")
+        if not Luhn.is_valid(s):
+            raise ValueError("PAN fails the Luhn check")
+        return Pan(s)
+
+    def digits(self) -> str:
+        """The full PAN. Only the vault's encrypt path and an authorized detokenize caller should call this."""
+        return self._digits
+
+    def last_four(self) -> str:
+        return self._digits[-4:]
+
+    def masked(self) -> str:
+        """First six and last four visible, as PCI DSS Requirement 3.4 allows for display; the rest masked."""
+        return self.bin() + "*" * (len(self._digits) - 10) + self.last_four()
+
+    def __str__(self) -> str:
+        return self.masked()
+
+    __repr__ = __str__
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Pan) and hmac.compare_digest(self._digits.encode("ascii"), other._digits.encode("ascii"))
 ```
 
-- **`Pan` masks both `__str__` and `__repr__`**, because f-strings with `!r`, containers, debuggers and failing assertions call `repr`; the digits live in a slot reached only through `digits()`, and equality uses `hmac.compare_digest` like Java's `MessageDigest.isEqual`. `TokenRecord.ciphertext` is a `bytearray` so `revoke` can shred it in place, as `Arrays.fill` does.
-- **Randomness is the JDK's.** `JavaRandom` ports `java.util.Random` including `nextBytes` and the unbounded `nextInt`, so `demo_key(seed)`, the minted tokens (`0384055893221111`) and the nonce (`5e688e99…`) match the Java demo exactly; the test asserts those values. Errors map to `AuthorizationError` and `TokenStateError` (both `RuntimeError`), `SecurityError` for authentication failures, and `ValueError` for bad arguments.
+#### Step 2: Keys, clock, randomness: injected, not ambient
+
+The constructor validates both key lengths and, instead of a `SecretKeySpec`, derives the two HMAC subkeys (`_enc_key`, `_mac_key`) from the data key with distinct labels. The index key, `JavaRandom`, and clock are stored as given.
+
+```python
+    def __init__(self, data_key: bytes, index_key: bytes, random: JavaRandom, clock: Clock, ttl_seconds: int) -> None:
+        if len(data_key) != 32:
+            raise ValueError("data key must be 32 bytes (256-bit)")
+        if len(index_key) < 32:
+            raise ValueError("index key must be at least 32 bytes")
+        # Key separation, as a KMS would do for AES-GCM: one subkey for the keystream, one for the tag.
+        self._enc_key = hmac.new(data_key, b"pefs-vault-keystream", hashlib.sha256).digest()
+        self._mac_key = hmac.new(data_key, b"pefs-vault-tag", hashlib.sha256).digest()
+        self._index_key = index_key
+        self._random = random
+        self._clock = clock
+        self._ttl_seconds = ttl_seconds
+        self._by_token: Dict[str, TokenRecord] = {}
+        self._token_by_pan_hmac: Dict[str, str] = {}
+        self._audit: List[AuditEntry] = []
+        self._nonce_counter = 0
+```
+
+#### Step 3: Minting a token that fails Luhn
+
+A list of characters stands in for the `char[]`. Because `JavaRandom.next_int(10)` reproduces the JDK's sequence, the minted tokens are the same as Java's; the bump at `len(t) - 5` and the collision check are unchanged.
+
+```python
+    def mint_token(self, pan: Pan) -> str:
+        """Format-preserving: same length, same last four, random middle, and Luhn-INVALID by construction."""
+        for _ in range(100):
+            t = [chr(48 + self._random.next_int(10)) for _ in range(pan.length() - 4)] + list(pan.last_four())
+            candidate = "".join(t)
+            if Luhn.is_valid(candidate):
+                # bump one non-preserved digit: a single-digit change always flips the Luhn sum mod 10
+                pos = len(t) - 5
+                t[pos] = chr(48 + (ord(t[pos]) - 48 + 1) % 10)
+                candidate = "".join(t)
+            if candidate not in self._by_token:
+                return candidate
+        raise RuntimeError("token space exhausted for this last-four")
+```
+
+#### Step 4: Idempotent tokenize through an HMAC index
+
+Scope check, keyed-hash lookup, early return for a live existing token, then mint, nonce, encrypt, store, index, log. `hmac_hex` is `hmac.new(index_key, pan, sha256).hexdigest()`.
+
+```python
+    def tokenize(self, pan: Pan, who: Principal) -> str:
+        """Returns the existing token for this PAN or mints a new one. Idempotent per PAN."""
+        if not who.has(Scope.TOKENIZE):
+            self._log(who, "TOKENIZE", "-", False, "missing scope TOKENIZE")
+            raise AuthorizationError(f"{who.id} may not tokenize")
+        index = self.hmac_hex(pan.digits())
+        existing = self._token_by_pan_hmac.get(index)
+        if existing is not None and self._by_token[existing].status is not TokenStatus.REVOKED:
+            self._log(who, "TOKENIZE", existing, True, "existing")
+            return existing
+        token = self.mint_token(pan)
+        now = self._clock.now_epoch_seconds()
+        nonce = self.next_nonce()
+        ciphertext = self.encrypt(pan.digits().encode("ascii"), nonce, token)
+        self._by_token[token] = TokenRecord(token, nonce, ciphertext, pan.last_four(), pan.length(), now, now + self._ttl_seconds)
+        self._token_by_pan_hmac[index] = token
+        self._log(who, "TOKENIZE", token, True, "new")
+        return token
+```
+
+#### Step 5: Authenticated encryption bound to the token
+
+The nonce is the same 4-byte random word plus 8-byte counter. The AEAD substitution: `_keystream` concatenates `HMAC(enc_key, nonce || block)` blocks, `encrypt` XORs and appends the 16-byte `_tag` over `nonce || len(aad) || aad || body`, and `decrypt` verifies the tag with `compare_digest` before touching the body.
+
+```python
+    def next_nonce(self) -> bytes:
+        """96-bit nonce: 4 random bytes || 64-bit counter. Never repeats under one key within this process."""
+        nonce = (self._random.next_int() & 0xFFFFFFFF).to_bytes(4, "big") + self._nonce_counter.to_bytes(8, "big")
+        self._nonce_counter += 1
+        return nonce
+
+    def _keystream(self, nonce: bytes, length: int) -> bytes:
+        """HMAC-SHA256(enc_key, nonce || block counter) blocks, concatenated: a PRF keystream, as AES-CTR uses AES."""
+        out = bytearray()
+        block = 0
+        while len(out) < length:
+            out += hmac.new(self._enc_key, nonce + block.to_bytes(4, "big"), hashlib.sha256).digest()
+            block += 1
+        return bytes(out[:length])
+
+    def _tag(self, nonce: bytes, aad: bytes, ciphertext: bytes) -> bytes:
+        """HMAC-SHA256(mac_key, nonce || len(aad) || aad || ciphertext), truncated to 16 bytes like a GCM tag."""
+        msg = nonce + len(aad).to_bytes(4, "big") + aad + ciphertext
+        return hmac.new(self._mac_key, msg, hashlib.sha256).digest()[: self.TAG_BYTES]
+
+    def encrypt(self, plaintext: bytes, nonce: bytes, aad: str) -> bytearray:
+        """Encrypt-then-MAC with the token as additional authenticated data. Output: ciphertext || 16-byte tag."""
+        stream = self._keystream(nonce, len(plaintext))
+        body = bytes(p ^ k for p, k in zip(plaintext, stream))
+        return bytearray(body + self._tag(nonce, aad.encode("ascii"), body))
+
+    def decrypt(self, ciphertext: bytes, nonce: bytes, aad: str) -> bytes:
+        if len(ciphertext) < self.TAG_BYTES:
+            raise SecurityError("ciphertext failed authentication: tampered record or wrong key")
+        body, tag = bytes(ciphertext[: -self.TAG_BYTES]), bytes(ciphertext[-self.TAG_BYTES:])
+        if not hmac.compare_digest(tag, self._tag(nonce, aad.encode("ascii"), body)):
+            raise SecurityError("ciphertext failed authentication: tampered record or wrong key")
+        stream = self._keystream(nonce, len(body))
+        return bytes(c ^ k for c, k in zip(body, stream))
+```
+
+#### Step 6: Detokenize is where the controls live
+
+The four gates in the same order, each denial logged before its `AuthorizationError` or `TokenStateError`. The decrypted bytes go back through `Pan.of`, so the caller receives the masked type.
+
+```python
+    def detokenize(self, token: str, who: Principal, purpose: str) -> Pan:
+        if not who.has(Scope.DETOKENIZE):
+            self._log(who, "DETOKENIZE", token, False, "missing scope DETOKENIZE")
+            raise AuthorizationError(f"{who.id} may not detokenize")
+        rec = self._by_token.get(token)
+        if rec is None:
+            self._log(who, "DETOKENIZE", token, False, "unknown token")
+            raise TokenStateError("unknown token")
+        if rec.status is not TokenStatus.ACTIVE:
+            self._log(who, "DETOKENIZE", token, False, f"status {rec.status.name}")
+            raise TokenStateError(f"token is {rec.status.name}")
+        if self._clock.now_epoch_seconds() >= rec.expires_at:
+            self._log(who, "DETOKENIZE", token, False, "expired")
+            raise TokenStateError("token expired")
+        plain = self.decrypt(rec.ciphertext, rec.nonce, token)
+        self._log(who, "DETOKENIZE", token, True, f"purpose={purpose}")
+        return Pan.of(plain.decode("ascii"))
+```
+
+#### Step 7: Lifecycle and crypto-shredding
+
+`rec.ciphertext[:] = bytes(len(...))` overwrites the `bytearray` in place, the Python `Arrays.fill`; the index is rebuilt without the revoked token. `suspend` and `reactivate` share `_transition`, which refuses any move not from the expected status.
+
+```python
+    def revoke(self, token: str, who: Principal) -> None:
+        """Revocation is a crypto-shred: zero the ciphertext so no future key compromise can recover the PAN."""
+        rec = self._require(token, who, "REVOKE")
+        if rec.status is TokenStatus.REVOKED:
+            raise TokenStateError("already revoked")
+        rec.ciphertext[:] = bytes(len(rec.ciphertext))
+        rec.status = TokenStatus.REVOKED
+        self._token_by_pan_hmac = {k: v for k, v in self._token_by_pan_hmac.items() if v != token}
+        self._log(who, "REVOKE", token, True, "ciphertext shredded")
+
+    def _transition(self, token: str, who: Principal, from_: TokenStatus, to: TokenStatus, action: str) -> None:
+        rec = self._require(token, who, action)
+        if rec.status is not from_:
+            raise TokenStateError(f"cannot {action} a token that is {rec.status.name}")
+        rec.status = to
+        self._log(who, action, token, True, "")
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/05-tokenization-and-pci-scope/code/python
@@ -329,13 +510,163 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Tokens, nonce, audit log, and scope counts match the Java run; only the ciphertext hex differs, because the HMAC-based AEAD cannot reproduce a GCM output:
+
+```console
+== Tokenize test PANs ==
+PAN 411111******1111 -> token 0384055893221111 (Luhn valid? false)
+PAN 555555******4444 -> token 2626039036334444 (Luhn valid? false)
+PAN 378282*****0005 -> token 087606057730005 (length 15)
+same PAN again -> 0384055893221111 (idempotent)
+
+== What is stored ==
+nonce      = 5e688e990000000000000000
+ciphertext = e1bd68be49097c5654fda33e230f707b6a57ad60b6f82a5a56c51ccd6e99b4f0 (32 bytes = 16 PAN + 16 tag)
+last four  = 1111, status = ACTIVE
+```
+
 ### In Go
 
-The full port is `code/go/main.go` (same `Pan`, `Principal`, `TokenRecord`, `TokenVault`, `SystemInventory`; tests in `code/go/main_test.go`). Unlike Python, Go's standard library has real AES-GCM, so there is no substitution: the demo prints the same ciphertext hex as Java, byte for byte. Three things differ:
+The Go port has the same `Pan`, `Principal`, `TokenRecord`, `TokenVault`, and `SystemInventory`. Unlike Python, Go's standard library has real AES-GCM, so there is no substitution: the demo prints the same ciphertext hex as Java, byte for byte. Three things differ. **The AEAD is a `cipher.AEAD` built once in the constructor:** `aes.NewCipher` plus `cipher.NewGCM` replaces `Cipher.getInstance("AES/GCM/NoPadding")` on every call; `Seal` appends the 16-byte tag and `Open` verifies it in constant time before returning any plaintext. The token is passed as the additional data, so a record moved to another token fails to open. **Exceptions become sentinel errors:** `AuthorizationException` is `ErrUnauthorized`, `TokenStateException` is `ErrTokenState`, `SecurityException` is `ErrAuthentication` and `IllegalArgumentException` is `ErrInvalidArgument`; every path wraps one with `fmt.Errorf("%w: ...")` so callers test `errors.Is` and the tests assert the kind of failure, not just that one happened. `Suspend`, `Reactivate` and `Revoke` return `error` instead of `void`. **The mask has to cover four `fmt` verbs:** `String()` handles `%v` and `%s`, the unexported `digits` field keeps `%+v` honest, and `GoString()` handles `%#v`, which bypasses `Stringer` and would otherwise print the struct in Go syntax with the field. `Equal` uses `crypto/subtle.ConstantTimeCompare` like Java's `MessageDigest.isEqual`. Randomness is the JDK's: `javarandom.go` ports `java.util.Random` including `nextBytes`, so `DemoKey`, the minted tokens and the nonces match the Java demo and the test pins those values.
 
-- **The AEAD is a `cipher.AEAD` built once in the constructor.** `aes.NewCipher` plus `cipher.NewGCM` replaces `Cipher.getInstance("AES/GCM/NoPadding")` on every call; `Seal` appends the 16-byte tag and `Open` verifies it in constant time before returning any plaintext. The token is passed as the additional data, so a record moved to another token fails to open:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A PAN that cannot be printed
+
+`PanOf` is the validating factory, wrapping `ErrInvalidArgument`. The field is unexported; `String` and `GoString` both return the mask; `Equal` is constant-time.
 
 ```go
+type Pan struct {
+	digits string
+}
+
+func PanOf(raw string) (Pan, error) {
+	s := strings.ReplaceAll(strings.ReplaceAll(raw, " ", ""), "-", "")
+	if len(s) < 12 || len(s) > 19 || !allDigits(s) {
+		return Pan{}, fmt.Errorf("%w: PAN must be 12-19 digits", ErrInvalidArgument)
+	}
+	if !LuhnValid(s) {
+		return Pan{}, fmt.Errorf("%w: PAN fails the Luhn check", ErrInvalidArgument)
+	}
+	return Pan{s}, nil
+}
+
+// Digits is the full PAN. Only the vault's encrypt path and an authorized detokenize caller should call this.
+func (p Pan) Digits() string   { return p.digits }
+func (p Pan) LastFour() string { return p.digits[len(p.digits)-4:] }
+func (p Pan) Bin() string      { return p.digits[:6] }
+func (p Pan) Length() int      { return len(p.digits) }
+
+// Masked shows the first six and last four, as PCI DSS Requirement 3.4 allows for display; the rest is masked.
+func (p Pan) Masked() string {
+	return p.Bin() + strings.Repeat("*", len(p.digits)-10) + p.LastFour()
+}
+
+func (p Pan) String() string { return p.Masked() }
+
+// GoString covers %#v, which bypasses Stringer and would otherwise print the unexported field in Go syntax.
+func (p Pan) GoString() string { return p.Masked() }
+
+// Equal is constant-time, like Java's MessageDigest.isEqual.
+func (p Pan) Equal(o Pan) bool {
+	return subtle.ConstantTimeCompare([]byte(p.digits), []byte(o.digits)) == 1
+}
+```
+
+#### Step 2: Keys, clock, randomness: injected, not ambient
+
+`NewTokenVault` validates both keys, builds the AES block and the GCM `AEAD` once, copies the index key, and stores the injected `*JavaRandom` and `Clock`.
+
+```go
+func NewTokenVault(dataKey, indexKey []byte, random *JavaRandom, clock Clock, ttlSeconds int64) (*TokenVault, error) {
+	if len(dataKey) != 32 {
+		return nil, fmt.Errorf("%w: data key must be 32 bytes (AES-256)", ErrInvalidArgument)
+	}
+	if len(indexKey) < 32 {
+		return nil, fmt.Errorf("%w: index key must be at least 32 bytes", ErrInvalidArgument)
+	}
+	block, err := aes.NewCipher(dataKey)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return &TokenVault{aead: aead, indexKey: append([]byte(nil), indexKey...), random: random, clock: clock, ttlSeconds: ttlSeconds,
+		byToken: map[string]*TokenRecord{}, tokenByPanHmac: map[string]string{}}, nil
+}
+```
+
+#### Step 3: Minting a token that fails Luhn
+
+A `[]byte` of ASCII digits, `copy` for the preserved suffix, the same bump, and a map lookup for collisions. `MintToken` returns an error instead of throwing when the space is exhausted.
+
+```go
+func (v *TokenVault) MintToken(pan Pan) (string, error) {
+	for attempt := 0; attempt < 100; attempt++ {
+		t := make([]byte, pan.Length())
+		for i := 0; i < len(t)-4; i++ {
+			t[i] = byte('0' + v.random.NextInt(10))
+		}
+		copy(t[len(t)-4:], pan.LastFour())
+		if LuhnValid(string(t)) {
+			// bump one non-preserved digit: a single-digit change always flips the Luhn sum mod 10
+			pos := len(t) - 5
+			t[pos] = byte('0' + (t[pos]-'0'+1)%10)
+		}
+		candidate := string(t)
+		if _, taken := v.byToken[candidate]; !taken {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("token space exhausted for this last-four")
+}
+```
+
+#### Step 4: Idempotent tokenize through an HMAC index
+
+The same sequence with `(string, error)` returns; the comma-ok map read combines the existence and status checks into one condition, and the record is stored as a pointer so `Revoke` can mutate it later.
+
+```go
+func (v *TokenVault) Tokenize(pan Pan, who Principal) (string, error) {
+	if !who.Has(Tokenize) {
+		v.log(who, "TOKENIZE", "-", false, "missing scope TOKENIZE")
+		return "", fmt.Errorf("%w: %s may not tokenize", ErrUnauthorized, who.ID)
+	}
+	index := v.HmacHex(pan.Digits())
+	if existing, ok := v.tokenByPanHmac[index]; ok && v.byToken[existing].Status != Revoked {
+		v.log(who, "TOKENIZE", existing, true, "existing")
+		return existing, nil
+	}
+	token, err := v.MintToken(pan)
+	if err != nil {
+		return "", err
+	}
+	now := v.clock.NowEpochSeconds()
+	nonce := v.NextNonce()
+	ciphertext := v.Encrypt([]byte(pan.Digits()), nonce, token)
+	v.byToken[token] = &TokenRecord{Token: token, Nonce: nonce, Ciphertext: ciphertext, LastFour: pan.LastFour(),
+		PanLength: pan.Length(), CreatedAt: now, ExpiresAt: now + v.ttlSeconds, Status: Active}
+	v.tokenByPanHmac[index] = token
+	v.log(who, "TOKENIZE", token, true, "new")
+	return token, nil
+}
+```
+
+#### Step 5: Authenticated encryption bound to the token
+
+`binary.BigEndian` writes the random word and the counter into the 12-byte nonce. `Encrypt` is one `Seal` call with the token as additional data; `Decrypt` maps any `Open` failure to `ErrAuthentication` because GCM does not distinguish a flipped bit, a wrong token, or a wrong key.
+
+```go
+func (v *TokenVault) NextNonce() []byte {
+	buf := make([]byte, NonceBytes)
+	binary.BigEndian.PutUint32(buf[:4], uint32(v.random.NextInt32()))
+	binary.BigEndian.PutUint64(buf[4:], uint64(v.nonceCounter))
+	v.nonceCounter++
+	return buf
+}
+
 func (v *TokenVault) Encrypt(plaintext, nonce []byte, aad string) []byte {
 	return v.aead.Seal(nil, nonce, plaintext, []byte(aad))
 }
@@ -343,19 +674,97 @@ func (v *TokenVault) Encrypt(plaintext, nonce []byte, aad string) []byte {
 func (v *TokenVault) Decrypt(ciphertext, nonce []byte, aad string) ([]byte, error) {
 	plain, err := v.aead.Open(nil, nonce, ciphertext, []byte(aad))
 	if err != nil {
-		return nil, ErrAuthentication // tampered record, wrong token, or wrong key: GCM does not say which
+		return nil, ErrAuthentication
 	}
 	return plain, nil
 }
+
+// HmacHex is the keyed hash of the PAN for the dedup index. Unkeyed SHA-256 would be brute-forceable: 10^15 PANs per BIN.
+func (v *TokenVault) HmacHex(pan string) string {
+	mac := hmac.New(sha256.New, v.indexKey)
+	mac.Write([]byte(pan))
+	return hex.EncodeToString(mac.Sum(nil))
+}
 ```
 
-- **Exceptions become sentinel errors.** `AuthorizationException` is `ErrUnauthorized`, `TokenStateException` is `ErrTokenState`, `SecurityException` is `ErrAuthentication` and `IllegalArgumentException` is `ErrInvalidArgument`; every path wraps one with `fmt.Errorf("%w: ...")` so callers test `errors.Is` and the tests assert the kind of failure, not just that one happened. `Suspend`, `Reactivate` and `Revoke` return `error` instead of `void`.
-- **The mask has to cover four `fmt` verbs.** `String()` handles `%v` and `%s`, the unexported `digits` field keeps `%+v` honest, and `GoString()` handles `%#v`, which bypasses `Stringer` and would otherwise print the struct in Go syntax with the field. `Equal` uses `crypto/subtle.ConstantTimeCompare` like Java's `MessageDigest.isEqual`. Randomness is the JDK's: `javarandom.go` ports `java.util.Random` including `nextBytes`, so `DemoKey`, the minted tokens and the nonces match the Java demo and the test pins those values.
+#### Step 6: Detokenize is where the controls live
+
+Four gates, each logging before it returns its wrapped sentinel; the `Decrypt` error (already `ErrAuthentication`) is passed through, and the plaintext is rebuilt into a masked `Pan` with `PanOf`.
+
+```go
+func (v *TokenVault) Detokenize(token string, who Principal, purpose string) (Pan, error) {
+	if !who.Has(Detokenize) {
+		v.log(who, "DETOKENIZE", token, false, "missing scope DETOKENIZE")
+		return Pan{}, fmt.Errorf("%w: %s may not detokenize", ErrUnauthorized, who.ID)
+	}
+	rec, ok := v.byToken[token]
+	if !ok {
+		v.log(who, "DETOKENIZE", token, false, "unknown token")
+		return Pan{}, fmt.Errorf("%w: unknown token", ErrTokenState)
+	}
+	if rec.Status != Active {
+		v.log(who, "DETOKENIZE", token, false, "status "+rec.Status.String())
+		return Pan{}, fmt.Errorf("%w: token is %v", ErrTokenState, rec.Status)
+	}
+	if v.clock.NowEpochSeconds() >= rec.ExpiresAt {
+		v.log(who, "DETOKENIZE", token, false, "expired")
+		return Pan{}, fmt.Errorf("%w: token expired", ErrTokenState)
+	}
+	plain, err := v.Decrypt(rec.Ciphertext, rec.Nonce, token)
+	if err != nil {
+		return Pan{}, err
+	}
+	v.log(who, "DETOKENIZE", token, true, "purpose="+purpose)
+	return PanOf(string(plain))
+}
+```
+
+#### Step 7: Lifecycle and crypto-shredding
+
+`Revoke` zeroes the ciphertext slice in place (the record is a pointer, so the stored bytes change), flips the status, and deletes the index entries that point at the token; deleting from a map while ranging over it is safe in Go.
+
+```go
+func (v *TokenVault) Revoke(token string, who Principal) error {
+	rec, err := v.require(token, who, "REVOKE")
+	if err != nil {
+		return err
+	}
+	if rec.Status == Revoked {
+		return fmt.Errorf("%w: already revoked", ErrTokenState)
+	}
+	for i := range rec.Ciphertext {
+		rec.Ciphertext[i] = 0
+	}
+	rec.Status = Revoked
+	for k, t := range v.tokenByPanHmac {
+		if t == token {
+			delete(v.tokenByPanHmac, k)
+		}
+	}
+	v.log(who, "REVOKE", token, true, "ciphertext shredded")
+	return nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/05-tokenization-and-pci-scope/code/go
 go run .
 go test ./...
+```
+
+With real AES-GCM and the JDK's random sequence, the output is byte-identical to the Java run, ciphertext included:
+
+```console
+== What is stored ==
+nonce      = 5e688e990000000000000000
+ciphertext = 707c786e63d25a369cfcafbec8ce1f2cfdbbfcc18cbce85acf35752dbe916a30 (32 bytes = 16 PAN + 16 tag)
+last four  = 1111, status = ACTIVE
+
+== PCI scope: before and after ==
+systems storing PAN before tokenization: 8 [analytics, auth-gateway, backup, crm, order-db, support-tool, token-vault, web-checkout]
+systems storing PAN after tokenization:  3 [auth-gateway, token-vault, web-checkout]
 ```
 
 ## Use It

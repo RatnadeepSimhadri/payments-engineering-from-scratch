@@ -385,51 +385,433 @@ The last line is produced by `RandomEntries`, a generator seeded with `42` that 
 
 ### In Python
 
+The Python port keeps every type and method name and differs in four places. **`JournalEntry` is a frozen dataclass with a hand-written `__init__`:** the validation must run before the fields are set and must normalize `postings` to a tuple, so the constructor is explicit and assigns through `object.__setattr__`; equality and hashing still come from the dataclass, which is what `post` uses to tell a replay from a conflict. **`AccountType` carries its normal balance as the enum value:** `AccountType.ASSET.value is Side.DEBIT`, exposed through a `normal_balance` property so the call sites read the same as Java. **No overflow checks:** Python ints are unbounded, so the `addExact` calls have no equivalent and the per-currency net is a plain `dict` sum. **`entries()` returns a tuple**, a snapshot the caller cannot mutate, where Java returns an unmodifiable view. All the ledger exceptions extend `LedgerError`, itself a `ValueError`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Sides and account types
+
+`Side` is a plain `Enum` with `opposite()` for reversals. `AccountType` uses the `Side` itself as each member's value, so the normal balance is data attached to the type exactly as in Java, and `balance()` later needs one branch. `Account` is a frozen dataclass that rejects a blank id in `__post_init__`.
+
+```python
+class Side(Enum):
+    DEBIT = "debit"
+    CREDIT = "credit"
+
+    def opposite(self) -> "Side":
+        return Side.CREDIT if self is Side.DEBIT else Side.DEBIT
+
+
+class AccountType(Enum):
+    ASSET = Side.DEBIT
+    EXPENSE = Side.DEBIT
+    LIABILITY = Side.CREDIT
+    EQUITY = Side.CREDIT
+    REVENUE = Side.CREDIT
+
+    @property
+    def normal_balance(self) -> Side:
+        return self.value
+
+
+@dataclass(frozen=True)
+class Account:
+    id: str
+    name: str
+    type: AccountType
+    currency: Currency
+
+    def __post_init__(self) -> None:
+        if not self.id or not self.id.strip():
+            raise ValueError("account id required")
+```
+
+#### Step 2: A posting is a positive amount on one side
+
+The positivity check lives in `__post_init__`, so a zero or negative amount raises `InvalidPostingError` the moment the posting is built. `signed_minor_units()` is a small helper the Java inlines: debits positive, credits negative, which is what the entry's balance check sums.
+
 ```python
 @dataclass(frozen=True)
-class JournalEntry:
-    id: str
-    description: str
-    postings: tuple[Posting, ...]
-    reversal_of: str | None = None
+class Posting:
+    account_id: str
+    side: Side
+    amount: Money
 
-    def __init__(self, id, description, postings, reversal_of=None):
+    def __post_init__(self) -> None:
+        if not self.amount.is_positive():
+            raise InvalidPostingError(f"posting amount must be positive, got {self.amount}")
+
+    @staticmethod
+    def debit(account_id: str, amount: Money) -> "Posting":
+        return Posting(account_id, Side.DEBIT, amount)
+
+    @staticmethod
+    def credit(account_id: str, amount: Money) -> "Posting":
+        return Posting(account_id, Side.CREDIT, amount)
+
+    def flipped(self) -> "Posting":
+        return Posting(self.account_id, self.side.opposite(), self.amount)
+
+    def signed_minor_units(self) -> int:
+        return self.amount.minor_units if self.side is Side.DEBIT else -self.amount.minor_units
+```
+
+#### Step 3: The entry validates itself
+
+The explicit `__init__` validates first and assigns last. `tuple(postings)` plays the role of `List.copyOf`: the entry owns an immutable copy, and the test asserts that it cannot be appended to. The per-currency net is a dict of signed ints (no `addExact`, since an `int` cannot overflow), and the error message lists every non-zero currency joined with `; `, identical to the Java text.
+
+```python
+    def __init__(self, id: str, description: str, postings, reversal_of: str | None = None) -> None:
+        if not id or not id.strip():
+            raise ValueError("entry id required")
         postings = tuple(postings)
         if len(postings) < 2:
             raise UnbalancedEntryError(id, "an entry needs at least two postings")
-        ...
+        net: dict[Currency, int] = {}
+        for p in postings:
+            net[p.amount.currency] = net.get(p.amount.currency, 0) + p.signed_minor_units()
+        problems = [f"debits minus credits in {c.code} = {Money(v, c)}" for c, v in net.items() if v != 0]
+        if problems:
+            raise UnbalancedEntryError(id, "; ".join(problems) + " (must be zero per currency)")
+        object.__setattr__(self, "id", id)
+        object.__setattr__(self, "description", description)
         object.__setattr__(self, "postings", postings)
+        object.__setattr__(self, "reversal_of", reversal_of)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 4: Reversal is a derived entry
 
-- **A frozen dataclass with a hand-written `__init__`.** The validation needs to run before the fields are set and needs to normalize `postings` to a tuple, so the constructor is explicit and assigns through `object.__setattr__`. Equality and hashing still come from the dataclass, which is what `post` uses to tell a replay from a conflict.
-- **`AccountType` carries its normal balance as the enum value.** `AccountType.ASSET.value is Side.DEBIT`, exposed through a `normal_balance` property so the call sites read the same as Java.
-- **No overflow checks.** Python ints are unbounded, so the `addExact` calls have no equivalent and the per-currency net is a plain `dict` sum.
-- **`entries()` returns a tuple**, a snapshot that the caller cannot mutate, where Java returns an unmodifiable view.
+One line: flip every posting with a comprehension and build a new entry through the same validating constructor, with `reversal_of` recording the lineage.
+
+```python
+    def reversal(self, new_id: str, description: str) -> "JournalEntry":
+        """The entry that undoes this one: same postings, every side flipped. Nothing is ever edited."""
+        return JournalEntry(new_id, description, [p.flipped() for p in self.postings], reversal_of=self.id)
+```
+
+#### Step 5: The ledger validates, then mutates everything
+
+The shape is the Java shape: every check that can raise runs above the comment line, every write below it. Dataclass equality (`self._journal[existing] == entry`) separates replay from conflict. `open_account` seeds both total dicts with `0`, so `totals[p.account_id] += ...` needs no `merge`.
+
+```python
+    def post(self, entry: JournalEntry) -> bool:
+        existing = self._index_by_id.get(entry.id)
+        if existing is not None:
+            if self._journal[existing] == entry:
+                return False
+            raise IdempotencyConflictError(entry.id)
+        for p in entry.postings:
+            account = self.account(p.account_id)
+            if account.currency != p.amount.currency:
+                raise InvalidPostingError(
+                    f"entry {entry.id} rejected: account {account.id} is {account.currency.code} "
+                    f"but posting is {p.amount.currency.code}")
+        if entry.reversal_of is not None:
+            if entry.reversal_of not in self._index_by_id:
+                raise UnknownEntryError(entry.reversal_of)
+            if entry.reversal_of in self._reversed_by:
+                raise AlreadyReversedError(entry.reversal_of)
+        # Validation complete: now mutate, and mutate everything.
+        self._journal.append(entry)
+        self._index_by_id[entry.id] = len(self._journal) - 1
+        if entry.reversal_of is not None:
+            self._reversed_by[entry.reversal_of] = entry.id
+        for p in entry.postings:
+            totals = self._debit_totals if p.side is Side.DEBIT else self._credit_totals
+            totals[p.account_id] += p.amount.minor_units
+        return True
+```
+
+#### Step 6: Balances in the normal direction, and the trial balance
+
+`balance` picks the subtraction order from `account.type.normal_balance`; `net_debit` is always debits minus credits. `trial_balance` iterates `self._accounts.values()`, and because a Python `dict` preserves insertion order the rows come out in the order accounts were opened, like the Java `LinkedHashMap`. The rows are returned as a tuple.
+
+```python
+    def balance(self, account_id: str) -> Money:
+        """Balance in the account's normal direction: positive means what you expect for that type."""
+        account = self.account(account_id)
+        debits, credits = self._debit_totals[account_id], self._credit_totals[account_id]
+        signed = debits - credits if account.type.normal_balance is Side.DEBIT else credits - debits
+        return Money(signed, account.currency)
+
+    def net_debit(self, account_id: str) -> Money:
+        """Debits minus credits regardless of type. Sums to zero across all accounts of a currency."""
+        account = self.account(account_id)
+        return Money(self._debit_totals[account_id] - self._credit_totals[account_id], account.currency)
+
+    def trial_balance(self, currency: Currency) -> TrialBalance:
+        rows = []
+        total_debits = total_credits = Money.zero(currency)
+        for account in self._accounts.values():
+            if account.currency != currency:
+                continue
+            net = self.net_debit(account.id)
+            debit = Money.zero(currency) if net.is_negative() else net
+            credit = net.negate() if net.is_negative() else Money.zero(currency)
+            rows.append(TrialBalanceRow(account, debit, credit))
+            total_debits = total_debits.plus(debit)
+            total_credits = total_credits.plus(credit)
+        return TrialBalance(currency, tuple(rows), total_debits, total_credits)
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/10-money-and-ledgers/03-double-entry-ledger/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The worked example prints the same entries, trial balance, and rejections as the Java run. Only the final stress-test line differs, because Python's `random.Random(42)` produces a different sequence from Java's `Random(42)`; the invariant holds either way:
+
+```console
+== Reversal: the capture is voided; nothing is edited ==
+rev-001  reversal: void pay-001  (reverses pay-001)
+      Cr 1200  100.00 USD
+  Dr 2100  97.10 USD
+  Dr 4100  2.90 USD
+fee revenue before reversal 2.90 USD, after 0.00 USD
+journal now holds 4 entries; pay-001 is still entry #1
+
+== 10,000 seeded random balanced entries: trial balance still sums to zero ==
+entries=10004 totalDebits=36406.94 USD totalCredits=36406.94 USD balances=True
+```
 
 ### In Go
 
-```go
-func NewJournalEntry(id, description string, postings []Posting) (JournalEntry, error)
+The Go port keeps the design and differs in four places. **Errors are values, and every rejection wraps a sentinel:** `ErrUnbalanced`, `ErrInvalidPosting`, `ErrUnknownAccount`, `ErrUnknownEntry`, `ErrIdempotencyConflict`, and `ErrAlreadyReversed` all support `errors.Is`, which is how the tests assert the failure kind. **The postings slice is unexported:** a Go struct cannot make a public slice field read-only, so `JournalEntry.postings` is lower-case and `Postings()` returns a copy; `Equal` is written by hand because slices are not comparable with `==`. **`Dr` and `Cr` panic on a non-positive amount; `NewPosting` returns an error:** the short constructors exist for the literal-heavy demo and tests, production code uses `NewPosting`. **Map iteration order is random in Go**, so the ledger keeps a separate `accountOrder` slice to make the trial balance rows deterministic, where Java's `LinkedHashMap` and Python's `dict` give this for free.
 
-func (l *Ledger) Post(entry JournalEntry) (bool, error) {
-    if existing, ok := l.indexByID[entry.ID]; ok {
-        if l.journal[existing].Equal(entry) {
-            return false, nil
-        }
-        return false, fmt.Errorf("%w: %s", ErrIdempotencyConflict, entry.ID)
-    }
-    ...
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Sides and account types
+
+Go has no enums, so `Side` and `AccountType` are `int` types with `iota` constants and methods. `NormalBalance` is a method rather than a stored field, but it is still the single place that knows which types are debit-normal. `Account` is a plain struct with exported fields; `OpenAccount` on the ledger is where a blank id is rejected.
+
+```go
+type Side int
+
+const (
+	Debit Side = iota
+	Credit
+)
+
+func (s Side) Opposite() Side {
+	if s == Debit {
+		return Credit
+	}
+	return Debit
+}
+
+type AccountType int
+
+const (
+	Asset AccountType = iota
+	Expense
+	Liability
+	Equity
+	Revenue
+)
+
+// NormalBalance is the side that increases this account: debit for assets and expenses, credit otherwise.
+func (t AccountType) NormalBalance() Side {
+	if t == Asset || t == Expense {
+		return Debit
+	}
+	return Credit
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: A posting is a positive amount on one side
 
-- **Errors are values, and every rejection wraps a sentinel.** `ErrUnbalanced`, `ErrInvalidPosting`, `ErrUnknownAccount`, `ErrUnknownEntry`, `ErrIdempotencyConflict`, and `ErrAlreadyReversed` all support `errors.Is`, which is how the tests assert the failure kind.
-- **The postings slice is unexported.** A Go struct cannot make a public slice field read-only, so `JournalEntry.postings` is lower-case and `Postings()` returns a copy. `Equal` is written by hand because slices are not comparable with `==`.
-- **`Dr` and `Cr` panic on a non-positive amount; `NewPosting` returns an error.** The short constructors exist for the literal-heavy demo and tests; production code uses `NewPosting`.
-- **Map iteration order is random in Go**, so the ledger keeps a separate `accountOrder` slice to make the trial balance rows deterministic. The Java `LinkedHashMap` and Python's insertion-ordered `dict` give this for free.
+`NewPosting` returns `ErrInvalidPosting` for zero or negative amounts. `Dr` and `Cr` wrap it with `mustPosting`, which panics, because the demo and tests only ever pass literals; `SignedMinorUnits` gives the entry validator the debit-positive, credit-negative number it sums.
+
+```go
+type Posting struct {
+	AccountID string
+	Side      Side
+	Amount    Money
+}
+
+func NewPosting(accountID string, side Side, amount Money) (Posting, error) {
+	if !amount.IsPositive() {
+		return Posting{}, fmt.Errorf("%w: posting amount must be positive, got %v", ErrInvalidPosting, amount)
+	}
+	return Posting{accountID, side, amount}, nil
+}
+
+func Dr(accountID string, amount Money) Posting {
+	return mustPosting(NewPosting(accountID, Debit, amount))
+}
+func Cr(accountID string, amount Money) Posting {
+	return mustPosting(NewPosting(accountID, Credit, amount))
+}
+
+func (p Posting) Flipped() Posting { return Posting{p.AccountID, p.Side.Opposite(), p.Amount} }
+
+func (p Posting) SignedMinorUnits() int64 {
+	if p.Side == Debit {
+		return p.Amount.MinorUnits
+	}
+	return -p.Amount.MinorUnits
+}
+```
+
+#### Step 3: The entry validates itself
+
+`NewJournalEntry` is the public constructor and `newEntry` the shared one that also takes `reversalOf`. Because a map does not iterate in insertion order, the validator keeps an `order` slice of currencies so the error message lists them in first-seen order, matching Java. `addChecked` is the `Math::addExact` equivalent, and the final `copy` is `List.copyOf`: the entry owns its own slice.
+
+```go
+func newEntry(id, description string, postings []Posting, reversalOf string) (JournalEntry, error) {
+	if strings.TrimSpace(id) == "" {
+		return JournalEntry{}, errors.New("entry id required")
+	}
+	if len(postings) < 2 {
+		return JournalEntry{}, fmt.Errorf("%w: entry %s needs at least two postings", ErrUnbalanced, id)
+	}
+	for _, p := range postings {
+		if !p.Amount.IsPositive() {
+			return JournalEntry{}, fmt.Errorf("%w: posting amount must be positive, got %v", ErrInvalidPosting, p.Amount)
+		}
+	}
+	net := map[Currency]int64{}
+	var order []Currency
+	for _, p := range postings {
+		if _, seen := net[p.Amount.Currency]; !seen {
+			order = append(order, p.Amount.Currency)
+		}
+		sum, err := addChecked(net[p.Amount.Currency], p.SignedMinorUnits())
+		if err != nil {
+			return JournalEntry{}, err
+		}
+		net[p.Amount.Currency] = sum
+	}
+	var problems []string
+	for _, c := range order {
+		if net[c] != 0 {
+			problems = append(problems, fmt.Sprintf("debits minus credits in %s = %v", c.Code, OfMinor(net[c], c)))
+		}
+	}
+	if len(problems) > 0 {
+		return JournalEntry{}, fmt.Errorf("%w: entry %s rejected: %s (must be zero per currency)", ErrUnbalanced, id, strings.Join(problems, "; "))
+	}
+	copied := make([]Posting, len(postings))
+	copy(copied, postings)
+	return JournalEntry{id, description, copied, reversalOf}, nil
+}
+```
+
+#### Step 4: Reversal is a derived entry
+
+`Reversal` flips each posting into a fresh slice and hands it to `newEntry` with this entry's `ID` as `reversalOf`, so the reversal is validated like any other entry and can fail the same way; hence the `(JournalEntry, error)` return.
+
+```go
+func (e JournalEntry) Reversal(newID, description string) (JournalEntry, error) {
+	flipped := make([]Posting, len(e.postings))
+	for i, p := range e.postings {
+		flipped[i] = p.Flipped()
+	}
+	return newEntry(newID, description, flipped, e.ID)
+}
+```
+
+#### Step 5: The ledger validates, then mutates everything
+
+`Post` returns `(bool, error)`: `(false, nil)` is an idempotent replay, `(true, nil)` an append, and every rejection is a wrapped sentinel. The hand-written `Equal` decides replay versus conflict. An empty `ReversalOf` string stands in for Java's `null`. As in Java, nothing below the comment line can fail for a caller-caused reason.
+
+```go
+func (l *Ledger) Post(entry JournalEntry) (bool, error) {
+	if existing, ok := l.indexByID[entry.ID]; ok {
+		if l.journal[existing].Equal(entry) {
+			return false, nil
+		}
+		return false, fmt.Errorf("%w: %s", ErrIdempotencyConflict, entry.ID)
+	}
+	for _, p := range entry.postings {
+		a, err := l.Account(p.AccountID)
+		if err != nil {
+			return false, err
+		}
+		if a.Currency != p.Amount.Currency {
+			return false, fmt.Errorf("%w: entry %s rejected: account %s is %s but posting is %s",
+				ErrInvalidPosting, entry.ID, a.ID, a.Currency.Code, p.Amount.Currency.Code)
+		}
+	}
+	if entry.ReversalOf != "" {
+		if _, ok := l.indexByID[entry.ReversalOf]; !ok {
+			return false, fmt.Errorf("%w: %s", ErrUnknownEntry, entry.ReversalOf)
+		}
+		if _, done := l.reversedBy[entry.ReversalOf]; done {
+			return false, fmt.Errorf("%w: %s", ErrAlreadyReversed, entry.ReversalOf)
+		}
+	}
+	// Validation complete: now mutate, and mutate everything.
+	l.journal = append(l.journal, entry)
+	l.indexByID[entry.ID] = len(l.journal) - 1
+	if entry.ReversalOf != "" {
+		l.reversedBy[entry.ReversalOf] = entry.ID
+	}
+	for _, p := range entry.postings {
+		if p.Side == Debit {
+			l.debitTotals[p.AccountID] += p.Amount.MinorUnits
+		} else {
+			l.creditTotals[p.AccountID] += p.Amount.MinorUnits
+		}
+	}
+	return true, nil
+}
+```
+
+#### Step 6: Balances in the normal direction, and the trial balance
+
+`Balance` and `NetDebit` return an error for an unknown account instead of throwing. Reading a missing key from a Go map yields `0`, so no default-initialisation is needed for the totals. `TrialBalance` walks `l.accountOrder`, the slice that stands in for `LinkedHashMap` iteration, and builds the rows and totals in place on the result struct.
+
+```go
+func (l *Ledger) Balance(accountID string) (Money, error) {
+	a, err := l.Account(accountID)
+	if err != nil {
+		return Money{}, err
+	}
+	debits, credits := l.debitTotals[accountID], l.creditTotals[accountID]
+	if a.Type.NormalBalance() == Debit {
+		return OfMinor(debits-credits, a.Currency), nil
+	}
+	return OfMinor(credits-debits, a.Currency), nil
+}
+
+func (l *Ledger) TrialBalance(currency Currency) TrialBalance {
+	tb := TrialBalance{Currency: currency, TotalDebits: Zero(currency), TotalCredits: Zero(currency)}
+	for _, id := range l.accountOrder {
+		a := l.accounts[id]
+		if a.Currency != currency {
+			continue
+		}
+		net, _ := l.NetDebit(id)
+		debit, credit := net, Zero(currency)
+		if net.IsNegative() {
+			debit, credit = Zero(currency), net.Negate()
+		}
+		tb.Rows = append(tb.Rows, TrialBalanceRow{a, debit, credit})
+		tb.TotalDebits = must(tb.TotalDebits.Plus(debit))
+		tb.TotalCredits = must(tb.TotalCredits.Plus(credit))
+	}
+	return tb
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/10-money-and-ledgers/03-double-entry-ledger/code/go
+go run .
+go test ./...
+```
+
+Everything up to the stress test matches the Java output. The random totals differ because Go's `math/rand` seeded with 42 produces its own sequence, but the two columns still agree:
+
+```console
+== 10,000 seeded random balanced entries: trial balance still sums to zero ==
+entries=10004 totalDebits=124959.72 USD totalCredits=124959.72 USD balances=true
+```
 
 ## Use It
 

@@ -386,22 +386,169 @@ The small-ticket lines are worth a second look. A "low" regulated debit rate of 
 
 ### In Python
 
-The full port is `code/python/main.py` (same `Rate`, `InterchangeTable`, `SchemeFees`, `FeeBreakdown`, `FeeEngine`; tests in `code/python/test_main.py`). Lessons are self-contained, so `Money` is copied into the same file rather than a second module. Three things differ:
+The Python port has the same `Rate`, `InterchangeTable`, `SchemeFees`, `FeeBreakdown`, and `FeeEngine`; lessons are self-contained, so `Money` is copied into the same file rather than a second module. Three things differ. **The sealed interface becomes two frozen dataclasses and a `match`:** `Pricing` is a plain base class with `IcPlusPlus(markup)` and `Blended(merchant_rate)` as its only subclasses (also reachable as `Pricing.IcPlusPlus` and `Pricing.Blended`, as in Java). Python cannot forbid a third subclass at compile time, so `quote` keeps a `case _` that raises `TypeError`, which is the runtime equivalent of the exhaustiveness check the Java `switch` gets for free. **No overflow, same rounding:** `amount x ppm` cannot overflow an `int`, so `multiplyExact` disappears, but every proportional fee still goes through `divide_rounded` (Phase 10, Lesson 01), which truncates toward zero on magnitudes rather than using `//`; `effective_rate_bps` uses it too. `Rate.of` parses the percent with `str.partition` and `ljust(4, "0")`, never through a float, and `Rate.__str__` reproduces Java's `1.80% + 10` rendering so the demo output is identical line for line. **Messages match Java's record rendering:** `RateKey.__str__` prints `RateKey[cardType=..., region=..., channel=...]` so the `NoRateError` and cap-violation messages read the same in both languages. `NoRateError` extends `RuntimeError`, the `FeeBreakdown` invariant raises `RuntimeError` (Java's `IllegalStateException`), and argument errors are `ValueError`.
 
-- **The sealed interface becomes two frozen dataclasses and a `match`.** `Pricing` is a plain base class with `IcPlusPlus(markup)` and `Blended(merchant_rate)` as its only subclasses (also reachable as `Pricing.IcPlusPlus` and `Pricing.Blended`, as in Java). Python cannot forbid a third subclass at compile time, so `quote` keeps a `case _` that raises `TypeError`, which is the runtime equivalent of the exhaustiveness check the Java `switch` gets for free:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Rates in parts per million
+
+`Rate.of` splits on the decimal point with `partition`, rejects more than four fractional digits, pads with `ljust`, and combines as integers. `apply_to` is the single rounding, `times(ppm, PPM, HALF_EVEN)`, plus the fixed part.
 
 ```python
-match pricing:
-    case IcPlusPlus(markup=markup):
-        merchant_discount = interchange.plus(scheme_fees).plus(markup.apply_to(gross))
-    case Blended(merchant_rate=merchant_rate):
-        merchant_discount = merchant_rate.apply_to(gross)
-    case _:
-        raise TypeError(f"unknown pricing model: {pricing!r}")
+    @staticmethod
+    def of(percent: str, fixed_minor: int) -> "Rate":
+        """Rate.of("1.80", 10) is 1.80% + 10 minor units. Parses the percent exactly; never via a float."""
+        whole, _, frac = percent.partition(".")
+        if len(frac) > 4:
+            raise ValueError(f"at most 4 decimals of a percent: {percent}")
+        if not whole.isdigit() or (frac and not frac.isdigit()):
+            raise ValueError(f"not a percent: {percent}")
+        return Rate(int(whole) * 10_000 + int(frac.ljust(4, "0")), fixed_minor)
+
+    def apply_to(self, amount: Money) -> Money:
+        """amount x ppm / 1e6 rounded HALF_EVEN, plus the fixed part. Exactly one rounding per fee component."""
+        proportional = amount.times(self.ppm, Rate.PPM, Rounding.HALF_EVEN)
+        return proportional.plus(Money.of_minor(self.fixed_minor, amount.currency))
 ```
 
-- **No overflow, same rounding.** `amount x ppm` cannot overflow an `int`, so `multiplyExact` disappears, but every proportional fee still goes through `divide_rounded` (Phase 10, Lesson 01), which truncates toward zero on magnitudes rather than using `//`; `effective_rate_bps` uses it too. `Rate.of` parses the percent with `str.partition` and `ljust(4, "0")`, never through a float, and `Rate.__str__` reproduces Java's `1.80% + 10` rendering so the demo output is identical line for line.
-- **Messages match Java's record rendering.** `RateKey.__str__` prints `RateKey[cardType=..., region=..., channel=...]` so the `NoRateError` and cap-violation messages read the same in both languages. `NoRateError` extends `RuntimeError`, the `FeeBreakdown` invariant raises `RuntimeError` (Java's `IllegalStateException`), and argument errors are `ValueError`.
+#### Step 2: The interchange table and its caps
+
+`RateKey` is a frozen dataclass, so it hashes on all three fields and works as a `dict` key. `put` runs `check_caps` first; `lookup` raises `NoRateError` for a missing row. The caps are the same two rules, raising `ValueError`.
+
+```python
+    def put(self, type: CardType, region: Region, channel: Channel, rate: Rate) -> "InterchangeTable":
+        key = RateKey(type, region, channel)
+        InterchangeTable.check_caps(key, rate)
+        self._rates[key] = rate
+        return self
+
+    def lookup(self, type: CardType, region: Region, channel: Channel) -> Rate:
+        key = RateKey(type, region, channel)
+        rate = self._rates.get(key)
+        if rate is None:
+            raise NoRateError(key)
+        return rate
+```
+
+```python
+    @staticmethod
+    def check_caps(key: RateKey, rate: Rate) -> None:
+        if key.region is Region.EEA_DOMESTIC and key.card_type.is_consumer():
+            cap = InterchangeTable.IFR_DEBIT_CAP_PPM if key.card_type.is_debit() else InterchangeTable.IFR_CREDIT_CAP_PPM
+            if rate.ppm > cap or rate.fixed_minor > 0:
+                raise ValueError(f"IFR cap exceeded for {key}: {rate}")
+        if key.region is Region.US_DOMESTIC and key.card_type is CardType.CONSUMER_DEBIT_REGULATED:
+            cap = InterchangeTable.REG_II_CAP
+            if rate.ppm > cap.ppm or rate.fixed_minor > cap.fixed_minor:
+                raise ValueError(f"Regulation II cap exceeded for {key}: {rate}")
+```
+
+#### Step 3: Scheme fees
+
+A frozen dataclass; the cross-border term is a second rounded `times` added only for `INTER_REGIONAL`.
+
+```python
+@dataclass(frozen=True)
+class SchemeFees:
+    assessment: Rate
+    cross_border_ppm: int
+
+    def fee_for(self, amount: Money, region: Region) -> Money:
+        fee = self.assessment.apply_to(amount)
+        if region is Region.INTER_REGIONAL:
+            fee = fee.plus(amount.times(self.cross_border_ppm, Rate.PPM, Rounding.HALF_EVEN))
+        return fee
+```
+
+#### Step 4: Pricing as a sealed interface
+
+A base class and two frozen dataclass subclasses, attached to the base as attributes so `Pricing.IcPlusPlus` reads as in Java. The closed-set guarantee moves to the `case _` in `quote`.
+
+```python
+class Pricing:
+    """How the acquirer prices the merchant. Exactly two variants; FeeEngine.quote dispatches with match."""
+
+
+@dataclass(frozen=True)
+class IcPlusPlus(Pricing):
+    """Interchange ++: pass interchange and scheme fees through at cost, add a disclosed markup."""
+
+    markup: Rate
+
+
+@dataclass(frozen=True)
+class Blended(Pricing):
+    """Blended: one rate for every card; the acquirer keeps whatever is left after interchange and scheme."""
+
+    merchant_rate: Rate
+
+
+Pricing.IcPlusPlus = IcPlusPlus  # type: ignore[attr-defined]
+Pricing.Blended = Blended  # type: ignore[attr-defined]
+```
+
+#### Step 5: The breakdown and its invariant
+
+`__post_init__` is the compact constructor: `Money.sum` enforces one currency and the equality check enforces conservation, raising `RuntimeError` on failure. `merchant_discount` is derived.
+
+```python
+@dataclass(frozen=True)
+class FeeBreakdown:
+    gross: Money
+    interchange_rate: Rate
+    interchange: Money
+    scheme_fees: Money
+    acquirer_margin: Money
+    merchant_net: Money
+
+    def __post_init__(self) -> None:
+        total = Money.sum(self.gross.currency, self.interchange, self.scheme_fees, self.acquirer_margin, self.merchant_net)
+        if total != self.gross:
+            raise RuntimeError(f"fee split does not sum to gross: {total} != {self.gross}")
+
+    def merchant_discount(self) -> Money:
+        """The merchant discount: everything the merchant does not receive."""
+        return self.gross.minus(self.merchant_net)
+```
+
+#### Step 6: The engine
+
+Structural pattern matching on the pricing dataclass replaces the sealed `switch`; the `case _` arm is the runtime exhaustiveness check. Everything after the discount is derived by subtraction, so the breakdown's invariant holds by construction.
+
+```python
+    def quote(self, tx: Transaction, pricing: Pricing) -> FeeBreakdown:
+        gross = tx.amount
+        ic_rate = self._table.lookup(tx.card_type, tx.region, tx.channel)
+        interchange = ic_rate.apply_to(gross)
+        scheme_fees = self._scheme.fee_for(gross, tx.region)
+        match pricing:
+            case IcPlusPlus(markup=markup):
+                merchant_discount = interchange.plus(scheme_fees).plus(markup.apply_to(gross))
+            case Blended(merchant_rate=merchant_rate):
+                merchant_discount = merchant_rate.apply_to(gross)
+            case _:
+                raise TypeError(f"unknown pricing model: {pricing!r}")
+        acquirer_margin = merchant_discount.minus(interchange).minus(scheme_fees)
+        merchant_net = gross.minus(merchant_discount)
+        return FeeBreakdown(gross, ic_rate, interchange, scheme_fees, acquirer_margin, merchant_net)
+```
+
+#### Step 7: Attribution with allocate
+
+The weights are the minor units; the currency check precedes the allocation; `allocate(*weights)` is the Lesson 01 largest-remainder split.
+
+```python
+    @staticmethod
+    def attribute(aggregate_fee: Money, txs: Sequence[Transaction]) -> List[Money]:
+        weights = []
+        for tx in txs:
+            if tx.amount.currency != aggregate_fee.currency:
+                raise CurrencyMismatchError(tx.amount.currency, aggregate_fee.currency)
+            weights.append(tx.amount.minor_units)
+        return aggregate_fee.allocate(*weights)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/07-interchange-and-scheme-fees/code/python
@@ -409,29 +556,270 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run, including the record-style `rejected:` messages:
+
+```console
+== Attributing a 25.00 USD monthly scheme fee to three transactions ==
+a 100.00 USD -> 17.89 USD
+b 37.77 USD -> 6.75 USD
+c 2.00 USD -> 0.36 USD
+sum = 25.00 USD
+month total IC++                   gross 139.77 USD  IC 2.84 USD  scheme 0.25 USD acquirer 0.43 USD  merchant 136.25 USD  (252 bps, IC rate 0.00% + 0)
+```
+
 ### In Go
 
-The full port is `code/go/main.go` (same `Rate`, `InterchangeTable`, `SchemeFees`, `FeeBreakdown`, `FeeEngine`; tests in `code/go/main_test.go`). `Money` is the canonical Go `Money` from Phase 10, Lesson 01, copied into `code/go/money.go`. Three things differ:
+The Go port has the same `Rate`, `InterchangeTable`, `SchemeFees`, `FeeBreakdown`, and `FeeEngine`; `Money` is the canonical Go `Money` from Phase 10, Lesson 01, copied into `code/go/money.go`. Three things differ. **The sealed interface is an interface with an unexported marker method:** only types in this package can implement `pricing()`, so `IcPlusPlus` and `Blended` are the whole set, as `permits` guarantees in Java. Go's type switch is not checked for exhaustiveness, so `Quote` keeps a `default` branch that returns an error instead of silently charging nothing. **Every arithmetic step returns an error, so overflow is impossible to ignore:** `Money.Times` and `Plus` return `(Money, error)` where Java's `multiplyExact` and `addExact` throw, so `Rate.ApplyTo`, `SchemeFees.FeeFor`, `Quote`, `Attribute` and `Total` all return `(T, error)` and the chain stops at the first failure. `NoRateException` is `ErrNoRate`, the `FeeBreakdown` invariant is `ErrInvariant`, cap and argument violations are `ErrInvalidArgument`, and the mixed-currency attribution is `Money`'s own `ErrCurrencyMismatch`; the tests assert the kind with `errors.Is`. `MerchantDiscount()` and `EffectiveRateBps()` stay error-free because the constructor already proved the parts share a currency and sum to gross. **Enums are typed integer constants with a `String()`:** `CardType`, `Region` and `Channel` print their Java names, `CardTypes` and `Channels` stand in for `values()`, and `RateKey.String()` prints `RateKey[cardType=..., region=..., channel=...]`, so the demo output, including the two `rejected:` lines, is byte-identical to Java. `RateOf` parses the percent with `strings.Cut` and zero-padding, never through a `float64`.
 
-- **The sealed interface is an interface with an unexported marker method.** Only types in this package can implement `pricing()`, so `IcPlusPlus` and `Blended` are the whole set, as `permits` guarantees in Java. Go's type switch is not checked for exhaustiveness, so `Quote` keeps a `default` branch that returns an error instead of silently charging nothing:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Rates in parts per million
+
+`RateOf` cuts on the point, pads with `strings.Repeat`, and parses both halves with `strconv.ParseInt`; every failure wraps `ErrInvalidArgument`. `ApplyTo` threads the error from `Times` and returns whatever `Plus` reports.
 
 ```go
-type Pricing interface{ pricing() }
+type Rate struct {
+	Ppm        int64
+	FixedMinor int64
+}
 
+// RateOf("1.80", 10) is 1.80% + 10 minor units. Parses the percent exactly; never via a float64.
+func RateOf(percent string, fixedMinor int64) (Rate, error) {
+	whole, frac, _ := strings.Cut(percent, ".")
+	if len(frac) > 4 {
+		return Rate{}, fmt.Errorf("%w: at most 4 decimals of a percent: %s", ErrInvalidArgument, percent)
+	}
+	frac += strings.Repeat("0", 4-len(frac))
+	w, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		return Rate{}, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	f, err := strconv.ParseInt(frac, 10, 64)
+	if err != nil {
+		return Rate{}, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	return NewRate(w*10_000+f, fixedMinor)
+}
+
+// ApplyTo is amount x ppm / 1e6 rounded HALF_EVEN, plus the fixed part. Exactly one rounding per fee component.
+func (r Rate) ApplyTo(amount Money) (Money, error) {
+	proportional, err := amount.Times(r.Ppm, PPM, HalfEven)
+	if err != nil {
+		return Money{}, err
+	}
+	return proportional.Plus(OfMinor(r.FixedMinor, amount.Currency))
+}
+```
+
+#### Step 2: The interchange table and its caps
+
+`RateKey` is a comparable struct, so it is a valid map key. `Put` returns the cap error; `Lookup` wraps `ErrNoRate` with the key's Java-style rendering. `CheckCaps` is a package-level function with the same two rules.
+
+```go
+func (t *InterchangeTable) Put(cardType CardType, region Region, channel Channel, rate Rate) error {
+	key := RateKey{cardType, region, channel}
+	if err := CheckCaps(key, rate); err != nil {
+		return err
+	}
+	t.rates[key] = rate
+	return nil
+}
+
+func (t *InterchangeTable) Lookup(cardType CardType, region Region, channel Channel) (Rate, error) {
+	key := RateKey{cardType, region, channel}
+	rate, ok := t.rates[key]
+	if !ok {
+		return Rate{}, fmt.Errorf("%w for %v", ErrNoRate, key)
+	}
+	return rate, nil
+}
+```
+
+```go
+func CheckCaps(key RateKey, rate Rate) error {
+	if key.Region == EEADomestic && key.CardType.IsConsumer() {
+		cap := IFRCreditCapPpm
+		if key.CardType.IsDebit() {
+			cap = IFRDebitCapPpm
+		}
+		if rate.Ppm > cap || rate.FixedMinor > 0 {
+			return fmt.Errorf("%w: IFR cap exceeded for %v: %v", ErrInvalidArgument, key, rate)
+		}
+	}
+	if key.Region == USDomestic && key.CardType == ConsumerDebitRegulated {
+		if rate.Ppm > RegIICap.Ppm || rate.FixedMinor > RegIICap.FixedMinor {
+			return fmt.Errorf("%w: Regulation II cap exceeded for %v: %v", ErrInvalidArgument, key, rate)
+		}
+	}
+	return nil
+}
+```
+
+#### Step 3: Scheme fees
+
+The assessment and the cross-border term are each checked; `Plus` returns the combined `(Money, error)` directly.
+
+```go
+type SchemeFees struct {
+	Assessment     Rate
+	CrossBorderPpm int64
+}
+
+func (s SchemeFees) FeeFor(amount Money, region Region) (Money, error) {
+	fee, err := s.Assessment.ApplyTo(amount)
+	if err != nil {
+		return Money{}, err
+	}
+	if region == InterRegional {
+		xb, err := amount.Times(s.CrossBorderPpm, PPM, HalfEven)
+		if err != nil {
+			return Money{}, err
+		}
+		return fee.Plus(xb)
+	}
+	return fee, nil
+}
+```
+
+#### Step 4: Pricing as a sealed interface
+
+The unexported `pricing()` method is the seal: no type outside this package can satisfy the interface.
+
+```go
+// Pricing is how the acquirer prices the merchant: a sealed interface, closed by the unexported marker method.
+type Pricing interface {
+	pricing()
+}
+
+// IcPlusPlus is interchange ++: pass interchange and scheme fees through at cost, add a disclosed markup.
 type IcPlusPlus struct{ Markup Rate }
+
+// Blended is one rate for every card; the acquirer keeps whatever is left after interchange and scheme.
 type Blended struct{ MerchantRate Rate }
 
 func (IcPlusPlus) pricing() {}
 func (Blended) pricing()    {}
 ```
 
-- **Every arithmetic step returns an error, so overflow is impossible to ignore.** `Money.Times` and `Plus` return `(Money, error)` where Java's `multiplyExact` and `addExact` throw, so `Rate.ApplyTo`, `SchemeFees.FeeFor`, `Quote`, `Attribute` and `Total` all return `(T, error)` and the chain stops at the first failure. `NoRateException` is `ErrNoRate`, the `FeeBreakdown` invariant is `ErrInvariant`, cap and argument violations are `ErrInvalidArgument`, and the mixed-currency attribution is `Money`'s own `ErrCurrencyMismatch`; the tests assert the kind with `errors.Is`. `MerchantDiscount()` and `EffectiveRateBps()` stay error-free because the constructor already proved the parts share a currency and sum to gross.
-- **Enums are typed integer constants with a `String()`.** `CardType`, `Region` and `Channel` print their Java names, `CardTypes` and `Channels` stand in for `values()`, and `RateKey.String()` prints `RateKey[cardType=..., region=..., channel=...]`, so the demo output, including the two `rejected:` lines, is byte-identical to Java. `RateOf` parses the percent with `strings.Cut` and zero-padding, never through a `float64`.
+#### Step 5: The breakdown and its invariant
+
+`NewFeeBreakdown` sums with the currency-checking `Sum` and compares with `==` (`Money` is a comparable struct), wrapping `ErrInvariant` on a mismatch. `MerchantDiscount` panics on the impossible branch because the constructor has already proved the subtraction is safe.
+
+```go
+type FeeBreakdown struct {
+	Gross           Money
+	InterchangeRate Rate
+	Interchange     Money
+	SchemeFees      Money
+	AcquirerMargin  Money
+	MerchantNet     Money
+}
+
+func NewFeeBreakdown(gross Money, interchangeRate Rate, interchange, schemeFees, acquirerMargin, merchantNet Money) (FeeBreakdown, error) {
+	total, err := Sum(gross.Currency, interchange, schemeFees, acquirerMargin, merchantNet)
+	if err != nil {
+		return FeeBreakdown{}, err
+	}
+	if total != gross {
+		return FeeBreakdown{}, fmt.Errorf("%w: %v != %v", ErrInvariant, total, gross)
+	}
+	return FeeBreakdown{gross, interchangeRate, interchange, schemeFees, acquirerMargin, merchantNet}, nil
+}
+
+func (f FeeBreakdown) MerchantDiscount() Money {
+	d, err := f.Gross.Minus(f.MerchantNet)
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+```
+
+#### Step 6: The engine
+
+A type switch on `pricing`; the IC++ arm uses `Sum` for the three-term discount and the `default` arm returns `ErrInvalidArgument` for an unknown model. Every `Minus` is checked before `NewFeeBreakdown` verifies the invariant.
+
+```go
+func (e *FeeEngine) Quote(tx Transaction, pricing Pricing) (FeeBreakdown, error) {
+	gross := tx.Amount
+	icRate, err := e.table.Lookup(tx.CardType, tx.Region, tx.Channel)
+	if err != nil {
+		return FeeBreakdown{}, err
+	}
+	interchange, err := icRate.ApplyTo(gross)
+	if err != nil {
+		return FeeBreakdown{}, err
+	}
+	schemeFees, err := e.scheme.FeeFor(gross, tx.Region)
+	if err != nil {
+		return FeeBreakdown{}, err
+	}
+	var merchantDiscount Money
+	switch p := pricing.(type) {
+	case IcPlusPlus:
+		markup, err := p.Markup.ApplyTo(gross)
+		if err != nil {
+			return FeeBreakdown{}, err
+		}
+		if merchantDiscount, err = Sum(gross.Currency, interchange, schemeFees, markup); err != nil {
+			return FeeBreakdown{}, err
+		}
+	case Blended:
+		if merchantDiscount, err = p.MerchantRate.ApplyTo(gross); err != nil {
+			return FeeBreakdown{}, err
+		}
+	default:
+		return FeeBreakdown{}, fmt.Errorf("%w: unknown pricing %T", ErrInvalidArgument, pricing)
+	}
+	acquirerMargin, err := merchantDiscount.Minus(interchange)
+	if err != nil {
+		return FeeBreakdown{}, err
+	}
+	if acquirerMargin, err = acquirerMargin.Minus(schemeFees); err != nil {
+		return FeeBreakdown{}, err
+	}
+	merchantNet, err := gross.Minus(merchantDiscount)
+	if err != nil {
+		return FeeBreakdown{}, err
+	}
+	return NewFeeBreakdown(gross, icRate, interchange, schemeFees, acquirerMargin, merchantNet)
+}
+```
+
+#### Step 7: Attribution with allocate
+
+A package-level `Attribute`; the currency check wraps `ErrCurrencyMismatch`, and `Allocate(weights...)` returns `([]Money, error)`.
+
+```go
+func Attribute(aggregateFee Money, txs []Transaction) ([]Money, error) {
+	weights := make([]int64, len(txs))
+	for i, tx := range txs {
+		if tx.Amount.Currency != aggregateFee.Currency {
+			return nil, fmt.Errorf("%w: %s vs %s", ErrCurrencyMismatch, tx.Amount.Currency.Code, aggregateFee.Currency.Code)
+		}
+		weights[i] = tx.Amount.MinorUnits
+	}
+	return aggregateFee.Allocate(weights...)
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/11-payment-rails/07-interchange-and-scheme-fees/code/go
 go run .
 go test ./...
+```
+
+The output is byte-identical to the Java run:
+
+```console
+== Attributing a 25.00 USD monthly scheme fee to three transactions ==
+a 100.00 USD -> 17.89 USD
+b 37.77 USD -> 6.75 USD
+c 2.00 USD -> 0.36 USD
+sum = 25.00 USD
+month total IC++                   gross 139.77 USD  IC 2.84 USD  scheme 0.25 USD acquirer 0.43 USD  merchant 136.25 USD  (252 bps, IC rate 0.00% + 0)
 ```
 
 ## Use It

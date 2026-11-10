@@ -413,27 +413,263 @@ wallet     21 checks  [SEPARATE_CAPTURE, REFUND, PARTIAL_REFUND, CUSTOMER_ACTION
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **The sealed interface is a `Union` of frozen dataclasses**, each with a `type()` method, and the adapters narrow it with `match`/`case` where Java used `instanceof` patterns; `PaymentProcessor` is a `typing.Protocol`, so the two deliberately broken adapters in the tests (`LossyCardAdapter`, `NoDedupeBankAdapter`) implement it without inheriting anything. **`Optional<PaymentEvent>` is `Optional[PaymentEvent]`:** `translate_event` returns `None` for foreign or malformed notifications and `PaymentService.on_raw_event`/`lookup` return `None` where Java returned `Optional.empty()`. **Enums carry their data:** `DeclineReason` members are `(label, RetryAdvice)` tuples so `reason.advice()` works as in Java; the vendor `switch` statements on tokens become dict lookups; `Capabilities.flags` is a `frozenset`, printed through `format_flags` in declaration order because `EnumSet` iteration order is what the Java demo shows. **The conformance suite's out-parameter is a tuple:** `_throws_unsupported(action)` returns `(raised, vendor_calls_delta)` instead of filling an `int[]`; `UnsupportedCapabilityError` is a `RuntimeError`, wrong method type and zero amounts raise `ValueError`, and a duplicate registration raises `RuntimeError`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The instrument and the outcome vocabulary
+
+Three frozen dataclasses and a `Union` alias stand in for the sealed interface; the set is closed by convention and by the `match` statements that narrow it. `PaymentStatus.is_final` is a method on the enum, with the same three final statuses.
+
 ```python
-PaymentMethod = Union[CardMethod, BankDebitMethod, WalletMethod]   # the sealed interface
+@dataclass(frozen=True)
+class BankDebitMethod:
+    token: str
+    mandate_id: str
 
-class PaymentProcessor(Protocol):                                   # the port
-    def charge(self, request: ChargeRequest) -> PaymentResult: ...
-    def translate_event(self, raw_event: str) -> Optional[PaymentEvent]: ...
+    def type(self) -> MethodType:
+        return MethodType.BANK_DEBIT
 
-def charge(self, request: ChargeRequest) -> PaymentResult:          # inside CardAdapter
-    match request.method:
-        case CardMethod() as card:
-            pass
-        case _:
-            raise ValueError(f"card adapter given {request.method.type().name}")
+
+@dataclass(frozen=True)
+class WalletMethod:
+    token: str
+    provider: str
+
+    def type(self) -> MethodType:
+        return MethodType.WALLET
+
+
+# The sealed interface: exactly these three, matched with isinstance / match-case.
+PaymentMethod = Union[CardMethod, BankDebitMethod, WalletMethod]
+
+class PaymentStatus(Enum):
+    AUTHORIZED = "authorized"
+    SUCCEEDED = "succeeded"
+    PENDING = "pending"
+    REQUIRES_ACTION = "requires_action"
+    DECLINED = "declined"
+    FAILED = "failed"
+
+    def is_final(self) -> bool:
+        return self in (PaymentStatus.SUCCEEDED, PaymentStatus.DECLINED, PaymentStatus.FAILED)
+
+    def __str__(self) -> str:
+        return self.name
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: Decline reasons that carry their own retry advice
 
-- **The sealed interface is a `Union` of frozen dataclasses**, each with a `type()` method, and the adapters narrow it with `match`/`case` where Java used `instanceof` patterns. `PaymentProcessor` is a `typing.Protocol`, so the two deliberately broken adapters in the tests (`LossyCardAdapter`, `NoDedupeBankAdapter`) implement it without inheriting anything.
-- **`Optional<PaymentEvent>` is `Optional[PaymentEvent]`**: `translate_event` returns `None` for foreign or malformed notifications and `PaymentService.on_raw_event`/`lookup` return `None` where Java returned `Optional.empty()`.
-- **Enums carry their data.** `DeclineReason` members are `(label, RetryAdvice)` tuples so `reason.advice()` works as in Java; the vendor `switch` statements on tokens become dict lookups. `Capabilities.flags` is a `frozenset`, printed through `format_flags` in declaration order because `EnumSet` iteration order is what the Java demo shows.
-- **The conformance suite's out-parameter is a tuple.** `_throws_unsupported(action)` returns `(raised, vendor_calls_delta)` instead of filling an `int[]`. `UnsupportedCapabilityError` is a `RuntimeError`; wrong method type and zero amounts raise `ValueError`; a duplicate registration raises `RuntimeError`.
+Each `DeclineReason` value is a `(label, advice)` tuple; `Enum.__init__` receives the tuple's elements and stores the advice, so there is still no way to construct a reason without one. The label exists only to keep the tuple values distinct, so no two members alias.
+
+```python
+class DeclineReason(Enum):
+    NONE = ("none", RetryAdvice.NOT_APPLICABLE)
+    INSUFFICIENT_FUNDS = ("insufficient_funds", RetryAdvice.RETRY_LATER)
+    DO_NOT_HONOR = ("do_not_honor", RetryAdvice.RETRY_LATER)
+    ISSUER_UNAVAILABLE = ("issuer_unavailable", RetryAdvice.RETRY_NOW)
+    AUTHENTICATION_REQUIRED = ("authentication_required", RetryAdvice.RETRY_WITH_CUSTOMER)
+    EXPIRED_INSTRUMENT = ("expired_instrument", RetryAdvice.DO_NOT_RETRY)
+    INVALID_ACCOUNT = ("invalid_account", RetryAdvice.DO_NOT_RETRY)
+    SUSPECTED_FRAUD = ("suspected_fraud", RetryAdvice.DO_NOT_RETRY)
+    UNAUTHORIZED_DEBIT = ("unauthorized_debit", RetryAdvice.DO_NOT_RETRY)
+    INVALID_AMOUNT = ("invalid_amount", RetryAdvice.DO_NOT_RETRY)
+    UNKNOWN = ("unknown", RetryAdvice.DO_NOT_RETRY)
+
+    def __init__(self, _label: str, advice: RetryAdvice) -> None:
+        self._advice = advice
+
+    def advice(self) -> RetryAdvice:
+        return self._advice
+
+    def __str__(self) -> str:
+        return self.name
+```
+
+#### Step 3: Capabilities and the port
+
+`Capabilities.__post_init__` freezes both sets, the Python equivalent of the Java defensive copy. `require` and `require_currency` raise `UnsupportedCapabilityError`. The port is a `Protocol` with the same seven methods, `translate_event` returning `Optional[PaymentEvent]`.
+
+```python
+class UnsupportedCapabilityError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    flags: frozenset[Capability]
+    currencies: frozenset[Currency]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "flags", frozenset(self.flags))
+        object.__setattr__(self, "currencies", frozenset(self.currencies))
+
+    def supports(self, c: Capability) -> bool:
+        return c in self.flags
+
+    def require(self, adapter: str, c: Capability) -> None:
+        if not self.supports(c):
+            raise UnsupportedCapabilityError(f"{adapter} does not support {c.name}")
+
+    def require_currency(self, adapter: str, c: Currency) -> None:
+        if c not in self.currencies:
+            raise UnsupportedCapabilityError(f"{adapter} does not support currency {c.code}")
+
+
+class PaymentProcessor(Protocol):
+    """The port. One interface for every rail; adapters implement it, product code depends on it."""
+
+    def name(self) -> str: ...
+    def method_type(self) -> MethodType: ...
+    def capabilities(self) -> Capabilities: ...
+    def charge(self, request: ChargeRequest) -> PaymentResult: ...
+    def capture(self, processor_ref: str, amount: Money) -> PaymentResult: ...
+    def refund(self, processor_ref: str, amount: Money) -> PaymentResult: ...
+    def translate_event(self, raw_event: str) -> Optional[PaymentEvent]: ...
+```
+
+#### Step 4: A vendor with quirks
+
+`FakeCardNetworkApi` keeps the magic tokens in a class-level `_CODES` dict in place of the Java `switch`, counts `_vendor_calls` on every invocation and `_charges_created` only for new charges, and honours the idempotency key natively. The currency travels as the ISO 4217 numeric code.
+
+```python
+class FakeCardNetworkApi:
+    """Card acquirer: ISO 8583-style response codes, ISO 4217 numeric currency, native idempotency keys."""
+
+    _CODES = {
+        "tok_insufficient": "51", "tok_do_not_honor": "05", "tok_expired": "54", "tok_fraud": "59",
+        "tok_bad_number": "14", "tok_issuer_down": "91", "tok_sca_required": "1A", "tok_weird": "N7",
+    }
+
+    def authorize(self, idempotency_key: str, pan_token: str, amount_minor: int, currency_numeric: str, capture: bool) -> AuthResponse:
+        self._vendor_calls += 1
+        self._last_wire = f"amount={amount_minor} currency={currency_numeric}"
+        prior = self._by_idempotency_key.get(idempotency_key)
+        if prior is not None:
+            return prior
+        self._charges_created += 1
+        code = FakeCardNetworkApi._CODES.get(pan_token, "00")
+        auth_id = f"auth_{self._charges_created:06d}"
+        if code == "00":
+            self._ledger[auth_id] = [amount_minor, amount_minor if capture else 0, 0]
+        response = AuthResponse(code, auth_id, amount_minor, currency_numeric)
+        self._by_idempotency_key[idempotency_key] = response
+        return response
+```
+
+#### Step 5: The card adapter
+
+`match request.method: case CardMethod() as card:` binds `card` the way the Java pattern-matching `instanceof` did; anything else raises `ValueError`. Then currency check, capability check for authorize-only, one vendor call, translation, with `1A` becoming `REQUIRES_ACTION`.
+
+```python
+    def charge(self, request: ChargeRequest) -> PaymentResult:
+        match request.method:
+            case CardMethod() as card:
+                pass
+            case _:
+                raise ValueError(f"card adapter given {request.method.type().name}")
+        CardAdapter.CAPS.require_currency(self.name(), request.amount.currency)
+        if not request.capture:
+            CardAdapter.CAPS.require(self.name(), Capability.SEPARATE_CAPTURE)
+        r = self._api.authorize(request.reference, card.token, request.amount.minor_units,
+                                request.amount.currency.numeric, request.capture)
+        if r.response_code == "00":
+            status = PaymentStatus.SUCCEEDED if request.capture else PaymentStatus.AUTHORIZED
+            return PaymentResult(request.reference, r.auth_id, status, request.amount, DeclineReason.NONE, "00")
+        reason = CardAdapter.map_code(r.response_code)
+        status = PaymentStatus.REQUIRES_ACTION if reason is DeclineReason.AUTHENTICATION_REQUIRED else PaymentStatus.DECLINED
+        return PaymentResult(request.reference, r.auth_id, status, request.amount, reason, r.response_code)
+```
+
+#### Step 6: The bank adapter supplies what the rail lacks
+
+The `_by_reference` dict is the dedupe the rail does not provide; `to_plain_string()` renders the decimal amount from the currency exponent. `translate_event` splits on `|`, returns `None` for anything it does not recognise, including a `returned` line without a code.
+
+```python
+    def charge(self, request: ChargeRequest) -> PaymentResult:
+        match request.method:
+            case BankDebitMethod() as account:
+                pass
+            case _:
+                raise ValueError(f"bank adapter given {request.method.type().name}")
+        BankDebitAdapter.CAPS.require_currency(self.name(), request.amount.currency)
+        if not request.capture:
+            BankDebitAdapter.CAPS.require(self.name(), Capability.SEPARATE_CAPTURE)
+        prior = self._by_reference.get(request.reference)
+        if prior is not None:
+            return prior
+        trace = self._api.submit_debit(account.token, request.amount.to_plain_string())
+        result = PaymentResult(request.reference, trace, PaymentStatus.PENDING, request.amount, DeclineReason.NONE, "")
+        self._by_reference[request.reference] = result
+        self._debited[trace] = request.amount
+        return result
+
+    def translate_event(self, raw_event: str) -> Optional[PaymentEvent]:
+        parts = raw_event.split("|")
+        if len(parts) < 3 or parts[0] != "ach":
+            return None
+        if parts[1] == "settled":
+            return PaymentEvent(parts[2], PaymentStatus.SUCCEEDED, DeclineReason.NONE, "")
+        if parts[1] == "returned":
+            if len(parts) < 4:
+                return None
+            return PaymentEvent(parts[2], PaymentStatus.FAILED, BankDebitAdapter.map_code(parts[3]), parts[3])
+        return None
+```
+
+#### Step 7: The service routes and applies events
+
+`pay` selects the adapter by `MethodType` and records the normalized result; `on_raw_event` lets the adapter interpret the raw line and applies it only to a known, non-final payment, returning `None` otherwise.
+
+```python
+    def pay(self, request: ChargeRequest) -> PaymentResult:
+        result = self.processor_for(request.method.type()).charge(request)
+        self._by_processor_ref[result.processor_ref] = result
+        return result
+
+    def on_raw_event(self, type_: MethodType, raw_event: str) -> Optional[PaymentResult]:
+        """Feed a raw notification to the adapter for its rail; apply it if the adapter recognizes it."""
+        e = self.processor_for(type_).translate_event(raw_event)
+        if e is None:
+            return None
+        current = self._by_processor_ref.get(e.processor_ref)
+        if current is None or current.status.is_final():
+            return None  # unknown, or already decided
+        updated = PaymentResult(current.reference, current.processor_ref, e.status, current.amount, e.reason, e.raw_code)
+        self._by_processor_ref[e.processor_ref] = updated
+        return updated
+```
+
+#### Step 8: The conformance suite
+
+`_throws_unsupported` returns a `(raised, delta)` tuple, so contracts 3 and 4 read as two assignments. The suite's checks are the same as the Java ones, keyed on declared capabilities; this excerpt shows idempotency and currency honesty.
+
+```python
+    def _throws_unsupported(self, action: Callable[[], object]) -> tuple[bool, int]:
+        """(did it raise UnsupportedCapabilityError, vendor calls made before raising; -1 if it did not raise)."""
+        before = self._t.vendor_calls()
+        try:
+            action()
+            return False, -1
+        except UnsupportedCapabilityError:
+            return True, self._t.vendor_calls() - before
+
+        # 3. Idempotency: the same reference twice is one charge at the vendor, one processor reference.
+        dup = self._request(t.approve, "12.34", True)
+        created_before = t.charges_created()
+        first = p.charge(dup)
+        second = p.charge(dup)
+        self._expect("same reference returns the same processor reference", first.processor_ref == second.processor_ref)
+        self._expect("same reference creates exactly one vendor charge", t.charges_created() - created_before == 1)
+
+        # 4. Currency honesty: an undeclared currency is refused before the vendor is called.
+        chf = ChargeRequest(f"conf-chf-{p.name()}", Money.parse("10.00", CHF), t.approve, True)
+        raised, delta = self._throws_unsupported(lambda: p.charge(chf))
+        self._expect("undeclared currency throws UnsupportedCapabilityError", raised)
+        self._expect("undeclared currency never reaches the vendor", delta == 0)
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/12-payment-systems-design/10-payment-method-abstraction/code/python
@@ -441,40 +677,355 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run, down to the check counts:
+
+```console
+== Conformance suite, run against every adapter ==
+card       19 checks  [SEPARATE_CAPTURE, PARTIAL_CAPTURE, REFUND, PARTIAL_REFUND]    PASS
+bank_debit 19 checks  [REFUND, PARTIAL_REFUND, ASYNC_CONFIRMATION]                   PASS
+wallet     21 checks  [SEPARATE_CAPTURE, REFUND, PARTIAL_REFUND, CUSTOMER_ACTION]    PASS
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`, `money.go`, tests in `main_test.go`) keeps the design with four differences. **The port returns errors as values:** `Charge`, `Capture`, and `Refund` return `(PaymentResult, error)`; `UnsupportedCapabilityException` is the sentinel `ErrUnsupportedCapability`, wrong instruments and zero amounts wrap `ErrInvalidArgument`, and a duplicate `Register` wraps `ErrIllegalState`, all checked with `errors.Is`; the conformance suite's `throwsUnsupported` becomes `failsUnsupported(action func() error) (bool, int)`, returning the vendor-call delta instead of filling an `int[]`. **`Optional` is a second return value:** `TranslateEvent` returns `(PaymentEvent, bool)`, and `PaymentService.OnRawEvent`/`Lookup` return `(PaymentResult, bool)`; `false` is Java's `Optional.empty()`. **Enums carry their data through parallel tables:** `DeclineReason` is an `int` constant whose `Advice()` indexes a `declineAdvice` array, so the retry advice still travels with the reason; the response-code, return-code, and issue maps are package-level `map[string]DeclineReason` values with a shared `lookupReason` that falls back to `UNKNOWN`; `Capabilities.Flags()` returns the declared flags in declaration order, which is what `EnumSet` iteration printed in the Java demo. **The conformance check count is unchanged:** the suite wraps each port call so an unexpected `error` is recorded as a failure without incrementing `checks`; the card, bank, and wallet adapters still report 19, 19, and 21 checks.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The instrument and the outcome vocabulary
+
+Go has no sealed types, so the unexported marker method `paymentMethod()` keeps the set of implementations closed to this package: no other package can satisfy the interface. The three instruments are plain structs; `PaymentStatus` is an `iota` enum with `IsFinal`.
+
 ```go
-// PaymentMethod is the sealed interface: Go has no sealed types, so the unexported marker
-// method keeps the set of instruments closed to this package.
 type PaymentMethod interface {
-    Type() MethodType
-    Token() string
-    paymentMethod()
+	Type() MethodType
+	Token() string
+	paymentMethod()
 }
 
-func (c *CardAdapter) Charge(request ChargeRequest) (PaymentResult, error) {
-    card, ok := request.Method.(CardMethod)
-    if !ok {
-        return PaymentResult{}, fmt.Errorf("%w: card adapter given %v", ErrInvalidArgument, request.Method.Type())
-    }
-    if err := cardCaps.RequireCurrency(c.Name(), request.Amount.Currency); err != nil {
-        return PaymentResult{}, err
-    }
-    ...
+type CardMethod struct{ CardToken, Network string }
+type BankDebitMethod struct{ AccountToken, MandateID string }
+type WalletMethod struct{ WalletToken, Provider string }
+
+func (m CardMethod) Type() MethodType      { return CARD }
+func (m CardMethod) Token() string         { return m.CardToken }
+func (m CardMethod) paymentMethod()        {}
+func (m BankDebitMethod) Type() MethodType { return BANK_DEBIT }
+func (m BankDebitMethod) Token() string    { return m.AccountToken }
+func (m BankDebitMethod) paymentMethod()   {}
+func (m WalletMethod) Type() MethodType    { return WALLET }
+func (m WalletMethod) Token() string       { return m.WalletToken }
+func (m WalletMethod) paymentMethod()      {}
+
+type PaymentStatus int
+
+const (
+	AUTHORIZED PaymentStatus = iota
+	SUCCEEDED
+	PENDING
+	REQUIRES_ACTION
+	DECLINED
+	FAILED
+)
+
+func (s PaymentStatus) String() string {
+	return [...]string{"AUTHORIZED", "SUCCEEDED", "PENDING", "REQUIRES_ACTION", "DECLINED", "FAILED"}[s]
+}
+
+func (s PaymentStatus) IsFinal() bool { return s == SUCCEEDED || s == DECLINED || s == FAILED }
+```
+
+#### Step 2: Decline reasons that carry their own retry advice
+
+The Java enum constructor becomes two parallel arrays indexed by the constant: `declineReasonNames` for printing and `declineAdvice` for `Advice()`. The arrays are declared next to the constants so a new reason cannot be added without a slot in each.
+
+```go
+type DeclineReason int
+
+const (
+	NONE DeclineReason = iota
+	INSUFFICIENT_FUNDS
+	DO_NOT_HONOR
+	ISSUER_UNAVAILABLE
+	AUTHENTICATION_REQUIRED
+	EXPIRED_INSTRUMENT
+	INVALID_ACCOUNT
+	SUSPECTED_FRAUD
+	UNAUTHORIZED_DEBIT
+	INVALID_AMOUNT
+	UNKNOWN
+)
+
+var declineReasonNames = [...]string{"NONE", "INSUFFICIENT_FUNDS", "DO_NOT_HONOR", "ISSUER_UNAVAILABLE", "AUTHENTICATION_REQUIRED",
+	"EXPIRED_INSTRUMENT", "INVALID_ACCOUNT", "SUSPECTED_FRAUD", "UNAUTHORIZED_DEBIT", "INVALID_AMOUNT", "UNKNOWN"}
+
+// declineAdvice is the data each Java enum constant carries: the retry advice travels with the reason.
+var declineAdvice = [...]RetryAdvice{NOT_APPLICABLE, RETRY_LATER, RETRY_LATER, RETRY_NOW, RETRY_WITH_CUSTOMER,
+	DO_NOT_RETRY, DO_NOT_RETRY, DO_NOT_RETRY, DO_NOT_RETRY, DO_NOT_RETRY, DO_NOT_RETRY}
+
+func (r DeclineReason) String() string      { return declineReasonNames[r] }
+func (r DeclineReason) Advice() RetryAdvice { return declineAdvice[r] }
+```
+
+#### Step 3: Capabilities and the port
+
+`NewCapabilities` copies the slices into private maps, so an adapter cannot mutate its advertised set after the router has read it. `Require`/`RequireCurrency` return an error wrapping `ErrUnsupportedCapability`; the `PaymentProcessor` interface returns `(PaymentResult, error)` from the three money methods and `(PaymentEvent, bool)` from `TranslateEvent`.
+
+```go
+type Capabilities struct {
+	flags      map[Capability]bool
+	currencies map[Currency]bool
+}
+
+func NewCapabilities(flags []Capability, currencies []Currency) Capabilities {
+	c := Capabilities{flags: map[Capability]bool{}, currencies: map[Currency]bool{}}
+	for _, f := range flags {
+		c.flags[f] = true
+	}
+	for _, cur := range currencies {
+		c.currencies[cur] = true
+	}
+	return c
+}
+
+func (c Capabilities) Supports(cap Capability) bool { return c.flags[cap] }
+
+// Flags lists the declared capabilities in declaration order, like Java's EnumSet iteration.
+func (c Capabilities) Flags() []Capability {
+	out := []Capability{}
+	for i := range capabilityNames {
+		if c.flags[Capability(i)] {
+			out = append(out, Capability(i))
+		}
+	}
+	return out
+}
+
+func (c Capabilities) Require(adapter string, cap Capability) error {
+	if !c.Supports(cap) {
+		return fmt.Errorf("%w: %s does not support %v", ErrUnsupportedCapability, adapter, cap)
+	}
+	return nil
+}
+
+func (c Capabilities) RequireCurrency(adapter string, cur Currency) error {
+	if !c.currencies[cur] {
+		return fmt.Errorf("%w: %s does not support currency %s", ErrUnsupportedCapability, adapter, cur.Code)
+	}
+	return nil
+}
+
+type PaymentProcessor interface {
+	Name() string
+	MethodType() MethodType
+	Capabilities() Capabilities
+	Charge(request ChargeRequest) (PaymentResult, error)
+	Capture(processorRef string, amount Money) (PaymentResult, error)
+	Refund(processorRef string, amount Money) (PaymentResult, error)
+	TranslateEvent(rawEvent string) (PaymentEvent, bool)
 }
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+#### Step 4: A vendor with quirks
 
-- **The port returns errors as values.** `Charge`, `Capture`, and `Refund` return `(PaymentResult, error)`; `UnsupportedCapabilityException` is the sentinel `ErrUnsupportedCapability`, wrong instruments and zero amounts wrap `ErrInvalidArgument`, and a duplicate `Register` wraps `ErrIllegalState`, all checked with `errors.Is`. The conformance suite's `throwsUnsupported` becomes `failsUnsupported(action func() error) (bool, int)`, returning the vendor-call delta instead of filling an `int[]`.
-- **`Optional` is a second return value.** `TranslateEvent` returns `(PaymentEvent, bool)`, and `PaymentService.OnRawEvent`/`Lookup` return `(PaymentResult, bool)`; `false` is Java's `Optional.empty()`.
-- **Enums carry their data through parallel tables.** `DeclineReason` is an `int` constant whose `Advice()` indexes a `declineAdvice` array, so the retry advice still travels with the reason; the `RESPONSE_CODES`, `RETURN_CODES`, and `ISSUES` maps are package-level `map[string]DeclineReason` values with a shared `lookupReason` that falls back to `UNKNOWN`. `Capabilities.Flags()` returns the declared flags in declaration order, which is what `EnumSet` iteration printed in the Java demo.
-- **The conformance check count is unchanged.** The suite wraps each port call so an unexpected `error` is recorded as a failure without incrementing `checks`; the card, bank, and wallet adapters still report 19, 19, and 21 checks.
+`cardTokenCodes` is the magic-token map; a token not in it is `"00"`. `Authorize` counts every call, dedupes on the idempotency key before creating a charge, and records the wire format with the numeric currency.
+
+```go
+var cardTokenCodes = map[string]string{
+	"tok_insufficient": "51", "tok_do_not_honor": "05", "tok_expired": "54", "tok_fraud": "59",
+	"tok_bad_number": "14", "tok_issuer_down": "91", "tok_sca_required": "1A", "tok_weird": "N7",
+}
+
+func (a *FakeCardNetworkApi) Authorize(idempotencyKey, panToken string, amountMinor int64, currencyNumeric string, capture bool) AuthResponse {
+	a.vendorCalls++
+	a.lastWire = fmt.Sprintf("amount=%d currency=%s", amountMinor, currencyNumeric)
+	if prior, ok := a.byIdempotencyKey[idempotencyKey]; ok {
+		return prior
+	}
+	a.chargesCreated++
+	code, ok := cardTokenCodes[panToken]
+	if !ok {
+		code = "00"
+	}
+	authID := fmt.Sprintf("auth_%06d", a.chargesCreated)
+	if code == "00" {
+		captured := int64(0)
+		if capture {
+			captured = amountMinor
+		}
+		a.ledger[authID] = &vendorRow{amountMinor, captured, 0}
+	}
+	response := AuthResponse{code, authID, amountMinor, currencyNumeric}
+	a.byIdempotencyKey[idempotencyKey] = response
+	return response
+}
+```
+
+#### Step 5: The card adapter
+
+The type assertion `request.Method.(CardMethod)` with its `ok` replaces the Java pattern match; each guard returns early with its error. After the one vendor call the response code is translated, with `1A` mapped to `REQUIRES_ACTION`.
+
+```go
+func (c *CardAdapter) Charge(request ChargeRequest) (PaymentResult, error) {
+	card, ok := request.Method.(CardMethod)
+	if !ok {
+		return PaymentResult{}, fmt.Errorf("%w: card adapter given %v", ErrInvalidArgument, request.Method.Type())
+	}
+	if err := cardCaps.RequireCurrency(c.Name(), request.Amount.Currency); err != nil {
+		return PaymentResult{}, err
+	}
+	if !request.Capture {
+		if err := cardCaps.Require(c.Name(), SEPARATE_CAPTURE); err != nil {
+			return PaymentResult{}, err
+		}
+	}
+	r := c.api.Authorize(request.Reference, card.Token(), request.Amount.MinorUnits, request.Amount.Currency.Numeric, request.Capture)
+	if r.ResponseCode == "00" {
+		status := AUTHORIZED
+		if request.Capture {
+			status = SUCCEEDED
+		}
+		return PaymentResult{request.Reference, r.AuthID, status, request.Amount, NONE, "00"}, nil
+	}
+	reason := CardMapCode(r.ResponseCode)
+	status := DECLINED
+	if reason == AUTHENTICATION_REQUIRED {
+		status = REQUIRES_ACTION
+	}
+	return PaymentResult{request.Reference, r.AuthID, status, request.Amount, reason, r.ResponseCode}, nil
+}
+```
+
+#### Step 6: The bank adapter supplies what the rail lacks
+
+Authorize-only fails at `Require(SEPARATE_CAPTURE)` before `SubmitDebit`; `byReference` is the adapter-side dedupe; `PlainString()` renders the decimal amount. `TranslateEvent` returns `false` for foreign and malformed lines.
+
+```go
+func (b *BankDebitAdapter) Charge(request ChargeRequest) (PaymentResult, error) {
+	account, ok := request.Method.(BankDebitMethod)
+	if !ok {
+		return PaymentResult{}, fmt.Errorf("%w: bank adapter given %v", ErrInvalidArgument, request.Method.Type())
+	}
+	if err := bankCaps.RequireCurrency(b.Name(), request.Amount.Currency); err != nil {
+		return PaymentResult{}, err
+	}
+	if !request.Capture {
+		if err := bankCaps.Require(b.Name(), SEPARATE_CAPTURE); err != nil {
+			return PaymentResult{}, err
+		}
+	}
+	if prior, ok := b.byReference[request.Reference]; ok {
+		return prior, nil
+	}
+	trace := b.api.SubmitDebit(account.Token(), request.Amount.PlainString())
+	result := PaymentResult{request.Reference, trace, PENDING, request.Amount, NONE, ""}
+	b.byReference[request.Reference] = result
+	b.debited[trace] = request.Amount
+	return result, nil
+}
+
+func (b *BankDebitAdapter) TranslateEvent(rawEvent string) (PaymentEvent, bool) {
+	parts := strings.Split(rawEvent, "|")
+	if len(parts) < 3 || parts[0] != "ach" {
+		return PaymentEvent{}, false
+	}
+	switch parts[1] {
+	case "settled":
+		return PaymentEvent{parts[2], SUCCEEDED, NONE, ""}, true
+	case "returned":
+		if len(parts) < 4 {
+			return PaymentEvent{}, false
+		}
+		return PaymentEvent{parts[2], FAILED, BankMapCode(parts[3]), parts[3]}, true
+	default:
+		return PaymentEvent{}, false
+	}
+}
+```
+
+#### Step 7: The service routes and applies events
+
+`Pay` propagates the adapter's error and records the normalized result. `OnRawEvent` returns `(PaymentResult, bool)`: `false` for an unrecognised event, an unknown reference, or a payment already in a final status, which is what makes redeliveries harmless.
+
+```go
+func (s *PaymentService) Pay(request ChargeRequest) (PaymentResult, error) {
+	p, err := s.ProcessorFor(request.Method.Type())
+	if err != nil {
+		return PaymentResult{}, err
+	}
+	result, err := p.Charge(request)
+	if err != nil {
+		return PaymentResult{}, err
+	}
+	s.byProcessorRef[result.ProcessorRef] = result
+	return result, nil
+}
+
+// OnRawEvent feeds a raw notification to the adapter for its rail; applies it if the adapter recognizes it.
+// The bool is false for an unrecognized event, an unknown reference, or a payment already decided.
+func (s *PaymentService) OnRawEvent(t MethodType, rawEvent string) (PaymentResult, bool) {
+	p, err := s.ProcessorFor(t)
+	if err != nil {
+		return PaymentResult{}, false
+	}
+	e, ok := p.TranslateEvent(rawEvent)
+	if !ok {
+		return PaymentResult{}, false
+	}
+	current, known := s.byProcessorRef[e.ProcessorRef]
+	if !known || current.Status.IsFinal() {
+		return PaymentResult{}, false
+	}
+	updated := PaymentResult{current.Reference, current.ProcessorRef, e.Status, current.Amount, e.Reason, e.RawCode}
+	s.byProcessorRef[e.ProcessorRef] = updated
+	return updated, true
+}
+```
+
+#### Step 8: The conformance suite
+
+`failsUnsupported` runs the action, checks the returned error with `errors.Is`, and reports the vendor-call delta. Contracts 3 and 4 read as in Java; `c.charge` is the suite's wrapper that records an unexpected error as a failure without counting a check.
+
+```go
+func (c *ProcessorConformance) failsUnsupported(action func() error) (bool, int) {
+	before := c.t.VendorCalls()
+	err := action()
+	if !errors.Is(err, ErrUnsupportedCapability) {
+		return false, -1
+	}
+	return true, c.t.VendorCalls() - before
+}
+
+	// 3. Idempotency: the same reference twice is one charge at the vendor, one processor reference.
+	dup := c.request(c.t.Approve, "12.34", true)
+	createdBefore := c.t.ChargesCreated()
+	first := c.charge(dup)
+	second := c.charge(dup)
+	c.expect("same reference returns the same processor reference", first.ProcessorRef == second.ProcessorRef)
+	c.expect("same reference creates exactly one vendor charge", c.t.ChargesCreated()-createdBefore == 1)
+
+	// 4. Currency honesty: an undeclared currency is refused before the vendor is called.
+	chf := ChargeRequest{"conf-chf-" + p.Name(), mustParse("10.00", CHF), c.t.Approve, true}
+	refused, delta := c.failsUnsupported(func() error { _, err := p.Charge(chf); return err })
+	c.expect("undeclared currency fails with ErrUnsupportedCapability", refused)
+	c.expect("undeclared currency never reaches the vendor", delta == 0)
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/12-payment-systems-design/10-payment-method-abstraction/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run:
+
+```console
+== One interface, three rails: the same 45.00 USD charge ==
+card  tok_visa_4242                -> SUCCEEDED       reason=NONE                     advice=NOT_APPLICABLE      raw=00
+bank  acct_ok                      -> PENDING         reason=NONE                     advice=NOT_APPLICABLE      raw=-
+wallet wal_ok                      -> SUCCEEDED       reason=NONE                     advice=NOT_APPLICABLE      raw=COMPLETED
 ```
 
 ## Use It

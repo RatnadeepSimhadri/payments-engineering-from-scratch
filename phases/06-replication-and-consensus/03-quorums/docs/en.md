@@ -348,58 +348,502 @@ Read the table as the three-way trade. `1/1` fails almost nothing and is wrong 1
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Placement needs Java's `String.hashCode`:** Python's `hash()` is salted per process, so it cannot place keys at all; `java_string_hash` reproduces the 32-bit wrapping `31*h + c` over UTF-16 code units and returns it signed, and `home_nodes` then uses `%`, which with a positive divisor is exactly `Math.floorMod`. The test suite pins three known Java hash values, including one that lands on `Integer.MIN_VALUE`. **`Versioned` is a frozen dataclass** whose `newer_than` compares the tuples `(timestamp, writer_id)`, the same lexicographic rule; being frozen it is hashable, so `replicas_agree` can put versions in a `set` like the Java `HashSet`. **Map order is made explicit:** Java's `TreeMap` iterates hints and keys in sorted order while Python dicts iterate in insertion order, so `handoff` and `anti_entropy` call `sorted(...)` where the Java relies on the tree. SplitMix64 is masked to 64 bits after every step, and with that the experiment table matches the Java numbers exactly. **Errors** are `QuorumNotReached(Exception)` and `ValueError` for bad configs. A real coordinator would issue the N requests concurrently with `asyncio` and wait for the first W or R by hand; that changes latency, not the intersection argument.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Versions and the LWW rule
+
+`Versioned` is a frozen dataclass with an `Optional[str]` value, and the module-level `NONE` plays the role of `Versioned.NONE`. `newer_than` is a single tuple comparison: Python compares `(timestamp, writer_id)` lexicographically, which is the same `timestamp > ... or (equal and writer_id > ...)` rule written in one line, and the `writer_id` tie-break still makes it total.
+
 ```python
-def java_string_hash(s: str) -> int:
-    h = 0
-    data = s.encode("utf-16-be")
-    for i in range(0, len(data), 2):
-        h = (31 * h + ((data[i] << 8) | data[i + 1])) & 0xFFFFFFFF
-    return h - (1 << 32) if h >= (1 << 31) else h
+@dataclass(frozen=True)
+class Versioned:
+    value: Optional[str]
+    timestamp: int
+    writer_id: int
+
+    def newer_than(self, other: "Versioned") -> bool:
+        return (self.timestamp, self.writer_id) > (other.timestamp, other.writer_id)
+
+    def __str__(self) -> str:
+        return "<none>" if self.value is None else f"{self.value}@{self.timestamp}/w{self.writer_id}"
+
+
+NONE = Versioned(None, -1, -1)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: A storage node with hints
 
-- **Placement needs Java's `String.hashCode`.** Python's `hash()` is salted per process, so it cannot place keys at all. `java_string_hash` reproduces the 32-bit wrapping `31*h + c` over UTF-16 code units and returns it signed; `home_nodes` then uses `%`, which with a positive divisor is exactly `Math.floorMod`. The test suite pins three known Java hash values, including one that lands on `Integer.MIN_VALUE`.
-- **`Versioned` is a frozen dataclass** and `newer_than` compares the tuples `(timestamp, writer_id)`, the same lexicographic rule. Being frozen, it is hashable, so `replicas_agree` can put versions in a `set` like the Java `HashSet`.
-- **Map order is made explicit.** Java's `TreeMap` iterates hints and keys in sorted order; Python dicts iterate in insertion order, so `handoff` and `anti_entropy` call `sorted(...)` where the Java relies on the tree. SplitMix64 is masked to 64 bits after every step, and with that the experiment table matches the Java numbers exactly.
-- **Errors** are `QuorumNotReached(Exception)` and `ValueError` for bad configs. A real coordinator would issue the N requests concurrently with `asyncio` and wait for the first W or R by hand; that changes latency, not the intersection argument.
+`put` is store-if-newer with `dict.get(key, NONE)` standing in for `getOrDefault`, and returns whether the stored version changed. `store_hint` uses `setdefault` where the Java uses `computeIfAbsent`, so the per-target hint map is created on first use; the hint is also kept only if newer, which makes delivering it twice harmless.
 
-Run it from `code/python/`:
+```python
+    def put(self, key: str, v: Versioned) -> bool:
+        self.writes_accepted += 1
+        current = self.data.get(key, NONE)
+        if v.newer_than(current):
+            self.data[key] = v
+            return True
+        return False
+
+    def get(self, key: str) -> Versioned:
+        self.reads_served += 1
+        return self.data.get(key, NONE)
+
+    def store_hint(self, for_node: int, key: str, v: Versioned) -> None:
+        self.hints_stored += 1
+        for_target = self.hints.setdefault(for_node, {})
+        if v.newer_than(for_target.get(key, NONE)):
+            for_target[key] = v
+```
+
+#### Step 3: The network as a predicate
+
+`reachable` is the same three checks in the same order: crashed target or cut partition first (no RNG consumed), then the seeded drop. The parameter is `from_` because `from` is a Python keyword. `next_double` builds the `[0, 1)` value from the top 53 bits the way `java.util.Random`-style generators do, so the drop decisions line up with the Java run.
+
+```python
+    def reachable(self, from_: int, to: int) -> bool:
+        self.attempts += 1
+        if to in self._down or (self._partitioned and ((from_ in self._side_a) != (to in self._side_a))):
+            self.dropped += 1
+            return False
+        if self._drop_rate > 0 and self._rng.next_double() < self._drop_rate:
+            self.dropped += 1
+            return False
+        return True
+```
+
+#### Step 4: Placement
+
+`home_nodes` is a list comprehension over N ring positions starting at `java_string_hash(key) % len(self.nodes)`. `contact_order` rotates with slicing (`order[at:] + order[:at]` is `Collections.rotate(order, -at)`) and, under sloppy quorums, extends with `fallback_nodes`, which continues the same ring from position N to the end.
+
+```python
+    def home_nodes(self, key: str) -> list[int]:
+        start = java_string_hash(key) % len(self.nodes)   # Python % with a positive divisor is Math.floorMod
+        return [(start + i) % len(self.nodes) for i in range(self.config.n)]
+
+    def contact_order(self, coordinator: int, key: str) -> list[int]:
+        order = self.home_nodes(key)
+        if coordinator in order:
+            at = order.index(coordinator)
+            order = order[at:] + order[:at]   # Collections.rotate(order, -at)
+        if self.config.sloppy:
+            order.extend(self.fallback_nodes(key))
+        return order
+
+    def fallback_nodes(self, key: str) -> list[int]:
+        start = java_string_hash(key) % len(self.nodes)
+        return [(start + i) % len(self.nodes) for i in range(self.config.n, len(self.nodes))]
+```
+
+#### Step 5: The write path
+
+The write path is the Java loop with one addition: the port keeps an `acked` list alongside the count so the event log can print who accepted the value. The sloppy branch walks the spare ring with an index that is never reset, so each missed home node takes the next untried fallback. Fewer than W acks raises `QuorumNotReached`, and nothing already stored is undone. (The `self.events.append` lines that feed the demo's event log are omitted here.)
+
+```python
+    def put(self, coordinator: int, key: str, value: str) -> int:
+        self.writes += 1
+        self._clock += 1
+        v = Versioned(value, self._clock, coordinator)
+        acks = 0
+        acked: list[int] = []
+        missed: list[int] = []
+        for node in self.home_nodes(key):
+            if node == coordinator or self.network.reachable(coordinator, node):
+                self.nodes[node].put(key, v)
+                acks += 1
+                acked.append(node)
+            else:
+                missed.append(node)
+        if self.config.sloppy and missed:
+            spare = self.fallback_nodes(key)
+            si = 0
+            for absent in missed:
+                while si < len(spare):
+                    candidate = spare[si]
+                    si += 1
+                    if candidate == coordinator or self.network.reachable(coordinator, candidate):
+                        self.nodes[candidate].put(key, v)
+                        self.nodes[candidate].store_hint(absent, key, v)
+                        self.hinted_writes += 1
+                        acks += 1
+                        acked.append(candidate)
+                        break
+        if acks < self.config.w:
+            self.write_failures += 1
+            raise QuorumNotReached(f"write {key} got {acks} acks, needs W={self.config.w}")
+        return acks
+```
+
+#### Step 6: The read path and read repair
+
+`get` stops at R responders and keeps the newest version in `winner`. Read repair is gated on `winner.value is not None`, the Python spelling of the Java null check, and pushes the winner only to responders whose `seen` version is older; `put` returning `False` means the replica already had it, so nothing is counted.
+
+```python
+    def get(self, coordinator: int, key: str) -> ReadResult:
+        self.reads += 1
+        winner = NONE
+        respondents: list[int] = []
+        seen: dict[int, Versioned] = {}
+        for node in self.contact_order(coordinator, key):
+            if len(respondents) >= self.config.r:
+                break
+            if node == coordinator or self.network.reachable(coordinator, node):
+                v = self.nodes[node].get(key)
+                respondents.append(node)
+                seen[node] = v
+                if v.newer_than(winner):
+                    winner = v
+        if len(respondents) < self.config.r:
+            self.read_failures += 1
+            raise QuorumNotReached(f"read {key} got {len(respondents)} responses, needs R={self.config.r}")
+        repaired = 0
+        if self.config.read_repair and winner.value is not None:
+            for node in respondents:
+                if winner.newer_than(seen[node]) and self.nodes[node].put(key, winner):
+                    self.nodes[node].repairs_applied += 1
+                    repaired += 1
+            self.repairs += repaired
+        return ReadResult(winner, len(respondents), respondents, repaired)
+```
+
+#### Step 7: Handoff and anti-entropy
+
+Both loops iterate `sorted(...)` views of their dicts so they consume the network RNG in the order the Java `TreeMap` would. `handoff` deletes the whole per-target hint map after delivery; `anti_entropy` builds the union of every node's keys with `set.update`, finds the newest live version per key, skips keys nobody holds, and relies on store-if-newer to make a second pass a no-op. The event-log appends are omitted from both chunks.
+
+```python
+    def handoff(self) -> int:
+        delivered = 0
+        for holder in self.nodes:
+            for target in sorted(holder.hints):   # TreeMap order
+                if not self.network.reachable(holder.id, target):
+                    continue
+                values = holder.hints[target]
+                for k in sorted(values):
+                    self.nodes[target].put(k, values[k])
+                    delivered += 1
+                holder.hints_delivered += len(values)
+                del holder.hints[target]
+        return delivered
+
+    def anti_entropy(self) -> int:
+        updates = 0
+        keys: set[str] = set()
+        for n in self.nodes:
+            keys.update(n.data)
+        for key in sorted(keys):
+            home = self.home_nodes(key)
+            newest = NONE
+            for node in home:
+                if not self.network.is_down(node):
+                    v = self.nodes[node].data.get(key, NONE)
+                    if v.newer_than(newest):
+                        newest = v
+            if newest.value is None:
+                continue
+            for node in home:
+                if not self.network.is_down(node) and self.nodes[node].put(key, newest):
+                    updates += 1
+        return updates
+```
+
+#### Step 8: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/03-quorums/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+With the Java hash and the masked RNG in place, the output matches the Java run line for line, including the experiment table:
+
+```console
+== R + W > N: a strict quorum read always overlaps the last quorum write (N=3, R=2, W=2, node 1 crashed) ==
+home replicas of merchant:m-77:settlement-currency: [1, 2, 3]; fallback ring: [4, 0]
+t=1 PUT merchant:m-77:settlement-currency=EUR via n1 acked by [1, 3] (missed [2])
+read from a different coordinator with R=2 saw EUR@1/w1 from [3, 1]  (replicas: n1=EUR@1/w1 n2=<none>(down) n3=EUR@1/w1)
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Placement needs Java's `String.hashCode`:** Go has no object hash, so `JavaStringHash` runs `31*h + c` over UTF-16 code units on an `int32`, which wraps exactly like Java's `int`, and `floorMod` does what `Math.floorMod` does because Go's `%` keeps the sign of the dividend; the test pins the same three known values as the Python port, including the one that lands on `math.MinInt32`. **Errors are values:** `Put` returns `(acks, error)` and `Get` returns `(ReadResult, error)`, both wrapping the sentinel `ErrQuorumNotReached` that tests check with `errors.Is`; `NewQuorumConfig` and `NewQuorumStore` return `ErrBadConfig`, and `MustConfig`/`MustStore` panic on it and exist only so the demo can pass literals. `Experiment.run` is `RunExperiment`, and a failed write is `if _, err := store.Put(...); err != nil { continue }`. **Absence is a flag, not `null`:** `None` is a `Versioned` with timestamp -1 and `IsNone()`, and `ReadResult.Value()` returns `(string, bool)`; `Versioned` is a comparable struct, so `ReplicasAgree` can use it as a `map` key the way the Java uses a `HashSet`. **Map order is made explicit:** `Handoff` sorts hint targets and keys before delivering, because the Java `TreeMap` iterates in order and `Network.Reachable` consumes the RNG in that order; `AntiEntropy` sorts the key set so the event log is stable. With that, the experiment table matches the Java numbers exactly.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Versions and the LWW rule
+
+`Versioned` is a comparable struct. There is no nullable string, so the absent version `None` is marked by a negative timestamp and `IsNone()` is the Go spelling of `value == null`. `NewerThan` is the Java expression unchanged, and `String()` prints `<none>` for the absent case.
+
 ```go
-func JavaStringHash(s string) int32 {
-    var h int32
-    for _, u := range utf16.Encode([]rune(s)) {
-        h = 31*h + int32(u)
-    }
-    return h
+type Versioned struct {
+	Value     string
+	Timestamp int64
+	WriterID  int
 }
 
-func (s *QuorumStore) HomeNodes(key string) []int {
-    start := floorMod(JavaStringHash(key), len(s.Nodes))
-    ...
+var None = Versioned{"", -1, -1}
+
+func (v Versioned) IsNone() bool { return v.Timestamp < 0 }
+
+func (v Versioned) NewerThan(other Versioned) bool {
+	return v.Timestamp > other.Timestamp || (v.Timestamp == other.Timestamp && v.WriterID > other.WriterID)
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: A storage node with hints
 
-- **Placement needs Java's `String.hashCode`.** Go has no object hash, so `JavaStringHash` runs `31*h + c` over UTF-16 code units on an `int32`, which wraps exactly like Java's `int`; `floorMod` then does what `Math.floorMod` does, because Go's `%` keeps the sign of the dividend. The test pins the same three known values as the Python port, including the one that lands on `math.MinInt32`.
-- **Errors are values.** `Put` returns `(acks, error)` and `Get` returns `(ReadResult, error)`; both wrap the sentinel `ErrQuorumNotReached`, which tests check with `errors.Is`. `NewQuorumConfig` and `NewQuorumStore` return `ErrBadConfig`; `MustConfig`/`MustStore` panic on it and exist only so the demo can pass literals. `Experiment.run` is `RunExperiment`, and a failed write is `if _, err := store.Put(...); err != nil { continue }`.
-- **Absence is a flag, not `null`.** `None` is a `Versioned` with timestamp -1 and `IsNone()`; `ReadResult.Value()` returns `(string, bool)`. `Versioned` is a comparable struct, so `ReplicasAgree` can use it as a `map` key the way the Java uses a `HashSet`.
-- **Map order is made explicit.** `Handoff` sorts hint targets and keys before delivering, because the Java `TreeMap` iterates in order and `Network.Reachable` consumes the RNG in that order; `AntiEntropy` sorts the key set so the event log is stable. With that, the experiment table matches the Java numbers exactly.
+Go maps return the zero value for a missing key, and the zero `Versioned` has timestamp 0, which would wrongly beat `None`; the unexported `current` helper does the `getOrDefault(key, NONE)` lookup correctly, and `Put` and `Get` go through it. `StoreHint` creates the per-target map on first use (the `computeIfAbsent` idiom spelled out) and keeps a hint only if newer.
 
-Run it from `code/go/`:
+```go
+func (n *StorageNode) current(key string) Versioned {
+	if v, ok := n.Data[key]; ok {
+		return v
+	}
+	return None
+}
+
+func (n *StorageNode) Put(key string, v Versioned) bool {
+	n.WritesAccepted++
+	if v.NewerThan(n.current(key)) {
+		n.Data[key] = v
+		return true
+	}
+	return false
+}
+
+func (n *StorageNode) Get(key string) Versioned {
+	n.ReadsServed++
+	return n.current(key)
+}
+
+func (n *StorageNode) StoreHint(forNode int, key string, v Versioned) {
+	n.HintsStored++
+	forTarget, ok := n.Hints[forNode]
+	if !ok {
+		forTarget = map[string]Versioned{}
+		n.Hints[forNode] = forTarget
+	}
+	existing, ok := forTarget[key]
+	if !ok {
+		existing = None
+	}
+	if v.NewerThan(existing) {
+		forTarget[key] = v
+	}
+}
+```
+
+#### Step 3: The network as a predicate
+
+`down` and `sideA` are `map[int]bool`, so a missing entry reads as `false` and the partition test is a direct comparison of two lookups. The drop decision consumes `NextDouble`, which scales the top 53 bits of the SplitMix64 output, only after the deterministic checks, so the RNG stream stays aligned with the Java run.
+
+```go
+func (n *Network) Reachable(from, to int) bool {
+	n.Attempts++
+	if n.down[to] || (n.partitioned && n.sideA[from] != n.sideA[to]) {
+		n.Dropped++
+		return false
+	}
+	if n.dropRate > 0 && n.rng.NextDouble() < n.dropRate {
+		n.Dropped++
+		return false
+	}
+	return true
+}
+```
+
+#### Step 4: Placement
+
+`HomeNodes` starts at `floorMod(JavaStringHash(key), len(s.Nodes))` and appends N consecutive ring positions. `ContactOrder` has to find the coordinator's index with a loop because slices have no `indexOf`, then rotates by re-slicing (`append(order[at:], order[:at]...)`) and appends the fallback ring under sloppy quorums.
+
+```go
+func (s *QuorumStore) HomeNodes(key string) []int {
+	start := floorMod(JavaStringHash(key), len(s.Nodes))
+	home := make([]int, 0, s.Config.N)
+	for i := 0; i < s.Config.N; i++ {
+		home = append(home, (start+i)%len(s.Nodes))
+	}
+	return home
+}
+
+func (s *QuorumStore) ContactOrder(coordinator int, key string) []int {
+	order := s.HomeNodes(key)
+	at := -1
+	for i, n := range order {
+		if n == coordinator {
+			at = i
+			break
+		}
+	}
+	if at > 0 {
+		order = append(order[at:], order[:at]...)
+	}
+	if s.Config.Sloppy {
+		order = append(order, s.FallbackNodes(key)...)
+	}
+	return order
+}
+```
+
+#### Step 5: The write path
+
+The same loop as Java with the error returned instead of thrown: a write below W returns `acks` together with a wrapped `ErrQuorumNotReached`, so a caller can still see how close it got. The sloppy branch shares a single `si` cursor across all missed nodes, and every acceptance is recorded in `acked` for the event log (the `s.Events = append(...)` lines are omitted here).
+
+```go
+func (s *QuorumStore) Put(coordinator int, key, value string) (int, error) {
+	s.Writes++
+	s.clock++
+	v := Versioned{value, s.clock, coordinator}
+	acks := 0
+	acked, missed := []int{}, []int{}
+	for _, node := range s.HomeNodes(key) {
+		if node == coordinator || s.Network.Reachable(coordinator, node) {
+			s.Nodes[node].Put(key, v)
+			acks++
+			acked = append(acked, node)
+		} else {
+			missed = append(missed, node)
+		}
+	}
+	if s.Config.Sloppy && len(missed) > 0 {
+		spare := s.FallbackNodes(key)
+		si := 0
+		for _, absent := range missed {
+			for si < len(spare) {
+				candidate := spare[si]
+				si++
+				if candidate == coordinator || s.Network.Reachable(coordinator, candidate) {
+					s.Nodes[candidate].Put(key, v)
+					s.Nodes[candidate].StoreHint(absent, key, v)
+					s.HintedWrites++
+					acks++
+					acked = append(acked, candidate)
+					break
+				}
+			}
+		}
+	}
+	if acks < s.Config.W {
+		s.WriteFailures++
+		return acks, fmt.Errorf("%w: write %s got %d acks, needs W=%d", ErrQuorumNotReached, key, acks, s.Config.W)
+	}
+	return acks, nil
+}
+```
+
+#### Step 6: The read path and read repair
+
+`Get` returns the zero `ReadResult` and a wrapped `ErrQuorumNotReached` when fewer than R nodes answer. Read repair is gated on `!winner.IsNone()` rather than a null check, and otherwise follows the Java exactly: only responders holding something older are written, and only a `Put` that changed something is counted.
+
+```go
+func (s *QuorumStore) Get(coordinator int, key string) (ReadResult, error) {
+	s.Reads++
+	winner := None
+	respondents := []int{}
+	seen := map[int]Versioned{}
+	for _, node := range s.ContactOrder(coordinator, key) {
+		if len(respondents) >= s.Config.R {
+			break
+		}
+		if node == coordinator || s.Network.Reachable(coordinator, node) {
+			v := s.Nodes[node].Get(key)
+			respondents = append(respondents, node)
+			seen[node] = v
+			if v.NewerThan(winner) {
+				winner = v
+			}
+		}
+	}
+	if len(respondents) < s.Config.R {
+		s.ReadFailures++
+		return ReadResult{}, fmt.Errorf("%w: read %s got %d responses, needs R=%d", ErrQuorumNotReached, key, len(respondents), s.Config.R)
+	}
+	repaired := 0
+	if s.Config.ReadRepair && !winner.IsNone() {
+		for _, node := range respondents {
+			if winner.NewerThan(seen[node]) && s.Nodes[node].Put(key, winner) {
+				s.Nodes[node].RepairsApplied++
+				repaired++
+			}
+		}
+		s.Repairs += repaired
+	}
+	return ReadResult{winner, len(respondents), respondents, repaired}, nil
+}
+```
+
+#### Step 7: Handoff and anti-entropy
+
+Go map iteration is randomised, so `Handoff` copies the hint targets into a slice and `sort.Ints` them, and sorts each target's keys with `sort.Strings`, before touching the network; that is what keeps the RNG consumption identical to the Java `TreeMap` walk. `AntiEntropy` collects the key union into a `map[string]bool`, sorts it, and converges the live home replicas through `current` and store-if-newer `Put`; the second chunk is its per-key loop, with the key-collection prologue and the event-log line left out.
+
+```go
+func (s *QuorumStore) Handoff() int {
+	delivered := 0
+	for _, holder := range s.Nodes {
+		targets := make([]int, 0, len(holder.Hints))
+		for target := range holder.Hints {
+			targets = append(targets, target)
+		}
+		sort.Ints(targets) // Java iterates the TreeMap in key order; the RNG is consumed in that order
+		for _, target := range targets {
+			if !s.Network.Reachable(holder.ID, target) {
+				continue
+			}
+			pending := holder.Hints[target]
+			keys := make([]string, 0, len(pending))
+			for k := range pending {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				s.Nodes[target].Put(k, pending[k])
+				delivered++
+			}
+			holder.HintsDelivered += len(pending)
+			delete(holder.Hints, target)
+		}
+	}
+	return delivered
+}
+```
+
+```go
+	for _, key := range keys {
+		home := s.HomeNodes(key)
+		newest := None
+		for _, node := range home {
+			if !s.Network.IsDown(node) {
+				if v := s.Nodes[node].current(key); v.NewerThan(newest) {
+					newest = v
+				}
+			}
+		}
+		if newest.IsNone() {
+			continue
+		}
+		for _, node := range home {
+			if !s.Network.IsDown(node) && s.Nodes[node].Put(key, newest) {
+				updates++
+			}
+		}
+	}
+```
+
+#### Step 8: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/03-quorums/code/go
 go run .
 go test ./...
+```
+
+The `int32` hash and the `uint64` RNG reproduce the Java placement and drops, so the output is identical:
+
+```console
+== R + W > N: a strict quorum read always overlaps the last quorum write (N=3, R=2, W=2, node 1 crashed) ==
+home replicas of merchant:m-77:settlement-currency: [1, 2, 3]; fallback ring: [4, 0]
+t=1 PUT merchant:m-77:settlement-currency=EUR via n1 acked by [1, 3] (missed [2])
+read from a different coordinator with R=2 saw EUR@1/w1 from [3, 1]  (replicas: n1=EUR@1/w1 n2=<none>(down) n3=EUR@1/w1)
 ```
 
 ## Use It

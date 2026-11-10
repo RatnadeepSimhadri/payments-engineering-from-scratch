@@ -328,23 +328,170 @@ Section 3 shows readers `[3, 4, 7]` on B: T3 and T4 committed long ago, but T8 (
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Ordered sets are dicts:** the conflict sets and the SIREAD sets are `dict[int, None]`, because Python has no `LinkedHashSet` and a plain `set` has no first element; the abort messages name `iterator().next()` in Java, so `_first` takes `next(iter(...))` and both languages blame the same transaction, while membership (`p.id in q.out_conflicts`), removal (`pop(id, None)`) and emptiness read the same as with a set. **Iterate over copies when the loop can abort:** `read` and `_check_readers_of` loop over `list(...)` snapshots because `_record_rw` may abort the current transaction, which removes it from `_txns` and from every SIREAD set mid-loop; Python raises `RuntimeError: dictionary changed size during iteration` where Java would throw `ConcurrentModificationException`. **Errors and numbers:** `SerializationFailureException` and `WriteConflictException` are `RuntimeError` subclasses, using a finished transaction raises a plain `RuntimeError` naming the abort reason, and a test checks it is not the serialization failure; `end_seq` starts at `INT64_MAX` to mirror `Long.MAX_VALUE`, and `Money` checks 64-bit overflow by hand as in Lesson 06. **No threads:** concurrency is event order (`begin_seq`, `end_seq`), never wall-clock time, so the demo's edges, aborts and counts (`commits = 8, aborts = 2`) are identical to Java's.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Two conflict sets and an event order
+
+The two conflict sets are insertion-ordered dicts with `None` values, and `_first` is `LinkedHashSet.iterator().next()`. `end_seq` starts at `INT64_MAX`, so an active transaction is concurrent with everything that has begun; `is_pivot` is the two non-empty checks.
+
 ```python
-reader.out_conflicts[writer.id] = None
-writer.in_conflicts[reader.id] = None
-if reader.is_active() and writer.is_committed() and writer.out_conflicts:
-    self.abort(reader, f"{reader} -rw-> {writer} -rw-> T{_first(writer.out_conflicts)}: "
-                       f"{writer} is a committed pivot")
-elif writer.is_active() and reader.is_committed() and reader.in_conflicts:
-    self.abort(writer, f"T{_first(reader.in_conflicts)} -rw-> {reader} -rw-> {writer}: "
-                       f"{reader} is a committed pivot")
+def _first(ordered_set: dict[int, None]) -> int:
+    return next(iter(ordered_set))
+
+
+class Transaction(Generic[V]):
+    def __init__(self, id: int, start_ts: int, begin_seq: int) -> None:
+        self.id = id
+        self.start_ts = start_ts
+        self.writes: dict[str, V | None] = {}
+        self.in_conflicts: dict[int, None] = {}  # T_in -rw-> this: they read a version this txn overwrote
+        self.out_conflicts: dict[int, None] = {}  # this -rw-> T_out: they wrote a newer version of what this txn read
+        self.status = TxnStatus.ACTIVE
+        self.commit_ts = -1
+        self.begin_seq = begin_seq
+        self.end_seq = INT64_MAX
+        self.abort_reason: str | None = None
+
+    def concurrent_with(self, other: "Transaction") -> bool:
+        return self.begin_seq < other.end_seq and other.begin_seq < self.end_seq
+
+    def is_pivot(self) -> bool:
+        return bool(self.in_conflicts) and bool(self.out_conflicts)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: Reads take SIREADs and look for newer versions
 
-- **Ordered sets are dicts.** The conflict sets and the SIREAD sets are `dict[int, None]`: Python has no `LinkedHashSet`, and a plain `set` has no first element. The abort messages name `iterator().next()` in Java, so `_first` takes `next(iter(...))` and both languages blame the same transaction. Membership (`p.id in q.out_conflicts`), removal (`pop(id, None)`) and emptiness read the same as with a set.
-- **Iterate over copies when the loop can abort.** `read` and `_check_readers_of` loop over `list(...)` snapshots because `_record_rw` may abort the current transaction, which removes it from `_txns` and from every SIREAD set mid-loop. Python raises `RuntimeError: dictionary changed size during iteration` where Java would throw `ConcurrentModificationException`.
-- **Errors and numbers.** `SerializationFailureException` and `WriteConflictException` are `RuntimeError` subclasses; using a finished transaction raises a plain `RuntimeError` naming the abort reason, and a test checks it is not the serialization failure. `end_seq` starts at `INT64_MAX` to mirror `Long.MAX_VALUE`, and `Money` checks 64-bit overflow by hand as in Lesson 06.
-- **No threads.** Concurrency is event order (`begin_seq`, `end_seq`), never wall-clock time, so the demo's edges, aborts and counts (`commits = 8, aborts = 2`) are identical to Java's.
+The SIREAD is `setdefault(key, {})[txn.id] = None`. Newer committed versions and active writers of the key each produce an rw-edge through `_record_rw`; the active-writer loop iterates `list(self._txns.values())` because the current transaction may be aborted and removed mid-loop. If that happened, the read raises `SerializationFailureException`; otherwise the Lesson 06 snapshot read follows.
+
+```python
+    def read(self, txn: Transaction[V], key: str) -> V | None:
+        self._require_active(txn)
+        self._sireads.setdefault(key, {})[txn.id] = None
+        # rw-antidependency: we read an older version than someone has written or is writing
+        for v in self._versions.get(key, ()):
+            if v.commit_ts > txn.start_ts:
+                self._record_rw(txn, self._txns.get(v.txn_id))
+        for other in list(self._txns.values()):  # copy: _record_rw may abort and remove txn
+            if other is not txn and other.is_active() and key in other.writes:
+                self._record_rw(txn, other)
+        if not txn.is_active():
+            raise SerializationFailureException(txn.abort_reason)
+        if key in txn.writes:
+            return txn.writes[key]
+        v = self._visible_version(key, txn.start_ts)
+        return None if v is None or v.is_tombstone() else v.value
+```
+
+#### Step 3: Writes look for readers
+
+`write` buffers the value (rejecting `None` with `TypeError`) and calls `_check_readers_of`, which walks a `list(...)` copy of the key's SIREAD holders and records `reader -rw-> txn` for each concurrent one. `delete` buffers `None` and runs the same check.
+
+```python
+    def write(self, txn: Transaction[V], key: str, value: V) -> None:
+        self._require_active(txn)
+        if value is None:
+            raise TypeError("use delete() for tombstones")
+        txn.writes[key] = value
+        self._check_readers_of(txn, key)
+
+    def _check_readers_of(self, txn: Transaction[V], key: str) -> None:
+        for reader_id in list(self._sireads.get(key, {})):
+            reader = self._txns.get(reader_id)
+            if reader is None or reader is txn:
+                continue
+            if reader.concurrent_with(txn):
+                self._record_rw(reader, txn)
+        if not txn.is_active():
+            raise SerializationFailureException(txn.abort_reason)
+```
+
+#### Step 4: Recording an edge, and the committed-pivot checks
+
+The two edges are dict insertions, and the two eager checks are the Java branches with `_first` naming the third transaction in the abort reason. Aborted participants on either side are skipped.
+
+```python
+    def _record_rw(self, reader: Transaction[V] | None, writer: Transaction[V] | None) -> None:
+        if reader is None or writer is None or reader is writer:
+            return
+        if not reader.is_active() and not reader.is_committed():
+            return
+        if not writer.is_active() and not writer.is_committed():
+            return
+        reader.out_conflicts[writer.id] = None
+        writer.in_conflicts[reader.id] = None
+        if reader.is_active() and writer.is_committed() and writer.out_conflicts:
+            self.abort(reader, f"{reader} -rw-> {writer} -rw-> T{_first(writer.out_conflicts)}: "
+                               f"{writer} is a committed pivot")
+        elif writer.is_active() and reader.is_committed() and reader.in_conflicts:
+            self.abort(writer, f"T{_first(reader.in_conflicts)} -rw-> {reader} -rw-> {writer}: "
+                               f"{reader} is a committed pivot")
+```
+
+#### Step 5: Commit aborts the pivot; abort cleans up
+
+`commit` runs first-committer-wins, then the pivot check, each aborting before raising its own exception type. `abort` does the four cleanups: clear writes, `pop` our id from every SIREAD set, `pop` our id from every other transaction's conflict sets, and record `end_seq` before leaving `_txns`.
+
+```python
+    def commit(self, txn: Transaction[V]) -> int:
+        self._require_active(txn)
+        for key in txn.writes:
+            newest = self._newest_version(key)
+            if newest is not None and newest.commit_ts > txn.start_ts:
+                self.abort(txn, f"first committer wins on {key}")
+                raise WriteConflictException(txn.abort_reason)
+        if txn.is_pivot():
+            self.abort(txn, f"T{_first(txn.in_conflicts)} -rw-> {txn} -rw-> T{_first(txn.out_conflicts)}: "
+                            f"{txn} is the pivot")
+            raise SerializationFailureException(txn.abort_reason)
+        ts = txn.start_ts if not txn.writes else self._oracle.next()
+        for key, value in txn.writes.items():
+            self._versions.setdefault(key, []).append(Version(ts, txn.id, value))
+        txn.status = TxnStatus.COMMITTED
+        txn.commit_ts = ts
+        self._seq += 1
+        txn.end_seq = self._seq
+        self._commits += 1
+        return ts
+
+    def abort(self, txn: Transaction[V], reason: str) -> None:
+        if not txn.is_active():
+            return
+        txn.status = TxnStatus.ABORTED
+        txn.abort_reason = reason
+        self._seq += 1
+        txn.end_seq = self._seq
+        txn.writes.clear()
+        for readers in self._sireads.values():
+            readers.pop(txn.id, None)
+        for other in self._txns.values():
+            other.in_conflicts.pop(txn.id, None)
+            other.out_conflicts.pop(txn.id, None)
+        self._txns.pop(txn.id, None)
+        self._aborts += 1
+```
+
+#### Step 6: Releasing retained locks
+
+The horizon is the smallest `begin_seq` among active transactions (or `seq + 1` if none). Committed transactions that ended before it are collected with a comprehension, removed from `_txns` and from every SIREAD set, and empty SIREAD sets are dropped by rebuilding the dict, the Python version of `removeIf(Set::isEmpty)`.
+
+```python
+    def release_finished(self) -> int:
+        oldest_active_begin = self._seq + 1
+        for t in self._txns.values():
+            if t.is_active():
+                oldest_active_begin = min(oldest_active_begin, t.begin_seq)
+        done = [t.id for t in self._txns.values() if t.is_committed() and t.end_seq < oldest_active_begin]
+        for id in done:
+            del self._txns[id]
+            for readers in self._sireads.values():
+                readers.pop(id, None)
+        self._sireads = {k: r for k, r in self._sireads.items() if r}
+        return len(done)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/07-serializable-snapshot-isolation/code/python
@@ -352,33 +499,250 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The four sections are the Java output, including which transaction is named as the pivot:
+
+```console
+== 1. Write skew from Lesson 06, now under SSI ==
+T2 read A,B (SIREAD on both), wrote A = -50.00; readers of A = [2]
+T3 read A,B, wrote B = -50.00
+edges: T3 -rw-> T2 (T3 read A, T2 writes A); T2 -rw-> T3 (T2 read B, T3 writes B)
+  T2 in=[3] out=[3] pivot=true
+  T3 in=[2] out=[2] pivot=true
+T2 ABORTED: T3 -rw-> T2 -rw-> T3: T2 is the pivot
+after the abort, T3 in=[] out=[]
+T3 committed at ts 2
+A = 100.00 USD, B = -50.00 USD, A+B = 50.00 USD  <- constraint holds
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Every operation can fail, so every operation returns an error:** `Read` is `(V, bool, error)`, where the `bool` is Java's `Optional` and the `error` is an `*AbortError` when the read itself closed a dangerous structure, or `ErrNotActive` on a finished transaction; `Write`/`Delete` return `error`, `Commit` returns `(int64, error)`, and one `AbortError` type serves both rules, its `Is` method letting `errors.Is(err, ErrSerializationFailure)` and `errors.Is(err, ErrWriteConflict)` tell them apart while `err.Error()` is exactly the `AbortReason` the Java exception carried. **Ordered sets by hand:** `InConflicts`/`OutConflicts` are an `idSet` (slice plus map) standing in for `LinkedHashSet<Long>`, so `First()` is the same transaction Java's `iterator().next()` names in the abort message; the store keeps `txnOrder` beside its map so the rw-edge sweep in `Read` visits transactions in begin order, as the `LinkedHashMap` does, and `ReadersOf` returns a sorted `[]int64` because Java's `HashSet<Long>` happens to print small ids ascending. **Generics with an explicit tombstone:** `SsiStore[V any]`, `Transaction[V]` and `Version[V]` are type parameters, a deleted key is `Version{Tombstone: true}` and a buffered delete is `pendingWrite{Delete: true}`, since Go has no `null` for an arbitrary `V`, and `BeginSeq`/`EndSeq` are `int64` with `math.MaxInt64` for "still open". **No goroutines:** the detection logic is sequential by design, the port has no mutex and `go test -race` passes trivially; if goroutines are introduced, the event counter `seq`, the SIREAD table and every conflict set must be protected by one store-wide mutex.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same four sections as the Java version, line for line (commits = 8, aborts = 2).
+
+#### Step 1: Two conflict sets and an event order
+
+The conflict sets are `*idSet` values, and `EndSeq` is initialised to `math.MaxInt64` in the constructor. `ConcurrentWith` and `IsPivot` are the Java expressions on those fields.
+
 ```go
-// AbortError carries the abort reason verbatim; errors.Is matches its Kind.
-type AbortError struct {
-    Kind   error // ErrWriteConflict or ErrSerializationFailure
-    Reason string
+type Transaction[V any] struct {
+	ID        int64
+	StartTs   int64
+	writeKeys []string
+	Writes    map[string]pendingWrite[V]
+	InConflicts *idSet
+	OutConflicts *idSet
+	Status       TxnStatus
+	CommitTs     int64
+	BeginSeq    int64
+	EndSeq      int64
+	AbortReason string
 }
 
-func (e *AbortError) Error() string        { return e.Reason }
-func (e *AbortError) Is(target error) bool { return target == e.Kind }
+func newTransaction[V any](id, startTs, beginSeq int64) *Transaction[V] {
+	return &Transaction[V]{ID: id, StartTs: startTs, Writes: map[string]pendingWrite[V]{}, InConflicts: newIDSet(), OutConflicts: newIDSet(),
+		Status: Active, CommitTs: -1, BeginSeq: beginSeq, EndSeq: math.MaxInt64}
+}
 
-func (s *SsiStore[V]) Write(txn *Transaction[V], key string, value V) error {
-    if err := s.requireActive(txn); err != nil {
-        return err
-    }
-    txn.put(key, pendingWrite[V]{Value: value})
-    return s.checkReadersOf(txn, key) // may abort txn on the spot and return the reason
+func (t *Transaction[V]) ConcurrentWith(other *Transaction[V]) bool {
+	return t.BeginSeq < other.EndSeq && other.BeginSeq < t.EndSeq
+}
+
+func (t *Transaction[V]) IsPivot() bool     { return !t.InConflicts.IsEmpty() && !t.OutConflicts.IsEmpty() }
+```
+
+#### Step 2: Reads take SIREADs and look for newer versions
+
+The SIREAD set is created lazily. The active-writer sweep uses `orderedTxns()`, a begin-ordered snapshot of the map, so it is both deterministic and safe against `recordRw` removing the current transaction. An abort during the read is returned as an `*AbortError` wrapping `ErrSerializationFailure`.
+
+```go
+func (s *SsiStore[V]) Read(txn *Transaction[V], key string) (V, bool, error) {
+	var zero V
+	if err := s.requireActive(txn); err != nil {
+		return zero, false, err
+	}
+	if s.sireads[key] == nil {
+		s.sireads[key] = newIDSet()
+	}
+	s.sireads[key].Add(txn.ID)
+	// rw-antidependency: we read an older version than someone has written or is writing
+	for _, v := range s.versions[key] {
+		if v.CommitTs > txn.StartTs {
+			s.recordRw(txn, s.txns[v.TxnID])
+		}
+	}
+	for _, other := range s.orderedTxns() {
+		if other != txn && other.IsActive() {
+			if _, writes := other.Writes[key]; writes {
+				s.recordRw(txn, other)
+			}
+		}
+	}
+	if !txn.IsActive() {
+		return zero, false, &AbortError{ErrSerializationFailure, txn.AbortReason}
+	}
+	if w, ok := txn.Writes[key]; ok {
+		if w.Delete {
+			return zero, false, nil
+		}
+		return w.Value, true, nil
+	}
+	v, ok := s.visibleVersion(key, txn.StartTs)
+	if !ok || v.IsTombstone() {
+		return zero, false, nil
+	}
+	return v.Value, true, nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: Writes look for readers
 
-- **Every operation can fail, so every operation returns an error.** `Read` is `(V, bool, error)`: the `bool` is Java's `Optional`, the `error` is an `*AbortError` when the read itself closed a dangerous structure, or `ErrNotActive` on a finished transaction. `Write`/`Delete` return `error`, `Commit` returns `(int64, error)`. One `AbortError` type serves both rules; its `Is` method lets `errors.Is(err, ErrSerializationFailure)` and `errors.Is(err, ErrWriteConflict)` tell them apart while `err.Error()` is exactly the `AbortReason` the Java exception carried.
-- **Ordered sets by hand.** `InConflicts`/`OutConflicts` are an `idSet` (slice plus map) standing in for `LinkedHashSet<Long>`, so `First()` is the same transaction Java's `iterator().next()` names in the abort message. The store keeps `txnOrder` beside its map so the rw-edge sweep in `Read` visits transactions in begin order, as the `LinkedHashMap` does. `ReadersOf` returns a sorted `[]int64` because Java's `HashSet<Long>` happens to print small ids ascending.
-- **Generics with an explicit tombstone.** `SsiStore[V any]`, `Transaction[V]` and `Version[V]` are type parameters; a deleted key is `Version{Tombstone: true}` and a buffered delete is `pendingWrite{Delete: true}`, since Go has no `null` for an arbitrary `V`. `BeginSeq`/`EndSeq` are `int64` with `math.MaxInt64` for "still open".
-- **No goroutines.** The detection logic is sequential by design; the port has no mutex and `go test -race` passes trivially. If goroutines are introduced, the event counter `seq`, the SIREAD table and every conflict set must be protected by one store-wide mutex.
+`Write` buffers through `put` and returns whatever `checkReadersOf` returns. The reader sweep iterates `readers.IDs()`, a copy, since `recordRw` can mutate the set; a two-value map read skips readers that have since been forgotten.
+
+```go
+func (s *SsiStore[V]) Write(txn *Transaction[V], key string, value V) error {
+	if err := s.requireActive(txn); err != nil {
+		return err
+	}
+	txn.put(key, pendingWrite[V]{Value: value})
+	return s.checkReadersOf(txn, key)
+}
+
+func (s *SsiStore[V]) checkReadersOf(txn *Transaction[V], key string) error {
+	if readers := s.sireads[key]; readers != nil {
+		for _, readerID := range readers.IDs() { // copy: recordRw may mutate the set
+			reader, ok := s.txns[readerID]
+			if !ok || reader == txn {
+				continue
+			}
+			if reader.ConcurrentWith(txn) {
+				s.recordRw(reader, txn)
+			}
+		}
+	}
+	if !txn.IsActive() {
+		return &AbortError{ErrSerializationFailure, txn.AbortReason}
+	}
+	return nil
+}
+```
+
+#### Step 4: Recording an edge, and the committed-pivot checks
+
+`idSet.Add` ignores duplicates, and `First()` names the third participant in the abort reason, exactly as the Java `iterator().next()` does. The two branches are unchanged.
+
+```go
+func (s *SsiStore[V]) recordRw(reader, writer *Transaction[V]) {
+	if reader == nil || writer == nil || reader == writer {
+		return
+	}
+	if !reader.IsActive() && !reader.IsCommitted() {
+		return
+	}
+	if !writer.IsActive() && !writer.IsCommitted() {
+		return
+	}
+	reader.OutConflicts.Add(writer.ID)
+	writer.InConflicts.Add(reader.ID)
+	if reader.IsActive() && writer.IsCommitted() && !writer.OutConflicts.IsEmpty() {
+		s.Abort(reader, fmt.Sprintf("%s -rw-> %s -rw-> T%d: %s is a committed pivot", reader, writer, writer.OutConflicts.First(), writer))
+	} else if writer.IsActive() && reader.IsCommitted() && !reader.InConflicts.IsEmpty() {
+		s.Abort(writer, fmt.Sprintf("T%d -rw-> %s -rw-> %s: %s is a committed pivot", reader.InConflicts.First(), reader, writer, reader))
+	}
+}
+```
+
+#### Step 5: Commit aborts the pivot; abort cleans up
+
+`Commit` returns an `*AbortError` with the right `Kind` after aborting: `ErrWriteConflict` for first-committer-wins, `ErrSerializationFailure` for the pivot. `Abort` removes our id from every SIREAD set and every other transaction's conflict sets, then from the store through `removeTxn`, which keeps `txnOrder` in step with the map.
+
+```go
+func (s *SsiStore[V]) Commit(txn *Transaction[V]) (int64, error) {
+	if err := s.requireActive(txn); err != nil {
+		return 0, err
+	}
+	for _, key := range txn.writeKeys {
+		if newest, ok := s.newestVersion(key); ok && newest.CommitTs > txn.StartTs {
+			s.Abort(txn, "first committer wins on "+key)
+			return 0, &AbortError{ErrWriteConflict, txn.AbortReason}
+		}
+	}
+	if txn.IsPivot() {
+		s.Abort(txn, fmt.Sprintf("T%d -rw-> %s -rw-> T%d: %s is the pivot", txn.InConflicts.First(), txn, txn.OutConflicts.First(), txn))
+		return 0, &AbortError{ErrSerializationFailure, txn.AbortReason}
+	}
+	ts := txn.StartTs
+	if len(txn.writeKeys) > 0 {
+		ts = s.oracle.Next()
+	}
+	for _, key := range txn.writeKeys {
+		w := txn.Writes[key]
+		s.versions[key] = append(s.versions[key], Version[V]{CommitTs: ts, TxnID: txn.ID, Value: w.Value, Tombstone: w.Delete})
+	}
+	txn.Status = Committed
+	txn.CommitTs = ts
+	s.seq++
+	txn.EndSeq = s.seq
+	s.commits++
+	return ts, nil
+}
+
+func (s *SsiStore[V]) Abort(txn *Transaction[V], reason string) {
+	if !txn.IsActive() {
+		return
+	}
+	txn.Status = Aborted
+	txn.AbortReason = reason
+	s.seq++
+	txn.EndSeq = s.seq
+	txn.Writes = map[string]pendingWrite[V]{}
+	txn.writeKeys = nil
+	for _, readers := range s.sireads {
+		readers.Remove(txn.ID)
+	}
+	for _, other := range s.txns {
+		other.InConflicts.Remove(txn.ID)
+		other.OutConflicts.Remove(txn.ID)
+	}
+	s.removeTxn(txn.ID)
+	s.aborts++
+}
+```
+
+#### Step 6: Releasing retained locks
+
+The horizon scan ranges over the map (order is irrelevant for a minimum), but the `done` list is built from `txnOrder` so releases happen in begin order. Deleting empty SIREAD sets inside a range over the same map is permitted in Go.
+
+```go
+func (s *SsiStore[V]) ReleaseFinished() int {
+	oldestActiveBegin := s.seq + 1
+	for _, t := range s.txns {
+		if t.IsActive() && t.BeginSeq < oldestActiveBegin {
+			oldestActiveBegin = t.BeginSeq
+		}
+	}
+	done := []int64{}
+	for _, id := range s.txnOrder {
+		if t := s.txns[id]; t.IsCommitted() && t.EndSeq < oldestActiveBegin {
+			done = append(done, id)
+		}
+	}
+	for _, id := range done {
+		s.removeTxn(id)
+		for _, readers := range s.sireads {
+			readers.Remove(id)
+		}
+	}
+	for key, readers := range s.sireads {
+		if readers.IsEmpty() {
+			delete(s.sireads, key)
+		}
+	}
+	return len(done)
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/07-serializable-snapshot-isolation/code/go
@@ -386,7 +750,15 @@ go run .
 go test ./...
 ```
 
-The demo prints the same four sections as the Java version, line for line (commits = 8, aborts = 2).
+```console
+== 4. The pivot has already committed: abort the newcomer on the spot ==
+T9 reads A, writes B, commits: T9 committed at ts 5
+T10 reads B (older version than T9 wrote): edge T10 -rw-> T9
+T10 tries to write A, which T9 read: ABORTED immediately: T10 -rw-> T9 -rw-> T10: T9 is a committed pivot
+commits = 8, aborts = 2
+```
+
+The three sections before this one are the Java output, line for line.
 
 ## Use It
 

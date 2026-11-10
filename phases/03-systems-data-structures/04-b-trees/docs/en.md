@@ -357,25 +357,220 @@ after removing every odd id: size=100000 height=4 nodes=3124 ... merges=3125
 
 ### In Python
 
-`code/python/main.py` keeps the same names: `PageStats`, `BTree` with `lower_bound`, `put`, `remove`, `range`, `check_invariants`, `height_bound`, and a frozen `Split` dataclass in place of the Java record. Three things differ:
+`code/python/main.py` keeps the same names: `PageStats`, `BTree` with `lower_bound`, `put`, `remove`, `range`, `check_invariants`, `height_bound`, and a frozen `Split` dataclass in place of the Java record. Three things differ. **List slicing replaces `subList(...).clear()`:** a split copies the upper half into the new right page and truncates the left in place with `del`; `pop()`, `pop(0)`, and `insert(0, ...)` do the borrow rotations. Since the right page gets fresh lists, there is no aliasing to worry about. **The page search stays hand-written:** `bisect.bisect_left` would compute the same index faster, but `lower_bound` is the within-page binary search the lesson is about, so it is spelled out. Keys compare with `<` and `==` instead of `compareTo`. Recursion depth is the tree height (4 or 5), so the recursion limit is not a concern. **Same random keys, same page counts:** the demo's random ids come from `JavaRandom`, a bit-exact port of `java.util.Random`, with `next_long() & LONG_MAX` standing in for `nextLong() & Long.MAX_VALUE`, and `java_shuffle` reproduces `Collections.shuffle`. That makes the node, split, read, write, and merge counts identical to Java's, which is a strong check that both versions touch the same pages. `IllegalStateError` replaces `IllegalStateException`, and `ValueError` replaces `IllegalArgumentException` for an order below 3.
 
-- **List slicing replaces `subList(...).clear()`.** A split copies the upper half into the new right page and truncates the left in place; `pop()`, `pop(0)`, and `insert(0, ...)` do the borrow rotations. Since the right page gets fresh lists, there is no aliasing to worry about:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Pages and page statistics
+
+`PageStats` is four counters with a `reset`. `BTreeNode` uses `__slots__` and three plain lists; a leaf is a node whose `children` list is empty. The constructor computes `min_keys` with integer `//` so it is `ceil(order / 2) - 1`.
 
 ```python
-mid = len(n.keys) // 2
-mid_key, mid_value = n.keys[mid], n.values[mid]
-right = BTreeNode()
-right.keys = n.keys[mid + 1:]
-right.values = n.values[mid + 1:]
-del n.keys[mid:]
-del n.values[mid:]
-if not n.is_leaf():
-    right.children = n.children[mid + 1:]
-    del n.children[mid + 1:]
+class PageStats:
+    def __init__(self) -> None:
+        self.reads = self.writes = self.splits = self.merges = 0
+
+    def reset(self) -> None:
+        self.reads = self.writes = self.splits = self.merges = 0
+
+
+class BTreeNode:
+    __slots__ = ("keys", "values", "children")
+
+    def __init__(self) -> None:
+        self.keys: list = []
+        self.values: list = []
+        self.children: list[BTreeNode] = []  # empty for a leaf
+
+    def is_leaf(self) -> bool:
+        return not self.children
 ```
 
-- **The page search stays hand-written.** `bisect.bisect_left` would compute the same index faster, but `lower_bound` is the within-page binary search the lesson is about, so it is spelled out. Keys compare with `<` and `==` instead of `compareTo`. Recursion depth is the tree height (4 or 5), so the recursion limit is not a concern.
-- **Same random keys, same page counts.** The demo's random ids come from `JavaRandom`, a bit-exact port of `java.util.Random`, with `next_long() & LONG_MAX` standing in for `nextLong() & Long.MAX_VALUE`. `java_shuffle` reproduces `Collections.shuffle`. That makes the node, split, read, write, and merge counts identical to Java's, which is a strong check that both versions touch the same pages. `IllegalStateError` replaces `IllegalStateException`, and `ValueError` replaces `IllegalArgumentException` for an order below 3.
+```python
+    def __init__(self, order: int) -> None:
+        if order < 3:
+            raise ValueError(f"order must be at least 3: {order}")
+        self.order = order
+        self.max_keys = order - 1
+        self.min_keys = (order + 1) // 2 - 1   # ceil(order / 2) - 1: at least half full
+        self.stats = PageStats()
+        self._root = BTreeNode()
+        self._size = 0
+```
+
+#### Step 2: Search within a page, then down
+
+`lower_bound` is the in-page binary search written out (not `bisect`), with `<` for `compareTo(...) < 0`. `get` counts one page read per level and returns `None` from a leaf that does not hold the key.
+
+```python
+    @staticmethod
+    def lower_bound(n: BTreeNode, key: Any) -> int:
+        """Index of the first key >= key in the node (binary search within the page)."""
+        lo, hi = 0, len(n.keys)
+        keys = n.keys
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if keys[mid] < key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def get(self, key: K) -> Optional[V]:
+        n = self._root
+        while True:
+            self.stats.reads += 1
+            i = self.lower_bound(n, key)
+            if i < len(n.keys) and n.keys[i] == key:
+                return n.values[i]
+            if n.is_leaf():
+                return None
+            n = n.children[i]
+```
+
+#### Step 3: Insert with split propagated by return value
+
+`Split` is a frozen dataclass. `_insert` returns `None` or a `Split`; `list.insert(i, x)` is `add(i, x)`, and the promoted key and new right child go in at `i` and `i + 1` exactly as in Java.
+
+```python
+    def _insert(self, n: BTreeNode, key: K, value: V) -> Optional[Split]:
+        """Insert into the subtree at n; returns a Split if n overflowed and had to be divided."""
+        self.stats.reads += 1
+        i = self.lower_bound(n, key)
+        if i < len(n.keys) and n.keys[i] == key:
+            n.values[i] = value
+            self.stats.writes += 1
+            return None
+        if n.is_leaf():
+            n.keys.insert(i, key)
+            n.values.insert(i, value)
+            self._size += 1
+        else:
+            child_split = self._insert(n.children[i], key, value)
+            if child_split is None:
+                return None
+            n.keys.insert(i, child_split.key)
+            n.values.insert(i, child_split.value)
+            n.children.insert(i + 1, child_split.right)
+        self.stats.writes += 1
+        return self._split(n) if len(n.keys) > self.max_keys else None
+```
+
+#### Step 4: The split itself
+
+Slices copy, so `right.keys = n.keys[mid + 1:]` gives the right page its own list, and `del n.keys[mid:]` truncates the left in place: the same two operations as `addAll(subList)` and `subList(...).clear()`. Children are moved only for an internal node.
+
+```python
+    def _split(self, n: BTreeNode) -> Split:
+        """Divide an overflowing node at its median. Left keeps the lower half, right takes the upper half."""
+        mid = len(n.keys) // 2
+        mid_key, mid_value = n.keys[mid], n.values[mid]
+        right = BTreeNode()
+        right.keys = n.keys[mid + 1:]
+        right.values = n.values[mid + 1:]
+        del n.keys[mid:]
+        del n.values[mid:]
+        if not n.is_leaf():
+            right.children = n.children[mid + 1:]
+            del n.children[mid + 1:]
+        self.stats.splits += 1
+        self.stats.writes += 1  # the new right page
+        return Split(mid_key, mid_value, right)
+```
+
+#### Step 5: Delete, borrow, merge
+
+Borrowing from the left is `insert(0, ...)` on the child and `pop()` on the sibling; from the right it is `append` and `pop(0)`. The merge branch pops the separator out of the parent, extends the left page with the right page's contents, and deletes the right child pointer. The write counts per branch match the Java so the demo's `writes=` line agrees.
+
+```python
+    def _rebalance(self, parent: BTreeNode, i: int) -> None:
+        """Child i of parent underflowed: borrow from a sibling that can spare a key, else merge with one."""
+        child = parent.children[i]
+        if i > 0 and len(parent.children[i - 1].keys) > self.min_keys:
+            left = parent.children[i - 1]  # rotate one key through the parent, from the left
+            child.keys.insert(0, parent.keys[i - 1])
+            child.values.insert(0, parent.values[i - 1])
+            parent.keys[i - 1] = left.keys.pop()
+            parent.values[i - 1] = left.values.pop()
+            if not left.is_leaf():
+                child.children.insert(0, left.children.pop())
+            self.stats.writes += 3
+        elif i < len(parent.children) - 1 and len(parent.children[i + 1].keys) > self.min_keys:
+            right = parent.children[i + 1]  # rotate one key through the parent, from the right
+            child.keys.append(parent.keys[i])
+            child.values.append(parent.values[i])
+            parent.keys[i] = right.keys.pop(0)
+            parent.values[i] = right.values.pop(0)
+            if not right.is_leaf():
+                child.children.append(right.children.pop(0))
+            self.stats.writes += 3
+        else:
+            left_index = i - 1 if i > 0 else i  # merge child with a sibling around the separator
+            left = parent.children[left_index]
+            right = parent.children[left_index + 1]
+            left.keys.append(parent.keys.pop(left_index))
+            left.values.append(parent.values.pop(left_index))
+            left.keys.extend(right.keys)
+            left.values.extend(right.values)
+            left.children.extend(right.children)
+            del parent.children[left_index + 1]
+            self.stats.merges += 1
+            self.stats.writes += 2
+```
+
+#### Step 6: Range scan
+
+The Java `for (; i < n; i++)` becomes a `while` with the increment at the bottom so the early `return` on a key above `hi` sits in the same place. `leaf` is hoisted because it is tested twice.
+
+```python
+    def _range(self, n: BTreeNode, lo: K, hi: K, out: list) -> None:
+        self.stats.reads += 1
+        i = self.lower_bound(n, lo)
+        leaf = n.is_leaf()
+        if not leaf:
+            self._range(n.children[i], lo, hi, out)
+        while i < len(n.keys):
+            k = n.keys[i]
+            if k > hi:
+                return
+            out.append(k)
+            if not leaf:
+                self._range(n.children[i + 1], lo, hi, out)
+            i += 1
+```
+
+#### Step 7: The invariant checker
+
+`leaf_depth` is a one-element list so the recursion can mutate it, the Python idiom for Java's `int[]` out-parameter. `None` is the unbounded separator. Occupancy, order within the `(lo, hi)` window, the `children == keys + 1` rule, and equal leaf depth are checked in one pass, raising `IllegalStateError`.
+
+```python
+    def _verify(self, n: BTreeNode, lo: Any, hi: Any, depth: int, leaf_depth: list) -> None:
+        if n is not self._root and len(n.keys) < self.min_keys:
+            raise IllegalStateError(f"underfull node: {n.keys}")
+        if len(n.keys) > self.max_keys:
+            raise IllegalStateError(f"overfull node: {n.keys}")
+        for i, k in enumerate(n.keys):
+            if i > 0 and n.keys[i - 1] >= k:
+                raise IllegalStateError(f"keys not sorted: {n.keys}")
+            if lo is not None and k <= lo:
+                raise IllegalStateError(f"key {k} below separator {lo}")
+            if hi is not None and k >= hi:
+                raise IllegalStateError(f"key {k} above separator {hi}")
+        if n.is_leaf():
+            if leaf_depth[0] == -1:
+                leaf_depth[0] = depth
+            elif leaf_depth[0] != depth:
+                raise IllegalStateError(f"leaves at different depths: {leaf_depth[0]} and {depth}")
+            return
+        if len(n.children) != len(n.keys) + 1:
+            raise IllegalStateError(f"children != keys + 1 at {n.keys}")
+        for i, child in enumerate(n.children):
+            child_lo = lo if i == 0 else n.keys[i - 1]
+            child_hi = hi if i == len(n.keys) else n.keys[i]
+            self._verify(child, child_lo, child_hi, depth + 1, leaf_depth)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/03-systems-data-structures/04-b-trees/code/python
@@ -383,29 +578,298 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### In Go
-
-`code/go/main.go` keeps the same names: `PageStats`, `BTree[K cmp.Ordered, V any]` with `LowerBound`, `Put`, `Remove`, `Range`, `CheckInvariants`, `HeightBound`, and an unexported `split` struct in place of the Java record. Three things differ:
-
-- **Slices replace `ArrayList`, and the right page must not alias the left.** `slices.Insert` and `slices.Delete` do the in-page shifts that `add(i, x)` and `remove(i)` did. A split re-slices the left page down to the median and gives the right page a `slices.Clone` of the upper half; without the clone both pages would share one backing array and a later `slices.Insert` into the left would overwrite the right's keys:
-
-```go
-right := &Node[K, V]{
-    Keys:   slices.Clone(n.Keys[mid+1:]),
-    Values: slices.Clone(n.Values[mid+1:]),
-}
-n.Keys = n.Keys[:mid]
-n.Values = n.Values[:mid]
+```console
+== A small tree you can draw: order 4, keys 1..10 ==
+height=2 nodes=5 keys=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+stats after 10 inserts: reads=16 writes=16 splits=3 merges=0
 ```
 
-- **Absence and violations are values.** `Get` returns `(V, bool)` because a `V` of `int` has no `null`; `NewBTree(order)` returns `(*BTree, error)` with `ErrInvalidArgument` for an order below 3; `CheckInvariants` returns an `error` wrapping `ErrInvariantViolated` instead of throwing `IllegalStateException`. `verify` carries `*K` separator bounds so "no bound" is `nil`. The `Stats` field is a pointer so `sequential.Stats.Reset()` mutates the tree's counters, as the Java field does.
-- **Same random keys, same page counts.** The demo's random ids come from `JavaRandom` (`javarandom.go`), a bit-exact port of `java.util.Random`, with `NextLong() & math.MaxInt64` standing in for `nextLong() & Long.MAX_VALUE`, and `Shuffle` reproducing `Collections.shuffle`. The node, split, read, write, and merge counts are identical to Java's, which is a strong check that both versions touch the same pages.
+Every count in the 200,000-key section matches Java because `JavaRandom(7)` yields the same ids and the page operations are the same.
+
+### In Go
+
+`code/go/main.go` keeps the same names: `PageStats`, `BTree[K cmp.Ordered, V any]` with `LowerBound`, `Put`, `Remove`, `Range`, `CheckInvariants`, `HeightBound`, and an unexported `split` struct in place of the Java record. Three things differ. **Slices replace `ArrayList`, and the right page must not alias the left:** `slices.Insert` and `slices.Delete` do the in-page shifts that `add(i, x)` and `remove(i)` did. A split re-slices the left page down to the median and gives the right page a `slices.Clone` of the upper half; without the clone both pages would share one backing array and a later `slices.Insert` into the left would overwrite the right's keys. **Absence and violations are values:** `Get` returns `(V, bool)` because a `V` of `int` has no `null`; `NewBTree(order)` returns `(*BTree, error)` with `ErrInvalidArgument` for an order below 3; `CheckInvariants` returns an `error` wrapping `ErrInvariantViolated` instead of throwing `IllegalStateException`. `verify` carries `*K` separator bounds so "no bound" is `nil`. The `Stats` field is a pointer so `sequential.Stats.Reset()` mutates the tree's counters, as the Java field does. **Same random keys, same page counts:** the demo's random ids come from `JavaRandom` (`javarandom.go`), a bit-exact port of `java.util.Random`, with `NextLong() & math.MaxInt64` standing in for `nextLong() & Long.MAX_VALUE`, and `Shuffle` reproducing `Collections.shuffle`. The node, split, read, write, and merge counts are identical to Java's.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Pages and page statistics
+
+`PageStats` resets with one parallel assignment. `Node` is generic over `cmp.Ordered` keys with exported slice fields; `IsLeaf` is `len(Children) == 0`. `NewBTree` returns an error for an order below 3 and allocates the shared `*PageStats`.
+
+```go
+type PageStats struct {
+	Reads, Writes, Splits, Merges int64
+}
+
+func (s *PageStats) Reset() { s.Reads, s.Writes, s.Splits, s.Merges = 0, 0, 0, 0 }
+
+// Node is one page: sorted keys, their values, and (for an internal node) keys+1 children.
+type Node[K cmp.Ordered, V any] struct {
+	Keys     []K
+	Values   []V
+	Children []*Node[K, V] // empty for a leaf
+}
+
+func (n *Node[K, V]) IsLeaf() bool  { return len(n.Children) == 0 }
+func (n *Node[K, V]) KeyCount() int { return len(n.Keys) }
+
+func NewBTree[K cmp.Ordered, V any](order int) (*BTree[K, V], error) {
+	if order < 3 {
+		return nil, fmt.Errorf("%w: order must be at least 3: %d", ErrInvalidArgument, order)
+	}
+	return &BTree[K, V]{Order: order, MaxKeys: order - 1, MinKeys: (order+1)/2 - 1, Stats: &PageStats{}, root: &Node[K, V]{}}, nil
+}
+```
+
+#### Step 2: Search within a page, then down
+
+`LowerBound` computes the midpoint as `int(uint(lo+hi) >> 1)`, the Go spelling of Java's overflow-safe `>>> 1`. `Get` returns the zero value and `false` from a leaf that lacks the key.
+
+```go
+func LowerBound[K cmp.Ordered, V any](n *Node[K, V], key K) int {
+	lo, hi := 0, n.KeyCount()
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if n.Keys[mid] < key {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+func (t *BTree[K, V]) Get(key K) (V, bool) {
+	n := t.root
+	for {
+		t.Stats.Reads++
+		i := LowerBound(n, key)
+		if i < n.KeyCount() && n.Keys[i] == key {
+			return n.Values[i], true
+		}
+		if n.IsLeaf() {
+			var zero V
+			return zero, false
+		}
+		n = n.Children[i]
+	}
+}
+```
+
+#### Step 3: Insert with split propagated by return value
+
+A `nil` `*split` is the Java `null`. `slices.Insert` returns the grown slice, so each insertion is an assignment back to the field; otherwise the control flow is the same recursion.
+
+```go
+type split[K cmp.Ordered, V any] struct {
+	key   K
+	value V
+	right *Node[K, V]
+}
+
+func (t *BTree[K, V]) insert(n *Node[K, V], key K, value V) *split[K, V] {
+	t.Stats.Reads++
+	i := LowerBound(n, key)
+	if i < n.KeyCount() && n.Keys[i] == key {
+		n.Values[i] = value
+		t.Stats.Writes++
+		return nil
+	}
+	if n.IsLeaf() {
+		n.Keys = slices.Insert(n.Keys, i, key)
+		n.Values = slices.Insert(n.Values, i, value)
+		t.size++
+	} else {
+		childSplit := t.insert(n.Children[i], key, value)
+		if childSplit == nil {
+			return nil
+		}
+		n.Keys = slices.Insert(n.Keys, i, childSplit.key)
+		n.Values = slices.Insert(n.Values, i, childSplit.value)
+		n.Children = slices.Insert(n.Children, i+1, childSplit.right)
+	}
+	t.Stats.Writes++
+	if n.KeyCount() > t.MaxKeys {
+		return t.split(n)
+	}
+	return nil
+}
+```
+
+#### Step 4: The split itself
+
+The one Go-specific hazard: re-slicing `n.Keys[:mid]` keeps the same backing array, so the right page takes `slices.Clone` of the upper half. Without the clone, a later `slices.Insert` into the left page would write into memory the right page still reads.
+
+```go
+func (t *BTree[K, V]) split(n *Node[K, V]) *split[K, V] {
+	mid := n.KeyCount() / 2
+	midKey := n.Keys[mid]
+	midValue := n.Values[mid]
+	right := &Node[K, V]{
+		Keys:   slices.Clone(n.Keys[mid+1:]),
+		Values: slices.Clone(n.Values[mid+1:]),
+	}
+	n.Keys = n.Keys[:mid]
+	n.Values = n.Values[:mid]
+	if !n.IsLeaf() {
+		right.Children = slices.Clone(n.Children[mid+1:])
+		n.Children = n.Children[:mid+1]
+	}
+	t.Stats.Splits++
+	t.Stats.Writes++ // the new right page
+	return &split[K, V]{midKey, midValue, right}
+}
+```
+
+#### Step 5: Delete, borrow, merge
+
+A tagless `switch` selects borrow-left, borrow-right, or merge. Removing a last element is a re-slice; removing a first element is `slices.Delete(xs, 0, 1)`; the merge appends the separator and the right page's slices onto the left and deletes the right child pointer.
+
+```go
+func (t *BTree[K, V]) rebalance(parent *Node[K, V], i int) {
+	child := parent.Children[i]
+	switch {
+	case i > 0 && parent.Children[i-1].KeyCount() > t.MinKeys:
+		left := parent.Children[i-1] // rotate one key through the parent, from the left
+		child.Keys = slices.Insert(child.Keys, 0, parent.Keys[i-1])
+		child.Values = slices.Insert(child.Values, 0, parent.Values[i-1])
+		last := left.KeyCount() - 1
+		parent.Keys[i-1] = left.Keys[last]
+		parent.Values[i-1] = left.Values[last]
+		left.Keys = left.Keys[:last]
+		left.Values = left.Values[:last]
+		if !left.IsLeaf() {
+			child.Children = slices.Insert(child.Children, 0, left.Children[len(left.Children)-1])
+			left.Children = left.Children[:len(left.Children)-1]
+		}
+		t.Stats.Writes += 3
+	case i < len(parent.Children)-1 && parent.Children[i+1].KeyCount() > t.MinKeys:
+		right := parent.Children[i+1] // rotate one key through the parent, from the right
+		child.Keys = append(child.Keys, parent.Keys[i])
+		child.Values = append(child.Values, parent.Values[i])
+		parent.Keys[i] = right.Keys[0]
+		parent.Values[i] = right.Values[0]
+		right.Keys = slices.Delete(right.Keys, 0, 1)
+		right.Values = slices.Delete(right.Values, 0, 1)
+		if !right.IsLeaf() {
+			child.Children = append(child.Children, right.Children[0])
+			right.Children = slices.Delete(right.Children, 0, 1)
+		}
+		t.Stats.Writes += 3
+	default:
+		leftIndex := i // merge child with a sibling around the separator
+		if i > 0 {
+			leftIndex = i - 1
+		}
+		left := parent.Children[leftIndex]
+		right := parent.Children[leftIndex+1]
+		left.Keys = append(left.Keys, parent.Keys[leftIndex])
+		left.Values = append(left.Values, parent.Values[leftIndex])
+		parent.Keys = slices.Delete(parent.Keys, leftIndex, leftIndex+1)
+		parent.Values = slices.Delete(parent.Values, leftIndex, leftIndex+1)
+		left.Keys = append(left.Keys, right.Keys...)
+		left.Values = append(left.Values, right.Values...)
+		left.Children = append(left.Children, right.Children...)
+		parent.Children = slices.Delete(parent.Children, leftIndex+1, leftIndex+2)
+		t.Stats.Merges++
+		t.Stats.Writes += 2
+	}
+}
+```
+
+#### Step 6: Range scan
+
+`rangeInto` appends through a pointer to the result slice; the loop is the Java `for (; i < n; i++)` verbatim.
+
+```go
+func (t *BTree[K, V]) rangeInto(n *Node[K, V], lo, hi K, out *[]K) {
+	t.Stats.Reads++
+	i := LowerBound(n, lo)
+	if !n.IsLeaf() {
+		t.rangeInto(n.Children[i], lo, hi, out)
+	}
+	for ; i < n.KeyCount(); i++ {
+		k := n.Keys[i]
+		if k > hi {
+			return
+		}
+		*out = append(*out, k)
+		if !n.IsLeaf() {
+			t.rangeInto(n.Children[i+1], lo, hi, out)
+		}
+	}
+}
+```
+
+#### Step 7: The invariant checker
+
+`verify` returns the first violation as an error wrapping `ErrInvariantViolated`. The separator bounds are `*K` (`nil` for unbounded) and `leafDepth` is an `*int` out-parameter; `&n.Keys[i]` passes a pointer into the page's own key slice as the child's bound.
+
+```go
+func (t *BTree[K, V]) verify(n *Node[K, V], lo, hi *K, depth int, leafDepth *int) error {
+	if n != t.root && n.KeyCount() < t.MinKeys {
+		return fmt.Errorf("%w: underfull node: %v", ErrInvariantViolated, n.Keys)
+	}
+	if n.KeyCount() > t.MaxKeys {
+		return fmt.Errorf("%w: overfull node: %v", ErrInvariantViolated, n.Keys)
+	}
+	for i, k := range n.Keys {
+		if i > 0 && n.Keys[i-1] >= k {
+			return fmt.Errorf("%w: keys not sorted: %v", ErrInvariantViolated, n.Keys)
+		}
+		if lo != nil && k <= *lo {
+			return fmt.Errorf("%w: key %v below separator %v", ErrInvariantViolated, k, *lo)
+		}
+		if hi != nil && k >= *hi {
+			return fmt.Errorf("%w: key %v above separator %v", ErrInvariantViolated, k, *hi)
+		}
+	}
+	if n.IsLeaf() {
+		if *leafDepth == -1 {
+			*leafDepth = depth
+		} else if *leafDepth != depth {
+			return fmt.Errorf("%w: leaves at different depths: %d and %d", ErrInvariantViolated, *leafDepth, depth)
+		}
+		return nil
+	}
+	if len(n.Children) != n.KeyCount()+1 {
+		return fmt.Errorf("%w: children != keys + 1 at %v", ErrInvariantViolated, n.Keys)
+	}
+	for i, child := range n.Children {
+		childLo, childHi := lo, hi
+		if i > 0 {
+			childLo = &n.Keys[i-1]
+		}
+		if i < n.KeyCount() {
+			childHi = &n.Keys[i]
+		}
+		if err := t.verify(child, childLo, childHi, depth+1, leafDepth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/03-systems-data-structures/04-b-trees/code/go
 go run .
 go test ./...
 ```
+
+```console
+range(100000, 100999): 1000 keys in 35 page reads
+
+== Deletes: borrow from a sibling or merge, leaves stay level ==
+after removing every odd id: size=100000 height=4 nodes=3124 reads=400001 writes=257304 splits=0 merges=3125
+
+== Shrinking all the way down ==
+5000 inserts then 5000 deletes in random order: height 6 -> 1, size=0
+```
+
+The sequential-versus-random section prints the same node, read, write, and split counts as the Java run.
 
 ## Use It
 

@@ -343,20 +343,179 @@ Section 2 is the correctness evidence: nine delays spanning three levels, each f
 
 ### In Python
 
-`code/python/main.py` has the same classes (`ManualClock`, `TimerEntry`, `Bucket`, `TimingWheel`, `HierarchicalTimer`, `HeapTimer`) and the same methods in snake_case (`advance_to`, `deadline_millis`, `cascades`). `Clock` is a `typing.Protocol` with one method, `now_millis`. Four things differ:
+`code/python/main.py` has the same classes (`ManualClock`, `TimerEntry`, `Bucket`, `TimingWheel`, `HierarchicalTimer`, `HeapTimer`) and the same methods in snake_case (`advance_to`, `deadline_millis`, `cascades`). `Clock` is a `typing.Protocol` with one method, `now_millis`. Four things differ. **Floor arithmetic is native:** Python's `//` and `%` already floor, which is exactly what `Math.floorDiv` and `Math.floorMod` do, so the bucket index is `(deadline // tick_millis) % wheel_size` with no helper. `Math.ceilDiv` becomes `-(-a // b)`, and `add_exact`/`multiply_exact` keep the Java overflow checks on the deadline arithmetic. **`TimerEntry` uses `__slots__`:** the entry has six mutable fields (`prev`, `next`, `bucket`, and the two flags), and 200,000 of them are live in the demo. Slots keep each entry compact and catch a misspelt field name at assignment time. **Closures bind late:** a `lambda` that captures a loop variable sees its final value when it runs, so the workload loops bind the index as a default argument (`lambda i=i: ...`). Without it, every timer would record the last `i`, and the wheel-versus-heap comparison would pass for the wrong reason. **`heapq` with a `(deadline, id, entry)` tuple is the comparison heap:** it gives the same total order as the Java comparator. The workload's delays come from `JavaRandom`, a bit-exact `java.util.Random`, so the pending counts, fired counts, and cascades match Java line for line. `ValueError` replaces `IllegalArgumentException`. Recursion depth is the number of wheel levels (four in the demo).
 
-- **Floor arithmetic is native.** Python's `//` and `%` already floor, which is exactly what `Math.floorDiv` and `Math.floorMod` do, so the bucket index is `(deadline // tick_millis) % wheel_size` with no helper. `Math.ceilDiv` becomes `-(-a // b)`, and `add_exact`/`multiply_exact` keep the Java overflow checks on the deadline arithmetic.
-- **`TimerEntry` uses `__slots__`.** The entry has six mutable fields (`prev`, `next`, `bucket`, and the two flags), and 200,000 of them are live in the demo. Slots keep each entry compact and catch a misspelt field name at assignment time. A cancelled entry still unlinks itself in `O(1)` through its `bucket` back-pointer.
-- **Closures bind late.** A `lambda` that captures a loop variable sees its final value when it runs, so the workload loops bind the index as a default argument. Without `i=i`, every timer would record the last `i`, and the wheel-versus-heap comparison would pass for the wrong reason:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The clock and the entry
+
+`Clock` is a `Protocol`, so `ManualClock` satisfies it structurally without inheriting. `TimerEntry` declares `__slots__` for its eight fields; `cancel` and `fire` are mutually exclusive and idempotent, each returning `False` when it lost the race, and `cancel` unlinks through the `bucket` back-pointer in `O(1)`.
 
 ```python
-for i in range(n):
-    delay = 1 + rng.next_int(600_000)  # up to 10 minutes
-    wheel_entries.append(wheel_t.schedule(delay, lambda i=i: wheel_order.append(i)))
-    heap_entries.append(heap_t.schedule(delay, lambda i=i: heap_order.append(i)))
+class Clock(Protocol):
+    def now_millis(self) -> int: ...
+
+
+class ManualClock:
+    def __init__(self, start_millis: int) -> None:
+        self._now = start_millis
+
+    def now_millis(self) -> int:
+        return self._now
+
+    def advance(self, millis: int) -> None:
+        if millis < 0:
+            raise ValueError("time does not go backwards")
+        self._now += millis
 ```
 
-- **`heapq` with a `(deadline, id, entry)` tuple is the comparison heap.** It gives the same total order as the Java comparator. The workload's delays come from `JavaRandom`, a bit-exact `java.util.Random`, so the pending counts, fired counts, and cascades match Java line for line. `ValueError` replaces `IllegalArgumentException`. Recursion depth is the number of wheel levels (four in the demo).
+```python
+class TimerEntry:
+    __slots__ = ("id", "deadline_millis", "task", "prev", "next", "bucket", "_cancelled", "_fired")
+
+    def cancel(self) -> bool:
+        """O(1): unlink from whatever bucket holds this entry. False if already cancelled or fired."""
+        if self._cancelled or self._fired:
+            return False
+        self._cancelled = True
+        if self.bucket is not None:
+            self.bucket.remove(self)
+        return True
+
+    def fire(self) -> bool:
+        """Run the task once. False if the entry was cancelled or has already fired."""
+        if self._cancelled or self._fired:
+            return False
+        self._fired = True
+        self.task()
+        return True
+```
+
+#### Step 2: A bucket is a sentinel list
+
+The sentinel is a `TimerEntry` with a no-op task pointing at itself. `add` links at the tail, `remove` checks the back-pointer first, and `flush` reads `nxt` before handing the entry to the consumer because a cascade may re-add it elsewhere.
+
+```python
+class Bucket:
+    def __init__(self) -> None:
+        self._sentinel = TimerEntry(-1, LONG_MIN, lambda: None)
+        self._sentinel.prev = self._sentinel
+        self._sentinel.next = self._sentinel
+        self._size = 0
+
+    def add(self, e: TimerEntry) -> None:
+        s = self._sentinel
+        e.bucket = self
+        e.prev = s.prev
+        e.next = s
+        s.prev.next = e
+        s.prev = e
+        self._size += 1
+
+    def remove(self, e: TimerEntry) -> None:
+        if e.bucket is not self:
+            return
+        e.prev.next = e.next
+        e.next.prev = e.prev
+        e.prev = e.next = None
+        e.bucket = None
+        self._size -= 1
+
+    def flush(self, consumer: Callable[[TimerEntry], None]) -> None:
+        """Remove every entry and hand each to the consumer, in insertion order."""
+        if self._size == 0:
+            return
+        e = self._sentinel.next
+        while e is not self._sentinel:
+            nxt = e.next
+            self.remove(e)
+            consumer(e)
+            e = nxt
+```
+
+#### Step 3: One level
+
+The three outcomes are unchanged; `deadline // self.tick_millis` is `Math.floorDiv` and `% self.wheel_size` is `Math.floorMod`, because Python's operators already floor. The overflow wheel is created lazily with this wheel's interval as its tick.
+
+```python
+    def add(self, e: TimerEntry) -> bool:
+        """Place an entry. False if its deadline falls inside the current tick (already due): the caller runs it."""
+        deadline = e.deadline_millis
+        if e.is_cancelled():
+            return True  # nothing to do, nothing to run
+        if deadline < self._current_time + self.tick_millis:
+            return False  # due now
+        if deadline < self._current_time + self.interval:
+            virtual_id = deadline // self.tick_millis  # Math.floorDiv
+            self._buckets[virtual_id % self.wheel_size].add(e)
+            return True
+        if self._overflow is None:
+            self._overflow = TimingWheel(self.interval, self.wheel_size, self._current_time)
+        return self._overflow.add(e)
+```
+
+#### Step 4: Ticking and cascading
+
+The Java lambdas become small nested functions (`expire`, `reinsert`) defined before the `flush` call that uses them. Only the lowest wheel is driven; `_cascade_to` asks the wheel above first so the coarsest cascades first, and re-inserts from `root`.
+
+```python
+    def advance_to(self, time_millis: int, due: Callable[[TimerEntry], None]) -> None:
+        def expire(e: TimerEntry) -> None:
+            if not e.is_cancelled():
+                due(e)
+
+        while self._current_time + self.tick_millis <= time_millis:
+            self._current_time += self.tick_millis
+            if self._overflow is not None:
+                self._overflow._cascade_to(self._current_time, self, due)
+            self._buckets[(self._current_time // self.tick_millis) % self.wheel_size].flush(expire)
+
+    def _cascade_to(self, time_millis: int, root: "TimingWheel", due: Callable[[TimerEntry], None]) -> None:
+        if time_millis < self._current_time + self.tick_millis:
+            return  # not our boundary yet
+        self._current_time = time_millis - time_millis % self.tick_millis
+        if self._overflow is not None:
+            self._overflow._cascade_to(self._current_time, root, due)
+
+        def reinsert(e: TimerEntry) -> None:
+            if e.is_cancelled():
+                return
+            root.cascades += 1
+            if not root.add(e):
+                due(e)  # deadline inside the current lowest tick
+
+        self._buckets[(self._current_time // self.tick_millis) % self.wheel_size].flush(reinsert)
+```
+
+#### Step 5: The facade and the heap to compare against
+
+`schedule` rounds the deadline up to a tick multiple through `ceil_div` and the overflow-checked helpers, then runs an already-due entry inline. `poll` passes a nested `run` function that counts fires. `HeapTimer` (not shown) pushes `(deadline, id, entry)` tuples onto `heapq`.
+
+```python
+    def schedule(self, delay_millis: int, task: Callable[[], None]) -> TimerEntry:
+        """Deadline rounded UP to the next tick multiple: never early, at most one tick late."""
+        if delay_millis < 0:
+            raise ValueError("delay must be >= 0")
+        deadline = add_exact(self._clock.now_millis(), delay_millis)
+        tick = self._wheel.tick_millis
+        rounded = multiply_exact(ceil_div(deadline, tick), tick)
+        e = TimerEntry(self._next_id, rounded, task)
+        self._next_id += 1
+        if not self._wheel.add(e) and e.fire():  # already due: run inline
+            self._fired += 1
+        return e
+
+    def poll(self) -> None:
+        """Process everything due at or before the clock's current time."""
+
+        def run(e: TimerEntry) -> None:
+            if e.fire():
+                self._fired += 1
+
+        self._wheel.advance_to(self._clock.now_millis(), run)
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/03-systems-data-structures/12-time-wheels-and-timers/code/python
@@ -364,30 +523,243 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== 1. Authorization holds: schedule, fire, cancel on capture ==
+  levels after scheduling = 2, pending = 4
+  t+4:  [auth-A expired]
+  auth-B captured, cancel() = true (O(1) unlink), pending = 2
+  t+12: [auth-A expired, auth-C expired, auth-D expired (beyond the 8 ms wheel: overflow level)]
+```
+
+Sections 2 through 4 print the same fire times, cascade counts, and pending/fired totals as the Java run.
+
 ### In Go
 
-`code/go/main.go` has the same types (`ManualClock`, `TimerEntry`, `Bucket`, `TimingWheel`, `HierarchicalTimer`, `HeapTimer`) and the same methods in exported CamelCase (`AdvanceTo`, `DeadlineMillis`, `Cascades`). `Clock` is an interface with one method, `NowMillis() int64`. Four things differ:
+`code/go/main.go` has the same types (`ManualClock`, `TimerEntry`, `Bucket`, `TimingWheel`, `HierarchicalTimer`, `HeapTimer`) and the same methods in exported CamelCase (`AdvanceTo`, `DeadlineMillis`, `Cascades`). `Clock` is an interface with one method, `NowMillis() int64`. Four things differ. **Floor arithmetic is written out:** Go's `/` and `%` truncate toward zero like Java's primitives, so `floorDiv`, `floorMod`, and `ceilDiv` reproduce `Math.floorDiv`, `Math.floorMod`, and `Math.ceilDiv` by hand; a test pins them on negative inputs and on a wheel started at a negative time. `addChecked` and `mulChecked` keep the Java overflow checks on the deadline arithmetic and return `ErrOverflow`. **Errors are values:** `NewTimingWheel`, `NewHierarchicalTimer`, and `Schedule` return `(value, error)`, and `ManualClock.Advance` returns an `error`, each wrapping `ErrInvalidArgument` where the Java throws `IllegalArgumentException`; the tests check with `errors.Is`. The one `panic` left is `NewTimerEntry` with a `nil` task, the counterpart of `Objects.requireNonNull`. **Closures capture per-iteration variables:** since Go 1.22 each loop iteration has its own `i`, but the workload still copies it into `id := int64(i)` so the intent is visible and the code reads the same as the Java `final long id = i`. **`container/heap` is the comparison heap:** `entryHeap` orders by deadline, then by id, the same total order as the Java comparator. The workload's delays come from `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random`), so the pending counts, fired counts, and cascades match Java line for line. The timer is single-threaded by design, like the Java; a version driven from one goroutine with `Cancel` called from others would guard the entry flags and the bucket unlink with a `sync.Mutex` on the facade.
 
-- **Floor arithmetic is written out.** Go's `/` and `%` truncate toward zero like Java's primitives, so `floorDiv`, `floorMod`, and `ceilDiv` reproduce `Math.floorDiv`, `Math.floorMod`, and `Math.ceilDiv` by hand; a test pins them on negative inputs and on a wheel started at a negative time. `addChecked` and `mulChecked` keep the Java overflow checks on the deadline arithmetic and return `ErrOverflow`.
-- **Errors are values.** `NewTimingWheel`, `NewHierarchicalTimer`, and `Schedule` return `(value, error)`, and `ManualClock.Advance` returns an `error`, each wrapping `ErrInvalidArgument` where the Java throws `IllegalArgumentException`; the tests check with `errors.Is`. The one `panic` left is `NewTimerEntry` with a `nil` task, the counterpart of `Objects.requireNonNull`.
-- **Closures capture per-iteration variables.** Since Go 1.22 each loop iteration has its own `i`, but the workload still copies it into `id := int64(i)` so the intent is visible and the code reads the same as the Java `final long id = i`:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The clock and the entry
+
+A one-method `Clock` interface; `Advance` returns an error for a negative step. `TimerEntry` exports its links and bucket pointer (the tests inspect them) and keeps the two flags unexported; `NewTimerEntry` panics on a `nil` task as `requireNonNull` would.
 
 ```go
-for i := 0; i < n; i++ {
-    delay := 1 + int64(rng.NextIntN(600_000)) // up to 10 minutes
-    id := int64(i)
-    wheelEntries = append(wheelEntries, must(wheelT.Schedule(delay, func() { wheelOrder = append(wheelOrder, id) })))
-    heapEntries = append(heapEntries, must(heapT.Schedule(delay, func() { heapOrder = append(heapOrder, id) })))
+type Clock interface {
+	NowMillis() int64
+}
+
+type ManualClock struct{ now int64 }
+
+func (c *ManualClock) Advance(millis int64) error {
+	if millis < 0 {
+		return fmt.Errorf("%w: time does not go backwards", ErrInvalidArgument)
+	}
+	c.now += millis
+	return nil
+}
+
+type TimerEntry struct {
+	ID             int64
+	DeadlineMillis int64
+	Task           func()
+	Prev, Next     *TimerEntry
+	Bucket         *Bucket
+	cancelled      bool
+	fired          bool
+}
+
+func (e *TimerEntry) Cancel() bool {
+	if e.cancelled || e.fired {
+		return false
+	}
+	e.cancelled = true
+	if e.Bucket != nil {
+		e.Bucket.Remove(e)
+	}
+	return true
+}
+
+func (e *TimerEntry) Fire() bool {
+	if e.cancelled || e.fired {
+		return false
+	}
+	e.fired = true
+	e.Task()
+	return true
 }
 ```
 
-- **`container/heap` is the comparison heap.** `entryHeap` orders by deadline, then by id, the same total order as the Java comparator. The workload's delays come from `JavaRandom` (`javarandom.go`, a bit-exact `java.util.Random`), so the pending counts, fired counts, and cascades match Java line for line. The timer is single-threaded by design, like the Java; a version driven from one goroutine with `Cancel` called from others would guard the entry flags and the bucket unlink with a `sync.Mutex` on the facade.
+#### Step 2: A bucket is a sentinel list
+
+`NewBucket` wires the sentinel to itself with one parallel assignment. `Add`, `Remove`, and `Flush` are the Java methods; `Flush` saves `next` before the consumer runs for the same cascade reason.
+
+```go
+type Bucket struct {
+	sentinel *TimerEntry
+	size     int
+}
+
+func NewBucket() *Bucket {
+	s := NewTimerEntry(-1, math.MinInt64, func() {})
+	s.Prev, s.Next = s, s
+	return &Bucket{sentinel: s}
+}
+
+func (b *Bucket) Add(e *TimerEntry) {
+	e.Bucket = b
+	e.Prev = b.sentinel.Prev
+	e.Next = b.sentinel
+	b.sentinel.Prev.Next = e
+	b.sentinel.Prev = e
+	b.size++
+}
+
+func (b *Bucket) Remove(e *TimerEntry) {
+	if e.Bucket != b {
+		return
+	}
+	e.Prev.Next = e.Next
+	e.Next.Prev = e.Prev
+	e.Prev, e.Next = nil, nil
+	e.Bucket = nil
+	b.size--
+}
+
+// Flush removes every entry and hands each to the consumer, in insertion order.
+func (b *Bucket) Flush(consumer func(*TimerEntry)) {
+	e := b.sentinel.Next
+	for e != b.sentinel {
+		next := e.Next
+		b.Remove(e)
+		consumer(e)
+		e = next
+	}
+}
+```
+
+#### Step 3: One level
+
+The hand-written `floorDiv` and `floorMod` compute the bucket index. The lazy overflow wheel comes from `NewTimingWheel`, whose error is turned into a panic because a wheel deep enough to overflow `int64` is a programming error, not an input.
+
+```go
+func (w *TimingWheel) Add(e *TimerEntry) bool {
+	deadline := e.DeadlineMillis
+	if e.IsCancelled() {
+		return true // nothing to do, nothing to run
+	}
+	if deadline < w.currentTime+w.TickMillis {
+		return false // due now
+	}
+	if deadline < w.currentTime+w.Interval {
+		virtualID := floorDiv(deadline, w.TickMillis)
+		w.buckets[floorMod(virtualID, int64(w.WheelSize))].Add(e)
+		return true
+	}
+	if w.overflow == nil {
+		// Interval * WheelSize cannot overflow for any workload this lesson runs; a wheel that deep is a programming error.
+		overflow, err := NewTimingWheel(w.Interval, w.WheelSize, w.currentTime)
+		if err != nil {
+			panic(err)
+		}
+		w.overflow = overflow
+	}
+	return w.overflow.Add(e)
+}
+```
+
+#### Step 4: Ticking and cascading
+
+Function literals stand in for the Java lambdas. `AdvanceTo` steps one tick at a time and asks the overflow wheel to cascade before flushing its own bucket; `cascadeTo` floors its own clock with `floorMod` and re-inserts from `root`, counting `root.Cascades`.
+
+```go
+func (w *TimingWheel) AdvanceTo(timeMillis int64, due func(*TimerEntry)) {
+	for w.currentTime+w.TickMillis <= timeMillis {
+		w.currentTime += w.TickMillis
+		if w.overflow != nil {
+			w.overflow.cascadeTo(w.currentTime, w, due)
+		}
+		w.buckets[floorMod(floorDiv(w.currentTime, w.TickMillis), int64(w.WheelSize))].Flush(func(e *TimerEntry) {
+			if !e.IsCancelled() {
+				due(e)
+			}
+		})
+	}
+}
+
+func (w *TimingWheel) cascadeTo(timeMillis int64, root *TimingWheel, due func(*TimerEntry)) {
+	if timeMillis < w.currentTime+w.TickMillis {
+		return // not our boundary yet
+	}
+	w.currentTime = timeMillis - floorMod(timeMillis, w.TickMillis)
+	if w.overflow != nil {
+		w.overflow.cascadeTo(w.currentTime, root, due)
+	}
+	w.buckets[floorMod(floorDiv(w.currentTime, w.TickMillis), int64(w.WheelSize))].Flush(func(e *TimerEntry) {
+		if e.IsCancelled() {
+			return
+		}
+		root.Cascades++
+		if !root.Add(e) {
+			due(e) // deadline inside the current lowest tick
+		}
+	})
+}
+```
+
+#### Step 5: The facade and the heap to compare against
+
+`Schedule` returns `(*TimerEntry, error)`: a negative delay is `ErrInvalidArgument`, and the two checked arithmetic steps can return `ErrOverflow`. `Poll` drives the wheel with a closure that counts fires; `HeapTimer` (not shown) is `container/heap` over `entryHeap`.
+
+```go
+func (t *HierarchicalTimer) Schedule(delayMillis int64, task func()) (*TimerEntry, error) {
+	if delayMillis < 0 {
+		return nil, fmt.Errorf("%w: delay must be >= 0", ErrInvalidArgument)
+	}
+	deadline, err := addChecked(t.clock.NowMillis(), delayMillis)
+	if err != nil {
+		return nil, err
+	}
+	tick := t.wheel.TickMillis
+	rounded, err := mulChecked(ceilDiv(deadline, tick), tick)
+	if err != nil {
+		return nil, err
+	}
+	e := NewTimerEntry(t.nextID, rounded, task)
+	t.nextID++
+	if !t.wheel.Add(e) && e.Fire() { // already due: run inline
+		t.fired++
+	}
+	return e, nil
+}
+
+// Poll processes everything due at or before the clock's current time.
+func (t *HierarchicalTimer) Poll() {
+	t.wheel.AdvanceTo(t.clock.NowMillis(), func(e *TimerEntry) {
+		if e.Fire() {
+			t.fired++
+		}
+	})
+}
+```
+
+#### Step 6: Run it
 
 ```bash
 cd phases/03-systems-data-structures/12-time-wheels-and-timers/code/go
 go run .
 go test ./...
 ```
+
+```console
+  cascades = 337148 (each entry moves down at most levels-1 times)
+
+== 5. Cost model ==
+  wheel: insert O(1), cancel O(1), tick O(1 + due); an idle wheel still pays one tick per tickMillis
+  heap:  insert O(log n), cancel O(1) lazy or O(n) eager, poll O(log n) per due; idle heap costs nothing
+  with n = 200000: log2(n) = 18 comparisons per heap insert versus one bucket link
+```
+
+Sections 1 through 4 print the same fire times, levels, and pending/fired counts as the Java run.
 
 ## Use It
 

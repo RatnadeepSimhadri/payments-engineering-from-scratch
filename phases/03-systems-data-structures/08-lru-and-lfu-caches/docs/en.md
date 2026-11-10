@@ -350,43 +350,420 @@ Python prints `0.795` where Java prints `0.796` on the third line: the exact val
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`__slots__` on the node classes:** a node is `key, value, expires_at, prev, next`; without `__slots__` each one also carries a `__dict__`, roughly doubling the memory of a cache that exists to save memory. **`None` is the miss signal**, so a cache cannot store `None` as a value. Java has the same limitation with `null`; Go returns `(value, ok)` and has no such limit. **Masking in `Rng`:** Python integers do not wrap, so every multiplication is followed by `& MASK64`, exactly as in Lesson 01's hash functions. Forget one and the trace diverges from Java and Go after the first key. **`OrderedDict.move_to_end` and `functools.lru_cache`** are the standard-library LRU; the lesson writes the list by hand so that the LFU's buckets, which have no standard-library equivalent, use the same mechanics. Python has no overloading, so `put` takes an optional `ttl_millis` keyword instead of a second signature.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A clock you can control
+
+`Clock` is a base class whose `now_millis` raises `NotImplementedError`, the lightweight form of an interface; `ManualClock` overrides it and `advance` refuses to go backwards with `ValueError`. The cache's constructor defaults to a `ManualClock` when none is passed.
+
 ```python
-def get(self, key: K) -> Optional[V]:
-    node = self._map.get(key)
-    if node is None:
-        self.misses += 1
-        return None
-    if self._expired(node):
-        ...
+class Clock:
+    """Something that tells the time in milliseconds. Injected so tests never sleep."""
+
+    def now_millis(self) -> int:
+        raise NotImplementedError
+
+
+class ManualClock(Clock):
+    def __init__(self, start_millis: int = 0) -> None:
+        self._now = start_millis
+
+    def now_millis(self) -> int:
+        return self._now
+
+    def advance(self, millis: int) -> None:
+        if millis < 0:
+            raise ValueError("clock cannot go backwards")
+        self._now += millis
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The node and the list surgery
 
-- **`__slots__` on the node classes.** A node is `key, value, expires_at, prev, next`; without `__slots__` each one also carries a `__dict__`, roughly doubling the memory of a cache that exists to save memory.
-- **`None` is the miss signal**, so a cache cannot store `None` as a value. Java has the same limitation with `null`; Go returns `(value, ok)` and has no such limit.
-- **Masking in `Rng`.** Python integers do not wrap, so every multiplication is followed by `& MASK64`, exactly as in Lesson 01's hash functions. Forget one and the trace diverges from Java and Go after the first key.
-- **`OrderedDict.move_to_end` and `functools.lru_cache`** are the standard-library LRU; the lesson writes the list by hand so that the LFU's buckets, which have no standard-library equivalent, use the same mechanics.
+`_Node` declares `__slots__` so each entry is five attributes and nothing else. `_unlink` and `_push_front` are the same four assignments; the two sentinels are wired to each other in the constructor so neither method ever sees `None`.
+
+```python
+class _Node(Generic[K, V]):
+    __slots__ = ("key", "value", "expires_at", "prev", "next")
+
+    def __init__(self, key: K, value: V, expires_at: int) -> None:
+        self.key = key
+        self.value = value
+        self.expires_at = expires_at
+        self.prev: Optional[_Node[K, V]] = None
+        self.next: Optional[_Node[K, V]] = None
+```
+
+```python
+    def _unlink(self, node: _Node[K, V]) -> None:
+        node.prev.next = node.next
+        node.next.prev = node.prev
+
+    def _push_front(self, node: _Node[K, V]) -> None:
+        node.next = self._head.next
+        node.prev = self._head
+        self._head.next.prev = node
+        self._head.next = node
+
+    def _expired(self, node: _Node[K, V]) -> bool:
+        return node.expires_at <= self.clock.now_millis()
+```
+
+#### Step 3: get, with expiry as a miss
+
+The same three outcomes, with `None` as the miss signal and `del self._map[key]` for `map.remove`. Only the fresh-hit path moves the node to the head.
+
+```python
+    def get(self, key: K) -> Optional[V]:
+        node = self._map.get(key)
+        if node is None:
+            self.misses += 1
+            return None
+        if self._expired(node):
+            self._unlink(node)
+            del self._map[key]
+            self.expirations += 1
+            self.misses += 1
+            return None
+        self._unlink(node)
+        self._push_front(node)
+        self.hits += 1
+        return node.value
+```
+
+#### Step 4: put, with eviction from the tail
+
+One `put` with an optional `ttl_millis` does the work of the Java's two overloads plus `putInternal`: validate the TTL, compute `expires_at` (`NO_EXPIRY` when none), touch an existing key, otherwise evict `tail.prev` if full and insert at the head.
+
+```python
+    def put(self, key: K, value: V, ttl_millis: Optional[int] = None) -> None:
+        if ttl_millis is not None and ttl_millis <= 0:
+            raise ValueError("ttl_millis must be positive")
+        expires_at = NO_EXPIRY if ttl_millis is None else self.clock.now_millis() + ttl_millis
+        node = self._map.get(key)
+        if node is not None:
+            node.value = value
+            node.expires_at = expires_at
+            self._unlink(node)
+            self._push_front(node)
+            return
+        if len(self._map) >= self.capacity:
+            victim = self._tail.prev
+            self._unlink(victim)
+            del self._map[victim.key]
+            self.evictions += 1
+        node = _Node(key, value, expires_at)
+        self._map[key] = node
+        self._push_front(node)
+```
+
+#### Step 5: LFU's bucket and the touch
+
+`_Bucket` is the same sentinel list with a `size` counter. `_touch` unlinks from bucket `f`, deletes the bucket if it emptied (bumping `_min_freq` when that bucket was the floor), and `setdefault` creates bucket `f + 1` on first use, the role `computeIfAbsent` plays.
+
+```python
+    def _touch(self, node: _LfuNode[K, V]) -> None:
+        """Move node from bucket f to bucket f+1, maintaining min_freq. Constant time."""
+        bucket = self._buckets[node.freq]
+        bucket.unlink(node)
+        if bucket.size == 0:
+            del self._buckets[node.freq]
+            if self._min_freq == node.freq:
+                self._min_freq = node.freq + 1
+        node.freq += 1
+        self._buckets.setdefault(node.freq, _Bucket()).push_front(node)
+```
+
+#### Step 6: LFU put and eviction from the floor
+
+Eviction reads bucket `_min_freq` and takes its least recent node; the new node enters bucket 1 and `_min_freq` is reset to 1 unconditionally.
+
+```python
+    def put(self, key: K, value: V) -> None:
+        node = self._map.get(key)
+        if node is not None:
+            node.value = value
+            self._touch(node)
+            return
+        if len(self._map) >= self.capacity:
+            bucket = self._buckets[self._min_freq]
+            victim = bucket.least_recent()
+            bucket.unlink(victim)
+            if bucket.size == 0:
+                del self._buckets[self._min_freq]
+            del self._map[victim.key]
+            self.evictions += 1
+        node = _LfuNode(key, value)
+        self._map[key] = node
+        self._buckets.setdefault(1, _Bucket()).push_front(node)
+        self._min_freq = 1
+```
+
+#### Step 7: A trace both languages agree on
+
+splitmix64 with `& MASK64` after the add and both multiplies; because the state is kept unsigned, `>>` is already the logical shift. `next_int` takes the top 31 bits with `>> 33`.
+
+```python
+class Rng:
+    """splitmix64: identical sequences in Java, Python, and Go for a given seed."""
+
+    def __init__(self, seed: int) -> None:
+        self.state = seed & MASK64
+
+    def next(self) -> int:
+        self.state = (self.state + 0x9E3779B97F4A7C15) & MASK64
+        z = self.state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        return z ^ (z >> 31)
+
+    def next_int(self, bound: int) -> int:
+        return (self.next() >> 33) % bound
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/03-systems-data-structures/08-lru-and-lfu-caches/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== LRU: merchant config, most recent at the head ==
+after 3 puts: ['merchant-3', 'merchant-2', 'merchant-1']
+after get(merchant-1): ['merchant-1', 'merchant-3', 'merchant-2']
+after put(merchant-4): ['merchant-4', 'merchant-1', 'merchant-3']  evicted merchant-2, evictions=1
+
+== TTL: a config entry that must be re-read after five minutes ==
+t+4:59.9 get(merchant-9) = fee_bps=290
+t+5:00   get(merchant-9) = None  expirations=1
+```
+
+The hit-rate table matches the Java run to three decimals except the `phase 1 again` LFU cell, where the exact value 1591/2000 = 0.7955 is a formatting tie that Python prints as `0.795` and Java as `0.796`.
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design with four differences. **Generics with `K comparable`:** the map key type must be comparable, which Go enforces at compile time; Java relies on `equals`/`hashCode` and Python on `__hash__`. **`(V, bool)` instead of null:** the idiomatic Go miss signal, which also allows caching the zero value. **`Put` and `PutWithTTL`** rather than an overload, since Go has none; `PutWithTTL` returns an error for a non-positive TTL where Java and Python throw. **`container/list`** would supply the doubly linked list; the lesson writes the four pointer assignments out so the structure is visible, and to keep the LFU buckets identical to the LRU list. The `Rng` state is a `uint64`, so the arithmetic wraps and shifts logically with no masking.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A clock you can control
+
+A one-method interface and a pointer-receiver implementation. `Advance` panics on a negative step rather than returning an error, because the clock is test scaffolding and a backwards step is a programming error.
+
 ```go
-func (c *LruCache[K, V]) Get(key K) (V, bool) {
-    var zero V
-    n, ok := c.m[key]
-    if !ok {
-        c.Misses++
-        return zero, false
-    }
-    ...
+type Clock interface {
+	NowMillis() int64
+}
+
+// ManualClock advances only when told to.
+type ManualClock struct{ now int64 }
+
+// NewManualClock starts at startMillis.
+func NewManualClock(startMillis int64) *ManualClock { return &ManualClock{now: startMillis} }
+
+// NowMillis implements Clock.
+func (c *ManualClock) NowMillis() int64 { return c.now }
+
+// Advance moves the clock forward; it never goes backwards.
+func (c *ManualClock) Advance(millis int64) {
+	if millis < 0 {
+		panic("clock cannot go backwards")
+	}
+	c.now += millis
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The node and the list surgery
 
-- **Generics with `K comparable`.** The map key type must be comparable, which Go enforces at compile time; Java relies on `equals`/`hashCode` and Python on `__hash__`.
-- **`(V, bool)` instead of null.** The idiomatic Go miss signal, which also allows caching the zero value.
-- **`Put` and `PutWithTTL`** rather than an overload, since Go has none; `PutWithTTL` returns an error for a non-positive TTL where Java and Python throw.
-- **`container/list`** would supply the doubly linked list; the lesson writes the four pointer assignments out so the structure is visible, and to keep the LFU buckets identical to the LRU list.
+An unexported generic node struct; the sentinels are zero-valued nodes allocated in `NewLruCache`. `unlink` and `pushFront` are the four assignments each.
+
+```go
+type lruNode[K comparable, V any] struct {
+	key        K
+	value      V
+	expiresAt  int64
+	prev, next *lruNode[K, V]
+}
+
+func (c *LruCache[K, V]) unlink(n *lruNode[K, V]) {
+	n.prev.next = n.next
+	n.next.prev = n.prev
+}
+
+func (c *LruCache[K, V]) pushFront(n *lruNode[K, V]) {
+	n.next = c.head.next
+	n.prev = c.head
+	c.head.next.prev = n
+	c.head.next = n
+}
+```
+
+#### Step 3: get, with expiry as a miss
+
+`Get` returns the zero `V` and `false` on both kinds of miss; `delete(c.m, key)` is `map.remove`. The counters are exported fields so the demo can print them.
+
+```go
+func (c *LruCache[K, V]) Get(key K) (V, bool) {
+	var zero V
+	n, ok := c.m[key]
+	if !ok {
+		c.Misses++
+		return zero, false
+	}
+	if c.expired(n) {
+		c.unlink(n)
+		delete(c.m, key)
+		c.Expirations++
+		c.Misses++
+		return zero, false
+	}
+	c.unlink(n)
+	c.pushFront(n)
+	c.Hits++
+	return n.value, true
+}
+```
+
+#### Step 4: put, with eviction from the tail
+
+Two exported entry points feed `putInternal`: `Put` passes `NoExpiry`, `PutWithTTL` validates and returns an error. The `if n, ok := c.m[key]; ok` form handles the touch-on-update case; eviction and insertion are the Java lines.
+
+```go
+func (c *LruCache[K, V]) Put(key K, value V) { c.putInternal(key, value, NoExpiry) }
+
+// PutWithTTL inserts or updates an entry that expires ttlMillis from now.
+func (c *LruCache[K, V]) PutWithTTL(key K, value V, ttlMillis int64) error {
+	if ttlMillis <= 0 {
+		return errors.New("ttlMillis must be positive")
+	}
+	c.putInternal(key, value, c.clock.NowMillis()+ttlMillis)
+	return nil
+}
+
+func (c *LruCache[K, V]) putInternal(key K, value V, expiresAt int64) {
+	if n, ok := c.m[key]; ok {
+		n.value = value
+		n.expiresAt = expiresAt
+		c.unlink(n)
+		c.pushFront(n)
+		return
+	}
+	if len(c.m) >= c.Capacity {
+		victim := c.tail.prev
+		c.unlink(victim)
+		delete(c.m, victim.key)
+		c.Evictions++
+	}
+	n := &lruNode[K, V]{key: key, value: value, expiresAt: expiresAt}
+	c.m[key] = n
+	c.pushFront(n)
+}
+```
+
+#### Step 5: LFU's bucket and the touch
+
+Without `computeIfAbsent`, the bucket for `f + 1` is looked up with the two-value map read and created on a miss. The `minFreq` bump and the unlink-then-push are the same.
+
+```go
+func (c *LfuCache[K, V]) touch(n *lfuNode[K, V]) {
+	b := c.buckets[n.freq]
+	b.unlink(n)
+	if b.size == 0 {
+		delete(c.buckets, n.freq)
+		if c.minFreq == n.freq {
+			c.minFreq = n.freq + 1
+		}
+	}
+	n.freq++
+	nb, ok := c.buckets[n.freq]
+	if !ok {
+		nb = newBucket[K, V]()
+		c.buckets[n.freq] = nb
+	}
+	nb.pushFront(n)
+}
+```
+
+#### Step 6: LFU put and eviction from the floor
+
+The same eviction from bucket `minFreq`, then insertion at frequency 1 with the lookup-or-create pattern and `minFreq = 1`.
+
+```go
+func (c *LfuCache[K, V]) Put(key K, value V) {
+	if n, ok := c.m[key]; ok {
+		n.value = value
+		c.touch(n)
+		return
+	}
+	if len(c.m) >= c.Capacity {
+		b := c.buckets[c.minFreq]
+		victim := b.leastRecent()
+		b.unlink(victim)
+		if b.size == 0 {
+			delete(c.buckets, c.minFreq)
+		}
+		delete(c.m, victim.key)
+		c.Evictions++
+	}
+	n := &lfuNode[K, V]{key: key, value: value, freq: 1}
+	c.m[key] = n
+	b, ok := c.buckets[1]
+	if !ok {
+		b = newBucket[K, V]()
+		c.buckets[1] = b
+	}
+	b.pushFront(n)
+	c.minFreq = 1
+}
+```
+
+#### Step 7: A trace both languages agree on
+
+With a `uint64` state the Java lines transcribe directly: addition and multiplication wrap, and `>>` is logical, so there is no `>>>` and no mask. The seed is taken as `uint64` so the `0x...` test constants read naturally.
+
+```go
+type Rng struct{ state uint64 }
+
+// NewRng seeds the generator.
+func NewRng(seed uint64) *Rng { return &Rng{seed} }
+
+// Next returns the next 64-bit value.
+func (r *Rng) Next() uint64 {
+	r.state += 0x9E3779B97F4A7C15
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
+// NextInt returns a value in [0, bound).
+func (r *Rng) NextInt(bound int) int { return int((r.Next() >> 33) % uint64(bound)) }
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/03-systems-data-structures/08-lru-and-lfu-caches/code/go
+go run .
+go test ./...
+```
+
+```console
+== Same trace, both policies, capacity 32 (20 hot BINs carry 80% of lookups) ==
+segment                  LRU hit rate LFU hit rate
+phase 1: hot set A              0.727        0.788
+scan: 500 one-off BINs          0.000        0.000
+
+== Why you do not cache balances ==
+ledger says 20.00 USD, cache says 100.00 USD
+authorize 50.00 USD against the cache: approved
+actual balance after that approval would be -30.00 USD: an overdraft the ledger never allowed
+```
+
+The LRU, TTL, and LFU sections match the Java run; a miss prints as `false` where Java prints `null`.
 
 ## Use It
 

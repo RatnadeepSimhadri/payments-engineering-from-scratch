@@ -402,33 +402,242 @@ The test file checks 40 assertions: the compatibility matrix, FIFO grant order, 
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **The sealed `Op` becomes four frozen dataclasses** attached to an `Op` base class, so the scripts still read `Op.Add("acct:A", usd(-1))`, and `match`/`case` with class patterns replaces the Java `switch` over records. **Ordering is explicit:** Java's `TreeMap` and `TreeSet` give sorted iteration for free, so Python iterates `sorted(self.table)` in `release_all` and `wait_for_graph`, and `find_cycle` visits start nodes and neighbours in sorted order; that is what makes the cycle `[1, 2]` and the victim `T2` identical in both languages. Holders stay in an insertion-ordered `dict` (`LinkedHashMap`) and the queue is a `collections.deque`, with `appendleft` for upgrades. **`Money` checks overflow by hand:** `Money.plus` calls `add_exact`, which raises `OverflowError` outside the signed 64-bit range, because Python's `int` would otherwise grow past `Long.MAX_VALUE` silently, and a Python-only test pins this; `Optional<List<Integer>>` becomes `list[int] | None`. **No threads, no GIL question:** the scheduler interleaves steps itself, so every deadlock is replayed by `run(1, 2, 1, 2)` in both languages and the demo output is identical.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Modes and the compatibility rule
+
+`LockMode` is an `Enum` with the one-expression matrix. `LockEntry.holders` is a plain dict, which keeps insertion order, and `queue` is a `deque`. `compatible` is an `all(...)` over the holders that skips the requester's own entry.
+
 ```python
-def _execute(self, t: Txn, op: Op) -> bool:
-    match op:
-        case Op.Read(key=key):
-            if not self._lock(t, key, LockMode.S):
-                return False
-            ...
-        case Op.Add(key=key, delta=delta):
-            if not self._lock(t, key, LockMode.X):
-                return False
-            before = self.db.get(key)
-            t.undo.setdefault(key, before)
-            self.db[key] = before.plus(delta)
-        case Op.Unlock(key=key):
-            t.phase = Txn.Phase.SHRINKING
-            self._grant(self.locks.release(t.id, key))
-        case Op.Commit():
-            self.commit(t)
-    return True
+class LockMode(Enum):
+    S = "S"
+    X = "X"
+
+    def compatible_with(self, other: "LockMode") -> bool:
+        return self is LockMode.S and other is LockMode.S
+
+
+@dataclass(frozen=True)
+class LockRequest:
+    tx: int
+    mode: LockMode
+
+
+class LockEntry:
+    def __init__(self) -> None:
+        self.holders: dict[int, LockMode] = {}  # insertion-ordered, like LinkedHashMap
+        self.queue: deque[LockRequest] = deque()
+
+    def compatible(self, tx: int, mode: LockMode) -> bool:
+        return all(h == tx or mode.compatible_with(m) for h, m in self.holders.items())
+
+    def is_empty(self) -> bool:
+        return not self.holders and not self.queue
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: Acquire, with queuing and upgrades
 
-- **The sealed `Op` becomes four frozen dataclasses** attached to an `Op` base class, so the scripts still read `Op.Add("acct:A", usd(-1))` and `match`/`case` with class patterns replaces the Java `switch` over records.
-- **Ordering is explicit.** Java's `TreeMap` and `TreeSet` give sorted iteration for free; Python iterates `sorted(self.table)` in `release_all` and `wait_for_graph`, and `find_cycle` visits start nodes and neighbours in sorted order. That is what makes the cycle `[1, 2]` and the victim `T2` identical in both languages. Holders stay in an insertion-ordered `dict` (`LinkedHashMap`) and the queue is a `collections.deque`, with `appendleft` for upgrades.
-- **`Money` checks overflow by hand.** `Money.plus` calls `add_exact`, which raises `OverflowError` outside the signed 64-bit range, because Python's `int` would otherwise grow past `Long.MAX_VALUE` silently. A Python-only test pins this. `Optional<List<Integer>>` becomes `list[int] | None`.
-- **No threads, no GIL question.** The scheduler interleaves steps itself, so every deadlock is replayed by `run(1, 2, 1, 2)` in both languages and the demo output is identical.
+The same two hidden rules: a non-empty queue blocks even a compatible request unless it is an upgrade, and an upgrade goes to the front with `appendleft`. The port also writes the `granted`/`WAITS for` trace lines here, which is why the demo output matches the Java.
+
+```python
+    def acquire(self, tx: int, key: str, mode: LockMode) -> bool:
+        e = self.table.setdefault(key, LockEntry())
+        held = e.holders.get(tx)
+        if held is LockMode.X or (held is LockMode.S and mode is LockMode.S):
+            return True  # already covered
+        upgrade = held is LockMode.S and mode is LockMode.X
+        if (not e.queue or upgrade) and e.compatible(tx, mode):
+            e.holders[tx] = mode
+            self.log.append(f"  T{tx} {mode.name}({key}) granted")
+            return True
+        if upgrade:
+            e.queue.appendleft(LockRequest(tx, mode))
+        else:
+            e.queue.append(LockRequest(tx, mode))
+        who = ",".join(f"T{b}" for b in self.blockers_of(tx, key, mode))
+        self.log.append(f"  T{tx} {mode.name}({key}) WAITS for {who}")
+        return False
+```
+
+#### Step 3: Release and the grant loop
+
+`release_all` iterates `self._keys()` (a sorted snapshot of the table's keys), removes the holder with `dict.pop`, rebuilds the deque without the transaction's own requests, and grants waiters only if the transaction actually held something. `_grant_waiters` peeks at `queue[0]` and pops from the left while the head is compatible.
+
+```python
+    def release_all(self, tx: int) -> list[int]:
+        granted: list[int] = []
+        for key in self._keys():
+            e = self.table[key]
+            held = e.holders.pop(tx, None) is not None
+            e.queue = deque(r for r in e.queue if r.tx != tx)
+            if held:
+                granted.extend(self._grant_waiters(key, e))
+            if e.is_empty():
+                del self.table[key]
+        return granted
+
+    def _grant_waiters(self, key: str, e: LockEntry) -> list[int]:
+        granted: list[int] = []
+        while e.queue and e.compatible(e.queue[0].tx, e.queue[0].mode):
+            r = e.queue.popleft()
+            e.holders[r.tx] = r.mode
+            self.log.append(f"  T{r.tx} {r.mode.name}({key}) granted (was waiting)")
+            granted.append(r.tx)
+        return granted
+```
+
+#### Step 4: The wait-for graph
+
+`blockers_of` collects incompatible holders and incompatible requests queued ahead into a set and returns it sorted (the Java `TreeSet`). `wait_for_graph` walks the sorted keys and every queued request, adding one edge per blocker.
+
+```python
+    def blockers_of(self, tx: int, key: str, mode: LockMode) -> list[int]:
+        out: set[int] = set()
+        e = self.table.get(key)
+        if e is None:
+            return []
+        for h, m in e.holders.items():
+            if h != tx and not mode.compatible_with(m):
+                out.add(h)
+        for ahead in e.queue:
+            if ahead.tx == tx:
+                break  # only requests ahead of ours
+            if not mode.compatible_with(ahead.mode):
+                out.add(ahead.tx)
+        return sorted(out)
+
+    def wait_for_graph(self) -> "WaitForGraph":
+        g = WaitForGraph()
+        for key in self._keys():
+            for r in self.table[key].queue:
+                for blocker in self.blockers_of(r.tx, key, r.mode):
+                    g.add_edge(r.tx, blocker)
+        return g
+```
+
+#### Step 5: Finding the cycle
+
+The three-colour DFS with a list as the path. A back edge returns `path[path.index(node):]`, the slice from the grey node to the top, which is one line where the Java loops. Start nodes and neighbours are visited in sorted order so the first cycle found is deterministic.
+
+```python
+    def find_cycle(self) -> list[int] | None:
+        colour: dict[int, int] = {}  # 0 white, 1 grey (on stack), 2 black
+        path: list[int] = []
+        for start in sorted(self.edges):
+            c = self._dfs(start, colour, path)
+            if c is not None:
+                return c
+        return None
+
+    def _dfs(self, node: int, colour: dict[int, int], path: list[int]) -> list[int] | None:
+        c = colour.get(node, 0)
+        if c == 2:
+            return None
+        if c == 1:  # back edge: the cycle is the path from node to here
+            return path[path.index(node):]
+        colour[node] = 1
+        path.append(node)
+        for nxt in sorted(self.edges.get(node, ())):
+            found = self._dfs(nxt, colour, path)
+            if found is not None:
+                return found
+        path.pop()
+        colour[node] = 2
+        return None
+```
+
+#### Step 6: Transactions and the scheduler
+
+The four operation classes are frozen dataclasses bound onto `Op` as attributes, so `Op.Read(...)` constructs one and `case Op.Read(key=key)` matches it. `step` and `_lock` are the Java methods; `_lock` raises `TwoPhaseViolationException` (a `RuntimeError`) when a shrinking transaction asks for a key it does not hold.
+
+```python
+class Op:
+    """The steps a scripted transaction can take (Java: sealed interface Op). Add is a read-modify-write under X."""
+
+
+@dataclass(frozen=True)
+class _Read(Op):
+    key: str
+
+
+@dataclass(frozen=True)
+class _Add(Op):
+    key: str
+    delta: Money
+
+
+Op.Read, Op.Add, Op.Unlock, Op.Commit = _Read, _Add, _Unlock, _Commit
+```
+
+```python
+    def step(self, t: Txn) -> bool:
+        if t.status is not Txn.Status.ACTIVE:
+            return False
+        op = t.script[t.pc]
+        if self._execute(t, op):
+            t.pc += 1
+            return True
+        t.status = Txn.Status.BLOCKED
+        self.detect_and_resolve()
+        return True
+
+    def _lock(self, t: Txn, key: str, mode: LockMode) -> bool:
+        if t.phase is Txn.Phase.SHRINKING and key not in self.locks.keys_held_by(t.id):
+            raise TwoPhaseViolationException(f"T{t.id} requested {mode.name}({key}) after releasing a lock")
+        return self.locks.acquire(t.id, key, mode)
+```
+
+#### Step 7: Resolving the deadlock
+
+`detect_and_resolve` returns the victim id or `None`. `choose_victim` is a `match` on the policy: `max(cycle)` for `YOUNGEST`, the fewest-locks scan with a youngest tie-break otherwise. `abort` undoes in reverse insertion order (`reversed(list(t.undo.items()))`), then releases, then optionally restarts the victim at `pc = 0`.
+
+```python
+    def detect_and_resolve(self) -> int | None:
+        cycle = self.locks.wait_for_graph().find_cycle()
+        if cycle is None:
+            return None
+        self.deadlocks_detected += 1
+        self.cycles.append(cycle)
+        victim = self.choose_victim(cycle)
+        self.victims.append(victim)
+        self.log.append(f"  DEADLOCK {Scheduler.describe(cycle)} -> victim T{victim} ({self.policy.name})")
+        self.abort(self.txns[victim])
+        return victim
+
+    def choose_victim(self, cycle: list[int]) -> int:
+        match self.policy:
+            case VictimPolicy.YOUNGEST:
+                return max(cycle)
+            case VictimPolicy.FEWEST_LOCKS:
+                best = cycle[0]
+                for id in cycle:
+                    mine, theirs = len(self.locks.keys_held_by(id)), len(self.locks.keys_held_by(best))
+                    if mine < theirs or (mine == theirs and id > best):  # tie: youngest
+                        best = id
+                return best
+```
+
+```python
+    def abort(self, t: Txn) -> None:
+        entries = list(t.undo.items())
+        for key, value in reversed(entries):
+            self.db[key] = value
+        t.undo.clear()
+        t.status = Txn.Status.ABORTED
+        self.log.append(f"  T{t.id} ABORT (undo {len(entries)} write{'' if len(entries) == 1 else 's'})")
+        self._grant(self.locks.release_all(t.id))
+        if self.restart_victims:
+            t.status = Txn.Status.ACTIVE
+            t.phase = Txn.Phase.GROWING
+            t.pc = 0
+            t.reads.clear()
+            t.restarts += 1
+            self.log.append(f"  T{t.id} restarted (attempt {t.restarts + 1})")
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/05-two-phase-locking/code/python
@@ -436,32 +645,342 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The four traces are the Java traces, line for line:
+
+```console
+== Two transfers in opposite directions: A->B and B->A, strict 2PL ==
+T1 begin
+T2 begin
+  T1 X(acct:A) granted
+  T1 acct:A 1000.00 USD -> 900.00 USD
+  T2 X(acct:B) granted
+  T2 acct:B 500.00 USD -> 450.00 USD
+  T1 X(acct:B) WAITS for T2
+  T2 X(acct:A) WAITS for T1
+  DEADLOCK T1 -> T2 -> T1 -> victim T2 (YOUNGEST)
+  T2 ABORT (undo 1 write)
+  T1 X(acct:B) granted (was waiting)
+```
+
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **Two kinds of "no":** `Acquire` returns a plain `bool` (granted now, or queued), exactly as in Java, because waiting is a normal outcome; the two-phase rule is a programming error in the script, so `Step`, `Run`, `Abort` and `DetectAndResolve` return an `error` that wraps the sentinel `ErrTwoPhaseViolation` (checked with `errors.Is`) instead of throwing, `Money.Plus` returns `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow` so an in-place `OpAdd` can never silently wrap an `int64`, and `DetectAndResolve` returns `(victim, found, err)` in place of `Optional<Integer>`. **Sealed interface to type switch:** `Op` is an interface with an unexported marker method, `OpRead`, `OpAdd`, `OpUnlock`, `OpCommit` are the four permitted structs, and `execute` is a `switch o := op.(type)`; the compiler does not check exhaustiveness the way Java's `switch` over a sealed type does, so the switch has no `default` on purpose, and an unknown `Op` would simply be treated as a no-op step. **Ordered maps by hand:** `TreeMap` iteration becomes `sortedKeys`/`sortedIntKeys` wherever order is observable (`ReleaseAll`, `KeysHeldBy`, the wait-for graph's DFS start order, `Txns` in round-robin), the `LinkedHashMap` undo log is a key slice plus a map so `Abort` can replay it in reverse, and the lock manager appends to the scheduler's log through a `*[]string`, mirroring the shared `List<String>` in Java. **No goroutines:** concurrency is modelled by the scheduler's interleaving, which is what makes every deadlock replayable, so there is no mutex and `go test -race` passes trivially; a port that drives transactions from goroutines must run `Acquire`, `ReleaseAll` and the detector under one mutex, and should run detection on a timer rather than on every wait.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same four traces as the Java version, line for line.
+
+#### Step 1: Modes and the compatibility rule
+
+`LockMode` is an `iota` enum with the matrix as a one-line method. `Holders` is a `map[int]LockMode` and `Queue` a slice used as a FIFO. `Compatible` ranges over the holders, skipping the requester.
+
 ```go
-// Op is Java's sealed interface; the scheduler dispatches with a type switch.
+type LockMode int
+
+const (
+	S LockMode = iota
+	X
+)
+
+func (m LockMode) CompatibleWith(other LockMode) bool { return m == S && other == S }
+
+type LockRequest struct {
+	Tx   int
+	Mode LockMode
+}
+
+type LockEntry struct {
+	Holders map[int]LockMode
+	Queue   []LockRequest
+}
+
+func (e *LockEntry) Compatible(tx int, mode LockMode) bool {
+	for holder, held := range e.Holders {
+		if holder != tx && !mode.CompatibleWith(held) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *LockEntry) IsEmpty() bool { return len(e.Holders) == 0 && len(e.Queue) == 0 }
+```
+
+#### Step 2: Acquire, with queuing and upgrades
+
+The two-value map read gives `holding`, which stands in for Java's `held == null` check. An upgrade is prepended with `append([]LockRequest{{tx, mode}}, e.Queue...)`; everything else queues at the back. The trace lines are written through `logf`.
+
+```go
+func (lm *LockManager) Acquire(tx int, key string, mode LockMode) bool {
+	e, ok := lm.Table[key]
+	if !ok {
+		e = newLockEntry()
+		lm.Table[key] = e
+	}
+	held, holding := e.Holders[tx]
+	if holding && (held == X || (held == S && mode == S)) {
+		return true // already covered
+	}
+	upgrade := holding && held == S && mode == X
+	if (len(e.Queue) == 0 || upgrade) && e.Compatible(tx, mode) {
+		e.Holders[tx] = mode
+		lm.logf("  T%d %s(%s) granted", tx, mode, key)
+		return true
+	}
+	if upgrade {
+		e.Queue = append([]LockRequest{{tx, mode}}, e.Queue...)
+	} else {
+		e.Queue = append(e.Queue, LockRequest{tx, mode})
+	}
+	who := make([]string, 0)
+	for _, b := range lm.BlockersOf(tx, key, mode) {
+		who = append(who, fmt.Sprintf("T%d", b))
+	}
+	lm.logf("  T%d %s(%s) WAITS for %s", tx, mode, key, strings.Join(who, ","))
+	return false
+}
+```
+
+#### Step 3: Release and the grant loop
+
+`ReleaseAll` walks `sortedKeys(lm.Table)`, deletes the holder, filters the queue in place with the `kept := e.Queue[:0]` idiom, and grants waiters only if the transaction held something. `grantWaiters` pops from the front with a reslice.
+
+```go
+func (lm *LockManager) ReleaseAll(tx int) []int {
+	granted := []int{}
+	for _, key := range sortedKeys(lm.Table) {
+		e := lm.Table[key]
+		_, held := e.Holders[tx]
+		delete(e.Holders, tx)
+		kept := e.Queue[:0]
+		for _, r := range e.Queue {
+			if r.Tx != tx {
+				kept = append(kept, r)
+			}
+		}
+		e.Queue = kept
+		if held {
+			granted = append(granted, lm.grantWaiters(key, e)...)
+		}
+		if e.IsEmpty() {
+			delete(lm.Table, key)
+		}
+	}
+	return granted
+}
+
+func (lm *LockManager) grantWaiters(key string, e *LockEntry) []int {
+	granted := []int{}
+	for len(e.Queue) > 0 && e.Compatible(e.Queue[0].Tx, e.Queue[0].Mode) {
+		r := e.Queue[0]
+		e.Queue = e.Queue[1:]
+		e.Holders[r.Tx] = r.Mode
+		lm.logf("  T%d %s(%s) granted (was waiting)", r.Tx, r.Mode, key)
+		granted = append(granted, r.Tx)
+	}
+	return granted
+}
+```
+
+#### Step 4: The wait-for graph
+
+`BlockersOf` collects into a `map[int]bool` and returns `sortedInts`, the `TreeSet` order. `WaitForGraph` iterates sorted keys so the edges are added in the same order every run.
+
+```go
+func (lm *LockManager) BlockersOf(tx int, key string, mode LockMode) []int {
+	set := map[int]bool{}
+	e, ok := lm.Table[key]
+	if !ok {
+		return []int{}
+	}
+	for holder, held := range e.Holders {
+		if holder != tx && !mode.CompatibleWith(held) {
+			set[holder] = true
+		}
+	}
+	for _, ahead := range e.Queue {
+		if ahead.Tx == tx {
+			break // only requests ahead of ours
+		}
+		if !mode.CompatibleWith(ahead.Mode) {
+			set[ahead.Tx] = true
+		}
+	}
+	return sortedInts(set)
+}
+
+func (lm *LockManager) WaitForGraph() *WaitForGraph {
+	g := NewWaitForGraph()
+	for _, key := range sortedKeys(lm.Table) {
+		for _, r := range lm.Table[key].Queue {
+			for _, blocker := range lm.BlockersOf(r.Tx, key, r.Mode) {
+				g.AddEdge(r.Tx, blocker)
+			}
+		}
+	}
+	return g
+}
+```
+
+#### Step 5: Finding the cycle
+
+`FindCycle` returns `([]int, bool)` in place of `Optional`. The path is passed as a `*[]int` so the recursive calls share one slice; a missing colour reads as 0 (white), and the back-edge branch copies the path from the grey node onward.
+
+```go
+func (g *WaitForGraph) FindCycle() ([]int, bool) {
+	colour := map[int]int{} // 0 white, 1 grey (on stack), 2 black
+	path := []int{}
+	for _, start := range sortedIntKeys(g.Edges) {
+		if c, found := g.dfs(start, colour, &path); found {
+			return c, true
+		}
+	}
+	return nil, false
+}
+
+func (g *WaitForGraph) dfs(node int, colour map[int]int, path *[]int) ([]int, bool) {
+	switch colour[node] {
+	case 2:
+		return nil, false
+	case 1: // back edge: the cycle is the path from node to here
+		cycle := []int{}
+		in := false
+		for _, n := range *path {
+			if n == node {
+				in = true
+			}
+			if in {
+				cycle = append(cycle, n)
+			}
+		}
+		return cycle, true
+	}
+	colour[node] = 1
+	*path = append(*path, node)
+	for _, next := range sortedInts(g.Edges[node]) {
+		if found, ok := g.dfs(next, colour, path); ok {
+			return found, true
+		}
+	}
+	*path = (*path)[:len(*path)-1]
+	colour[node] = 2
+	return nil, false
+}
+```
+
+#### Step 6: Transactions and the scheduler
+
+The marker-method interface is Go's sealed type. `Step` returns `(advanced, error)`, and `lock` returns the two-phase violation as a wrapped error rather than a panic, so `Run` can surface it to the demo.
+
+```go
 type Op interface{ isOp() }
 
 type OpRead struct{ Key string }
 type OpAdd struct {
-    Key   string
-    Delta Money
+	Key   string
+	Delta Money
+}
+type OpUnlock struct{ Key string }
+type OpCommit struct{}
+
+func (OpRead) isOp()   {}
+func (OpAdd) isOp()    {}
+func (OpUnlock) isOp() {}
+func (OpCommit) isOp() {}
+```
+
+```go
+func (s *Scheduler) Step(t *Txn) (bool, error) {
+	if t.Status != Active {
+		return false, nil
+	}
+	ok, err := s.execute(t, t.Script[t.PC])
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		t.PC++
+		return true, nil
+	}
+	t.Status = Blocked
+	_, _, err = s.DetectAndResolve()
+	return true, err
 }
 
 func (s *Scheduler) lock(t *Txn, key string, mode LockMode) (bool, error) {
-    if t.Phase == Shrinking && !containsString(s.Locks.KeysHeldBy(t.ID), key) {
-        return false, fmt.Errorf("%w: T%d requested %s(%s) after releasing a lock", ErrTwoPhaseViolation, t.ID, mode, key)
-    }
-    return s.Locks.Acquire(t.ID, key, mode), nil
+	if t.Phase == Shrinking && !containsString(s.Locks.KeysHeldBy(t.ID), key) {
+		return false, fmt.Errorf("%w: T%d requested %s(%s) after releasing a lock", ErrTwoPhaseViolation, t.ID, mode, key)
+	}
+	return s.Locks.Acquire(t.ID, key, mode), nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 7: Resolving the deadlock
 
-- **Two kinds of "no".** `Acquire` returns a plain `bool` (granted now, or queued), exactly as in Java, because waiting is a normal outcome. The two-phase rule is a programming error in the script, so `Step`, `Run`, `Abort` and `DetectAndResolve` return an `error` that wraps the sentinel `ErrTwoPhaseViolation` (checked with `errors.Is`) instead of throwing; `Money.Plus` returns `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow`, so an in-place `OpAdd` can never silently wrap an `int64`. `DetectAndResolve` returns `(victim, found, err)` in place of `Optional<Integer>`.
-- **Sealed interface to type switch.** `Op` is an interface with an unexported marker method; `OpRead`, `OpAdd`, `OpUnlock`, `OpCommit` are the four permitted structs, and `execute` is a `switch o := op.(type)`. The compiler does not check exhaustiveness the way Java's `switch` over a sealed type does, so the switch has no `default` on purpose: an unknown `Op` would simply be treated as a no-op step.
-- **Ordered maps by hand.** `TreeMap` iteration becomes `sortedKeys`/`sortedIntKeys` wherever order is observable (`ReleaseAll`, `KeysHeldBy`, the wait-for graph's DFS start order, `Txns` in round-robin). The `LinkedHashMap` undo log is a key slice plus a map so `Abort` can replay it in reverse. The lock manager appends to the scheduler's log through a `*[]string`, mirroring the shared `List<String>` in Java.
-- **No goroutines.** Concurrency is modelled by the scheduler's interleaving, which is what makes every deadlock replayable, so there is no mutex and `go test -race` passes trivially. A port that drives transactions from goroutines must run `Acquire`, `ReleaseAll` and the detector under one mutex, and should run detection on a timer rather than on every wait.
+`DetectAndResolve` returns the victim, a found flag, and any error from the abort. `ChooseVictim` starts from `cycle[0]` and scans for the largest id or the fewest locks with a youngest tie-break. `Abort` replays `undoKeys` backwards, releases, and restarts the victim if configured.
+
+```go
+func (s *Scheduler) DetectAndResolve() (int, bool, error) {
+	g := s.Locks.WaitForGraph()
+	cycle, found := g.FindCycle()
+	if !found {
+		return 0, false, nil
+	}
+	s.DeadlocksDetected++
+	s.Cycles = append(s.Cycles, cycle)
+	victim := s.ChooseVictim(cycle)
+	s.Victims = append(s.Victims, victim)
+	s.logf("  DEADLOCK %s -> victim T%d (%s)", Describe(cycle), victim, s.Policy)
+	if err := s.Abort(s.Txns[victim]); err != nil {
+		return victim, true, err
+	}
+	return victim, true, nil
+}
+
+func (s *Scheduler) ChooseVictim(cycle []int) int {
+	best := cycle[0]
+	switch s.Policy {
+	case Youngest:
+		for _, id := range cycle {
+			if id > best {
+				best = id
+			}
+		}
+	case FewestLocks:
+		for _, id := range cycle {
+			mine, theirs := len(s.Locks.KeysHeldBy(id)), len(s.Locks.KeysHeldBy(best))
+			if mine < theirs || (mine == theirs && id > best) { // tie: youngest
+				best = id
+			}
+		}
+	}
+	return best
+}
+```
+
+```go
+func (s *Scheduler) Abort(t *Txn) error {
+	n := len(t.undoKeys)
+	for i := n - 1; i >= 0; i-- {
+		s.DB[t.undoKeys[i]] = t.Undo[t.undoKeys[i]]
+	}
+	t.Undo = map[string]Money{}
+	t.undoKeys = nil
+	t.Status = Aborted
+	if err := s.grant(s.Locks.ReleaseAll(t.ID)); err != nil {
+		return err
+	}
+	if s.RestartVictims {
+		t.Status = Active
+		t.Phase = Growing
+		t.PC = 0
+		t.Reads = map[string]Money{}
+		t.Restarts++
+		s.logf("  T%d restarted (attempt %d)", t.ID, t.Restarts+1)
+	}
+	return nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/07-storage-and-transactions/05-two-phase-locking/code/go
@@ -469,7 +988,13 @@ go run .
 go test ./...
 ```
 
-The demo prints the same four traces as the Java version, line for line.
+```console
+  T1 ABORT (undo 1 write)
+  => T2 committed having read 100.00 USD; the committed balance is 1000.00 USD
+  => T1 requested S(j) after releasing a lock: the two-phase rule forbids growing after shrinking
+```
+
+The two deadlock traces above this are the Java traces, line for line.
 
 ## Use It
 

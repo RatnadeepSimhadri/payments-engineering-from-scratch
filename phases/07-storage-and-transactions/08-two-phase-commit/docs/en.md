@@ -400,38 +400,564 @@ The `total=600.00 USD` column never changes across all six scenarios. That is th
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **`None` instead of `Optional.empty()`:** a timed-out prepare returns `None`, and the coordinator checks `if vote is None` before `if vote == Vote.NO`; the order matters, because `None` and `Vote.NO` are both falsy-adjacent in careless code, and conflating them is harmless here but would not be in a protocol where a missing answer and a negative answer have different recovery paths. **`CrashError` is a `RuntimeError`:** the demo catches it with `except CrashError`, the tests use `assertRaises`, and because Python has no checked exceptions the crash point is documented in the docstring of `run` rather than in a `throws` clause. **Dict ordering is insertion order,** so the participant list recorded in `BEGIN` and the order of PREPARE messages is deterministic without the `LinkedHashMap` Java needs.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The durable log and the crash
+
+`LogRecord` and `Posting` are frozen dataclasses, `DurableLog` wraps a list and hands out copies, `CrashError` is a `RuntimeError`, and `CrashPoint` is an `Enum` with the same three values.
+
 ```python
-def prepare(self, node: str, tx_id: str, posting: Posting) -> Vote | None:
-    if not self._reachable(node):
-        return None
-    vote = self._nodes[node].prepare(tx_id, posting)
-    if node in self._crash_after_vote:
-        self._crash_after_vote.discard(node)
-        self._partitioned.add(node)
-    return vote
+class CrashPoint(Enum):
+    NONE = "NONE"
+    AFTER_VOTES_BEFORE_DECISION_LOG = "AFTER_VOTES_BEFORE_DECISION_LOG"
+    AFTER_DECISION_LOG_BEFORE_SEND = "AFTER_DECISION_LOG_BEFORE_SEND"
+
+
+@dataclass(frozen=True)
+class LogRecord:
+    tx_id: str
+    kind: str
+    detail: str
+
+
+class DurableLog:
+    def __init__(self) -> None:
+        self._records: list[LogRecord] = []
+
+    def append(self, tx_id: str, kind: str, detail: str = "") -> None:
+        self._records.append(LogRecord(tx_id, kind, detail))
+
+    def records(self) -> list[LogRecord]:
+        return list(self._records)
+
+
+class CrashError(RuntimeError):
+    def __init__(self, where: str) -> None:
+        super().__init__(f"crash at {where}")
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The participant votes
 
-- **`None` instead of `Optional.empty()`.** A timed-out prepare returns `None`, and the coordinator checks `if vote is None` before `if vote is Vote.NO`. The order matters: `None` and `Vote.NO` are both falsy-adjacent in careless code, and conflating them is harmless here but would not be in a protocol where a missing answer and a negative answer have different recovery paths.
-- **`CrashError` is a `RuntimeError`.** The demo catches it with `except CrashError`; the tests use `assertRaises`. Python has no checked exceptions, so the crash point is documented in the docstring of `run` rather than in a `throws` clause.
-- **Dict ordering is insertion order**, so the participant list recorded in `BEGIN` and the order of PREPARE messages is deterministic without the `LinkedHashMap` Java needs.
+The same checks in the same order; `dict.get` returns `None` for an unknown account where Java gets `null`. The lock is added to the `_locked` set before the `PREPARED` record is appended, and the record's detail is the posting rendered as `account delta`, which recovery parses back.
+
+```python
+    def prepare(self, tx_id: str, posting: Posting) -> Vote:
+        if self._states.get(tx_id) == TxState.PREPARED:
+            return Vote.YES  # duplicate prepare: same answer
+        if tx_id in self._states:
+            return Vote.NO  # already decided: too late
+        current = self._balances.get(posting.account)
+        if current is None or posting.account in self._locked:
+            why = "unknown account" if current is None else "account locked"
+            self._log.append(tx_id, "ABORTED", f"vote NO: {why}")
+            self._states[tx_id] = TxState.ABORTED
+            return Vote.NO
+        if current.plus(posting.delta).is_negative():
+            self._log.append(tx_id, "ABORTED", f"vote NO: insufficient funds in {posting.account}")
+            self._states[tx_id] = TxState.ABORTED
+            return Vote.NO
+        self._locked.add(posting.account)
+        self._prepared[tx_id] = posting
+        self._states[tx_id] = TxState.PREPARED
+        self._log.append(tx_id, "PREPARED", f"{posting.account} {posting.delta}")
+        return Vote.YES
+```
+
+#### Step 3: The participant applies the decision, idempotently
+
+`commit` and `abort` keep the asymmetry: `commit` from anything but `PREPARED` raises `RuntimeError`, `abort` is legal from `NONE` (`pop(tx_id, None)` tolerates a missing posting) and raises only from `COMMITTED`. `set.discard` releases a lock that may not be held.
+
+```python
+    def commit(self, tx_id: str) -> None:
+        state = self.state_of(tx_id)
+        if state == TxState.COMMITTED:
+            return
+        if state != TxState.PREPARED:
+            raise RuntimeError(f"{self.name}: commit of {tx_id} in state {state.value}")
+        posting = self._prepared.pop(tx_id)
+        self._balances[posting.account] = self._balances[posting.account].plus(posting.delta)
+        self._locked.discard(posting.account)
+        self._states[tx_id] = TxState.COMMITTED
+        self._log.append(tx_id, "COMMITTED")
+
+    def abort(self, tx_id: str) -> None:
+        state = self.state_of(tx_id)
+        if state == TxState.ABORTED:
+            return
+        if state == TxState.COMMITTED:
+            raise RuntimeError(f"{self.name}: cannot abort committed {tx_id}")
+        posting = self._prepared.pop(tx_id, None)
+        if posting is not None:
+            self._locked.discard(posting.account)
+        self._states[tx_id] = TxState.ABORTED
+        self._log.append(tx_id, "ABORTED")
+```
+
+#### Step 4: Participant recovery from its own log
+
+A fresh `Ledger` is built on the same log and replayed with an `if`/`elif` chain. `PREPARED` details are unpacked with `split(" ")` into account, amount and currency code; whatever is still in `pending` at the end is re-locked as in-doubt.
+
+```python
+    def crash_and_recover(self) -> "Ledger":
+        fresh = Ledger(self.name, self._initial, self._log)
+        pending: dict[str, Posting] = {}
+        for r in self._log.records():
+            if r.kind == "PREPARED":
+                account, amount, code = r.detail.split(" ")
+                pending[r.tx_id] = Posting(account, _parse_money(amount, code))
+                fresh._states[r.tx_id] = TxState.PREPARED
+            elif r.kind == "COMMITTED":
+                p = pending.pop(r.tx_id)
+                fresh._balances[p.account] = fresh._balances[p.account].plus(p.delta)
+                fresh._states[r.tx_id] = TxState.COMMITTED
+            elif r.kind == "ABORTED":
+                pending.pop(r.tx_id, None)
+                fresh._states[r.tx_id] = TxState.ABORTED
+            else:
+                raise RuntimeError(f"unknown record {r}")
+        for tx_id, p in pending.items():
+            fresh._prepared[tx_id] = p
+            fresh._locked.add(p.account)
+        return fresh
+```
+
+#### Step 5: The coordinator's commit point
+
+`run` records `BEGIN` with `",".join(postings)` (dict keys in insertion order), collects votes with `None` meaning timeout, raises `CrashError` at the first crash point, appends `DECISION`, and raises at the second. The unacked set is `set(postings)`.
+
+```python
+    def run(self, tx_id: str, postings: dict[str, Posting]) -> Outcome:
+        self._participants[tx_id] = postings
+        self._log.append(tx_id, "BEGIN", ",".join(postings))
+
+        # Phase 1: collect votes. Any NO or any timeout means ABORT.
+        decision, reason = Decision.COMMIT, "all voted YES"
+        for node, posting in postings.items():
+            vote = self._net.prepare(node, tx_id, posting)
+            if vote is None:
+                decision, reason = Decision.ABORT, f"{node} timed out in prepare"
+                break
+            if vote == Vote.NO:
+                decision, reason = Decision.ABORT, f"{node} voted NO"
+                break
+
+        if self.crash_point == CrashPoint.AFTER_VOTES_BEFORE_DECISION_LOG:
+            raise CrashError("after votes, before decision log")
+
+        # The commit point. Before this append the outcome is undecided; after it, it is fixed forever.
+        self._log.append(tx_id, "DECISION", decision.value)
+        self._decisions[tx_id] = decision
+        self._unacked[tx_id] = set(postings)
+
+        if self.crash_point == CrashPoint.AFTER_DECISION_LOG_BEFORE_SEND:
+            raise CrashError("after decision log, before send")
+
+        # Phase 2: deliver the decision until every participant acknowledges.
+        complete = self.deliver(tx_id)
+        if not complete:
+            reason = f"{reason}; awaiting acks from {sorted(self._unacked[tx_id])}"
+        return Outcome(tx_id, decision, complete, reason)
+```
+
+#### Step 6: Delivery, retry, and recovery from the coordinator log
+
+`deliver` iterates `sorted(waiting)` so the message order is stable, and logs `END` when the set empties. `recover` is a static method that replays the crashed log into a fresh coordinator, applies presumed abort to every `BEGIN` without `DECISION`, and redelivers every undecided-or-unended transaction; `Decision(r.detail)` is the `Enum` lookup that replaces `Decision.valueOf`.
+
+```python
+    def deliver(self, tx_id: str) -> bool:
+        waiting = self._unacked.get(tx_id)
+        if waiting is None:
+            return True
+        decision = self._decisions[tx_id]
+        for node in sorted(waiting):
+            if self._net.decide(node, tx_id, decision):
+                waiting.discard(node)
+        if not waiting:
+            del self._unacked[tx_id]
+            self._log.append(tx_id, "END")
+            return True
+        return False
+
+    @staticmethod
+    def recover(crashed: "Coordinator", net: SimNetwork) -> "Coordinator":
+        fresh = Coordinator(net)
+        begun: dict[str, list[str]] = {}
+        ended: set[str] = set()
+        for r in crashed._log.records():
+            fresh._log.append(r.tx_id, r.kind, r.detail)
+            if r.kind == "BEGIN":
+                begun[r.tx_id] = r.detail.split(",")
+            elif r.kind == "DECISION":
+                fresh._decisions[r.tx_id] = Decision(r.detail)
+            elif r.kind == "END":
+                ended.add(r.tx_id)
+        for tx_id, nodes in begun.items():
+            if tx_id in ended:
+                continue
+            if tx_id not in fresh._decisions:
+                fresh._log.append(tx_id, "DECISION", Decision.ABORT.value)  # presumed abort
+                fresh._decisions[tx_id] = Decision.ABORT
+            fresh._unacked[tx_id] = set(nodes)
+            fresh.deliver(tx_id)
+        return fresh
+```
+
+#### Step 7: The simulated network
+
+`_reachable` charges a full timeout for a partitioned node and a latency otherwise. `prepare` returns `None` on timeout; after delivering the vote it checks `_crash_after_vote` and, if the node was marked, partitions it, which models the participant that votes YES and dies.
+
+```python
+    def _reachable(self, node: str) -> bool:
+        self.messages_sent += 1
+        if node in self._partitioned:
+            self._clock.advance(self.timeout_ms)
+            self.timeouts += 1
+            return False
+        self._clock.advance(self.latency_ms)
+        return True
+
+    def prepare(self, node: str, tx_id: str, posting: Posting) -> Vote | None:
+        if not self._reachable(node):
+            return None
+        vote = self._nodes[node].prepare(tx_id, posting)
+        if node in self._crash_after_vote:
+            self._crash_after_vote.discard(node)
+            self._partitioned.add(node)
+        return vote
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/07-storage-and-transactions/08-two-phase-commit/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The six scenarios print as in Java, with the Python list syntax for the in-doubt sets:
+
+```console
+== 1. Happy path: 150.00 USD alice@bank-a -> bob@bank-b ==
+  tx-1 -> COMMIT
+  bank-a: alice=350.00 USD locked=false | bank-b: bob=250.00 USD locked=false | total=600.00 USD
+  coordinator log: [tx-1 BEGIN bank-a,bank-b, tx-1 DECISION COMMIT, tx-1 END]
+
+== 4. Coordinator dies after both YES votes, before logging the decision ==
+  coordinator: crash at after votes, before decision log
+  bank-a in doubt: ['tx-4'], bank-b in doubt: ['tx-4']
+  bank-a: alice=350.00 USD locked=true | bank-b: bob=250.00 USD locked=true | total=600.00 USD
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes three things. **A crash is an error value:** `Run` returns `(Outcome, error)` and the only error it returns wraps `ErrCrash`, tested with `errors.Is`; a protocol violation inside a participant (commit from `NONE`) is returned as `ErrIllegalState`, while an unknown log record on recovery is a `panic`, because it is a bug, not a condition the caller can handle. **Map iteration is random,** so `Run` takes an explicit `order []string` in addition to the postings map, and `PendingTransactions` and `InDoubt` sort their output; without this the `BEGIN` record, the message count, and the test expectations would vary run to run, which is precisely what a deterministic simulation must not do. **Prepare returns `(Vote, bool)`:** the `ok` flag is the Go idiom for "the answer may be absent", mirroring `Optional` and `None`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The durable log and the crash
+
+`CrashPoint` is an `iota` enum (`NoCrash` rather than `NONE`, which would collide with nothing but reads oddly in Go). `DurableLog.Records` returns a copy of the slice, and the two sentinels replace the Java exception classes.
+
 ```go
-func (c *Coordinator) Run(txID string, order []string, postings map[string]Posting) (Outcome, error) {
-    ...
-    if c.CrashPoint == AfterVotesBeforeDecisionLog {
-        return Outcome{}, fmt.Errorf("%w at after votes, before decision log", ErrCrash)
-    }
+type CrashPoint int
+
+const (
+	NoCrash CrashPoint = iota
+	AfterVotesBeforeDecisionLog
+	AfterDecisionLogBeforeSend
+)
+
+type Posting struct {
+	Account string
+	Delta   Money
+}
+
+type LogRecord struct {
+	TxID, Kind, Detail string
+}
+
+type DurableLog struct{ records []LogRecord }
+
+func (l *DurableLog) Append(txID, kind, detail string) {
+	l.records = append(l.records, LogRecord{txID, kind, detail})
+}
+func (l *DurableLog) Records() []LogRecord { return append([]LogRecord(nil), l.records...) }
+
+// ErrCrash is returned by an injected crash point, where the real process would die.
+var ErrCrash = errors.New("crash")
+
+// ErrIllegalState is returned when a participant is asked for a transition its state forbids.
+var ErrIllegalState = errors.New("illegal state")
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The participant votes
 
-- **A crash is an error value.** `Run` returns `(Outcome, error)` and the only error it returns wraps `ErrCrash`, tested with `errors.Is`. A protocol violation inside a participant (commit from `NONE`) is a `panic`, because it is a bug in the coordinator, not a condition the caller can handle.
-- **Map iteration is random**, so `Run` takes an explicit `order []string` in addition to the postings map, and `PendingTransactions` and `InDoubt` sort their output. Without this the `BEGIN` record, the message count, and the test expectations would vary run to run, which is precisely what a deterministic simulation must not do.
-- **Prepare returns `(Vote, bool)`.** The `ok` flag is the Go idiom for "the answer may be absent", mirroring `Optional` and `None`.
+`states` is a map whose zero value is the `None` state, so the two-value read distinguishes "never seen" from any decided state. `mustPlus` panics on a currency mismatch, which cannot happen inside one ledger. The lock map, the prepared map, the state, and the log record are written in the Java order.
+
+```go
+func (l *Ledger) Prepare(txID string, p Posting) Vote {
+	if l.states[txID] == StatePrepared {
+		return VoteYes // duplicate prepare: same answer
+	}
+	if _, decided := l.states[txID]; decided {
+		return VoteNo // already decided: too late
+	}
+	current, ok := l.balances[p.Account]
+	if !ok || l.locked[p.Account] {
+		why := "account locked"
+		if !ok {
+			why = "unknown account"
+		}
+		l.log.Append(txID, "ABORTED", "vote NO: "+why)
+		l.states[txID] = StateAborted
+		return VoteNo
+	}
+	if mustPlus(current, p.Delta).IsNegative() {
+		l.log.Append(txID, "ABORTED", "vote NO: insufficient funds in "+p.Account)
+		l.states[txID] = StateAborted
+		return VoteNo
+	}
+	l.locked[p.Account] = true
+	l.prepared[txID] = p
+	l.states[txID] = StatePrepared
+	l.log.Append(txID, "PREPARED", p.Account+" "+p.Delta.String())
+	return VoteYes
+}
+```
+
+#### Step 3: The participant applies the decision, idempotently
+
+Both methods return `error`. `Commit` uses a `switch` with an empty `StatePrepared` arm to fall through to the body and a `default` that returns `ErrIllegalState`; `Abort` returns nil from `StateAborted`, an error from `StateCommitted`, and otherwise releases whatever lock the two-value read finds.
+
+```go
+func (l *Ledger) Commit(txID string) error {
+	switch l.StateOf(txID) {
+	case StateCommitted:
+		return nil
+	case StatePrepared:
+	default:
+		return fmt.Errorf("%w: %s: commit of %s in state %v", ErrIllegalState, l.Name, txID, l.StateOf(txID))
+	}
+	p := l.prepared[txID]
+	delete(l.prepared, txID)
+	l.balances[p.Account] = mustPlus(l.balances[p.Account], p.Delta)
+	delete(l.locked, p.Account)
+	l.states[txID] = StateCommitted
+	l.log.Append(txID, "COMMITTED", "")
+	return nil
+}
+
+func (l *Ledger) Abort(txID string) error {
+	switch l.StateOf(txID) {
+	case StateAborted:
+		return nil
+	case StateCommitted:
+		return fmt.Errorf("%w: %s: cannot abort committed %s", ErrIllegalState, l.Name, txID)
+	}
+	if p, ok := l.prepared[txID]; ok {
+		delete(l.prepared, txID)
+		delete(l.locked, p.Account)
+	}
+	l.states[txID] = StateAborted
+	l.log.Append(txID, "ABORTED", "")
+	return nil
+}
+```
+
+#### Step 4: Participant recovery from its own log
+
+Because `pending` is a map, the port also keeps an `order` slice of `PREPARED` transaction ids so the in-doubt locks are re-taken in log order. An unknown record kind panics.
+
+```go
+func (l *Ledger) CrashAndRecover() *Ledger {
+	fresh := newLedger(l.Name, l.initial, l.log)
+	pending := map[string]Posting{}
+	order := []string{}
+	for _, r := range l.log.Records() {
+		switch r.Kind {
+		case "PREPARED":
+			parts := strings.Split(r.Detail, " ")
+			pending[r.TxID] = Posting{parts[0], parseMoney(parts[1], parts[2])}
+			order = append(order, r.TxID)
+			fresh.states[r.TxID] = StatePrepared
+		case "COMMITTED":
+			p := pending[r.TxID]
+			delete(pending, r.TxID)
+			fresh.balances[p.Account] = mustPlus(fresh.balances[p.Account], p.Delta)
+			fresh.states[r.TxID] = StateCommitted
+		case "ABORTED":
+			delete(pending, r.TxID)
+			fresh.states[r.TxID] = StateAborted
+		default:
+			panic("unknown record " + r.String())
+		}
+	}
+	for _, id := range order {
+		if p, ok := pending[id]; ok {
+			fresh.prepared[id] = p
+			fresh.locked[p.Account] = true
+		}
+	}
+	return fresh
+}
+```
+
+#### Step 5: The coordinator's commit point
+
+`Run` takes the participant `order` explicitly and records it in `BEGIN`. Each crash point returns a wrapped `ErrCrash` instead of throwing, and the unacked set is a `map[string]bool` built from the order.
+
+```go
+func (c *Coordinator) Run(txID string, order []string, postings map[string]Posting) (Outcome, error) {
+	c.participants[txID] = order
+	c.postings[txID] = postings
+	c.log.Append(txID, "BEGIN", strings.Join(order, ","))
+
+	// Phase 1: collect votes. Any NO or any timeout means ABORT.
+	decision, reason := Commit, "all voted YES"
+	for _, node := range order {
+		vote, ok := c.net.Prepare(node, txID, postings[node])
+		if !ok {
+			decision, reason = Abort, node+" timed out in prepare"
+			break
+		}
+		if vote == VoteNo {
+			decision, reason = Abort, node+" voted NO"
+			break
+		}
+	}
+
+	if c.CrashPoint == AfterVotesBeforeDecisionLog {
+		return Outcome{}, fmt.Errorf("%w at after votes, before decision log", ErrCrash)
+	}
+
+	// The commit point. Before this append the outcome is undecided; after it, it is fixed forever.
+	c.log.Append(txID, "DECISION", decision.String())
+	c.decisions[txID] = decision
+	waiting := map[string]bool{}
+	for _, node := range order {
+		waiting[node] = true
+	}
+	c.unacked[txID] = waiting
+
+	if c.CrashPoint == AfterDecisionLogBeforeSend {
+		return Outcome{}, fmt.Errorf("%w at after decision log, before send", ErrCrash)
+	}
+
+	// Phase 2: deliver the decision until every participant acknowledges.
+	complete := c.Deliver(txID)
+	if !complete {
+		reason = fmt.Sprintf("%s; awaiting acks from %v", reason, sortedKeys(c.unacked[txID]))
+	}
+	return Outcome{txID, decision, complete, reason}, nil
+}
+```
+
+#### Step 6: Delivery, retry, and recovery from the coordinator log
+
+`Deliver` walks `sortedKeys(waiting)` so delivery order is stable and deletes acknowledged nodes from the map. `RecoverCoordinator` keeps a `begunOrder` slice beside the `begun` map so redelivery happens in `BEGIN` order; `parseDecision` replaces `Decision.valueOf`.
+
+```go
+func (c *Coordinator) Deliver(txID string) bool {
+	waiting, ok := c.unacked[txID]
+	if !ok {
+		return true
+	}
+	decision := c.decisions[txID]
+	for _, node := range sortedKeys(waiting) {
+		if c.net.Decide(node, txID, decision) {
+			delete(waiting, node)
+		}
+	}
+	if len(waiting) == 0 {
+		delete(c.unacked, txID)
+		c.log.Append(txID, "END", "")
+		return true
+	}
+	return false
+}
+
+func RecoverCoordinator(crashed *Coordinator, net *SimNetwork) *Coordinator {
+	fresh := NewCoordinator(net)
+	begun := map[string][]string{}
+	begunOrder := []string{}
+	ended := map[string]bool{}
+	for _, r := range crashed.log.Records() {
+		fresh.log.Append(r.TxID, r.Kind, r.Detail)
+		switch r.Kind {
+		case "BEGIN":
+			begun[r.TxID] = strings.Split(r.Detail, ",")
+			begunOrder = append(begunOrder, r.TxID)
+		case "DECISION":
+			fresh.decisions[r.TxID] = parseDecision(r.Detail)
+		case "END":
+			ended[r.TxID] = true
+		}
+	}
+	for _, txID := range begunOrder {
+		if ended[txID] {
+			continue
+		}
+		if _, decided := fresh.decisions[txID]; !decided {
+			fresh.log.Append(txID, "DECISION", Abort.String()) // presumed abort
+			fresh.decisions[txID] = Abort
+		}
+		waiting := map[string]bool{}
+		for _, node := range begun[txID] {
+			waiting[node] = true
+		}
+		fresh.unacked[txID] = waiting
+		fresh.Deliver(txID)
+	}
+	return fresh
+}
+```
+
+#### Step 7: The simulated network
+
+`reachable` is the Java method on maps instead of sets. `Prepare` uses named results and returns `(VoteNo, false)` on timeout; the `false` is what the coordinator reads, the vote value is irrelevant.
+
+```go
+func (n *SimNetwork) reachable(node string) bool {
+	n.MessagesSent++
+	if n.partitioned[node] {
+		n.clock.Advance(n.TimeoutMs)
+		n.Timeouts++
+		return false
+	}
+	n.clock.Advance(n.LatencyMs)
+	return true
+}
+
+func (n *SimNetwork) Prepare(node, txID string, p Posting) (vote Vote, ok bool) {
+	if !n.reachable(node) {
+		return VoteNo, false
+	}
+	vote = n.nodes[node].Prepare(txID, p)
+	if n.crashAfterVote[node] {
+		delete(n.crashAfterVote, node)
+		n.partitioned[node] = true
+	}
+	return vote, true
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/07-storage-and-transactions/08-two-phase-commit/code/go
+go run .
+go test ./...
+```
+
+```console
+== 5. Coordinator dies after logging COMMIT, before telling anyone ==
+  coordinator: crash at after decision log, before send
+  participants still PREPARED: PREPARED, PREPARED
+```
+
+The other five scenarios match the Java output, and `total=600.00 USD` holds in every one.
 
 ## Use It
 

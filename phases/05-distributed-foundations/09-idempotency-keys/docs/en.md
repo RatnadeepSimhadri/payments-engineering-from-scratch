@@ -296,47 +296,372 @@ The test file ends with the eight-thread test. Run it several times; the outcome
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **A tuple is the scoped key.** Python dictionaries hash tuples, so `(account_id, key)` replaces the `\u0000`-joined string and the collision argument becomes trivial. **`threading.Lock` is held for the whole of `begin`.** The GIL does not make `get` followed by `__setitem__` atomic; another thread can run between them. The lock is required for the same reason as in Java, and the eight-thread test proves it. **Exceptions are the crash signal.** The processor raises `ConnectionError`; the API catches `Exception`, abandons, and re-raises with a bare `raise` so the traceback is preserved. **`Money` rejects floats at construction** (`TypeError`), copied from Phase 10 Lesson 01, so `Money(19.99, USD)` cannot reach the fingerprint.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The request and its fingerprint
+
+A frozen dataclass with `__post_init__` as the compact constructor: a blank or over-long key and a non-positive amount both raise `ValueError`. `idempotency_key` is `str | None` because the header is optional. `canonical` hashes `minor_units` and the currency code, never a decimal string, and `description or ''` normalises `None` to empty exactly as the Java ternary does.
+
 ```python
-def begin(self, account_id: str, key: str, fingerprint: str) -> Begin:
-    with self._lock:
-        now = self.clock.now_ms()
-        k = (account_id, key)
-        e = self._entries.get(k)
-        ...
-        self._entries[k] = Entry(fingerprint, now)
-        return Begin(Outcome.NEW)
+@dataclass(frozen=True)
+class ChargeRequest:
+    account_id: str
+    idempotency_key: str | None
+    amount: Money
+    card_token: str
+    description: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.idempotency_key is not None and (not self.idempotency_key.strip() or len(self.idempotency_key) > 255):
+            raise ValueError("Idempotency-Key must be 1..255 characters")
+        if self.amount.minor_units <= 0:
+            raise ValueError("amount must be positive")
+
+    def canonical(self) -> str:
+        """Fixed field order, one field per line, so a reordered JSON body hashes the same."""
+        return (f"POST /v1/charges\n{self.amount.minor_units}\n{self.amount.currency.code}\n"
+                f"{self.card_token}\n{self.description or ''}")
+
+    def fingerprint(self) -> str:
+        return sha256_hex(self.canonical())
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The outcomes and the entry
 
-- **A tuple is the scoped key.** Python dictionaries hash tuples, so `(account_id, key)` replaces the `\u0000`-joined string and the collision argument becomes trivial.
-- **`threading.Lock` is held for the whole of `begin`.** The GIL does not make `get` followed by `__setitem__` atomic; another thread can run between them. The lock is required for the same reason as in Java, and the eight-thread test proves it.
-- **Exceptions are the crash signal.** The processor raises `ConnectionError`; the API catches `Exception`, abandons, and re-raises with a bare `raise` so the traceback is preserved.
-- **`Money` rejects floats at construction** (`TypeError`), copied from Phase 10 Lesson 01, so `Money(19.99, USD)` cannot reach the fingerprint.
+`Outcome` is an `Enum`; `Begin` a frozen dataclass whose `response` defaults to `None` for the three outcomes that have nothing to return. `Entry` is a mutable `__slots__` class because `complete` fills it in place; `response is None` is the in-progress marker.
+
+```python
+class Outcome(Enum):
+    NEW = "NEW"                  # no usable entry: execute, then complete() or abandon()
+    REPLAY = "REPLAY"            # completed entry, same fingerprint: return its response
+    IN_PROGRESS = "IN_PROGRESS"  # another request with this key is executing: 409
+    CONFLICT = "CONFLICT"        # same key, different fingerprint: 422
+
+
+@dataclass(frozen=True)
+class Begin:
+    outcome: Outcome
+    response: Response | None = None
+
+
+class Entry:
+    """One row of the store. IN_PROGRESS until complete() stores a response."""
+
+    __slots__ = ("fingerprint", "started_at_ms", "response", "expires_at_ms")
+
+    def __init__(self, fingerprint: str, started_at_ms: int) -> None:
+        self.fingerprint = fingerprint
+        self.started_at_ms = started_at_ms
+        self.response: Response | None = None
+        self.expires_at_ms = 0
+
+    def in_progress(self) -> bool:
+        return self.response is None
+```
+
+#### Step 3: The atomic check-and-reserve
+
+`with self._lock:` covers the whole method, so the `get` and the `__setitem__` cannot be separated by another thread. The check order is the Java order: expiry (TTL or dead lease) first, then fingerprint, then in-progress, then replay, then reserve. The tuple `(account_id, key)` is the scoped key.
+
+```python
+    def begin(self, account_id: str, key: str, fingerprint: str) -> Begin:
+        with self._lock:
+            now = self.clock.now_ms()
+            k = (account_id, key)
+            e = self._entries.get(k)
+            if e is not None:
+                if not e.in_progress() and now >= e.expires_at_ms:
+                    del self._entries[k]                                    # TTL passed: forget it
+                    e = None
+                elif e.in_progress() and now - e.started_at_ms >= self.in_progress_lease_ms:
+                    del self._entries[k]                                    # first attempt died: let a retry take over
+                    e = None
+            if e is not None:
+                if e.fingerprint != fingerprint:
+                    return Begin(Outcome.CONFLICT)
+                if e.in_progress():
+                    return Begin(Outcome.IN_PROGRESS)
+                assert e.response is not None
+                return Begin(Outcome.REPLAY, e.response.as_replay())
+            self._entries[k] = Entry(fingerprint, now)
+            return Begin(Outcome.NEW)
+```
+
+#### Step 4: Completing and abandoning
+
+`complete` raises `RuntimeError` (the Java `IllegalStateException`) without a live reservation and starts the TTL at completion. `abandon` is forgiving because it runs from an exception handler.
+
+```python
+    def complete(self, account_id: str, key: str, response: Response) -> None:
+        """Store the handler's response, whatever its status, and start the TTL."""
+        with self._lock:
+            e = self._entries.get((account_id, key))
+            if e is None or not e.in_progress():
+                raise RuntimeError(f"complete without a live reservation: {key}")
+            e.response = response
+            e.expires_at_ms = self.clock.now_ms() + self.ttl_ms
+
+    def abandon(self, account_id: str, key: str) -> None:
+        """The handler crashed before producing a response: release the reservation so a retry can execute."""
+        with self._lock:
+            e = self._entries.get((account_id, key))
+            if e is not None and e.in_progress():
+                del self._entries[(account_id, key)]
+```
+
+#### Step 5: The endpoint
+
+The three early returns come before the processor is touched; only `NEW` falls through. `except Exception: abandon; raise` is the crash branch, and the bare `raise` keeps the original traceback. A `402` or `502` is a response, so it is completed and will replay.
+
+```python
+    def charge(self, request: ChargeRequest) -> Response:
+        if request.idempotency_key is None:
+            return self.processor.charge(request)
+        key = request.idempotency_key
+        b = self.store.begin(request.account_id, key, request.fingerprint())
+        if b.outcome is Outcome.REPLAY:
+            assert b.response is not None
+            return b.response
+        if b.outcome is Outcome.IN_PROGRESS:
+            return Response(409, '{"error":"idempotency_key_in_progress"}')
+        if b.outcome is Outcome.CONFLICT:
+            return Response(422, '{"error":"idempotency_key_reused_with_different_request"}')
+        try:
+            response = self.processor.charge(request)
+        except Exception:
+            self.store.abandon(request.account_id, key)
+            raise
+        self.store.complete(request.account_id, key, response)
+        return response
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/05-distributed-foundations/09-idempotency-keys/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+Identical to the Java output, including the fingerprint prefix (SHA-256 over the same canonical bytes):
+
+```console
+== With a key: the retry replays the stored response ==
+fingerprint = 795fe63bfb540da3...
+first:  200 {"id":"ch_3","amount":"19.99 USD","status":"succeeded"} replayed=false
+retry:  200 {"id":"ch_3","amount":"19.99 USD","status":"succeeded"} replayed=true
+processor executions so far: 3 (the keyed pair added exactly one)
+
+== Same key, different amount: 422, nothing executes ==
+conflict: 422 {"error":"idempotency_key_reused_with_different_request"}
+
+== Concurrent duplicates: one wins, the other sees 409 until it is done ==
+request A begin -> NEW ; request B begin -> IN_PROGRESS
+A completes; B retries -> REPLAY with body {"id":"ch_9001"}
+
+== A crash mid-execution releases the reservation; the retry executes ==
+first attempt: processor connection reset
+retry: 200, executions for this key: 2 (the hazard: did the first attempt move money?)
+
+== TTL: after 24 h the key is forgotten and a retry executes again ==
+purged 4 expired entries; entries now: 0
+same request after TTL: 200 replayed=false -> a new charge {"id":"ch_7","amount":"19.99 USD","status":"succeeded"}
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with four differences. **The crash is an error value, not a panic.** `Processor.Charge` returns `(Response, error)`; a non-nil error means no response was produced and the reservation is abandoned. The sentinel errors `ErrProcessorCrash`, `ErrNoReservation`, and `ErrInvalidRequest` support `errors.Is`. **An optional key is a `*string`.** Go has no `null` for strings; `nil` means the header was absent and `""` is rejected by validation like any blank key. **A struct is the scoped key.** `scopedKey{account, key}` is comparable and so usable as a map key, like the Python tuple. **The concurrency test uses channels.** The eight goroutines report on a buffered channel; the test drains seven results before closing the `release` channel that unblocks the winner, then checks the eighth. `go test -race ./...` passes because every shared counter is behind a mutex.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The request and its fingerprint
+
+Validation lives in `NewChargeRequest`, which returns `ErrInvalidRequest` where the Java compact constructor throws; `IdempotencyKey` is a `*string` so absence is `nil`. `Canonical` is one `Sprintf` with the same fixed order, and `Description` is a plain string whose zero value is already the empty line.
+
 ```go
-func (a *PaymentsApi) Charge(request ChargeRequest) (Response, error) {
-    ...
-    response, err := a.Processor.Charge(request)
-    if err != nil {
-        a.Store.Abandon(request.AccountID, key)
-        return Response{}, err
-    }
-    if err := a.Store.Complete(request.AccountID, key, response); err != nil {
-        return Response{}, err
-    }
-    return response, nil
+type ChargeRequest struct {
+	AccountID      string
+	IdempotencyKey *string
+	Amount         Money
+	CardToken      string
+	Description    string
+}
+
+func NewChargeRequest(accountID string, idempotencyKey *string, amount Money, cardToken, description string) (ChargeRequest, error) {
+	if idempotencyKey != nil && (strings.TrimSpace(*idempotencyKey) == "" || len(*idempotencyKey) > 255) {
+		return ChargeRequest{}, fmt.Errorf("%w: Idempotency-Key must be 1..255 characters", ErrInvalidRequest)
+	}
+	if amount.MinorUnits <= 0 {
+		return ChargeRequest{}, fmt.Errorf("%w: amount must be positive", ErrInvalidRequest)
+	}
+	return ChargeRequest{accountID, idempotencyKey, amount, cardToken, description}, nil
+}
+
+// Canonical is the fixed-order, one-field-per-line form, so a reordered JSON body hashes the same.
+func (r ChargeRequest) Canonical() string {
+	return fmt.Sprintf("POST /v1/charges\n%d\n%s\n%s\n%s", r.Amount.MinorUnits, r.Amount.Currency.Code, r.CardToken, r.Description)
+}
+
+func (r ChargeRequest) Fingerprint() string { return Sha256Hex(r.Canonical()) }
+```
+
+#### Step 2: The outcomes and the entry
+
+`Outcome` is an `int` with `iota` constants and a `String` method. `Begin.Response` is a `*Response`, nil except for `Replay`; `entry.response` is likewise a pointer so `nil` can mean in progress. `scopedKey` is a two-string struct, comparable and therefore a valid map key.
+
+```go
+type Outcome int
+
+const (
+	New        Outcome = iota // no usable entry: execute, then Complete() or Abandon()
+	Replay                    // completed entry, same fingerprint: return its response
+	InProgress                // another request with this key is executing: 409
+	Conflict                  // same key, different fingerprint: 422
+)
+
+type Begin struct {
+	Outcome  Outcome
+	Response *Response // set only for Replay
+}
+
+// entry is one row of the store. It is in progress until Complete stores a response.
+type entry struct {
+	fingerprint string
+	startedAtMs int64
+	response    *Response
+	expiresAtMs int64
+}
+
+func (e *entry) inProgress() bool { return e.response == nil }
+
+type scopedKey struct{ account, key string }
+```
+
+#### Step 3: The atomic check-and-reserve
+
+`defer s.mu.Unlock()` holds the mutex for the whole function, so the map read and write are one critical section. A missing key reads as `nil` from the map, and the check order is unchanged.
+
+```go
+func (s *IdempotencyStore) Begin(accountID, key, fingerprint string) Begin {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.NowMs()
+	k := scopedKey{accountID, key}
+	e := s.entries[k]
+	if e != nil {
+		if !e.inProgress() && now >= e.expiresAtMs {
+			delete(s.entries, k) // TTL passed: forget it
+			e = nil
+		} else if e.inProgress() && now-e.startedAtMs >= s.inProgressLeaseMs {
+			delete(s.entries, k) // the first attempt died: let a retry take over
+			e = nil
+		}
+	}
+	if e != nil {
+		if e.fingerprint != fingerprint {
+			return Begin{Outcome: Conflict}
+		}
+		if e.inProgress() {
+			return Begin{Outcome: InProgress}
+		}
+		r := e.response.AsReplay()
+		return Begin{Outcome: Replay, Response: &r}
+	}
+	s.entries[k] = &entry{fingerprint: fingerprint, startedAtMs: now}
+	return Begin{Outcome: New}
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 4: Completing and abandoning
 
-- **The crash is an error value, not a panic.** `Processor.Charge` returns `(Response, error)`; a non-nil error means no response was produced and the reservation is abandoned. The sentinel errors `ErrProcessorCrash`, `ErrNoReservation`, and `ErrInvalidRequest` support `errors.Is`.
-- **An optional key is a `*string`.** Go has no `null` for strings; `nil` means the header was absent and `""` is rejected by validation like any blank key.
-- **A struct is the scoped key.** `scopedKey{account, key}` is comparable and so usable as a map key, like the Python tuple.
-- **The concurrency test uses channels.** The eight goroutines report on a buffered channel; the test drains seven results before closing the `release` channel that unblocks the winner, then checks the eighth. `go test -race ./...` passes because every shared counter is behind a mutex.
+`Complete` returns `ErrNoReservation` wrapped with the key instead of throwing; it copies the response into a fresh value before taking its address so the entry does not alias the caller's variable. `Abandon` stays silent.
+
+```go
+func (s *IdempotencyStore) Complete(accountID, key string, response Response) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.entries[scopedKey{accountID, key}]
+	if e == nil || !e.inProgress() {
+		return fmt.Errorf("%w: %s", ErrNoReservation, key)
+	}
+	r := response
+	e.response = &r
+	e.expiresAtMs = s.clock.NowMs() + s.ttlMs
+	return nil
+}
+
+// Abandon releases a reservation whose handler crashed before producing a response, so a retry can execute.
+func (s *IdempotencyStore) Abandon(accountID, key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := scopedKey{accountID, key}
+	if e := s.entries[k]; e != nil && e.inProgress() {
+		delete(s.entries, k)
+	}
+}
+```
+
+#### Step 5: The endpoint
+
+The `switch` returns for three outcomes and falls out for `New`. A non-nil error from the processor is the crash: abandon and return the error. A successful `Charge` yields a response regardless of its HTTP status, which is completed and stored.
+
+```go
+func (a *PaymentsApi) Charge(request ChargeRequest) (Response, error) {
+	if request.IdempotencyKey == nil {
+		return a.Processor.Charge(request)
+	}
+	key := *request.IdempotencyKey
+	b := a.Store.Begin(request.AccountID, key, request.Fingerprint())
+	switch b.Outcome {
+	case Replay:
+		return *b.Response, nil
+	case InProgress:
+		return Response{409, `{"error":"idempotency_key_in_progress"}`, false}, nil
+	case Conflict:
+		return Response{422, `{"error":"idempotency_key_reused_with_different_request"}`, false}, nil
+	}
+	response, err := a.Processor.Charge(request)
+	if err != nil {
+		a.Store.Abandon(request.AccountID, key)
+		return Response{}, err
+	}
+	if err := a.Store.Complete(request.AccountID, key, response); err != nil {
+		return Response{}, err
+	}
+	return response, nil
+}
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/05-distributed-foundations/09-idempotency-keys/code/go
+go run .
+go test -race ./...
+```
+
+`diff <(go run .) <(python3 ../python/main.py)` is empty: the Go output is identical to the Java and Python runs.
+
+```console
+== With a key: the retry replays the stored response ==
+fingerprint = 795fe63bfb540da3...
+first:  200 {"id":"ch_3","amount":"19.99 USD","status":"succeeded"} replayed=false
+retry:  200 {"id":"ch_3","amount":"19.99 USD","status":"succeeded"} replayed=true
+processor executions so far: 3 (the keyed pair added exactly one)
+
+== Concurrent duplicates: one wins, the other sees 409 until it is done ==
+request A begin -> NEW ; request B begin -> IN_PROGRESS
+A completes; B retries -> REPLAY with body {"id":"ch_9001"}
+
+== Declines are responses too: they replay ==
+first 402, retry 402 replayed=true, executions for this key: 1
+
+== A crash mid-execution releases the reservation; the retry executes ==
+first attempt: processor connection reset
+retry: 200, executions for this key: 2 (the hazard: did the first attempt move money?)
+```
 
 ## Use It
 

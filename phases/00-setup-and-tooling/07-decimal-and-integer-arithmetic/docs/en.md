@@ -302,54 +302,418 @@ The Python and Go programs print the same sections with the same numbers, down t
 
 ### In Python
 
-```python
-def checked_add(a: int, b: int) -> int:
-    return _require_int64(a + b, f"{a} + {b}")      # Python never wraps; the check is against the int64 range
+The Python port (`code/python/main.py`) is the same design with five differences. **No overflow to detect, so the check is a range check:** `checked_add` computes the exact result and raises `OverflowError` if it would not fit in an `int64`. The test `INT64_MAX + 1 == 2**63` records the language's behaviour; the test that `checked_add(INT64_MAX, 1)` raises records the design's. **`wrapping_add` is an emulation**, masking to 64 bits and reinterpreting the sign, so the three demos can print the same wrapped number side by side. **`sum()` compensates since Python 3.12:** `sum([0.1] * 10)` is `1.0` and `math.fsum` always was, so the lesson's loop deliberately uses neither; a test (`test_python_sum_hides_the_error_since_3_12`) asserts `math.fsum([0.1] * 10) == 1.0`, so a reader who wonders why the loop exists finds the answer in the suite. **`//` floors; Java and Go truncate:** `-129 // 10` is `-13` in Python and `-12` in the others, so `divide_rounded` works on magnitudes and reapplies the sign; the test asserts both the function's answer and the raw `//` answer so the difference is on record. **`Fixed2` rejects floats at construction** (`Fixed2(19.99)` raises `TypeError`, with `bool` excluded because `True` is an `int`), and `from_double` goes through `repr`, which is the shortest round-trip string, then `Decimal` for a plain (non-exponent) format, then `parse`.
 
-def wrapping_add(a: int, b: int) -> int:
-    u = (a + b) & _MASK64                            # emulate what Java and Go do, for the demo
-    return u - (1 << 64) if u > INT64_MAX else u
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Make the float failures reproducible
+
+Three module-level functions instead of a static class. `naive_cents` uses `int()`, which truncates toward zero exactly like the Java cast, so `int(19.99 * 100)` is `1998`. `sum_repeated` is an explicit loop on purpose: `sum()` over floats has used compensated summation since 3.12 and would print `1.0`, hiding the bug the tests pin.
+
+```python
+def add_floats(a: float, b: float) -> float:
+    return a + b
+
+
+def naive_cents(amount: float) -> int:
+    """The penny-skimming bug: int(19.99 * 100) is 1998 because 19.99 * 100 is really 1998.9999999999998."""
+    return int(amount * 100)
+
 
 def sum_repeated(term: float, times: int) -> float:
     acc = 0.0
-    for _ in range(times):                           # not sum(): since 3.12 sum() compensates and hides the error
+    for _ in range(times):
         acc += term
     return acc
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: Checked arithmetic by hand
 
-- **No overflow to detect, so the check is a range check.** `checked_add` computes the exact result and raises `OverflowError` if it would not fit in an `int64`. The test `INT64_MAX + 1 == 2**63` records the language's behaviour; the test that `checked_add(INT64_MAX, 1)` raises records the design's.
-- **`wrapping_add` is an emulation**, masking to 64 bits and reinterpreting the sign, so the three demos can print the same wrapped number side by side.
-- **`sum()` compensates since Python 3.12.** `sum([0.1] * 10)` is `1.0` and `math.fsum` always was. The lesson's loop deliberately does not use either. There is a test (`test_python_sum_hides_the_error_since_3_12`) that asserts `math.fsum([0.1] * 10) == 1.0`, so a reader who wonders why the loop exists finds the answer in the suite.
-- **`//` floors; Java and Go truncate.** `-129 // 10` is `-13` in Python, `-12` in the others. `divide_rounded` works on magnitudes and reapplies the sign so the three agree on every negative input; the test asserts both the function's answer and the raw `//` answer so the difference is on record.
-- **`Fixed2` rejects floats at construction** (`Fixed2(19.99)` raises `TypeError`, with `bool` excluded because `True` is an `int`), and `from_double` goes through `repr`, which is the shortest round-trip string, then `Decimal` for a plain (non-exponent) format, then `parse`.
+Python has nothing to check at the hardware level, so `_require_int64` compares the exact result against the `int64` range and raises `OverflowError`. That makes the four checked functions one line each, and it makes a Python service that writes to a `BIGINT` column fail at the arithmetic rather than at the database. `wrapping_add` reproduces what Java and Go do with plain `+` by masking and reinterpreting the sign bit.
+
+```python
+INT64_MIN = -(1 << 63)
+INT64_MAX = (1 << 63) - 1
+_MASK64 = (1 << 64) - 1
+
+
+def _require_int64(value: int, what: str) -> int:
+    if value < INT64_MIN or value > INT64_MAX:
+        raise OverflowError(f"int64 overflow: {what}")
+    return value
+
+
+def checked_add(a: int, b: int) -> int:
+    return _require_int64(a + b, f"{a} + {b}")
+
+
+def checked_sub(a: int, b: int) -> int:
+    return _require_int64(a - b, f"{a} - {b}")
+
+
+def checked_mul(a: int, b: int) -> int:
+    return _require_int64(a * b, f"{a} * {b}")
+
+
+def checked_negate(a: int) -> int:
+    return _require_int64(-a, f"-({a})")
+
+
+def wrapping_add(a: int, b: int) -> int:
+    """What Java and Go do with plain +: two's-complement wrap. Emulated here so the three demos print the same."""
+    u = (a + b) & _MASK64
+    return u - (1 << 64) if u > INT64_MAX else u
+```
+
+#### Step 3: Division that rounds the way you say
+
+Because `//` floors toward negative infinity, the function never divides a signed value: it computes the sign, runs `divmod` on magnitudes, applies the rule, and reapplies the sign. `DOWN` needs no branch because the magnitude quotient is already truncated. `rounding_bias` is a generator expression over the hundred exact ties; `sum()` is fine here because the terms are ints.
+
+```python
+def divide_rounded(dividend: int, divisor: int, rounding: Rounding) -> int:
+    if divisor == 0:
+        raise ZeroDivisionError("division by zero")
+    sign = -1 if (dividend < 0) != (divisor < 0) else 1
+    quotient, remainder = divmod(abs(dividend), abs(divisor))
+    if remainder == 0:
+        return sign * quotient
+    twice = remainder * 2
+    abs_divisor = abs(divisor)
+    if rounding is Rounding.UP:
+        quotient += 1
+    elif rounding is Rounding.HALF_UP:
+        if twice >= abs_divisor:
+            quotient += 1
+    elif rounding is Rounding.HALF_EVEN:
+        if twice > abs_divisor or (twice == abs_divisor and quotient % 2 == 1):
+            quotient += 1
+    return sign * quotient
+
+
+def rounding_bias(rounding: Rounding) -> int:
+    total = sum(divide_rounded(tenths, 10, rounding) for tenths in range(5, 1000, 10))
+    return total - 5000
+```
+
+#### Step 4: `Fixed2`
+
+`Fixed2` is a frozen, ordered dataclass; `__post_init__` rejects anything that is not an `int` and anything outside the `int64` range, so the type behaves like its Java and Go twins even though Python would keep going. `parse` splits with `str.partition`, validates with `isdigit`, pads with `ljust`, and raises `ArithmeticError` for a third decimal. `from_double` takes `repr(value)` (the shortest round-trip string), formats it through `Decimal` so there is never an exponent, and hands the result to `parse`.
+
+```python
+    @staticmethod
+    def parse(text: str) -> "Fixed2":
+        """Parse "19.99", "-0.5", "7" exactly. More than two decimals is an error, not a rounding."""
+        s = text.strip()
+        negative = s.startswith("-")
+        if negative or s.startswith("+"):
+            s = s[1:]
+        if not s:
+            raise ValueError("empty amount")
+        whole, _, frac = s.partition(".")
+        whole = whole or "0"
+        if not whole.isdigit() or (frac and not frac.isdigit()):
+            raise ValueError(f"not a decimal: {text!r}")
+        if len(frac) > 2:
+            raise ArithmeticError(f"{text} has more than two decimals")
+        value = checked_add(checked_mul(int(whole), 100), int(frac.ljust(2, "0")))
+        return Fixed2(-value if negative else value)
+
+    @staticmethod
+    def from_double(value: float) -> "Fixed2":
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ArithmeticError(f"not finite: {value}")
+        return Fixed2.parse(format(Decimal(repr(value)), "f"))  # repr is the shortest string that round-trips
+```
+
+The three multiplying methods carry `Rounding` in their signatures, as in Java; `plus`, `minus`, and `negate` delegate to the checked functions and are not shown.
+
+```python
+    def times(self, other: "Fixed2", rounding: Rounding) -> "Fixed2":
+        """Multiply two Fixed2 values: the product has four decimals, so two must be rounded away, your way."""
+        product = checked_mul(self.hundredths, other.hundredths)  # scaled by 10^4
+        return Fixed2(divide_rounded(product, 100, rounding))
+
+    def times_rate(self, numerator: int, denominator: int, rounding: Rounding) -> "Fixed2":
+        """Multiply by an exact rational: 2.9% is 29/1000, an FX rate of 0.9217 is 9217/10000."""
+        if denominator <= 0:
+            raise ArithmeticError("denominator must be positive")
+        return Fixed2(divide_rounded(checked_mul(self.hundredths, numerator), denominator, rounding))
+
+    def divided_by(self, divisor: int, rounding: Rounding) -> "Fixed2":
+        return Fixed2(divide_rounded(self.hundredths, divisor, rounding))
+```
+
+#### Step 5: Run it
+
+```bash
+cd phases/00-setup-and-tooling/07-decimal-and-integer-arithmetic/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== 0.1 + 0.2 ==
+0.1 + 0.2 = 0.30000000000000004  (equals 0.3? false)
+int(19.99 * 100) = 1998  <- the penny-skimming bug (19.99 * 100 = 1998.9999999999998)
+Fixed2.from_double(19.99) = 19.99  (via the shortest decimal string "19.99")
+
+== Accumulation ==
+0.1 added 10 times as float = 0.9999999999999999
+0.01 added 1,000,000 times as float = 10000.0000001719 (error 1.719e-07)
+0.01 added 1,000,000 times as Fixed2 = 10000.00 exactly
+
+== Overflow ==
+2**63 - 1 + 1 with plain + = 9223372036854775808  (Python ints do not wrap)
+the same in Java/Go, emulated: wrapping_add = -9223372036854775808  (wrapped to INT64_MIN)
+checked_add(INT64_MAX, 1) -> OverflowError: int64 overflow: 9223372036854775807 + 1
+
+== Decimal types in the standard library ==
+Decimal('0.1') + Decimal('0.2') = 0.3
+Decimal(0.1)  (from a float)    = 0.1000000000000000055511151231257827021181583404541015625
+```
+
+The float and `Fixed2` sections match Java digit for digit. The overflow section is the one that differs: `2**63` is a legal Python integer, and only the design's range check turns it into an error.
 
 ### In Go
 
-```go
-func CheckedMul(a, b int64) (int64, error) {
-    r := a * b
-    if a != 0 && (r/a != b || (a == -1 && b == math.MinInt64)) {
-        return 0, fmt.Errorf("%w: %d * %d", ErrOverflow, a, b)
-    }
-    return r, nil
-}
+The Go port (`code/go/main.go`) keeps the design with four differences. **Errors are values:** every checked operation returns `(int64, error)`, `Fixed2` methods return `(Fixed2, error)`, and the sentinels `ErrOverflow` and `ErrTooManyDecimals` support `errors.Is`. The demo uses a small `must` helper to keep the output readable; production code would not. **No `Math.multiplyExact` to compare against**, so the hand-written checks are the only checks; the Java test that compares `Checked` with `Math.*Exact` has no Go counterpart. **Constant folding:** `0.1 + 0.2` as a constant expression is evaluated exactly by the compiler and prints `0.3`; `AddFloats(a, b)` with variables is the run-time addition, and the test stores the operands in variables for the same reason. **No decimal type in the standard library.** The closest thing is `math/big.Rat`, an exact rational: `Rat("0.1") + Rat("0.2")` is `3/10`, and `new(big.Rat).SetFloat64(0.1)` is `3602879701896397/36028797018963968`, which is the binary value written as a fraction. Go payment services use `int64` minor units and bring in a decimal library only at the JSON boundary.
 
-func FromDouble(value float64) (Fixed2, error) {
-    if math.IsNaN(value) || math.IsInf(value, 0) {
-        return Fixed2{}, fmt.Errorf("not finite: %v", value)
-    }
-    return Parse(strconv.FormatFloat(value, 'f', -1, 64))   // precision -1: shortest round-trip
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Make the float failures reproducible
+
+The same three functions. `AddFloats` exists precisely so the addition happens at run time on variables; written inline with literals, the compiler folds `0.1 + 0.2` to exactly `0.3` and the demonstration vanishes. `int64(amount * 100)` truncates toward zero like the Java cast.
+
+```go
+// AddFloats adds at run time. A constant expression 0.1 + 0.2 would be folded exactly by the compiler and print 0.3.
+func AddFloats(a, b float64) float64 { return a + b }
+
+// NaiveCents is the penny-skimming bug: int64(19.99 * 100) is 1998 because 19.99 * 100 is really 1998.9999999999998.
+func NaiveCents(amount float64) int64 { return int64(amount * 100) }
+
+// SumRepeated adds term to 0.0 `times` times. Each addition rounds; the errors do not cancel.
+func SumRepeated(term float64, times int) float64 {
+	acc := 0.0
+	for i := 0; i < times; i++ {
+		acc += term
+	}
+	return acc
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: Checked arithmetic by hand
 
-- **Errors are values.** Every checked operation returns `(int64, error)`, `Fixed2` methods return `(Fixed2, error)`, and the sentinels `ErrOverflow` and `ErrTooManyDecimals` support `errors.Is`. The demo uses a small `must` helper to keep the output readable; production code would not.
-- **No `Math.multiplyExact` to compare against**, so the hand-written checks are the only checks; the Java test that compares `Checked` with `Math.*Exact` has no Go counterpart.
-- **Constant folding.** `0.1 + 0.2` as a constant expression is evaluated exactly by the compiler and prints `0.3`. `AddFloats(a, b)` with variables is the run-time addition. The test stores the operands in variables for the same reason.
-- **No decimal type in the standard library.** The closest thing is `math/big.Rat`, an exact rational: `Rat("0.1") + Rat("0.2")` is `3/10`, and `new(big.Rat).SetFloat64(0.1)` is `3602879701896397/36028797018963968`, which is the binary value written as a fraction. Go payment services use `int64` minor units and bring in a decimal library only at the JSON boundary.
+Go's `int64` wraps silently and there is no `addExact`, so these four functions are the only overflow checks the program has. The XOR sign tests and the divide-back multiplication test are the same as the Java, but each returns `ErrOverflow` wrapped with the operands instead of throwing. `WrappingAdd` is plain `+` under an honest name.
+
+```go
+var ErrOverflow = errors.New("int64 overflow")
+
+func CheckedAdd(a, b int64) (int64, error) {
+	r := a + b
+	if (a^r)&(b^r) < 0 { // overflow iff both operands disagree in sign with the result
+		return 0, fmt.Errorf("%w: %d + %d", ErrOverflow, a, b)
+	}
+	return r, nil
+}
+
+func CheckedSub(a, b int64) (int64, error) {
+	r := a - b
+	if (a^b)&(a^r) < 0 {
+		return 0, fmt.Errorf("%w: %d - %d", ErrOverflow, a, b)
+	}
+	return r, nil
+}
+
+func CheckedMul(a, b int64) (int64, error) {
+	r := a * b
+	// if it did not wrap, dividing back recovers b; the one case division cannot catch is -1 * MinInt64
+	if a != 0 && (r/a != b || (a == -1 && b == math.MinInt64)) {
+		return 0, fmt.Errorf("%w: %d * %d", ErrOverflow, a, b)
+	}
+	return r, nil
+}
+
+func CheckedNegate(a int64) (int64, error) {
+	if a == math.MinInt64 {
+		return 0, fmt.Errorf("%w: -(%d)", ErrOverflow, a)
+	}
+	return -a, nil
+}
+
+// WrappingAdd is what the hardware does: two's-complement wrap. Here only to show it next to the checked version.
+func WrappingAdd(a, b int64) int64 { return a + b }
+```
+
+#### Step 3: Division that rounds the way you say
+
+Go's `/` and `%` truncate toward zero exactly like Java's, so the function works on the signed quotient and only takes magnitudes for the tie test. The `switch` has `HalfEven` as its `default` arm. Division by zero is returned as an error rather than left to panic; `RoundingBias` discards that error because its divisor is the constant 10.
+
+```go
+func DivideRounded(dividend, divisor int64, rounding Rounding) (int64, error) {
+	if divisor == 0 {
+		return 0, errors.New("division by zero")
+	}
+	quotient := dividend / divisor  // truncates toward zero
+	remainder := dividend % divisor // same sign as dividend
+	if remainder == 0 {
+		return quotient, nil
+	}
+	sign := int64(1)
+	if (dividend < 0) != (divisor < 0) {
+		sign = -1
+	}
+	twiceRemainder := abs64(remainder) * 2
+	absDivisor := abs64(divisor)
+	switch rounding {
+	case Down:
+		return quotient, nil
+	case Up:
+		return quotient + sign, nil
+	case HalfUp:
+		if twiceRemainder >= absDivisor {
+			return quotient + sign, nil
+		}
+		return quotient, nil
+	default: // HalfEven
+		if twiceRemainder > absDivisor {
+			return quotient + sign, nil
+		}
+		if twiceRemainder < absDivisor {
+			return quotient, nil
+		}
+		if quotient%2 == 0 {
+			return quotient, nil
+		}
+		return quotient + sign, nil
+	}
+}
+
+func RoundingBias(rounding Rounding) int64 {
+	var sum int64
+	for tenths := int64(5); tenths < 1000; tenths += 10 {
+		q, _ := DivideRounded(tenths, 10, rounding)
+		sum += q
+	}
+	return sum - 5000
+}
+```
+
+#### Step 4: `Fixed2`
+
+`Parse` uses `strings.Cut` to split at the dot and `allDigits` to validate; a third decimal returns `ErrTooManyDecimals`. `strconv.ParseInt` already fails on a whole part that does not fit in 64 bits, which is reported as `ErrOverflow`, and the scale-and-add goes through the checked functions. `FromDouble` formats with precision `-1`, Go's shortest round-trip representation, in `'f'` format so there is no exponent.
+
+```go
+func Parse(text string) (Fixed2, error) {
+	s := strings.TrimSpace(text)
+	negative := strings.HasPrefix(s, "-")
+	if negative || strings.HasPrefix(s, "+") {
+		s = s[1:]
+	}
+	if s == "" {
+		return Fixed2{}, errors.New("empty amount")
+	}
+	whole, frac, _ := strings.Cut(s, ".")
+	if whole == "" {
+		whole = "0"
+	}
+	if !allDigits(whole) || !allDigits(frac) {
+		return Fixed2{}, fmt.Errorf("not a decimal: %q", text)
+	}
+	if len(frac) > 2 {
+		return Fixed2{}, fmt.Errorf("%w: %s", ErrTooManyDecimals, text)
+	}
+	for len(frac) < 2 {
+		frac += "0"
+	}
+	w, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		return Fixed2{}, fmt.Errorf("%w: %s", ErrOverflow, text)
+	}
+	f, _ := strconv.ParseInt(frac, 10, 64)
+	scaled, err := CheckedMul(w, 100)
+	if err != nil {
+		return Fixed2{}, err
+	}
+	value, err := CheckedAdd(scaled, f)
+	if err != nil {
+		return Fixed2{}, err
+	}
+	if negative {
+		value = -value
+	}
+	return Fixed2{value}, nil
+}
+
+func FromDouble(value float64) (Fixed2, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return Fixed2{}, fmt.Errorf("not finite: %v", value)
+	}
+	return Parse(strconv.FormatFloat(value, 'f', -1, 64)) // precision -1: the shortest string that round-trips
+}
+```
+
+The arithmetic methods return `(Fixed2, error)` and thread every checked result through; `Rounding` is in every signature that can produce a fraction.
+
+```go
+// Times multiplies two Fixed2 values: the product has four decimals, so two must be rounded away, your way.
+func (f Fixed2) Times(other Fixed2, rounding Rounding) (Fixed2, error) {
+	product, err := CheckedMul(f.Hundredths, other.Hundredths) // scaled by 10^4
+	if err != nil {
+		return Fixed2{}, err
+	}
+	h, err := DivideRounded(product, 100, rounding)
+	return Fixed2{h}, err
+}
+
+// TimesRate multiplies by an exact rational: 2.9% is 29/1000, an FX rate of 0.9217 is 9217/10000.
+func (f Fixed2) TimesRate(numerator, denominator int64, rounding Rounding) (Fixed2, error) {
+	if denominator <= 0 {
+		return Fixed2{}, errors.New("denominator must be positive")
+	}
+	product, err := CheckedMul(f.Hundredths, numerator)
+	if err != nil {
+		return Fixed2{}, err
+	}
+	h, err := DivideRounded(product, denominator, rounding)
+	return Fixed2{h}, err
+}
+
+func (f Fixed2) DividedBy(divisor int64, rounding Rounding) (Fixed2, error) {
+	h, err := DivideRounded(f.Hundredths, divisor, rounding)
+	return Fixed2{h}, err
+}
+```
+
+#### Step 5: Run it
+
+```bash
+cd phases/00-setup-and-tooling/07-decimal-and-integer-arithmetic/code/go
+go run .
+go test ./...
+```
+
+```console
+== 0.1 + 0.2 ==
+0.1 + 0.2 = 0.30000000000000004  (equals 0.3? false)
+int64(19.99 * 100) = 1998  <- the penny-skimming bug (19.99 * 100 = 1998.9999999999998)
+FromDouble(19.99) = 19.99  (via the shortest decimal string "19.99")
+
+== Accumulation ==
+0.1 added 10 times as float64 = 0.9999999999999999
+0.01 added 1,000,000 times as float64 = 10000.0000001719 (error 1.719e-07)
+0.01 added 1,000,000 times as Fixed2 = 10000.00 exactly
+
+== Overflow ==
+math.MaxInt64 + 1 with plain + = -9223372036854775808  (wrapped to math.MinInt64)
+CheckedAdd(math.MaxInt64, 1) -> error: int64 overflow: 9223372036854775807 + 1
+
+== Decimal types in the standard library ==
+Go has no decimal type; math/big.Rat is the exact rational:
+Rat("0.1") + Rat("0.2") = 3/10 = 0.30
+Rat from the float64 0.1    = 3602879701896397/36028797018963968
+```
+
+The float, rounding-bias, and `Fixed2` sections match Java exactly. If the first line ever prints `0.3`, the operands were constants and the compiler did the addition for you.
 
 ## Use It
 

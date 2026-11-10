@@ -334,32 +334,469 @@ The test harness runs 64 assertions, including a 32-thread race on one key that 
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with three differences. **A `threading.Lock` replaces `synchronized`:** the GIL does not make the check-and-insert atomic, because a thread can be preempted between `get` and `__setitem__`, so the lock is held for the whole decision; `FakeClock` also takes a lock because `advance` and `now_millis` are called from different threads in the crash tests. **Control characters are detected with `ord(c) < 32 or ord(c) == 127`**, the same set as Java's `Character.isISOControl` for the ASCII range and Go's `unicode.IsControl` for the key grammar the handler accepts. **The concurrency tests use `threading.Event` and `threading.Barrier`:** the in-flight test holds the processor inside `before_commit` until the duplicate has been observed to get `409`, exactly as the Java `CountDownLatch` pair does.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The request and its fingerprint
+
+A frozen dataclass validates the amount in `__post_init__`. There is no `TreeMap`; the canonical form sorts the field names with `sorted(fields)` and joins one `name=value\n` per field, and `sha256_hex` is `hashlib.sha256(...).hexdigest()` over the UTF-8 bytes. Because the amount is rendered from `minor_units`, `Money.parse("19.99", USD)` and `Money.of_minor(1999, USD)` produce the same line and therefore the same fingerprint.
+
 ```python
-def reserve(self, key: str, fingerprint: str, reference_id: str) -> ReserveOutcome:
-    with self._lock:
-        now = self._clock.now_millis()
-        existing = self._records.get(key)
-        ...
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class PaymentRequest:
+    amount: Money
+    source: str
+    description: str
+
+    def __post_init__(self) -> None:
+        if not self.amount.is_positive():
+            raise ValueError(f"amount must be positive: {self.amount}")
+
+    def canonical(self) -> str:
+        """Fields sorted by name, one `name=value` per line, amount in minor units."""
+        fields = {
+            "amount": str(self.amount.minor_units),
+            "currency": self.amount.currency.code,
+            "description": self.description,
+            "source": self.source,
+        }
+        return "".join(f"{k}={fields[k]}\n" for k in sorted(fields))
+
+    def fingerprint(self) -> str:
+        return sha256_hex(self.canonical())
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: The store record and the reserve outcome
 
-- **A `threading.Lock` replaces `synchronized`.** The GIL does not make the check-and-insert atomic; a thread can be preempted between `get` and `__setitem__`. The lock is held for the whole decision. `FakeClock` also takes a lock, because `advance` and `now_millis` are called from different threads in the crash tests.
-- **Control characters are detected with `ord(c) < 32 or ord(c) == 127`**, the same set as Java's `Character.isISOControl` for the ASCII range and Go's `unicode.IsControl` for the key grammar the handler accepts.
-- **The concurrency tests use `threading.Event` and `threading.Barrier`.** The in-flight test holds the processor inside `before_commit` until the duplicate has been observed to get `409`, exactly as the Java `CountDownLatch` pair does.
+`KeyState` and `Reservation` are `Enum`s; `IdempotencyRecord` and `ReserveOutcome` are frozen dataclasses, so `complete` and `renew_lease` return new records rather than mutating. `response` is `Optional[PaymentResponse]` and is `None` while the record is `IN_PROGRESS`; `created_at_millis` is copied forward unchanged (it drives the TTL) while `updated_at_millis` takes the new `now` (it drives the lease).
+
+```python
+class KeyState(Enum):
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True)
+class IdempotencyRecord:
+    key: str
+    fingerprint: str
+    reference_id: str
+    state: KeyState
+    response: Optional[PaymentResponse]
+    created_at_millis: int
+    updated_at_millis: int
+
+    def complete(self, response: PaymentResponse, now: int) -> "IdempotencyRecord":
+        return IdempotencyRecord(self.key, self.fingerprint, self.reference_id, KeyState.COMPLETED, response,
+                                 self.created_at_millis, now)
+
+    def renew_lease(self, now: int) -> "IdempotencyRecord":
+        return IdempotencyRecord(self.key, self.fingerprint, self.reference_id, KeyState.IN_PROGRESS, None,
+                                 self.created_at_millis, now)
+
+
+class Reservation(Enum):
+    RESERVED = "reserved"
+    RECOVER = "recover"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FINGERPRINT_MISMATCH = "fingerprint_mismatch"
+
+
+@dataclass(frozen=True)
+class ReserveOutcome:
+    decision: Reservation
+    record: IdempotencyRecord
+```
+
+#### Step 3: Atomic check-and-reserve
+
+The method body is the Java method wrapped in `with self._lock:`; the ordering of the checks is identical, TTL, fingerprint, state, lease. Enum comparisons use `is` because `Enum` members are singletons. Everything the lock protects, including the `del` of an expired record and the `renew_lease` take-over, happens before the `with` block exits, which is what the 32-thread test relies on to see exactly one `RESERVED`.
+
+```python
+    def reserve(self, key: str, fingerprint: str, reference_id: str) -> ReserveOutcome:
+        """Atomic check-and-reserve: the whole decision happens under one lock."""
+        with self._lock:
+            now = self._clock.now_millis()
+            existing = self._records.get(key)
+            if existing is not None and now - existing.created_at_millis >= self._ttl_millis:
+                del self._records[key]
+                existing = None
+            if existing is None:
+                fresh = IdempotencyRecord(key, fingerprint, reference_id, KeyState.IN_PROGRESS, None, now, now)
+                self._records[key] = fresh
+                return ReserveOutcome(Reservation.RESERVED, fresh)
+            if existing.fingerprint != fingerprint:
+                return ReserveOutcome(Reservation.FINGERPRINT_MISMATCH, existing)
+            if existing.state is KeyState.COMPLETED:
+                return ReserveOutcome(Reservation.COMPLETED, existing)
+            if now - existing.updated_at_millis < self._lease_millis:
+                return ReserveOutcome(Reservation.IN_PROGRESS, existing)
+            renewed = existing.renew_lease(now)
+            self._records[key] = renewed
+            return ReserveOutcome(Reservation.RECOVER, renewed)
+```
+
+#### Step 4: The handler and the HTTP mapping
+
+`post` accepts `Optional[str]` for the merchant and key because an HTTP layer may hand it nothing. Validation precedes reservation; `scoped_key` and `reference_id_for` are module-level functions. Python has no `switch` on enums, so the five verdicts are an `if` ladder in the same order as the Java `case` arms; the `COMPLETED` branch adds the `Idempotent-Replayed` header to the stored response object, so the body is byte-identical by construction.
+
+```python
+KEY_SEPARATOR = "\u001f"  # a control character the key grammar forbids, so scoped keys cannot collide
+
+
+def scoped_key(merchant_id: str, idempotency_key: str) -> str:
+    """Keys are scoped to the merchant (the authenticated caller): merchant + key is the store key."""
+    return merchant_id + KEY_SEPARATOR + idempotency_key
+
+
+def reference_id_for(scoped: str) -> str:
+    """Our reference at the processor is a pure function of the scoped key, so a retry can ask about it."""
+    return "ref_" + sha256_hex("ref:" + scoped)[:16]
+
+    def post(self, merchant_id: Optional[str], idempotency_key: Optional[str], request: PaymentRequest) -> PaymentResponse:
+        """POST /payments: the only idempotent operation."""
+        if merchant_id is None or not merchant_id.strip():
+            return PaymentResponse(401, '{"error":"unauthenticated"}')
+        if idempotency_key is None or not idempotency_key.strip():
+            return PaymentResponse(400, '{"error":"idempotency_key_required"}')
+        if len(idempotency_key) > 255 or any(ord(c) < 32 or ord(c) == 127 for c in idempotency_key):
+            return PaymentResponse(400, '{"error":"idempotency_key_invalid"}')
+        key = scoped_key(merchant_id, idempotency_key)
+        fingerprint = request.fingerprint()
+        reference_id = reference_id_for(key)
+        outcome = self._store.reserve(key, fingerprint, reference_id)
+        if outcome.decision is Reservation.FINGERPRINT_MISMATCH:
+            return PaymentResponse(422, '{"error":"idempotency_key_reused_with_different_request"}')
+        if outcome.decision is Reservation.IN_PROGRESS:
+            return PaymentResponse(409, '{"error":"request_in_progress"}').with_header(RETRY_AFTER, str(RETRY_AFTER_SECONDS))
+        if outcome.decision is Reservation.COMPLETED:
+            assert outcome.record.response is not None
+            return outcome.record.response.with_header(REPLAYED, "true")
+        if outcome.decision is Reservation.RECOVER:
+            return self._recover(key, request, reference_id)
+        return self._execute(key, request, reference_id)
+```
+
+#### Step 5: Execute and recover
+
+`_execute` and `_recover` are private methods. `SimulatedCrash` is a `RuntimeError` raised by `FakeProcessor.charge` *after* the charge is stored, so when it propagates out of `_execute` the `complete` call never runs and the record stays `IN_PROGRESS`. `_recover` asks `lookup` first and charges only on `None`; `render` maps approval to `201` and a decline to `402`, and both go through `complete`.
+
+```python
+    def _execute(self, key: str, request: PaymentRequest, reference_id: str) -> PaymentResponse:
+        result = self._processor.charge(reference_id, request.amount, request.source)
+        response = render(result)
+        self._store.complete(key, response)
+        return response
+
+    def _recover(self, key: str, request: PaymentRequest, reference_id: str) -> PaymentResponse:
+        """The previous owner died between charge() and complete(). Ask before charging again."""
+        result = self._processor.lookup(reference_id)
+        if result is None:
+            result = self._processor.charge(reference_id, request.amount, request.source)
+        response = render(result)
+        self._store.complete(key, response)
+        return response
+
+
+def render(result: ProcessorResult) -> PaymentResponse:
+    status = "succeeded" if result.approved else "failed"
+    body = f'{{"id":"{result.reference_id}","status":"{status}","code":"{result.code}","amount":"{result.amount}"}}'
+    return PaymentResponse(201 if result.approved else 402, body)
+```
+
+#### Step 6: The read path
+
+`get` consults the processor only: no key, no store record, no replay header. `render(current).body` is re-rendered from the current processor state, which is the point of the read being a read.
+
+```python
+    def get(self, payment_id: str) -> PaymentResponse:
+        """GET /payments/{id}: a read. No key, no store record, always the *current* state.
+        Replaying a stored response here would hide a capture, refund, or dispute that happened since."""
+        current = self._processor.lookup(payment_id)
+        if current is None:
+            return PaymentResponse(404, '{"error":"not_found"}')
+        return PaymentResponse(200, render(current).body)
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/12-payment-systems-design/01-idempotent-payment-api/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output matches the Java run except that headers print as a Python dict:
+
+```console
+== First call charges; the duplicate is replayed, not re-charged ==
+POST #1 -> 201 {"id":"ref_349281adde6ae74d","status":"succeeded","code":"approved","amount":"19.99 USD"} {}
+POST #2 -> 201 {"id":"ref_349281adde6ae74d","status":"succeeded","code":"approved","amount":"19.99 USD"} {'Idempotent-Replayed': 'true'}
+processor charge calls = 1
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`, tests in `main_test.go`) keeps the design and changes how failure is reported. **The simulated crash is an error value, not a panic:** `Charge` returns `ErrSimulatedCrash`, `execute` returns it without calling `Complete`, so the record stays `IN_PROGRESS` exactly as in Java; tests check it with `errors.Is`. **`FakeClock` is an `atomic.Int64`**, `FakeProcessor` guards its map with a `sync.Mutex`, and `chargeCalls` is an `atomic.Int32`; the suite passes under `go test -race ./...`, which is the check that the reserve path has no unsynchronized access. **The `beforeCommit` hook is read under the mutex and then called outside it**, so the hook can block (the in-flight test blocks it on a channel) without holding the processor's lock and deadlocking the duplicate's `Lookup`. **`IdempotencyRecord.Response` is a pointer** so an `IN_PROGRESS` record can carry "no response yet", the role `null` plays in Java and `None` in Python.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The request and its fingerprint
+
+A struct literal cannot validate itself, so `NewPaymentRequest` is the checked constructor. Go maps iterate in random order, so `Canonical` collects the keys, `sort.Strings` them, and writes `name=value\n` through a `strings.Builder`: the sort is the canonicalization. `sha256Hex` is `sha256.Sum256` plus `hex.EncodeToString`.
+
 ```go
-func (h *PaymentsHandler) Post(merchantID, idempotencyKey string, request PaymentRequest) (PaymentResponse, error)
+type PaymentRequest struct {
+	Amount      Money
+	Source      string
+	Description string
+}
+
+func NewPaymentRequest(amount Money, source, description string) (PaymentRequest, error) {
+	if !amount.IsPositive() {
+		return PaymentRequest{}, fmt.Errorf("amount must be positive: %v", amount)
+	}
+	return PaymentRequest{amount, source, description}, nil
+}
+
+// Canonical renders fields sorted by name, one name=value per line, amount in minor units.
+func (r PaymentRequest) Canonical() string {
+	fields := map[string]string{
+		"amount":      strconv.FormatInt(r.Amount.MinorUnits, 10),
+		"currency":    r.Amount.Currency.Code,
+		"description": r.Description,
+		"source":      r.Source,
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for _, k := range keys {
+		sb.WriteString(k)
+		sb.WriteByte('=')
+		sb.WriteString(fields[k])
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+func (r PaymentRequest) Fingerprint() string { return sha256Hex(r.Canonical()) }
+
+func sha256Hex(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
 ```
 
-Differences, all in `code/go/main.go` and `main_test.go`:
+#### Step 2: The store record and the reserve outcome
 
-- **The simulated crash is an error value, not a panic.** `Charge` returns `ErrSimulatedCrash`; `execute` returns it without calling `Complete`, so the record stays `IN_PROGRESS` exactly as in Java. Tests check it with `errors.Is`.
-- **`FakeClock` is an `atomic.Int64`** and `FakeProcessor` guards its map with a `sync.Mutex`; `chargeCalls` is an `atomic.Int32`. The whole suite passes under `go test -race ./...`, which is the check that the reserve path has no unsynchronized access.
-- **The `beforeCommit` hook is read under the mutex and then called outside it**, so the hook can block (the in-flight test blocks it on a channel) without holding the processor's lock and deadlocking the duplicate's `Lookup`.
-- **The `IdempotencyRecord.Response` is a pointer** so an `IN_PROGRESS` record can carry "no response yet", the role `null` plays in Java and `None` in Python.
+`KeyState` and `Reservation` are `int` enums built with `iota`. Two of the reservation names carry a `Reservation` prefix (`ReservationInProgress`, `ReservationCompleted`) because Go has one namespace per package and `InProgress`/`Completed` are already taken by `KeyState`. Records are plain value structs; "no response yet" is a `nil` `*PaymentResponse`.
+
+```go
+type KeyState int
+
+const (
+	InProgress KeyState = iota
+	Completed
+)
+
+type IdempotencyRecord struct {
+	Key             string
+	Fingerprint     string
+	ReferenceID     string
+	State           KeyState
+	Response        *PaymentResponse
+	CreatedAtMillis int64
+	UpdatedAtMillis int64
+}
+
+// Reservation is what Reserve decided. Exactly one caller per key gets Reserved or Recover.
+type Reservation int
+
+const (
+	Reserved Reservation = iota
+	Recover
+	ReservationInProgress
+	ReservationCompleted
+	FingerprintMismatch
+)
+
+type ReserveOutcome struct {
+	Decision Reservation
+	Record   IdempotencyRecord
+}
+```
+
+#### Step 3: Atomic check-and-reserve
+
+`s.mu.Lock(); defer s.mu.Unlock()` holds the store mutex for the whole decision. The checks run in the same order as the Java method. Because records are values, there is no `renewLease` method: the take-over copies `existing`, bumps `UpdatedAtMillis`, and writes the copy back into the map.
+
+```go
+func (s *IdempotencyStore) Reserve(key, fingerprint, referenceID string) ReserveOutcome {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.NowMillis()
+	existing, ok := s.records[key]
+	if ok && now-existing.CreatedAtMillis >= s.ttlMillis {
+		delete(s.records, key) // expired: the key may be reused with any body
+		ok = false
+	}
+	if !ok {
+		fresh := IdempotencyRecord{key, fingerprint, referenceID, InProgress, nil, now, now}
+		s.records[key] = fresh
+		return ReserveOutcome{Reserved, fresh}
+	}
+	if existing.Fingerprint != fingerprint {
+		return ReserveOutcome{FingerprintMismatch, existing}
+	}
+	if existing.State == Completed {
+		return ReserveOutcome{ReservationCompleted, existing}
+	}
+	if now-existing.UpdatedAtMillis < s.leaseMillis {
+		return ReserveOutcome{ReservationInProgress, existing} // a live owner is still working
+	}
+	renewed := existing
+	renewed.UpdatedAtMillis = now // owner died: this caller takes over
+	s.records[key] = renewed
+	return ReserveOutcome{Recover, renewed}
+}
+```
+
+#### Step 4: The handler and the HTTP mapping
+
+`Post` returns `(PaymentResponse, error)`: the error is only ever the simulated crash, every HTTP outcome is a response value. `strings.IndexFunc(idempotencyKey, unicode.IsControl)` is the control-character check; `ScopedKey` and `ReferenceIDFor` are package functions. The `switch` maps the five verdicts exactly as the Java one does, with `Reserved` as the `default` arm.
+
+```go
+const (
+	KeyTTLMillis      = int64(24 * 60 * 60 * 1000) // 24h
+	LeaseMillis       = int64(30_000)              // how long an IN_PROGRESS owner is trusted
+	RetryAfterSeconds = 1
+	KeySeparator      = "\u001f" // a control character the key grammar forbids
+)
+
+// ScopedKey joins the merchant (the authenticated caller) and the key: two merchants may both send
+// "order-1001" and must never see each other's responses.
+func ScopedKey(merchantID, idempotencyKey string) string {
+	return merchantID + KeySeparator + idempotencyKey
+}
+
+// ReferenceIDFor is a pure function of the scoped key, so a retry can ask the processor about it.
+func ReferenceIDFor(scoped string) string { return "ref_" + sha256Hex("ref:" + scoped)[:16] }
+
+func (h *PaymentsHandler) Post(merchantID, idempotencyKey string, request PaymentRequest) (PaymentResponse, error) {
+	if strings.TrimSpace(merchantID) == "" {
+		return respond(401, `{"error":"unauthenticated"}`), nil
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return respond(400, `{"error":"idempotency_key_required"}`), nil
+	}
+	if len(idempotencyKey) > 255 || strings.IndexFunc(idempotencyKey, unicode.IsControl) >= 0 {
+		return respond(400, `{"error":"idempotency_key_invalid"}`), nil
+	}
+	key := ScopedKey(merchantID, idempotencyKey)
+	fingerprint := request.Fingerprint()
+	referenceID := ReferenceIDFor(key)
+	outcome := h.store.Reserve(key, fingerprint, referenceID)
+	switch outcome.Decision {
+	case FingerprintMismatch:
+		return respond(422, `{"error":"idempotency_key_reused_with_different_request"}`), nil
+	case ReservationInProgress:
+		return respond(409, `{"error":"request_in_progress"}`).WithHeader(HeaderRetryAfter, strconv.Itoa(RetryAfterSeconds)), nil
+	case ReservationCompleted:
+		return outcome.Record.Response.WithHeader(HeaderReplayed, "true"), nil
+	case Recover:
+		return h.recover(key, request, referenceID)
+	default:
+		return h.execute(key, request, referenceID)
+	}
+}
+```
+
+#### Step 5: Execute and recover
+
+`execute` returns the `Charge` error unchanged, which leaves the record `IN_PROGRESS` because `Complete` is never reached. `recover` uses the `(result, found)` pair from `Lookup` and charges only when `found` is false; both paths pass the rendered response through `Complete`.
+
+```go
+func (h *PaymentsHandler) execute(key string, request PaymentRequest, referenceID string) (PaymentResponse, error) {
+	result, err := h.processor.Charge(referenceID, request.Amount, request.Source)
+	if err != nil {
+		return PaymentResponse{}, err // the process "died" here: the record stays IN_PROGRESS
+	}
+	response := render(result)
+	if err := h.store.Complete(key, response); err != nil {
+		return PaymentResponse{}, err
+	}
+	return response, nil
+}
+
+// recover runs when the previous owner died between Charge and Complete: ask before charging again.
+func (h *PaymentsHandler) recover(key string, request PaymentRequest, referenceID string) (PaymentResponse, error) {
+	result, found := h.processor.Lookup(referenceID)
+	if !found {
+		var err error
+		if result, err = h.processor.Charge(referenceID, request.Amount, request.Source); err != nil {
+			return PaymentResponse{}, err
+		}
+	}
+	response := render(result)
+	if err := h.store.Complete(key, response); err != nil {
+		return PaymentResponse{}, err
+	}
+	return response, nil
+}
+```
+
+#### Step 6: The read path
+
+`Get` returns a bare `PaymentResponse` (no error is possible) and consults only the processor, so neither the store size nor the charge count moves when it is called.
+
+```go
+func (h *PaymentsHandler) Get(paymentID string) PaymentResponse {
+	current, ok := h.processor.Lookup(paymentID)
+	if !ok {
+		return respond(404, `{"error":"not_found"}`)
+	}
+	return respond(200, render(current).Body)
+}
+
+func render(result ProcessorResult) PaymentResponse {
+	status, http := "failed", 402
+	if result.Approved {
+		status, http = "succeeded", 201
+	}
+	body := fmt.Sprintf(`{"id":"%s","status":"%s","code":"%s","amount":"%v"}`, result.ReferenceID, status, result.Code, result.Amount)
+	return respond(http, body)
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/12-payment-systems-design/01-idempotent-payment-api/code/go
+go run .
+go test ./...
+```
+
+The crash section shows the error value rather than an exception message, and headers print as a Go map:
+
+```console
+POST #1 -> 201 {"id":"ref_349281adde6ae74d","status":"succeeded","code":"approved","amount":"19.99 USD"} map[]
+POST #2 -> 201 {"id":"ref_349281adde6ae74d","status":"succeeded","code":"approved","amount":"19.99 USD"} map[Idempotent-Replayed:true]
+
+== Crash after the processor committed, before we stored the response ==
+POST #4 -> process crashed after the processor committed the charge
+retry at +0s   -> 409 Retry-After=1 (owner lease still live)
+retry at +30s  -> 201 {"id":"ref_db1d1c2769c470a6","status":"succeeded","code":"approved","amount":"45.00 USD"}
+processor charge calls = 3, charges stored = 3  (recovery looked up ref_db1d1c2769c470a6 instead of charging again)
+```
 
 ## Use It
 

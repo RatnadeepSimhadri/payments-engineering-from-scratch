@@ -307,53 +307,390 @@ The line to keep is the last one. It is the test that snapshots are a cache and 
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Closed sets are a union type, not a sealed interface:** `Event = Opened | Deposited | ...` documents the set, and `match` with class patterns destructures each case, but nothing stops a caller passing a stranger; the trailing `raise TypeError` is the runtime stand-in for the exhaustiveness check Java gets at compile time. **Immutability is `frozen=True` plus `MappingProxyType`:** a frozen dataclass stops attribute assignment but a plain `dict` field is still mutable; wrapping holds in a `MappingProxyType` makes the view read-only, and equality still works because the proxy compares as its underlying mapping, which is what the snapshot-equals-replay test needs. **`handle` takes an optional expected version:** Python has no overloading, so `handle(stream, command, expected_version=None)` covers both Java methods; `None` means "the latest". **Exceptions are `CommandRejectedError` and `ConcurrencyError`**, both plain `Exception` subclasses, so a caller can catch the first and return a 4xx while letting the second drive a retry.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Events and commands as closed sets
+
+Each event is a tiny frozen dataclass, which gives the immutability and value equality the Java records give; the `Union` alias is documentation plus a type-checker hint. The commands (`OpenAccount`, `Deposit`, `Withdraw`, `PlaceHold`, `ReleaseHold`) follow the same shape just below, with `Command = Union[...]`. No `version`, `timestamp`, or `account_id` on `Deposited`: the stream supplies those.
+
 ```python
-def apply(self, event: Event) -> "AccountState":
-    nxt = self.version + 1
-    match event:
-        case Opened(account_id, currency):
-            return AccountState(account_id, currency, Money.zero(currency), MappingProxyType({}), nxt)
-        case Held(hold_id, amount):
-            holds = dict(self.holds)
-            holds[hold_id] = amount
-            return AccountState(self.account_id, self.currency, self.balance, MappingProxyType(holds), nxt)
-        ...
-    raise TypeError(f"unknown event {event!r}")
+@dataclass(frozen=True)
+class Opened:
+    account_id: str
+    currency: Currency
+
+
+@dataclass(frozen=True)
+class Deposited:
+    amount: Money
+
+
+@dataclass(frozen=True)
+class Withdrawn:
+    amount: Money
+
+
+@dataclass(frozen=True)
+class Held:
+    hold_id: str
+    amount: Money
+
+
+@dataclass(frozen=True)
+class Released:
+    hold_id: str
+
+
+Event = Union[Opened, Deposited, Withdrawn, Held, Released]
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The state and the fold step
 
-- **Closed sets are a union type, not a sealed interface.** `Event = Opened | Deposited | ...` documents the set, and `match` with class patterns destructures each case, but nothing stops a caller passing a stranger. The trailing `raise TypeError` is the runtime stand-in for the exhaustiveness check Java gets at compile time.
-- **Immutability is `frozen=True` plus `MappingProxyType`.** A frozen dataclass stops attribute assignment but a plain `dict` field is still mutable; wrapping holds in a `MappingProxyType` makes the view read-only. Equality still works because the proxy compares as its underlying mapping, which is what the snapshot-equals-replay test needs.
-- **`handle` takes an optional expected version.** Python has no overloading, so `handle(stream, command, expected_version=None)` covers both Java methods; `None` means "the latest".
-- **Exceptions are `CommandRejectedError` and `ConcurrencyError`**, both plain `Exception` subclasses, so a caller can catch the first and return a 4xx while letting the second drive a retry.
+`match` with class patterns plays the role of the Java pattern switch; each arm returns a new `AccountState` with `version + 1`. Holds are copied into a fresh `dict` and re-wrapped in `MappingProxyType` so the previous state's view is untouched. The `raise TypeError` after the `match` is reached only by an event that is not in the union.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The demo prints the same versions, balances, and snapshot counts as the Java run.
+```python
+    def apply(self, event: Event) -> "AccountState":
+        nxt = self.version + 1
+        match event:
+            case Opened(account_id, currency):
+                return AccountState(account_id, currency, Money.zero(currency), MappingProxyType({}), nxt)
+            case Deposited(amount):
+                return AccountState(self.account_id, self.currency, self.balance.plus(amount), self.holds, nxt)
+            case Withdrawn(amount):
+                return AccountState(self.account_id, self.currency, self.balance.minus(amount), self.holds, nxt)
+            case Held(hold_id, amount):
+                holds = dict(self.holds)
+                holds[hold_id] = amount
+                return AccountState(self.account_id, self.currency, self.balance, MappingProxyType(holds), nxt)
+            case Released(hold_id):
+                holds = dict(self.holds)
+                holds.pop(hold_id, None)  # the balance never moved; only the available amount changes
+                return AccountState(self.account_id, self.currency, self.balance, MappingProxyType(holds), nxt)
+        raise TypeError(f"unknown event {event!r}")
+
+    @staticmethod
+    def replay(events: List[Event]) -> "AccountState":
+        return AccountState.empty().apply_all(events)
+```
+
+#### Step 3: Decide, where the rules live
+
+The same `match` shape over commands. `decide` reads state and returns a list of events; it never writes. Rejections raise `CommandRejectedError`, the overdraft check compares against `available()` with `Money.compare_to`, and a duplicate hold id is rejected so a retried authorisation does not double-reserve. `Deposit` and `ReleaseHold` follow the same pattern in the full method.
+
+```python
+    def decide(self, command: Command) -> List[Event]:
+        match command:
+            case OpenAccount(account_id, currency):
+                if self.is_open():
+                    raise CommandRejectedError(f"account {self.account_id} is already open")
+                return [Opened(account_id, currency)]
+            case Withdraw(amount):
+                self._require_open()
+                self._require_positive_same_currency(amount)
+                if amount.compare_to(self.available()) > 0:
+                    raise CommandRejectedError(f"insufficient available funds: {self.available()} < {amount}")
+                return [Withdrawn(amount)]
+            case PlaceHold(hold_id, amount):
+                self._require_open()
+                self._require_positive_same_currency(amount)
+                if hold_id in self.holds:
+                    raise CommandRejectedError(f"hold {hold_id} already exists")
+                if amount.compare_to(self.available()) > 0:
+                    raise CommandRejectedError(f"insufficient available funds for hold: {self.available()} < {amount}")
+                return [Held(hold_id, amount)]
+```
+
+#### Step 4: The event store with conditional append
+
+`dict.setdefault` is `computeIfAbsent`. The one `if` is the whole of optimistic concurrency: if the stream's length is not the version the writer decided against, `ConcurrencyError` carries both numbers. `read(stream_id, after_version)` is a list comprehension and is the primitive snapshots need.
+
+```python
+class EventStore:
+    def __init__(self) -> None:
+        self._streams: Dict[str, List[StoredEvent]] = {}
+        self._all: List[StoredEvent] = []
+
+    def version(self, stream_id: str) -> int:
+        return len(self._streams.get(stream_id, []))
+
+    def append(self, stream_id: str, expected_version: int, events: List[Event]) -> int:
+        stream = self._streams.setdefault(stream_id, [])
+        if len(stream) != expected_version:
+            raise ConcurrencyError(stream_id, expected_version, len(stream))
+        for e in events:
+            stored = StoredEvent(len(stream) + 1, e)
+            stream.append(stored)
+            self._all.append(stored)
+        return len(stream)
+
+    def read(self, stream_id: str, after_version: int) -> List[Event]:
+        return [s.event for s in self._streams.get(stream_id, []) if s.version > after_version]
+```
+
+#### Step 5: Snapshots and the service
+
+`load` is "snapshot plus tail". `handle` resolves `expected_version=None` to the loaded version (Java's two-argument overload), checks it before deciding, appends at it, folds the produced events onto the state it already has, and snapshots when `//` shows a multiple of `snapshot_every` was crossed.
+
+```python
+    def load(self, stream_id: str) -> AccountState:
+        snap = self._snapshots.load(stream_id)
+        base = snap.state if snap is not None else AccountState.empty()
+        tail = self._events.read(stream_id, base.version)
+        self._events_replayed_on_last_load = len(tail)
+        return base.apply_all(tail)
+
+    def handle(self, stream_id: str, command: Command, expected_version: Optional[int] = None) -> AccountState:
+        current = self.load(stream_id)
+        if expected_version is None:
+            expected_version = current.version
+        if current.version != expected_version:
+            raise ConcurrencyError(stream_id, expected_version, current.version)
+        produced = current.decide(command)
+        new_version = self._events.append(stream_id, expected_version, produced)
+        nxt = current.apply_all(produced)
+        if new_version // self._snapshot_every > expected_version // self._snapshot_every:
+            self._snapshots.save(stream_id, nxt)
+        return nxt
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/08-messaging-and-streams/05-event-sourcing/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The demo prints the same versions, balances, and snapshot counts as the Java run:
+
+```console
+== Optimistic concurrency: two writers load version 4 ==
+writer A released auth-1 at expected version 4 -> version 5, available 40.00 USD
+writer B withdraw 40.00 at expected version 4 rejected: stream acct-42: expected version 4 but found 5
+writer B reloaded and retried -> version 6, balance 0.00 USD
+
+== Snapshots: every 4 events, load folds only the tail ==
+after 8 events: snapshot writes = 2, latest snapshot version = 8
+load at version 9 replayed 1 event(s) on top of the snapshot; balance 30.00 USD
+full replay from version 0 gives the same state: true
+```
 
 ### In Go
 
+The Go port (`code/go/main.go` and `code/go/money.go`) keeps the design with five differences. **Closed sets via an unexported marker method:** `type Event interface{ isEvent() }` with `func (Opened) isEvent() {}` on each type means only types in this package can be events; the type switch in `Apply` has a `default: panic`, because the compiler does not check exhaustiveness. **Errors are values:** `Decide`, `Append`, and `HandleAt` return `error`; rejections wrap the sentinel `ErrCommandRejected` so callers use `errors.Is`, the concurrency failure is a `*ConcurrencyError` struct carrying expected and actual versions, matched with `errors.As`, and a currency mismatch wraps `ErrCurrencyMismatch`. **Immutability is by convention:** `AccountState` is passed by value, but a Go map is a reference, so `Apply` copies the holds map (`copyHolds`) before changing it; forgetting this copy is the Go-specific bug, two states that should be independent sharing one map. **Maps have no order:** `HoldIDs()` sorts before printing so the demo output is deterministic, and `Equal` compares states field by field because a struct containing a map is not comparable with `==`. **Overflow is checked by hand** in `addChecked` (`money.go`), as in the Money lesson; `Apply` discards the error because events were validated before being written, and a well-formed stream cannot overflow.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Events and commands as closed sets
+
+Plain structs implement the marker interface by defining the unexported method; because the method name is lowercase, no type outside this package can satisfy `Event`, which is as close as Go gets to `sealed`. The commands use the same trick with `isCommand()`.
+
 ```go
-func (s AccountState) Decide(command Command) ([]Event, error) {
-    switch c := command.(type) {
-    case Withdraw:
-        if err := s.requireOpen(); err != nil { return nil, err }
-        if err := s.requirePositiveSameCurrency(c.Amount); err != nil { return nil, err }
-        if c.Amount.Compare(s.Available()) > 0 {
-            return nil, rejected("insufficient available funds: %s < %s", s.Available(), c.Amount)
-        }
-        return []Event{Withdrawn{c.Amount}}, nil
-    ...
+type Event interface{ isEvent() }
+
+type Opened struct {
+	AccountID string
+	Currency  Currency
+}
+
+type Deposited struct{ Amount Money }
+
+type Withdrawn struct{ Amount Money }
+
+type Held struct {
+	HoldID string
+	Amount Money
+}
+
+type Released struct{ HoldID string }
+
+func (Opened) isEvent()    {}
+func (Deposited) isEvent() {}
+func (Withdrawn) isEvent() {}
+func (Held) isEvent()      {}
+func (Released) isEvent()  {}
 ```
 
-Differences, all in `code/go/main.go`:
+```go
+type Command interface{ isCommand() }
 
-- **Closed sets via an unexported marker method.** `type Event interface{ isEvent() }` with `func (Opened) isEvent() {}` on each type means only types in this package can be events. The type switch in `Apply` has a `default: panic`, because the compiler does not check exhaustiveness.
-- **Errors are values.** `Decide`, `Append`, and `HandleAt` return `error`. Rejections wrap the sentinel `ErrCommandRejected` so callers use `errors.Is`; the concurrency failure is a `*ConcurrencyError` struct carrying expected and actual versions, matched with `errors.As`. Currency mismatch wraps `ErrCurrencyMismatch`.
-- **Immutability is by convention.** `AccountState` is passed by value, but a Go map is a reference, so `Apply` copies the holds map (`copyHolds`) before changing it. Forgetting this copy is the Go-specific bug: two states that should be independent would share one map.
-- **Maps have no order.** `HoldIDs()` sorts before printing so the demo output is deterministic; `Equal` compares states field by field because a struct containing a map is not comparable with `==`.
-- **Overflow is checked by hand** in `addChecked` (`code/go/money.go`), as in the Money lesson; `Apply` discards the error because events were validated before being written, and a well-formed stream cannot overflow.
+type OpenAccount struct {
+	AccountID string
+	Currency  Currency
+}
 
-Run it from `code/go/` with `go run .`; test with `go test ./...`. The demo prints the same versions, balances, and snapshot counts as the Java run.
+type Deposit struct{ Amount Money }
+
+type Withdraw struct{ Amount Money }
+
+type PlaceHold struct {
+	HoldID string
+	Amount Money
+}
+
+type ReleaseHold struct{ HoldID string }
+```
+
+#### Step 2: The state and the fold step
+
+A type switch replaces the pattern switch. `copyHolds` is the line that keeps states independent: `Held` and `Released` write into a fresh map, never into `s.Holds`. The `_` on `Plus` and `Minus` discards the `Money` error on purpose, because `Decide` already validated the event before it was written. An empty `AccountID` plays the role of Java's `null` for a not-yet-opened account.
+
+```go
+func copyHolds(holds map[string]Money) map[string]Money {
+	out := make(map[string]Money, len(holds)+1)
+	for k, v := range holds {
+		out[k] = v
+	}
+	return out
+}
+
+func (s AccountState) Apply(event Event) AccountState {
+	next := s.Version + 1
+	switch e := event.(type) {
+	case Opened:
+		return AccountState{e.AccountID, e.Currency, Zero(e.Currency), map[string]Money{}, next}
+	case Deposited:
+		balance, _ := s.Balance.Plus(e.Amount)
+		return AccountState{s.AccountID, s.Currency, balance, s.Holds, next}
+	case Withdrawn:
+		balance, _ := s.Balance.Minus(e.Amount)
+		return AccountState{s.AccountID, s.Currency, balance, s.Holds, next}
+	case Held:
+		h := copyHolds(s.Holds)
+		h[e.HoldID] = e.Amount
+		return AccountState{s.AccountID, s.Currency, s.Balance, h, next}
+	case Released:
+		h := copyHolds(s.Holds)
+		delete(h, e.HoldID) // the balance never moved; only the available amount changes
+		return AccountState{s.AccountID, s.Currency, s.Balance, h, next}
+	default:
+		panic(fmt.Sprintf("unknown event %T", event))
+	}
+}
+```
+
+#### Step 3: Decide, where the rules live
+
+`Decide` returns `([]Event, error)`. Each rule failure is `rejected(...)`, which wraps `ErrCommandRejected` with a formatted message; the helper checks `requireOpen` and `requirePositiveSameCurrency` return errors that are passed straight up. The comma-ok map lookup is the duplicate-hold check.
+
+```go
+	case Withdraw:
+		if err := s.requireOpen(); err != nil {
+			return nil, err
+		}
+		if err := s.requirePositiveSameCurrency(c.Amount); err != nil {
+			return nil, err
+		}
+		if c.Amount.Compare(s.Available()) > 0 {
+			return nil, rejected("insufficient available funds: %s < %s", s.Available(), c.Amount)
+		}
+		return []Event{Withdrawn{c.Amount}}, nil
+	case PlaceHold:
+		if err := s.requireOpen(); err != nil {
+			return nil, err
+		}
+		if err := s.requirePositiveSameCurrency(c.Amount); err != nil {
+			return nil, err
+		}
+		if _, exists := s.Holds[c.HoldID]; exists {
+			return nil, rejected("hold %s already exists", c.HoldID)
+		}
+		if c.Amount.Compare(s.Available()) > 0 {
+			return nil, rejected("insufficient available funds for hold: %s < %s", s.Available(), c.Amount)
+		}
+		return []Event{Held{c.HoldID, c.Amount}}, nil
+```
+
+#### Step 4: The event store with conditional append
+
+Reading a missing key from `s.streams` yields a nil slice of length 0, so no `computeIfAbsent` is needed; the slice is written back after the loop because `append` may reallocate. The version mismatch returns a `*ConcurrencyError` value rather than throwing.
+
+```go
+func (s *EventStore) Append(streamID string, expectedVersion int64, events []Event) (int64, error) {
+	stream := s.streams[streamID]
+	if int64(len(stream)) != expectedVersion {
+		return int64(len(stream)), &ConcurrencyError{streamID, expectedVersion, int64(len(stream))}
+	}
+	for _, e := range events {
+		stored := StoredEvent{int64(len(stream)) + 1, e}
+		stream = append(stream, stored)
+		s.all = append(s.all, stored)
+	}
+	s.streams[streamID] = stream
+	return int64(len(stream)), nil
+}
+
+func (s *EventStore) Read(streamID string, afterVersion int64) []Event {
+	out := []Event{}
+	for _, se := range s.streams[streamID] {
+		if se.Version > afterVersion {
+			out = append(out, se.Event)
+		}
+	}
+	return out
+}
+```
+
+#### Step 5: Snapshots and the service
+
+`SnapshotStore.Load` returns `(Snapshot, bool)` instead of an `Optional`. `HandleAt` is the explicit-version method and `Handle` the convenience that loads first; both return `(AccountState, error)`, and on a rejection the current state is returned alongside the error so a caller can show it. The integer-division snapshot trick is unchanged.
+
+```go
+func (a *AccountService) Load(streamID string) AccountState {
+	base := EmptyState()
+	if snap, ok := a.snapshots.Load(streamID); ok {
+		base = snap.State
+	}
+	tail := a.events.Read(streamID, base.Version)
+	a.eventsReplayedOnLastLoad = len(tail)
+	return base.ApplyAll(tail)
+}
+
+func (a *AccountService) HandleAt(streamID string, command Command, expectedVersion int64) (AccountState, error) {
+	current := a.Load(streamID)
+	if current.Version != expectedVersion {
+		return current, &ConcurrencyError{streamID, expectedVersion, current.Version}
+	}
+	produced, err := current.Decide(command)
+	if err != nil {
+		return current, err
+	}
+	newVersion, err := a.events.Append(streamID, expectedVersion, produced)
+	if err != nil {
+		return current, err
+	}
+	next := current.ApplyAll(produced)
+	if newVersion/a.snapshotEvery > expectedVersion/a.snapshotEvery {
+		a.snapshots.Save(streamID, next)
+	}
+	return next, nil
+}
+
+func (a *AccountService) Handle(streamID string, command Command) (AccountState, error) {
+	return a.HandleAt(streamID, command, a.Load(streamID).Version)
+}
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/08-messaging-and-streams/05-event-sourcing/code/go
+go run .
+go test ./...
+```
+
+The demo prints the same versions, balances, and snapshot counts as the Java run, and ends with the stream itself, each event printed in Java's record `toString` shape:
+
+```console
+v5  Released[holdId=auth-1]
+v6  Withdrawn[amount=40.00 USD]
+v7  Deposited[amount=10.00 USD]
+v8  Deposited[amount=10.00 USD]
+v9  Deposited[amount=10.00 USD]
+balance is derived: 30.00 USD = sum of deposits - sum of withdrawals; available = 30.00 USD
+```
 
 ## Use It
 

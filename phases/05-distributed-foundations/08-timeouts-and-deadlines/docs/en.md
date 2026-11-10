@@ -342,20 +342,201 @@ The test file has 39 assertions. The ones to read first are the three about the 
 
 ### In Python
 
-`code/python/main.py` has the same `Deadline`, `Context`, `RemoteService`, `Client`, `DeadlineAwareRetrier`, and `Hedger`, and prints the same demo line for line, including the seed-42 latency study (`p50=41 ms p99=919 ms; hedged p99=113 ms`). Python has no standard context type, so `Context` is a frozen dataclass passed explicitly, exactly like the Java record. Three things differ.
+The Python port (`code/python/main.py`) has the same `Deadline`, `Context`, `RemoteService`, `Client`, `DeadlineAwareRetrier`, and `Hedger`, and prints the same demo line for line, including the seed-42 latency study (`p50=41 ms p99=919 ms; hedged p99=113 ms`). Python has no standard context type, so `Context` is a frozen dataclass passed explicitly, exactly like the Java record. Three things differ. **Time stays in integer milliseconds.** `time.monotonic()` returns float seconds, and float budgets reintroduce rounding into the subtraction chain (`0.5 - 0.4 - 0.1` is `-2.8e-17`, a budget that is both "nearly zero" and negative). Every clock and budget in the port is an `int`, and `Deadline.NONE` is `2**63 - 1` so it compares and prints like `Long.MAX_VALUE`. **Overflow and parsing are Java's, on purpose.** A Python `int` never wraps, so `saturating_add` first reproduces the 64-bit wrap with `to_int64` and then applies the same sign test the Java uses. `from_wire` validates the digits with the grammar `Long.parseLong` accepts, because Python's `int()` also accepts `" 5"` and `"1_0"`, and a header parser that is laxer than the sender's peers is a bug. The `u` and `n` units divide with truncation toward zero, not `//`. **The study's generator is `java.util.Random`, ported.** `JavaRandom` reproduces the 48-bit LCG and `nextInt(bound)`, so `Hedger.study(42, 10_000, 60)` draws the same 20,000 latencies in both languages; a test pins the three percentiles. For in-process cancellation (which this lesson does not need, because the fake clock makes every wait explicit), `asyncio.timeout()` is the standard-library deadline; it takes a relative delay and converts it to an absolute loop time, the same shape as `Deadline.after`.
 
-- **Time stays in integer milliseconds.** `time.monotonic()` returns float seconds, and float budgets reintroduce rounding into the subtraction chain (`0.5 - 0.4 - 0.1` is `-2.8e-17`, a budget that is both "nearly zero" and negative). Every clock and budget in the port is an `int`, and `Deadline.NONE` is `2**63 - 1` so it compares and prints like `Long.MAX_VALUE`.
-- **Overflow and parsing are Java's, on purpose.** A Python `int` never wraps, so `saturating_add` first reproduces the 64-bit wrap with `to_int64` and then applies the same sign test the Java uses. `from_wire` validates the digits with the grammar `Long.parseLong` accepts, because Python's `int()` also accepts `" 5"` and `"1_0"`, and a header parser that is laxer than the sender's peers is a bug. The `u` and `n` units divide with truncation toward zero, not `//`.
-- **The study's generator is `java.util.Random`, ported.** `JavaRandom` reproduces the 48-bit LCG and `nextInt(bound)`, so `Hedger.study(42, 10_000, 60)` draws the same 20,000 latencies in both languages; a test pins the three percentiles.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Absolute deadlines that never go negative
+
+`Deadline` is a frozen dataclass over `at_ms`. `saturating_add` is the one place Python has to pretend to be Java: it wraps the sum to a signed 64-bit value with `to_int64` and then applies the sign-disagreement test, so `after(clock, INT64_MAX)` clamps instead of becoming a bigger int. `remaining_ms` clamps at zero and `earliest` is the min rule.
 
 ```python
-@staticmethod
-def saturating_add(a: int, b: int) -> int:
-    r = to_int64(a + b)
-    return INT64_MAX if ((a ^ r) & (b ^ r)) < 0 else r
+class Deadline:
+    at_ms: int
+
+    @staticmethod
+    def after(clock: Clock, timeout_ms: int) -> "Deadline":
+        if timeout_ms < 0:
+            raise ValueError(f"timeout must be >= 0: {timeout_ms}")
+        return Deadline(Deadline.saturating_add(clock.now_ms(), timeout_ms))
+
+    @staticmethod
+    def saturating_add(a: int, b: int) -> int:
+        r = to_int64(a + b)
+        return INT64_MAX if ((a ^ r) & (b ^ r)) < 0 else r
+
+    def is_none(self) -> bool:
+        return self.at_ms == INT64_MAX
+
+    def remaining_ms(self, clock: Clock) -> int:
+        """Milliseconds left, clamped at zero. Never negative, so callers can subtract margins safely."""
+        if self.is_none():
+            return INT64_MAX
+        return max(0, self.at_ms - clock.now_ms())
+
+    def is_expired(self, clock: Clock) -> bool:
+        return not self.is_none() and clock.now_ms() >= self.at_ms
+
+    def earliest(self, other: "Deadline") -> "Deadline":
+        """The tighter of two deadlines. A child may shorten its parent's deadline, never extend it."""
+        return self if self.at_ms <= other.at_ms else other
 ```
 
-For in-process cancellation (which this lesson does not need, because the fake clock makes every wait explicit), `asyncio.timeout()` is the standard-library deadline; it takes a relative delay and converts it to an absolute loop time, the same shape as `Deadline.after`.
+#### Step 2: The context that travels with the request
+
+A frozen dataclass with `request_id` and `deadline`. `with_timeout` builds a new context with the earlier of the parent's deadline and `now + timeout`; `without_deadline` is the bug, kept deliberately; `require_budget` raises `DeadlineExceededException` carrying the remaining budget.
+
+```python
+class Context:
+    request_id: str
+    deadline: Deadline
+
+    @staticmethod
+    def root(request_id: str) -> "Context":
+        return Context(request_id, Deadline.NONE)
+
+    def with_timeout(self, clock: Clock, timeout_ms: int) -> "Context":
+        """Derive a child context whose deadline is min(parent, now + timeout). Tightening only."""
+        return Context(self.request_id, self.deadline.earliest(Deadline.after(clock, timeout_ms)))
+
+    def without_deadline(self) -> "Context":
+        """What a service that drops the deadline effectively passes downstream. The bug this lesson is about."""
+        return Context(self.request_id, Deadline.NONE)
+
+    def require_budget(self, clock: Clock, needed_ms: int, where: str) -> None:
+        """Refuse work that cannot finish in the budget: the step that prevents a side effect nobody will read."""
+        remaining = self.remaining_ms(clock)
+        if remaining < needed_ms:
+            raise DeadlineExceededException(f"{where} needs {needed_ms} ms but only {remaining} ms remain", remaining)
+```
+
+#### Step 3: Crossing the wire as a duration
+
+`to_wire_timeout` returns `None` for no header, otherwise the remaining milliseconds with the `m` unit. `from_wire` checks the header length (1 to 8 digits plus a unit), matches the digits against a regex that mirrors `Long.parseLong`'s grammar because `int()` is more permissive, and uses `tdiv` for the sub-millisecond units so that truncation matches Java.
+
+```python
+    def to_wire_timeout(self, clock: Clock) -> Optional[str]:
+        if self.deadline.is_none():
+            return None
+        return f"{self.remaining_ms(clock)}m"
+
+    @staticmethod
+    def from_wire(request_id: str, header: Optional[str], clock: Clock) -> "Context":
+        """Rebuild a context on the receiving side from the wire header against the receiver's own clock."""
+        if header is None:
+            return Context.root(request_id)
+        if len(header) < 2 or len(header) > 9:
+            raise ValueError(f"bad timeout header: {header}")
+        unit = header[-1]
+        digits = header[:-1]
+        if not _JAVA_LONG.fullmatch(digits):          # Long.parseLong: no spaces, no underscores
+            raise ValueError(f"For input string: \"{digits}\"")
+        value = int(digits)
+        if unit == "H":
+            ms = value * 3_600_000
+        elif unit == "M":
+            ms = value * 60_000
+        elif unit == "S":
+            ms = value * 1_000
+        elif unit == "m":
+            ms = value
+        elif unit == "u":
+            ms = tdiv(value, 1_000)
+        elif unit == "n":
+            ms = tdiv(value, 1_000_000)
+        else:
+            raise ValueError(f"bad timeout unit: {unit}")
+        return Context.root(request_id).with_timeout(clock, ms)
+```
+
+#### Step 4: A simulated service that may or may not forward the deadline
+
+The `try/finally` charges the return hop whether the call returns or raises. The context is rebuilt from the header against this service's clock, the admission check runs before any work, and the `propagate` flag decides whether the downstream gets the real context or `without_deadline()`.
+
+```python
+    def call(self, incoming: Context) -> str:
+        self._clock.advance(RemoteService.HOP_MS)                       # request on the wire
+        # What arrives is a header, not an object: rebuild the context against this service's clock.
+        ctx = Context.from_wire(incoming.request_id, incoming.to_wire_timeout(self._clock), self._clock)
+        try:
+            ctx.require_budget(self._clock, self.work_ms, self.name)    # admission: refuse what cannot finish
+            self._clock.advance(self.work_ms)
+            if self.downstream is not None:
+                forwarded = ctx if self.propagate else ctx.without_deadline()
+                self.downstream.call(forwarded)
+            if self.side_effect is not None:
+                self._log.record(self._clock.now_ms(), f"{self.name}: {self.side_effect}")
+            return f"{self.name} ok"
+        finally:
+            self._clock.advance(RemoteService.HOP_MS)                   # response (or error) on the wire
+```
+
+#### Step 5: The edge decides what a late answer means
+
+`invoke` classifies the outcome by elapsed time, not by what the response says: a result that arrives after `timeout_ms` is `TIMED_OUT` and discarded, and a `DeadlineExceededException` is `FAILED_FAST` only if it arrived inside the budget.
+
+```python
+    def invoke(self, service: Service, request_id: str, timeout_ms: int) -> CallOutcome:
+        start = self._clock.now_ms()
+        ctx = Context.root(request_id).with_timeout(self._clock, timeout_ms)
+        try:
+            result = service.call(ctx)
+            elapsed = self._clock.now_ms() - start
+            # The response may have arrived after we stopped listening. Then it is a timeout, whatever it says.
+            if elapsed > timeout_ms:
+                return CallOutcome(Status.TIMED_OUT, elapsed,
+                                   f"response discarded: arrived {elapsed - timeout_ms} ms late")
+            return CallOutcome(Status.OK, elapsed, result)
+        except DeadlineExceededException as e:
+            elapsed = self._clock.now_ms() - start
+            return CallOutcome(Status.TIMED_OUT if elapsed > timeout_ms else Status.FAILED_FAST, elapsed, str(e))
+        except UnavailableException as e:
+            return CallOutcome(Status.UNAVAILABLE, self._clock.now_ms() - start, str(e))
+```
+
+#### Step 6: Retries that respect the envelope
+
+The three guards are the Java ones: no attempt below `min_useful_attempt_ms`, each attempt's budget clipped to what remains, and the backoff sleep clipped too. The two `except` clauses split the retryable `UnavailableException` from the terminal `DeadlineExceededException`.
+
+```python
+    def call(self, service: Service, ctx: Context) -> RetryOutcome:
+        start = self._clock.now_ms()
+        budgets: list[int] = []
+        attempts = 0
+        while True:
+            remaining = ctx.remaining_ms(self._clock)
+            if remaining < self._min_useful_attempt_ms:
+                return RetryOutcome(Status.FAILED_FAST, attempts, self._clock.now_ms() - start, budgets)
+            attempt_budget = min(self._per_attempt_timeout_ms, remaining)
+            budgets.append(attempt_budget)
+            attempts += 1
+            attempt = ctx.with_timeout(self._clock, attempt_budget)
+            try:
+                service.call(attempt)
+                return RetryOutcome(Status.OK, attempts, self._clock.now_ms() - start, budgets)
+            except UnavailableException:
+                sleep = min(self._backoff_ms, ctx.remaining_ms(self._clock))   # never sleep past the deadline
+                self._clock.advance(sleep)
+            except DeadlineExceededException:
+                return RetryOutcome(Status.FAILED_FAST, attempts, self._clock.now_ms() - start, budgets)
+```
+
+#### Step 7: Hedging the tail
+
+The closed form for one hedged call is three comparisons; `Hedger.study` runs it ten thousand times over latencies drawn from `JavaRandom`, which is why the percentiles match Java to the millisecond.
+
+```python
+    @staticmethod
+    def call(primary_latency_ms: int, backup_latency_ms: int, hedge_after_ms: int) -> HedgeResult:
+        if primary_latency_ms <= hedge_after_ms:
+            return HedgeResult(primary_latency_ms, 1, "primary")
+        hedged_arrival = hedge_after_ms + backup_latency_ms
+        if primary_latency_ms <= hedged_arrival:
+            return HedgeResult(primary_latency_ms, 2, "primary")
+        return HedgeResult(hedged_arrival, 2, "backup")
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/05-distributed-foundations/08-timeouts-and-deadlines/code/python
@@ -363,30 +544,294 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Line for line the Java output:
+
+```console
+== The downstream call that outlives its caller ==
+no propagation : TIMED_OUT after 620 ms; response discarded: arrived 120 ms late
+  side effect: t=560ms processor: CHARGE 19.99 USD card 4242
+  customer saw a timeout and will retry; the card was charged anyway.
+propagation    : FAILED_FAST after 220 ms; processor needs 400 ms but only 340 ms remain
+  side effects recorded: 0
+budget 700 ms  : OK after 620 ms; checkout ok
+
+== Retries live inside the deadline, not beside it ==
+deadline 1000 ms: OK after 3 attempts, 550 ms, per-attempt budgets [300, 300, 300]
+deadline  400 ms: FAILED_FAST after 2 attempts, 400 ms, per-attempt budgets [300, 200] (third attempt never started)
+
+== Hedged requests cut the tail for a few percent more load ==
+10000 calls, seed 42: p50=41 ms p99=919 ms; hedged p99=113 ms; extra load=5.1%
+```
+
 ### In Go
 
-`code/go/main.go` has the same `Deadline`, `Context`, `RemoteService`, `Client`, `DeadlineAwareRetrier`, and hedging study, and prints the same demo line for line, including `p50=41 ms p99=919 ms; hedged p99=113 ms` from the ported `java.util.Random` (`javarandom.go`). Go is the language this `Context` was modelled on, which raises the obvious question: why not `context.Context`? Because `context.WithDeadline` reads the real clock, and the whole lesson runs on a `FakeClock` so that a 620 ms chain costs 0 ms of test time. The lesson's `Context` keeps the same three operations (`WithTimeout` tightens with the min rule, `Deadline`, `RequireBudget`); `ctx.Done()` is the one thing it lacks, and the in-process cancellation it enables is the subject of Phase 4, Lesson 11. Three things differ.
+The Go port (`code/go/main.go`) has the same `Deadline`, `Context`, `RemoteService`, `Client`, `DeadlineAwareRetrier`, and hedging study, and prints the same demo line for line, including `p50=41 ms p99=919 ms; hedged p99=113 ms` from the ported `java.util.Random` (`javarandom.go`). Go is the language this `Context` was modelled on, which raises the obvious question: why not `context.Context`? Because `context.WithDeadline` reads the real clock, and the whole lesson runs on a `FakeClock` so that a 620 ms chain costs 0 ms of test time. The lesson's `Context` keeps the same three operations (`WithTimeout` tightens with the min rule, `Deadline`, `RequireBudget`); `ctx.Done()` is the one thing it lacks, and the in-process cancellation it enables is the subject of Phase 4, Lesson 11. Three things differ. **`Service.Call` returns `(string, error)`.** `*DeadlineExceededError` carries the message and the remaining budget and matches `ErrDeadlineExceeded` under `errors.Is`; `*UnavailableError` matches `ErrUnavailable`. `Client.Invoke` sorts the outcome by `errors.Is`, and the retrier's `switch` on the error class replaces the two `catch` blocks. `FromWire` returns `ErrBadHeader` for a malformed header instead of throwing. **Overflow is explicit.** Go's `int64` wraps silently like Java's `long`, so `SaturatingAdd` uses the same sign test; `math.MaxInt64` is `DeadlineNone`. The `u` and `n` units divide with `/`, which truncates toward zero exactly as Java does. **Two programming errors panic.** A negative timeout and a clock moved backwards are bugs in the caller, not conditions a payment flow can handle, so `DeadlineAfter` and `FakeClock.Advance` panic where every other failure is a returned error. `ToWireTimeout` returns `""` for "no header" because Go has no `null` string. In production Go, `context.WithTimeout(parent, d)` is `WithTimeout`, `ctx.Deadline()` is the absolute instant, gRPC-Go writes the `grpc-timeout` header from it, and `select { case <-ctx.Done(): ... }` is the checkpoint the fake-clock version calls by hand.
 
-- **`Service.Call` returns `(string, error)`.** `*DeadlineExceededError` carries the message and the remaining budget and matches `ErrDeadlineExceeded` under `errors.Is`; `*UnavailableError` matches `ErrUnavailable`. `Client.Invoke` sorts the outcome by `errors.Is`, and the retrier's `switch` on the error class replaces the two `catch` blocks. `FromWire` returns `ErrBadHeader` for a malformed header instead of throwing.
-- **Overflow is explicit.** Go's `int64` wraps silently like Java's `long`, so `SaturatingAdd` uses the same sign test; `math.MaxInt64` is `DeadlineNone`. The `u` and `n` units divide with `/`, which truncates toward zero exactly as Java does.
-- **Two programming errors panic.** A negative timeout and a clock moved backwards are bugs in the caller, not conditions a payment flow can handle, so `DeadlineAfter` and `FakeClock.Advance` panic where every other failure is a returned error. `ToWireTimeout` returns `""` for "no header" because Go has no `null` string.
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Absolute deadlines that never go negative
+
+`int64` wraps exactly like Java's `long`, so `SaturatingAdd` is the sign test with no preprocessing. `DeadlineAfter` panics on a negative timeout; `RemainingMs` uses the builtin `max` to clamp at zero.
 
 ```go
-func (c Context) RequireBudget(clock Clock, neededMs int64, where string) error {
-    remaining := c.RemainingMs(clock)
-    if remaining < neededMs {
-        return &DeadlineExceededError{fmt.Sprintf("%s needs %d ms but only %d ms remain", where, neededMs, remaining), remaining}
-    }
-    return nil
+type Deadline struct{ AtMs int64 }
+
+// DeadlineNone: no deadline. RemainingMs reports math.MaxInt64 and it never expires.
+var DeadlineNone = Deadline{math.MaxInt64}
+
+// DeadlineAfter is now + timeout. A negative timeout is a programming error and panics.
+func DeadlineAfter(clock Clock, timeoutMs int64) Deadline {
+	if timeoutMs < 0 {
+		panic(fmt.Sprintf("timeout must be >= 0: %d", timeoutMs))
+	}
+	return Deadline{SaturatingAdd(clock.NowMs(), timeoutMs)}
+}
+
+// SaturatingAdd clamps at math.MaxInt64 instead of wrapping: overflow iff both operands disagree in sign with the result.
+func SaturatingAdd(a, b int64) int64 {
+	r := a + b
+	if ((a ^ r) & (b ^ r)) < 0 {
+		return math.MaxInt64
+	}
+	return r
+}
+
+func (d Deadline) IsNone() bool { return d.AtMs == math.MaxInt64 }
+
+// RemainingMs is the milliseconds left, clamped at zero. Never negative, so callers can subtract margins safely.
+func (d Deadline) RemainingMs(clock Clock) int64 {
+	if d.IsNone() {
+		return math.MaxInt64
+	}
+	return max(0, d.AtMs-clock.NowMs())
+}
+
+func (d Deadline) IsExpired(clock Clock) bool { return !d.IsNone() && clock.NowMs() >= d.AtMs }
+
+// Earliest is the tighter of two deadlines. A child may shorten its parent's deadline, never extend it.
+func (d Deadline) Earliest(other Deadline) Deadline {
+	if d.AtMs <= other.AtMs {
+		return d
+	}
+	return other
 }
 ```
 
-In production Go, `context.WithTimeout(parent, d)` is `WithTimeout`, `ctx.Deadline()` is the absolute instant, gRPC-Go writes the `grpc-timeout` header from it, and `select { case <-ctx.Done(): ... }` is the checkpoint the fake-clock version calls by hand.
+#### Step 2: The context that travels with the request
+
+A two-field value struct with value receivers, so every derived context is a copy. `RequireBudget` returns a `*DeadlineExceededError` rather than raising; the caller decides whether to propagate it.
+
+```go
+type Context struct {
+	RequestID string
+	Deadline  Deadline
+}
+
+func Root(requestID string) Context { return Context{requestID, DeadlineNone} }
+
+// WithTimeout derives a child context whose deadline is min(parent, now + timeout). Tightening only.
+func (c Context) WithTimeout(clock Clock, timeoutMs int64) Context {
+	return Context{c.RequestID, c.Deadline.Earliest(DeadlineAfter(clock, timeoutMs))}
+}
+
+// WithoutDeadline is what a service that drops the deadline effectively passes downstream. The bug this lesson is about.
+func (c Context) WithoutDeadline() Context { return Context{c.RequestID, DeadlineNone} }
+
+func (c Context) RemainingMs(clock Clock) int64 { return c.Deadline.RemainingMs(clock) }
+
+func (c Context) RequireBudget(clock Clock, neededMs int64, where string) error {
+	remaining := c.RemainingMs(clock)
+	if remaining < neededMs {
+		return &DeadlineExceededError{fmt.Sprintf("%s needs %d ms but only %d ms remain", where, neededMs, remaining), remaining}
+	}
+	return nil
+}
+```
+
+#### Step 3: Crossing the wire as a duration
+
+The empty string stands for "no header". `FromWire` enforces the digits-only grammar with `strings.Trim` before `strconv.ParseInt` (which would otherwise accept a leading `+`), and every malformed case wraps `ErrBadHeader`. Integer `/` truncates toward zero, as in Java.
+
+```go
+func (c Context) ToWireTimeout(clock Clock) string {
+	if c.Deadline.IsNone() {
+		return ""
+	}
+	return strconv.FormatInt(c.RemainingMs(clock), 10) + "m"
+}
+
+// FromWire rebuilds a context on the receiving side from the wire header against the receiver's own clock.
+func FromWire(requestID, header string, clock Clock) (Context, error) {
+	if header == "" {
+		return Root(requestID), nil
+	}
+	if len(header) < 2 || len(header) > 9 {
+		return Context{}, fmt.Errorf("%w: %q", ErrBadHeader, header)
+	}
+	unit := header[len(header)-1]
+	digits := header[:len(header)-1]
+	if strings.Trim(digits, "0123456789") != "" { // Long.parseLong's grammar: ASCII digits only
+		return Context{}, fmt.Errorf("%w: %q", ErrBadHeader, header)
+	}
+	value, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return Context{}, fmt.Errorf("%w: %q", ErrBadHeader, header)
+	}
+	var ms int64
+	switch unit {
+	case 'H':
+		ms = value * 3_600_000
+	case 'M':
+		ms = value * 60_000
+	case 'S':
+		ms = value * 1_000
+	case 'm':
+		ms = value
+	case 'u':
+		ms = value / 1_000
+	case 'n':
+		ms = value / 1_000_000
+	default:
+		return Context{}, fmt.Errorf("%w: bad timeout unit: %c", ErrBadHeader, unit)
+	}
+	return Root(requestID).WithTimeout(clock, ms), nil
+}
+```
+
+#### Step 4: A simulated service that may or may not forward the deadline
+
+`defer s.clock.Advance(HopMs)` is the `finally`: the return hop is charged on every exit, error or not. Each failing step returns its error immediately, which is what lets the admission check stop the chain before any work.
+
+```go
+func (s *RemoteService) Call(incoming Context) (string, error) {
+	s.clock.Advance(HopMs)       // request on the wire
+	defer s.clock.Advance(HopMs) // response (or error) on the wire
+	// What arrives is a header, not an object: rebuild the context against this service's clock.
+	ctx, err := FromWire(incoming.RequestID, incoming.ToWireTimeout(s.clock), s.clock)
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.RequireBudget(s.clock, s.WorkMs, s.Name); err != nil { // admission: refuse what cannot finish
+		return "", err
+	}
+	s.clock.Advance(s.WorkMs)
+	if s.Downstream != nil {
+		forwarded := ctx
+		if !s.Propagate {
+			forwarded = ctx.WithoutDeadline()
+		}
+		if _, err := s.Downstream.Call(forwarded); err != nil {
+			return "", err
+		}
+	}
+	if s.SideEffect != "" {
+		s.log.Record(s.clock.NowMs(), s.Name+": "+s.SideEffect)
+	}
+	return s.Name + " ok", nil
+}
+```
+
+#### Step 5: The edge decides what a late answer means
+
+A tagless `switch` with `errors.Is` replaces the three `catch` blocks. `elapsed` is computed once, before the switch, since every branch needs it.
+
+```go
+func (c *Client) Invoke(service Service, requestID string, timeoutMs int64) CallOutcome {
+	start := c.clock.NowMs()
+	ctx := Root(requestID).WithTimeout(c.clock, timeoutMs)
+	result, err := service.Call(ctx)
+	elapsed := c.clock.NowMs() - start
+	switch {
+	case err == nil:
+		// The response may have arrived after we stopped listening. Then it is a timeout, whatever it says.
+		if elapsed > timeoutMs {
+			return CallOutcome{TimedOut, elapsed, fmt.Sprintf("response discarded: arrived %d ms late", elapsed-timeoutMs)}
+		}
+		return CallOutcome{OK, elapsed, result}
+	case errors.Is(err, ErrDeadlineExceeded):
+		if elapsed > timeoutMs {
+			return CallOutcome{TimedOut, elapsed, err.Error()}
+		}
+		return CallOutcome{FailedFast, elapsed, err.Error()}
+	case errors.Is(err, ErrUnavailable):
+		return CallOutcome{Unavailable, elapsed, err.Error()}
+	}
+	return CallOutcome{FailedFast, elapsed, err.Error()}
+}
+```
+
+#### Step 6: Retries that respect the envelope
+
+Same three guards; the `switch` on `err` separates success, the retryable `ErrUnavailable`, and everything else (a deadline error) which ends the loop. The builtin `min` does the clipping.
+
+```go
+func (r *DeadlineAwareRetrier) Call(service Service, ctx Context) RetryOutcome {
+	start := r.clock.NowMs()
+	var budgets []int64
+	attempts := 0
+	for {
+		remaining := ctx.RemainingMs(r.clock)
+		if remaining < r.minUsefulAttemptMs {
+			return RetryOutcome{FailedFast, attempts, r.clock.NowMs() - start, budgets}
+		}
+		attemptBudget := min(r.perAttemptTimeout, remaining)
+		budgets = append(budgets, attemptBudget)
+		attempts++
+		attempt := ctx.WithTimeout(r.clock, attemptBudget)
+		_, err := service.Call(attempt)
+		switch {
+		case err == nil:
+			return RetryOutcome{OK, attempts, r.clock.NowMs() - start, budgets}
+		case errors.Is(err, ErrUnavailable):
+			sleep := min(r.backoffMs, ctx.RemainingMs(r.clock)) // never sleep past the deadline
+			r.clock.Advance(sleep)
+		default: // deadline exceeded
+			return RetryOutcome{FailedFast, attempts, r.clock.NowMs() - start, budgets}
+		}
+	}
+}
+```
+
+#### Step 7: Hedging the tail
+
+`Hedge` is the closed form; `RunStudy` drives it with the ported generator so the percentiles agree with Java and Python.
+
+```go
+func Hedge(primaryLatencyMs, backupLatencyMs, hedgeAfterMs int64) HedgeResult {
+	if primaryLatencyMs <= hedgeAfterMs {
+		return HedgeResult{primaryLatencyMs, 1, "primary"}
+	}
+	hedgedArrival := hedgeAfterMs + backupLatencyMs
+	if primaryLatencyMs <= hedgedArrival {
+		return HedgeResult{primaryLatencyMs, 2, "primary"}
+	}
+	return HedgeResult{hedgedArrival, 2, "backup"}
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/05-distributed-foundations/08-timeouts-and-deadlines/code/go
 go run .
 go test ./...
+```
+
+`diff <(go run .) <(python3 ../python/main.py)` is empty; the output is identical to the Java and Python runs:
+
+```console
+== The downstream call that outlives its caller ==
+no propagation : TIMED_OUT after 620 ms; response discarded: arrived 120 ms late
+  side effect: t=560ms processor: CHARGE 19.99 USD card 4242
+propagation    : FAILED_FAST after 220 ms; processor needs 400 ms but only 340 ms remain
+  side effects recorded: 0
+
+== Retries live inside the deadline, not beside it ==
+deadline 1000 ms: OK after 3 attempts, 550 ms, per-attempt budgets [300, 300, 300]
+deadline  400 ms: FAILED_FAST after 2 attempts, 400 ms, per-attempt budgets [300, 200] (third attempt never started)
+
+== Hedged requests cut the tail for a few percent more load ==
+10000 calls, seed 42: p50=41 ms p99=919 ms; hedged p99=113 ms; extra load=5.1%
 ```
 
 ## Use It

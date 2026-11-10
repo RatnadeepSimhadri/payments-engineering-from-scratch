@@ -361,8 +361,45 @@ The call counts (20,736 and 56) are asserted exactly in all three test suites. I
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Closures instead of helper methods:** the recursive forms are nested functions that close over `denominations`, `memo`, and `calls`; the call counter is still a one-element list because a nested function cannot rebind an outer integer without `nonlocal`. **No overflow, no `addExact`:** `count_ways` on Python ints is exact at any size; the Java and Go versions must check. The knapsack table is a list of lists of ints and `best_batch` binds `prev, row = best[i - 1], best[i]` before the inner loop, which removes two index operations per cell and roughly halves the running time on the pure-Python inner loop. **`functools.lru_cache` exists** and is the idiomatic memoiser; the lesson writes the dictionary by hand so the two added lines are visible. Exercise 1 asks you to swap it in. **Recursion depth:** Python's default recursion limit is 1,000 frames, so the recursive and memoised forms fail on amounts around 1,000 with denominations that include 1. The table has no such limit, which is one more reason it is the production form.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The recurrence, with a call counter
+
+`recurse` is a closure inside `min_coins_recursive`, so it sees `denominations` and `calls` without passing them. `INF` is `2**31`; it cannot overflow but it must still be a value that `sub + 1` never reaches legitimately, which is why unreachable branches are tested with `!= INF` before the `min`.
+
 ```python
-def min_coins_memo(denominations, amount, calls):
+INF = 2**31  # "unreachable" sentinel for the recurrence forms; Python ints never overflow
+```
+
+```python
+def min_coins_recursive(denominations: Sequence[int], amount: int, calls: list[int]) -> int:
+    """The recurrence as written: f(0) = 0, f(a) = 1 + min over d <= a of f(a - d). Exponential."""
+    _validate(denominations, amount)
+
+    def recurse(a: int) -> int:
+        calls[0] += 1
+        if a == 0:
+            return 0
+        best = INF
+        for d in denominations:
+            if d <= a:
+                sub = recurse(a - d)
+                if sub != INF:
+                    best = min(best, sub + 1)
+        return best
+
+    return recurse(amount)
+```
+
+#### Step 2: Memoise
+
+The same closure with two lines added: `if a in memo: return memo[a]` before the loop and `memo[a] = best` after it. `memo` is a plain `dict`; the 20,736 calls become 56, exactly as in Java.
+
+```python
+def min_coins_memo(denominations: Sequence[int], amount: int, calls: list[int]) -> int:
+    """Same recurrence; every subproblem solved once. O(amount * len(denominations))."""
     _validate(denominations, amount)
     memo: dict[int, int] = {}
 
@@ -372,33 +409,411 @@ def min_coins_memo(denominations, amount, calls):
             return 0
         if a in memo:
             return memo[a]
-        ...
+        best = INF
+        for d in denominations:
+            if d <= a:
+                sub = memoised(a - d)
+                if sub != INF:
+                    best = min(best, sub + 1)
+        memo[a] = best
+        return best
+
+    return memoised(amount)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 3: The table, with reconstruction
 
-- **Closures instead of helper methods.** The recursive forms are nested functions that close over `denominations`, `memo`, and `calls`; the call counter is still a one-element list because a nested function cannot rebind an outer integer without `nonlocal`.
-- **No overflow, no `addExact`.** `count_ways` on Python ints is exact at any size; the Java and Go versions must check. The knapsack table is a list of lists of ints and `best_batch` binds `prev, row = best[i - 1], best[i]` before the inner loop, which removes two index operations per cell and roughly halves the running time on the pure-Python inner loop.
-- **`functools.lru_cache` exists** and is the idiomatic memoiser; the lesson writes the dictionary by hand so the two added lines are visible. Exercise 1 asks you to swap it in.
-- **Recursion depth.** Python's default recursion limit is 1,000 frames, so the recursive and memoised forms fail on amounts around 1,000 with denominations that include 1. The table has no such limit, which is one more reason it is the production form.
+`[INF] * (amount + 1)` and `[-1] * (amount + 1)` are the filled arrays. `enumerate` supplies the denomination index for `choice`, and the strict `<` gives ties to the lowest index. The reconstruction is a `while` loop that subtracts the chosen denomination until zero; `used` is returned as a tuple so `ChangeResult` stays hashable.
+
+```python
+def min_coins_table(denominations: Sequence[int], amount: int) -> ChangeResult:
+    """Bottom-up table plus a choice array for reconstruction. Ties go to the lowest index."""
+    _validate(denominations, amount)
+    best = [INF] * (amount + 1)
+    choice = [-1] * (amount + 1)
+    best[0] = 0
+    for a in range(1, amount + 1):
+        for i, d in enumerate(denominations):
+            if d <= a and best[a - d] != INF and best[a - d] + 1 < best[a]:
+                best[a] = best[a - d] + 1
+                choice[a] = i
+    used = [0] * len(denominations)
+    if best[amount] == INF:
+        return ChangeResult(UNREACHABLE, tuple(used))
+    a = amount
+    while a > 0:
+        used[choice[a]] += 1
+        a -= denominations[choice[a]]
+    return ChangeResult(best[amount], tuple(used))
+```
+
+#### Step 4: Number of ways
+
+Denominations outer, amounts inner, and a plain `+=` because Python ints cannot overflow. The count for 100.00 USD is 242 here as everywhere; the difference is that a count in the quadrillions would be correct rather than an exception.
+
+```python
+def count_ways(denominations: Sequence[int], amount: int) -> int:
+    """Distinct multisets summing to amount. Denominations OUTER so {1,2} and {2,1} count once."""
+    _validate(denominations, amount)
+    ways = [0] * (amount + 1)
+    ways[0] = 1
+    for d in denominations:
+        for a in range(d, amount + 1):
+            ways[a] += ways[a - d]
+    return ways[amount]
+```
+
+#### Step 5: Knapsack over payouts
+
+The table is a list comprehension of rows. Binding `prev` and `row` once per outer iteration is the interpreter optimisation mentioned above; the `take` branch still reads the previous row, which is the 0/1 constraint. Reconstruction walks the rows backwards, `insert(0, p)` keeps input order, and the total is re-summed with `Money.plus`.
+
+```python
+    n, w = len(payouts), limit.minor_units
+    best = [[0] * (w + 1) for _ in range(n + 1)]  # best[i][c]: max priority, first i payouts, capacity c
+    for i in range(1, n + 1):
+        p = payouts[i - 1]
+        weight, prev, row = p.amount.minor_units, best[i - 1], best[i]
+        for c in range(w + 1):
+            skip = prev[c]
+            take = prev[c - weight] + p.priority if weight <= c else -1
+            row[c] = skip if skip >= take else take
+```
+
+```python
+    chosen: list[Payout] = []
+    total = Money.of_minor(0, limit.currency)
+    c = w
+    for i in range(n, 0, -1):
+        if best[i][c] != best[i - 1][c]:  # this row's value changed: the item was taken
+            p = payouts[i - 1]
+            chosen.insert(0, p)
+            total = total.plus(p.amount)
+            c -= p.amount.minor_units
+    return Batch(chosen, total, best[n][w])
+```
+
+#### Step 6: LCS and the alignment
+
+`lcs_table` is the Java table with a list-of-lists allocation. `lcs_align` collects the three outputs by appending during the backward walk and reversing at the end, which is cheaper in Python than `insert(0, ...)`; the `>=` tie rule (consume from `a`) is unchanged, so the demo matches `CARD 19.99` exactly as the Java does.
+
+```python
+def lcs_table(a: Sequence[str], b: Sequence[str]) -> list[list[int]]:
+    """length[i][j] = LCS of a[:i] and b[:j]. O(|a| * |b|) time and space."""
+    length = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                length[i][j] = length[i - 1][j - 1] + 1
+            else:
+                length[i][j] = max(length[i - 1][j], length[i][j - 1])
+    return length
+```
+
+```python
+def lcs_align(a: Sequence[str], b: Sequence[str]) -> Alignment:
+    """Walk the table back from the corner. Ties prefer consuming from a, so the result is deterministic."""
+    length = lcs_table(a, b)
+    common: list[str] = []
+    left_only: list[str] = []
+    right_only: list[str] = []
+    i, j = len(a), len(b)
+    while i > 0 and j > 0:
+        if a[i - 1] == b[j - 1]:
+            common.append(a[i - 1])
+            i -= 1
+            j -= 1
+        elif length[i - 1][j] >= length[i][j - 1]:
+            left_only.append(a[i - 1])
+            i -= 1
+        else:
+            right_only.append(b[j - 1])
+            j -= 1
+    left_only.extend(reversed(a[:i]))
+    right_only.extend(reversed(b[:j]))
+    return Alignment(common[::-1], left_only[::-1], right_only[::-1])
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/02-algorithms/06-dynamic-programming/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== Recurrence -> memo -> table: fewest coins for 20 with {1, 3, 4} ==
+recursive: 5 coins after 20736 calls
+memoised : 5 coins after 56 calls
+table    : 5 coins = [4, 4, 4, 4, 4]
+
+== Greedy is wrong for non-canonical denominations ==
+{1,3,4} for 6: greedy=3 (4+1+1), optimal=2 (3+3)
+30.00 USD in {1, 15, 25} vouchers: greedy=6 instruments, table=2 -> [1500, 1500] cents
+
+== 0/1 knapsack: payout batch under a 100.00 USD settlement limit ==
+greedy by priority: ['P-A', 'P-D', 'P-E'] total=100.00 USD priority=115
+knapsack table   : ['P-B', 'P-C'] total=100.00 USD priority=180
+
+== LCS: statement lines in order ==
+matched in order (3): ['DEP 500.00', 'CARD 19.99', 'CARD 7.00']
+bank only   : ['CARD 42.10', 'FEE 2.50']
+ledger only : ['CARD 42.10', 'REFUND 19.99']
+```
+
+The numbers match the Java run; lists print with Python's quoting, so `['P-B', 'P-C']` where Java prints `[P-B, P-C]`. The call counts 20,736 and 56 are asserted exactly in the test suite.
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with four differences. **Errors are values:** every public function returns `(result, error)`; `BestBatch` wraps `ErrCurrencyMismatch` so tests use `errors.Is`. The demo's `must` helper panics on error, which is acceptable in `main` and nowhere else. **A 2D table is a slice of slices**, allocated row by row. Go has no rectangular array type with runtime dimensions; for very large tables a single flat slice indexed by `i*(w+1)+c` is faster and friendlier to the garbage collector. **Overflow is checked by hand** in `CountWays` (`next < ways[a]` after an addition of non-negatives) because Go, like Java primitives, wraps silently and has no `addExact`. **Closures for recursion** need the `var recurse func(int) int` declaration before assignment so the function literal can refer to itself.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The recurrence, with a call counter
+
+The counter is an `*int64` because a closure can increment through a pointer. The `var recurse func(a int) int` line is required: a Go function literal cannot name itself, so the variable is declared first and assigned second. `INF` is `1 << 30`, half of `MaxInt32`, for the same no-overflow reason as in Java.
+
 ```go
-func BestBatch(payouts []Payout, limit Money) (Batch, error) {
-    ...
-    best := make([][]int64, n+1)
-    for i := range best {
-        best[i] = make([]int64, w+1)
-    }
+// INF marks an unreachable amount in the recurrence forms; half of MaxInt32 so INF+1 cannot overflow.
+const INF = 1 << 30
 ```
 
-Differences, all in `code/go/main.go`:
+```go
+func MinCoinsRecursive(denominations []int, amount int, calls *int64) (int, error) {
+	if err := validate(denominations, amount); err != nil {
+		return 0, err
+	}
+	var recurse func(a int) int
+	recurse = func(a int) int {
+		*calls++
+		if a == 0 {
+			return 0
+		}
+		best := INF
+		for _, d := range denominations {
+			if d <= a {
+				if sub := recurse(a - d); sub != INF && sub+1 < best {
+					best = sub + 1
+				}
+			}
+		}
+		return best
+	}
+	return recurse(amount), nil
+}
+```
 
-- **Errors are values.** Every public function returns `(result, error)`; `BestBatch` wraps `ErrCurrencyMismatch` so tests use `errors.Is`. The demo's `must` helper panics on error, which is acceptable in `main` and nowhere else.
-- **A 2D table is a slice of slices**, allocated row by row. Go has no rectangular array type with runtime dimensions; for very large tables a single flat slice indexed by `i*(w+1)+c` is faster and friendlier to the garbage collector.
-- **Overflow is checked by hand** in `CountWays` (`next < ways[a]` after an addition of non-negatives) because Go, like Java primitives, wraps silently and has no `addExact`.
-- **Closures for recursion** need the `var recurse func(int) int` declaration before assignment so the function literal can refer to itself.
+#### Step 2: Memoise
+
+The memo is a `map[int]int`; the two-value lookup `known, ok := memo[a]` is the "is it cached" test, and the store happens after the loop. The call count drops from 20,736 to 56, as in Java.
+
+```go
+func MinCoinsMemo(denominations []int, amount int, calls *int64) (int, error) {
+	if err := validate(denominations, amount); err != nil {
+		return 0, err
+	}
+	memo := map[int]int{}
+	var memoised func(a int) int
+	memoised = func(a int) int {
+		*calls++
+		if a == 0 {
+			return 0
+		}
+		if known, ok := memo[a]; ok {
+			return known
+		}
+		best := INF
+		for _, d := range denominations {
+			if d <= a {
+				if sub := memoised(a - d); sub != INF && sub+1 < best {
+					best = sub + 1
+				}
+			}
+		}
+		memo[a] = best
+		return best
+	}
+	return memoised(amount), nil
+}
+```
+
+#### Step 3: The table, with reconstruction
+
+Go has no `Arrays.fill`, so a `range` loop initialises `best` and `choice` together. The table loop and the reconstruction `for` are otherwise the Java code; `ChangeResult` holds `Used` as a slice.
+
+```go
+func MinCoinsTable(denominations []int, amount int) (ChangeResult, error) {
+	if err := validate(denominations, amount); err != nil {
+		return ChangeResult{}, err
+	}
+	best := make([]int, amount+1)
+	choice := make([]int, amount+1)
+	for a := range best {
+		best[a], choice[a] = INF, -1
+	}
+	best[0] = 0
+	for a := 1; a <= amount; a++ {
+		for i, d := range denominations {
+			if d <= a && best[a-d] != INF && best[a-d]+1 < best[a] {
+				best[a] = best[a-d] + 1
+				choice[a] = i
+			}
+		}
+	}
+	used := make([]int, len(denominations))
+	if best[amount] == INF {
+		return ChangeResult{Unreachable, used}, nil
+	}
+	for a := amount; a > 0; a -= denominations[choice[a]] {
+		used[choice[a]]++
+	}
+	return ChangeResult{best[amount], used}, nil
+}
+```
+
+#### Step 4: Number of ways
+
+The hand-written overflow check: both operands are non-negative, so a sum smaller than either operand means the `int64` wrapped. An overflow becomes an error rather than a wrong count.
+
+```go
+func CountWays(denominations []int, amount int) (int64, error) {
+	if err := validate(denominations, amount); err != nil {
+		return 0, err
+	}
+	ways := make([]int64, amount+1)
+	ways[0] = 1
+	for _, d := range denominations {
+		for a := d; a <= amount; a++ {
+			next := ways[a] + ways[a-d]
+			if next < ways[a] {
+				return 0, errors.New("int64 overflow in count of ways")
+			}
+			ways[a] = next
+		}
+	}
+	return ways[amount], nil
+}
+```
+
+#### Step 5: Knapsack over payouts
+
+The table is allocated row by row. `int(limit.MinorUnits)` is the index conversion; the `take`/`skip` comparison is written as an `if` because the demo predates the built-in `max` on `int64` in some toolchains. Reconstruction prepends with `append([]Payout{p}, chosen...)` to keep input order and re-sums the total with `Money.Plus`.
+
+```go
+	n, w := len(payouts), int(limit.MinorUnits)
+	best := make([][]int64, n+1) // best[i][c]: max priority using the first i payouts under capacity c
+	for i := range best {
+		best[i] = make([]int64, w+1)
+	}
+	for i := 1; i <= n; i++ {
+		p := payouts[i-1]
+		weight := int(p.Amount.MinorUnits)
+		for c := 0; c <= w; c++ {
+			skip := best[i-1][c]
+			take := int64(-1)
+			if weight <= c {
+				take = best[i-1][c-weight] + p.Priority
+			}
+			if take > skip {
+				best[i][c] = take
+			} else {
+				best[i][c] = skip
+			}
+		}
+	}
+```
+
+```go
+	chosen := []Payout{}
+	total := OfMinor(0, limit.Currency)
+	c := w
+	for i := n; i >= 1; i-- {
+		if best[i][c] != best[i-1][c] { // this row's value changed: the item was taken
+			p := payouts[i-1]
+			chosen = append([]Payout{p}, chosen...)
+			total, _ = total.Plus(p.Amount)
+			c -= int(p.Amount.MinorUnits)
+		}
+	}
+	return Batch{chosen, total, best[n][w]}, nil
+```
+
+#### Step 6: LCS and the alignment
+
+`LcsTable` writes the `max` as an explicit `else if`. `LcsAlign` uses a tagless `switch` for the three cases and appends during the backward walk; the `>=` tie rule is the same, and the file reverses the three slices before returning.
+
+```go
+func LcsTable(a, b []string) [][]int {
+	length := make([][]int, len(a)+1)
+	for i := range length {
+		length[i] = make([]int, len(b)+1)
+	}
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			if a[i-1] == b[j-1] {
+				length[i][j] = length[i-1][j-1] + 1
+			} else if length[i-1][j] >= length[i][j-1] {
+				length[i][j] = length[i-1][j]
+			} else {
+				length[i][j] = length[i][j-1]
+			}
+		}
+	}
+	return length
+}
+```
+
+```go
+// LcsAlign walks the table back from the corner. Ties prefer consuming from a, so the result is deterministic.
+func LcsAlign(a, b []string) Alignment {
+	length := LcsTable(a, b)
+	var common, leftOnly, rightOnly []string
+	i, j := len(a), len(b)
+	for i > 0 && j > 0 {
+		switch {
+		case a[i-1] == b[j-1]:
+			common = append(common, a[i-1])
+			i--
+			j--
+		case length[i-1][j] >= length[i][j-1]:
+			leftOnly = append(leftOnly, a[i-1])
+			i--
+		default:
+			rightOnly = append(rightOnly, b[j-1])
+			j--
+		}
+	}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/02-algorithms/06-dynamic-programming/code/go
+go run .
+go test ./...
+```
+
+```console
+== Recurrence -> memo -> table: fewest coins for 20 with {1, 3, 4} ==
+recursive: 5 coins after 20736 calls
+memoised : 5 coins after 56 calls
+table    : 5 coins = [4 4 4 4 4]
+
+== Greedy is wrong for non-canonical denominations ==
+{1,3,4} for 6: greedy=3 (4+1+1), optimal=2 (3+3)
+30.00 USD in {1, 15, 25} vouchers: greedy=6 instruments, table=2 -> [1500 1500] cents
+
+== 0/1 knapsack: payout batch under a 100.00 USD settlement limit ==
+greedy by priority: [P-A P-D P-E] total=100.00 USD priority=115
+knapsack table   : [P-B P-C] total=100.00 USD priority=180
+
+== LCS: statement lines in order ==
+matched in order (3): ["DEP 500.00" "CARD 19.99" "CARD 7.00"]
+bank only   : ["CARD 42.10" "FEE 2.50"]
+ledger only : ["CARD 42.10" "REFUND 19.99"]
+```
+
+The numbers match Java and Python; Go's `fmt` prints slices without commas and quotes strings inside them. The call counts 20,736 and 56 are pinned by the Go tests too.
 
 ## Use It
 

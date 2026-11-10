@@ -343,21 +343,231 @@ Read the five verdicts as five findings. The first is evidence that 300 ms of ex
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Sealed interfaces become a base class plus frozen dataclasses:** `Fault` and `BlastRadius` are plain classes; `Latency`, `Error`, `Partition`, `ClockSkew` and `PercentOfRequests`, `Merchants`, `Everyone` are `@dataclass(frozen=True)` subclasses attached as `Fault.Latency` and so on, so call sites read like the Java. The network uses `match` with class patterns where Java uses `instanceof` pattern matching. Nothing stops a third party adding a fifth `Fault` in Python; the "sealed" part is a convention here, not a compiler guarantee. **Every RNG is `java.util.Random`, not `random.Random`:** `JavaRandom.next_int` ports the 48-bit LCG and its rejection loop, so seeds 7, 11, 13, 17 produce the same blast-radius draws, declines, latencies, and merchant ids as the Java demo, and the GameDay numbers (488/12 baseline, p99 417 ms, 298 faults applied) match exactly rather than approximately. **Exceptions and the `finally`:** `ProcessorErrorException` and `StaleRequestException` subclass `RuntimeError`; `SimNetwork.call` keeps the same `try`/`except`/`finally` so the processor's clock skew is always reset, and every `IllegalArgumentException` is a `ValueError`. **The abort index is a return value:** Java smuggles `stoppedAt` out of `drive` through a one-element `int[]`; Python returns `(metrics, stopped_at)` as a tuple. `Money.__post_init__` additionally rejects floats, since nothing else in Python would.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Faults as values
+
+Four frozen dataclasses under an empty `Fault` base; each `__str__` renders the Java record form so the report text is identical. The last line attaches them as `Fault.Latency` and friends, which is the Python spelling of the nested sealed types.
+
 ```python
-for f in self._injector.faults_for(self.LINK_GATEWAY_TO_PROCESSOR, request):
-    match f:
-        case Fault.Latency(added_millis=added):
-            latency += added
-        case Fault.Partition():
-            partitioned = True
+class Fault:
+    """The four faults this lesson injects. Each is a value: it can be logged, diffed, and replayed."""
+
+
+@dataclass(frozen=True)
+class Latency(Fault):
+    added_millis: int
+
+    def __post_init__(self) -> None:
+        if self.added_millis < 0:
+            raise ValueError("latency must be >= 0")
+
+    def __str__(self) -> str:
+        return f"Latency[addedMillis={self.added_millis}]"
+
+
+@dataclass(frozen=True)
+class Error(Fault):
+    code: str
+
+
+@dataclass(frozen=True)
+class Partition(Fault):
+    def __str__(self) -> str:
+        return "Partition[]"
+
+
+@dataclass(frozen=True)
+class ClockSkew(Fault):
+    skew_millis: int
+
+
+Fault.Latency, Fault.Error, Fault.Partition, Fault.ClockSkew = Latency, Error, Partition, ClockSkew
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: Blast radius as a predicate
 
-- **Sealed interfaces become a base class plus frozen dataclasses.** `Fault` and `BlastRadius` are plain classes; `Latency`, `Error`, `Partition`, `ClockSkew` and `PercentOfRequests`, `Merchants`, `Everyone` are `@dataclass(frozen=True)` subclasses attached as `Fault.Latency` and so on, so call sites read like the Java. The network uses `match` with class patterns where Java uses `instanceof` pattern matching. Nothing stops a third party adding a fifth `Fault` in Python; the "sealed" part is a convention here, not a compiler guarantee.
-- **Every RNG is `java.util.Random`, not `random.Random`.** `JavaRandom.next_int` ports the 48-bit LCG and its rejection loop, so seeds 7, 11, 13, 17 produce the same blast-radius draws, declines, latencies, and merchant ids as the Java demo, and the GameDay numbers (488/12 baseline, p99 417 ms, 298 faults applied) match exactly rather than approximately.
-- **Exceptions and the `finally`.** `ProcessorErrorException` and `StaleRequestException` subclass `RuntimeError`; `SimNetwork.call` keeps the same `try`/`except`/`finally` so the processor's clock skew is always reset, and every `IllegalArgumentException` is a `ValueError`.
-- **The abort index is a return value.** Java smuggles `stoppedAt` out of `drive` through a one-element `int[]`; Python returns `(metrics, stopped_at)` as a tuple. `Money.__post_init__` additionally rejects floats, since nothing else in Python would.
+Same shape: a base class with `includes`, three frozen dataclasses. `Merchants` holds a `frozenset` (hashable, so the dataclass stays frozen) and prints it sorted; `PercentOfRequests` draws from the injector's `JavaRandom`, never its own.
+
+```python
+class BlastRadius:
+    def includes(self, request: AuthRequest, rng: Optional[JavaRandom]) -> bool:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class PercentOfRequests(BlastRadius):
+    percent: int
+
+    def __post_init__(self) -> None:
+        if self.percent < 0 or self.percent > 100:
+            raise ValueError("percent 0..100")
+
+    def includes(self, request: AuthRequest, rng: Optional[JavaRandom]) -> bool:
+        return rng.next_int(100) < self.percent
+
+
+@dataclass(frozen=True)
+class Merchants(BlastRadius):
+    merchant_ids: frozenset[str]
+
+    def includes(self, request: AuthRequest, rng: Optional[JavaRandom]) -> bool:
+        return request.merchant_id in self.merchant_ids
+
+
+@dataclass(frozen=True)
+class Everyone(BlastRadius):
+    def includes(self, request: AuthRequest, rng: Optional[JavaRandom]) -> bool:
+        return True
+```
+
+#### Step 3: The injector
+
+A list of `Injection`s and one seeded `JavaRandom`. `clear()` is the abort path and is a list clear; `faults_for` counts every applied fault so the report can say how many requests were actually touched.
+
+```python
+class FaultInjector:
+    def __init__(self, seed: int) -> None:
+        self._injections: list[Injection] = []
+        self._rng = JavaRandom(seed)
+        self._applied = 0
+
+    def inject(self, target: str, fault: Fault, radius: BlastRadius) -> None:
+        self._injections.append(Injection(target, fault, radius))
+
+    def clear(self) -> None:
+        self._injections.clear()
+
+    def is_armed(self) -> bool:
+        return bool(self._injections)
+
+    def applied_count(self) -> int:
+        return self._applied
+
+    def faults_for(self, target: str, request: AuthRequest) -> list[Fault]:
+        out: list[Fault] = []
+        for inj in self._injections:
+            if inj.target == target and inj.blast_radius.includes(request, self._rng):
+                out.append(inj.fault)
+                self._applied += 1
+        return out
+```
+
+#### Step 4: The processor, with its own clock
+
+The processor checks the request timestamp against `local_now_millis()`, which the `ClockSkew` fault offsets, and raises `StaleRequestException` outside the window. The idempotency dict returns the first answer on a replay; the 2% decline comes from the processor's own `JavaRandom`.
+
+```python
+    def local_now_millis(self) -> int:
+        return self._clock.now_millis() + self._clock_skew_millis
+
+    def handle(self, request: AuthRequest) -> Outcome:
+        age = abs(self.local_now_millis() - request.sent_at_millis)
+        if age > self.TIMESTAMP_TOLERANCE_MILLIS:
+            raise StaleRequestException(f"request timestamp outside signing window by {age} ms")
+        seen = self._by_idempotency_key.get(request.idempotency_key)
+        if seen is not None:
+            return seen  # replay: same answer, no second authorization
+        outcome = Outcome.DECLINED if self._rng.next_int(100) < 2 else Outcome.AUTHORIZED
+        self._by_idempotency_key[request.idempotency_key] = outcome
+        if outcome == Outcome.AUTHORIZED:
+            self._authorizations_by_payment[request.payment_id] = self._authorizations_by_payment.get(request.payment_id, 0) + 1
+        return outcome
+
+    def no_double_authorizations(self) -> bool:
+        return all(n <= 1 for n in self._authorizations_by_payment.values())
+```
+
+#### Step 5: The network applies faults in the order they happen
+
+Link faults first, matched with `match`/`case` class patterns; a partition or over-timeout latency advances the clock by the timeout and returns `TIMEOUT` without touching the processor. Processor faults are matched the same way, and the `finally` resets the skew whatever happens.
+
+```python
+    def call(self, request: AuthRequest, processor: Processor, timeout_millis: int) -> Outcome:
+        latency = 80 + self._rng.next_int(41)  # 80..120 ms baseline
+        partitioned = False
+        for f in self._injector.faults_for(self.LINK_GATEWAY_TO_PROCESSOR, request):
+            match f:
+                case Fault.Latency(added_millis=added):
+                    latency += added
+                case Fault.Partition():
+                    partitioned = True
+        if partitioned or latency > timeout_millis:
+            self._clock.advance(timeout_millis)
+            return Outcome.TIMEOUT
+        self._clock.advance(latency)
+        skew = 0
+        error_code: Optional[str] = None
+        for f in self._injector.faults_for(self.TARGET_PROCESSOR, request):
+            match f:
+                case Fault.ClockSkew(skew_millis=s):
+                    skew = s
+                case Fault.Error(code=c):
+                    error_code = c
+        processor.set_clock_skew(skew)
+        try:
+            if error_code is not None:
+                raise ProcessorErrorException(error_code)
+            return processor.handle(request)
+        except ProcessorErrorException:
+            return Outcome.PROCESSOR_ERROR
+        except StaleRequestException:
+            return Outcome.STALE_REQUEST
+        finally:
+            processor.set_clock_skew(0)
+```
+
+#### Step 6: The gateway under test
+
+A 2-second timeout, at most two attempts, the same idempotency key across attempts, and a retry only on `TIMEOUT` or `PROCESSOR_ERROR` (the `not in` tuple test).
+
+```python
+    def authorize(self, payment_id: str, merchant_id: str, amount: Money) -> AuthResult:
+        started = self._clock.now_millis()
+        idempotency_key = "idem-" + payment_id
+        outcome = Outcome.TIMEOUT
+        attempts = 0
+        while attempts < self.MAX_ATTEMPTS:
+            attempts += 1
+            request = AuthRequest(payment_id, merchant_id, amount, idempotency_key, self._clock.now_millis())
+            outcome = self._network.call(request, self._processor, self.TIMEOUT_MILLIS)
+            if outcome not in (Outcome.TIMEOUT, Outcome.PROCESSOR_ERROR):
+                break
+        return AuthResult(outcome, self._clock.now_millis() - started, attempts)
+```
+
+#### Step 7: Steady state, abort, and the runner
+
+`SteadyState` and `AbortCondition` are frozen dataclasses with one predicate each. `_drive` returns `(metrics, stopped_at)` as a tuple, so the runner's five phases read without the `int[]` trick; `injector.clear()` runs on both the abort and the normal path before the recovery run.
+
+```python
+    def holds(self, m: Metrics) -> bool:
+        return m.good_rate_percent() >= self.min_good_rate_percent and m.p99_millis() <= self.max_p99_millis
+```
+
+```python
+    def run(self, e: Experiment) -> ExperimentReport:
+        self._injector.clear()
+        baseline, _ = self._drive(e.requests, None)
+        baseline_held = e.steady_state.holds(baseline)
+        if not baseline_held:
+            empty = Metrics()
+            return ExperimentReport(e, baseline, empty, empty, False, False, 0, False, False,
+                                    self._processor.no_double_authorizations())
+        self._injector.inject(e.target, e.fault, e.blast_radius)
+        experimental, stop = self._drive(e.requests, e.abort)
+        aborted = stop > 0
+        requests_before_abort = stop if aborted else experimental.total()
+        self._injector.clear()  # the abort path and the normal path both end here
+        recovery, _ = self._drive(e.requests, None)
+        hypothesis_held = not aborted and e.steady_state.holds(experimental)
+        return ExperimentReport(e, baseline, experimental, recovery, True, aborted, requests_before_abort,
+                                hypothesis_held, e.steady_state.holds(recovery), self._processor.no_double_authorizations())
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/09-chaos-engineering/code/python
@@ -365,31 +575,295 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Every number in the five experiments matches the Java run exactly:
+
+```console
+Experiment: latency +300ms, 10% of requests
+  Hypothesis: A 300 ms slower processor stays inside the 2 s timeout; p99 rises but the SLO holds
+  Fault: Latency[addedMillis=300] on gateway->processor, blast radius PercentOfRequests[percent=10]
+  Baseline:     n=500 good=100.0% p99=120ms auth=488 decl=12 timeout=0 error=0 stale=0
+  Experimental: n=500 good=100.0% p99=417ms auth=490 decl=10 timeout=0 error=0 stale=0
+  Recovery:     n=500 good=100.0% p99=120ms auth=496 decl=4 timeout=0 error=0 stale=0
+  Invariant (no payment authorized twice): HELD
+  Recovered to steady state after clearing faults: yes
+```
+
 ### In Go
 
+The Go port (`code/go/main.go` and `javarandom.go`) keeps the design with five differences. **Sealed interfaces become interfaces with an unexported method:** `Fault` declares `fault()` and `String()`; `Latency`, `Error`, `Partition`, and `ClockSkew` are the only types in the package that can implement it, which is as close to `sealed ... permits` as Go gets. `BlastRadius` works the same way with `Includes`. The network's `instanceof` chain is a type switch. Each type has a `String()` that renders the Java record form (`Latency[addedMillis=300]`, `Merchants[merchantIds=[m-3]]`), so the report text is identical. **Exceptions become `(Outcome, error)`:** `Processor.Handle` returns `ErrStaleRequest` (wrapped with the age) instead of throwing; `SimNetwork.Call` maps it to `STALE_REQUEST` with `errors.Is`, and the Java `finally` that resets the clock skew is a `defer processor.SetClockSkew(0)`. Constructor checks (`NewLatency`, `NewPercentOfRequests`) return `error` where Java throws `IllegalArgumentException`; `SimClock.Advance` panics on a negative step because that is a bug in the simulation, not a condition. **The abort index is a return value:** Java smuggles `stoppedAt` out of `drive` through a one-element `int[]`; Go returns `(*Metrics, int)` with `-1` for "ran to completion". **Every RNG is `java.util.Random`:** `JavaRandom.NextInt` ports the 48-bit LCG with its rejection loop, so seeds 7, 11, 13, 17 produce the same blast-radius draws, declines, latencies, and merchant ids as the Java demo, and the GameDay numbers (488/12 baseline, p99 417 ms, 298 faults applied) match exactly; `TestDemoParity` pins them. The processor's 2% decline and the 80..120 ms baseline both come from `NextInt`, which is why `math/rand` would have changed every row. **Sets and ordered maps:** `Set<String>` is `map[string]bool` built by `NewMerchants(ids...)`, printed sorted; the `LinkedHashMap<Outcome, Integer>` of counts is a plain `map[Outcome]int` because nothing iterates it in order.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Faults as values
+
+The unexported `fault()` method closes the set to this package. `NewLatency` is the validating constructor (a struct literal cannot reject a negative value), and the `String()` methods reproduce the Java record `toString`.
+
 ```go
-for _, f := range n.injector.FaultsFor(LinkGatewayToProcessor, request) {
-    switch f := f.(type) {
-    case Latency:
-        latency += f.AddedMillis
-    case Partition:
-        partitioned = true
-    }
+type Fault interface {
+	fault()
+	String() string
+}
+
+type Latency struct{ AddedMillis int64 }
+
+type Error struct{ Code string }
+
+type Partition struct{}
+
+type ClockSkew struct{ SkewMillis int64 }
+
+func NewLatency(addedMillis int64) (Latency, error) {
+	if addedMillis < 0 {
+		return Latency{}, errors.New("latency must be >= 0")
+	}
+	return Latency{addedMillis}, nil
+}
+
+func (Latency) fault()   {}
+func (Error) fault()     {}
+func (Partition) fault() {}
+func (ClockSkew) fault() {}
+
+func (l Latency) String() string   { return fmt.Sprintf("Latency[addedMillis=%d]", l.AddedMillis) }
+func (e Error) String() string     { return fmt.Sprintf("Error[code=%s]", e.Code) }
+```
+
+#### Step 2: Blast radius as a predicate
+
+The interface takes the injector's `*JavaRandom` so the seed is controlled centrally. `Merchants` is a `map[string]bool` filled by the variadic `NewMerchants`; `Everyone` ignores both arguments.
+
+```go
+type BlastRadius interface {
+	Includes(request AuthRequest, rng *JavaRandom) bool
+	String() string
+}
+
+type PercentOfRequests struct{ Percent int }
+
+type Merchants struct{ MerchantIds map[string]bool }
+
+type Everyone struct{}
+
+func NewPercentOfRequests(percent int) (PercentOfRequests, error) {
+	if percent < 0 || percent > 100 {
+		return PercentOfRequests{}, errors.New("percent 0..100")
+	}
+	return PercentOfRequests{percent}, nil
+}
+
+func NewMerchants(ids ...string) Merchants {
+	m := Merchants{map[string]bool{}}
+	for _, id := range ids {
+		m.MerchantIds[id] = true
+	}
+	return m
+}
+
+func (p PercentOfRequests) Includes(_ AuthRequest, rng *JavaRandom) bool {
+	return rng.NextInt(100) < p.Percent
+}
+func (m Merchants) Includes(r AuthRequest, _ *JavaRandom) bool { return m.MerchantIds[r.MerchantId] }
+func (Everyone) Includes(AuthRequest, *JavaRandom) bool        { return true }
+```
+
+#### Step 3: The injector
+
+`Clear` sets the slice to `nil`; `FaultsFor` ranges over the injections in order and counts each applied fault.
+
+```go
+type FaultInjector struct {
+	injections []Injection
+	rng        *JavaRandom
+	applied    int
+}
+
+func NewFaultInjector(seed int64) *FaultInjector { return &FaultInjector{rng: NewJavaRandom(seed)} }
+
+func (fi *FaultInjector) Inject(target string, fault Fault, radius BlastRadius) {
+	fi.injections = append(fi.injections, Injection{target, fault, radius})
+}
+
+func (fi *FaultInjector) Clear()            { fi.injections = nil }
+func (fi *FaultInjector) IsArmed() bool     { return len(fi.injections) > 0 }
+func (fi *FaultInjector) AppliedCount() int { return fi.applied }
+
+func (fi *FaultInjector) FaultsFor(target string, request AuthRequest) []Fault {
+	var out []Fault
+	for _, inj := range fi.injections {
+		if inj.Target == target && inj.BlastRadius.Includes(request, fi.rng) {
+			out = append(out, inj.Fault)
+			fi.applied++
+		}
+	}
+	return out
 }
 ```
 
-Differences, all in `code/go/main.go` and `javarandom.go`:
+#### Step 4: The processor, with its own clock
 
-- **Sealed interfaces become interfaces with an unexported method.** `Fault` declares `fault()` and `String()`; `Latency`, `Error`, `Partition`, and `ClockSkew` are the only types in the package that can implement it, which is as close to `sealed ... permits` as Go gets. `BlastRadius` works the same way with `Includes`. The network's `instanceof` chain is a type switch. Each type has a `String()` that renders the Java record form (`Latency[addedMillis=300]`, `Merchants[merchantIds=[m-3]]`), so the report text is identical.
-- **Exceptions become `(Outcome, error)`.** `Processor.Handle` returns `ErrStaleRequest` (wrapped with the age) instead of throwing; `SimNetwork.Call` maps it to `STALE_REQUEST` with `errors.Is`, and the Java `finally` that resets the clock skew is a `defer processor.SetClockSkew(0)`. Constructor checks (`NewLatency`, `NewPercentOfRequests`) return `error` where Java throws `IllegalArgumentException`; `SimClock.Advance` panics on a negative step because that is a bug in the simulation, not a condition.
-- **The abort index is a return value.** Java smuggles `stoppedAt` out of `drive` through a one-element `int[]`; Go returns `(*Metrics, int)` with `-1` for "ran to completion".
-- **Every RNG is `java.util.Random`.** `JavaRandom.NextInt` ports the 48-bit LCG with its rejection loop, so seeds 7, 11, 13, 17 produce the same blast-radius draws, declines, latencies, and merchant ids as the Java demo, and the GameDay numbers (488/12 baseline, p99 417 ms, 298 faults applied) match exactly; `TestDemoParity` pins them. The processor's 2% decline and the 80..120 ms baseline both come from `NextInt`, which is why `math/rand` would have changed every row.
-- **Sets and ordered maps.** `Set<String>` is `map[string]bool` built by `NewMerchants(ids...)`, printed sorted; the `LinkedHashMap<Outcome, Integer>` of counts is a plain `map[Outcome]int` because nothing iterates it in order.
+`Handle` returns `(Outcome, error)`; a stale timestamp is `ErrStaleRequest` wrapped with the age. The comma-ok lookup is the idempotency replay, and `authorizationsByPayment[...]++` works on a missing key.
+
+```go
+func (p *Processor) Handle(request AuthRequest) (Outcome, error) {
+	age := p.LocalNowMillis() - request.SentAtMillis
+	if age < 0 {
+		age = -age
+	}
+	if age > TimestampToleranceMillis {
+		return 0, fmt.Errorf("%w: request timestamp outside signing window by %d ms", ErrStaleRequest, age)
+	}
+	if seen, ok := p.byIdempotencyKey[request.IdempotencyKey]; ok {
+		return seen, nil // replay: same answer, no second authorization
+	}
+	outcome := AUTHORIZED
+	if p.rng.NextInt(100) < 2 {
+		outcome = DECLINED
+	}
+	p.byIdempotencyKey[request.IdempotencyKey] = outcome
+	if outcome == AUTHORIZED {
+		p.authorizationsByPayment[request.PaymentId]++
+	}
+	return outcome, nil
+}
+```
+
+#### Step 5: The network applies faults in the order they happen
+
+Two type switches replace the `instanceof` chains. `defer processor.SetClockSkew(0)` is the `finally`; an injected error short-circuits to `PROCESSOR_ERROR` before the processor is called, and the processor's own error is classified with `errors.Is`. Any other error is a bug and panics.
+
+```go
+func (n *SimNetwork) Call(request AuthRequest, processor *Processor, timeoutMillis int64) Outcome {
+	latency := int64(80 + n.rng.NextInt(41)) // 80..120 ms baseline
+	partitioned := false
+	for _, f := range n.injector.FaultsFor(LinkGatewayToProcessor, request) {
+		switch f := f.(type) {
+		case Latency:
+			latency += f.AddedMillis
+		case Partition:
+			partitioned = true
+		}
+	}
+	if partitioned || latency > timeoutMillis {
+		n.clock.Advance(timeoutMillis)
+		return TIMEOUT
+	}
+	n.clock.Advance(latency)
+	var skew int64
+	var errorCode *string
+	for _, f := range n.injector.FaultsFor(TargetProcessor, request) {
+		switch f := f.(type) {
+		case ClockSkew:
+			skew = f.SkewMillis
+		case Error:
+			code := f.Code
+			errorCode = &code
+		}
+	}
+	processor.SetClockSkew(skew)
+	defer processor.SetClockSkew(0) // the Java finally: skew never leaks into the next request
+	if errorCode != nil {
+		return PROCESSOR_ERROR
+	}
+	outcome, err := processor.Handle(request)
+	switch {
+	case errors.Is(err, ErrStaleRequest):
+		return STALE_REQUEST
+	case errors.Is(err, ErrProcessorError):
+		return PROCESSOR_ERROR
+	case err != nil:
+		panic(err)
+	}
+	return outcome
+}
+```
+
+#### Step 6: The gateway under test
+
+Package constants for the timeout and attempt count; the loop is the Java one.
+
+```go
+func (g *Gateway) Authorize(paymentId, merchantId string, amount Money) AuthResult {
+	started := g.clock.NowMillis()
+	idempotencyKey := "idem-" + paymentId
+	outcome := TIMEOUT
+	attempts := 0
+	for attempts < MaxAttempts {
+		attempts++
+		request := AuthRequest{paymentId, merchantId, amount, idempotencyKey, g.clock.NowMillis()}
+		outcome = g.network.Call(request, g.processor, TimeoutMillis)
+		if outcome != TIMEOUT && outcome != PROCESSOR_ERROR {
+			break
+		}
+	}
+	return AuthResult{outcome, g.clock.NowMillis() - started, attempts}
+}
+```
+
+#### Step 7: Steady state, abort, and the runner
+
+Value structs with one predicate method each. `drive` returns `(*Metrics, int)`; `Run` passes `&e.Abort` so a nil pointer means "no abort checks" on the baseline and recovery runs.
+
+```go
+type SteadyState struct {
+	MinGoodRatePercent float64
+	MaxP99Millis       int64
+}
+
+func (s SteadyState) Holds(m *Metrics) bool {
+	return m.GoodRatePercent() >= s.MinGoodRatePercent && m.P99Millis() <= s.MaxP99Millis
+}
+
+type AbortCondition struct {
+	MinGoodRatePercent float64
+	CheckEvery         int
+}
+
+func (a AbortCondition) Triggered(m *Metrics) bool { return m.GoodRatePercent() < a.MinGoodRatePercent }
+```
+
+```go
+func (r *ExperimentRunner) Run(e Experiment) ExperimentReport {
+	r.injector.Clear()
+	baseline, _ := r.drive(e.Requests, nil)
+	baselineHeld := e.SteadyState.Holds(baseline)
+	if !baselineHeld {
+		empty := NewMetrics()
+		return ExperimentReport{e, baseline, empty, empty, false, false, 0, false, false, r.processor.NoDoubleAuthorizations()}
+	}
+	r.injector.Inject(e.Target, e.Fault, e.BlastRadius)
+	experimental, stop := r.drive(e.Requests, &e.Abort)
+	aborted := stop > 0
+	requestsBeforeAbort := experimental.Total()
+	if aborted {
+		requestsBeforeAbort = stop
+	}
+	r.injector.Clear() // the abort path and the normal path both end here
+	recovery, _ := r.drive(e.Requests, nil)
+	hypothesisHeld := !aborted && e.SteadyState.Holds(experimental)
+	return ExperimentReport{e, baseline, experimental, recovery, true, aborted, requestsBeforeAbort,
+		hypothesisHeld, e.SteadyState.Holds(recovery), r.processor.NoDoubleAuthorizations()}
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/09-chaos-engineering/code/go
 go run .
 go test ./...
+```
+
+The five verdicts and the fault count match the Java run:
+
+```console
+GameDay summary
+  latency +300ms, 10% of requests              HYPOTHESIS HELD
+  latency +2500ms, 10% of requests             HYPOTHESIS VIOLATED
+  processor 500s, 70% of requests              ABORTED after 50 requests
+  partition, canary merchant m-3               HYPOTHESIS VIOLATED
+  processor clock +6 minutes, everyone         ABORTED after 50 requests
+
+Faults applied in total: 298; injector armed now: false
 ```
 
 ## Use It

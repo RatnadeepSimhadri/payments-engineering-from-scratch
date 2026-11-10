@@ -324,32 +324,345 @@ The line to keep is `0 moved anywhere else`. That zero is monotonicity, and it i
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with three differences. **`bisect` is the standard library's lower bound:** `bisect_left` on a sorted list is exactly `bisectLeft`; the Java version spells it out because the JDK's `Collections.binarySearch` returns an insertion point encoded as a negative number and does not support unsigned comparison. **Unsigned is free:** Python integers are unbounded and non-negative here, so the hashes sort correctly with plain `<`; the 64-bit masking lives inside `fnv1a64` and `mix64`. **`LookupError` for an empty ring**, the base class of `KeyError` and `IndexError`, which is what "no owner for this key" is; argument errors raise `ValueError`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The point hash
+
+The Lesson 01 hash pair, masked to 64 bits after each multiply so the result is the Java `long` read as unsigned. Because the value is non-negative, the ring can compare hashes with `<` and `bisect` can search them directly; there is no `compareUnsigned` anywhere.
+
 ```python
-def _first_index_at_or_after(self, h: int) -> int:
-    pos = bisect.bisect_left(self._hashes, h)
-    return 0 if pos == len(self._hashes) else pos
+def fnv1a64(data: bytes) -> int:
+    h = FNV_OFFSET
+    for b in data:
+        h ^= b
+        h = (h * FNV_PRIME) & MASK64
+    return h
+
+
+def mix64(h: int) -> int:
+    h &= MASK64
+    h ^= h >> 33
+    h = (h * 0xFF51AFD7ED558CCD) & MASK64
+    h ^= h >> 33
+    h = (h * 0xC4CEB9FE1A85EC53) & MASK64
+    h ^= h >> 33
+    return h
+
+
+def hash_key(key: str) -> int:
+    return mix64(fnv1a64(key.encode("utf-8")))
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The sorted points and the search
 
-- **`bisect` is the standard library's lower bound.** `bisect_left` on a sorted list is exactly `bisectLeft`; the Java version spells it out because the JDK's `Collections.binarySearch` returns an insertion point encoded as a negative number and does not support unsigned comparison.
-- **Unsigned is free.** Python integers are unbounded and non-negative here, so the hashes sort correctly with plain `<`; the 64-bit masking lives inside `fnv1a64` and `mix64`.
-- **`LookupError` for an empty ring**, the base class of `KeyError` and `IndexError`, which is what "no owner for this key" is.
+Two parallel lists, `_hashes` and `_owners`, plus a `set` of node names. There is no hand-written `bisect_left` method: the standard library's `bisect.bisect_left` is the lower-bound search, and it is called at the two places the Java calls `bisectLeft`.
+
+```python
+class HashRing:
+    def __init__(self, virtual_nodes: int = 100) -> None:
+        if virtual_nodes <= 0:
+            raise ValueError(f"virtual_nodes must be positive: {virtual_nodes}")
+        self.virtual_nodes = virtual_nodes
+        self._hashes: list[int] = []   # sorted ascending; parallel to _owners
+        self._owners: list[str] = []
+        self._nodes: set[str] = set()
+```
+
+#### Step 3: Adding a node
+
+`point_hash` formats `node#replica` and hashes it. Each point is inserted at its `bisect_left` position, with the same owner-name tie-break so every language builds the identical ring from the same membership regardless of insertion order.
+
+```python
+    @staticmethod
+    def point_hash(node: str, replica: int) -> int:
+        """The i-th virtual node of `node` sits at hash(node + '#' + i)."""
+        return hash_key(f"{node}#{replica}")
+
+    def add_node(self, node: str) -> None:
+        if node in self._nodes:
+            raise ValueError(f"node already on ring: {node}")
+        for i in range(self.virtual_nodes):
+            h = self.point_hash(node, i)
+            pos = bisect.bisect_left(self._hashes, h)
+            # Ties on a 64-bit hash are practically impossible; order them by owner name so every
+            # language builds the identical ring.
+            while pos < len(self._hashes) and self._hashes[pos] == h and self._owners[pos] < node:
+                pos += 1
+            self._hashes.insert(pos, h)
+            self._owners.insert(pos, node)
+        self._nodes.add(node)
+```
+
+#### Step 4: Lookup, with the wrap
+
+`_first_index_at_or_after` wraps a past-the-end result to 0. `lookup` raises `LookupError` on an empty ring rather than returning `None`.
+
+```python
+    def _first_index_at_or_after(self, h: int) -> int:
+        """Binary search for the first point with hash >= h, wrapping to 0 past the end."""
+        pos = bisect.bisect_left(self._hashes, h)
+        return 0 if pos == len(self._hashes) else pos
+
+    def lookup(self, key: str) -> str:
+        """The node that owns `key`: O(log P) for P points."""
+        if not self._hashes:
+            raise LookupError("ring is empty")
+        return self._owners[self._first_index_at_or_after(hash_key(key))]
+```
+
+#### Step 5: The preference list
+
+A clockwise walk with `%` for the wrap, `owner not in result` as the linear distinct check, and the early stop when either `n` or the number of physical nodes is reached.
+
+```python
+    def lookup_n(self, key: str, n: int) -> list[str]:
+        if n <= 0:
+            raise ValueError("n must be positive")
+        if not self._hashes:
+            raise LookupError("ring is empty")
+        start = self._first_index_at_or_after(hash_key(key))
+        result: list[str] = []
+        total = len(self._hashes)
+        for step in range(total):
+            owner = self._owners[(start + step) % total]
+            if owner not in result:
+                result.append(owner)
+                if len(result) == n or len(result) == len(self._nodes):
+                    break
+        return result
+```
+
+#### Step 6: Removing a node and measuring movement
+
+Instead of deleting backwards by index, the Python rebuilds both lists from the pairs whose owner is not the departing node, which has the same `O(P)` cost and no index arithmetic. `fraction_moved` counts disagreements between two assignments with a generator expression.
+
+```python
+    def remove_node(self, node: str) -> None:
+        if node not in self._nodes:
+            raise ValueError(f"node not on ring: {node}")
+        keep = [(h, o) for h, o in zip(self._hashes, self._owners) if o != node]
+        self._hashes = [h for h, _ in keep]
+        self._owners = [o for _, o in keep]
+        self._nodes.remove(node)
+```
+
+```python
+def fraction_moved(before: dict[str, str], after: dict[str, str]) -> float:
+    """Share of keys whose owner changed between two assignments of the same key set."""
+    if not before:
+        return 0.0
+    moved = sum(1 for key, owner in before.items() if after[key] != owner)
+    return moved / len(before)
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/03-systems-data-structures/06-consistent-hashing/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== Where an account lands ==
+hash_key('acct-000123') = 0xd43cbef4d0200057
+1000 points on the ring for 10 shards
+lookup('acct-000123') = ledger-shard-c
+lookup_n('acct-000123', 3) = ['ledger-shard-c', 'ledger-shard-d', 'ledger-shard-e']  (owner + 2 replicas)
+```
+
+The movement fractions, the `0 moved anywhere else` line, and the balance table are the same numbers as the Java run.
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design with four differences. **`sort.Search` is the lower bound:** it returns the smallest index for which the predicate is true, or `n`, which is the same contract as `bisectLeft`. **A slice of `point{hash, owner}` structs** rather than two parallel lists; insertion uses `append` plus `copy` to shift the tail, the idiomatic Go way to insert into a slice. **Errors are values:** `Lookup` and `LookupN` return `(value, error)`, with `ErrEmptyRing`, `ErrNodeExists`, `ErrNodeMissing`, and `ErrBadParameter` as sentinels for `errors.Is`. `Assign` panics on an empty ring because it is a demo and test helper, not an API. **`uint64` compares unsigned natively**, so there is no `compareUnsigned` anywhere.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The point hash
+
+Over `uint64` the two functions are the Java lines without the sign workarounds, and `>=` on the hashes in the ring is already an unsigned comparison.
+
 ```go
+func fnv1a64(data []byte) uint64 {
+	h := fnvOffset
+	for _, b := range data {
+		h ^= uint64(b)
+		h *= fnvPrime
+	}
+	return h
+}
+
+func mix64(h uint64) uint64 {
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return h
+}
+
+func HashKey(key string) uint64 { return mix64(fnv1a64([]byte(key))) }
+```
+
+#### Step 2: The sorted points and the search
+
+One slice of `point` structs replaces the two parallel lists, and membership is a `map[string]bool`. `bisectLeft` is a one-line `sort.Search` with the predicate `hash >= h`.
+
+```go
+type point struct {
+	hash  uint64
+	owner string
+}
+
+type HashRing struct {
+	VirtualNodes int
+	points       []point
+	nodes        map[string]bool
+}
+
+func NewHashRing(virtualNodes int) (*HashRing, error) {
+	if virtualNodes <= 0 {
+		return nil, fmt.Errorf("%w: virtualNodes must be positive: %d", ErrBadParameter, virtualNodes)
+	}
+	return &HashRing{VirtualNodes: virtualNodes, nodes: map[string]bool{}}, nil
+}
+
 func (r *HashRing) bisectLeft(h uint64) int {
-    return sort.Search(len(r.points), func(i int) bool { return r.points[i].hash >= h })
+	return sort.Search(len(r.points), func(i int) bool { return r.points[i].hash >= h })
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: Adding a node
 
-- **`sort.Search` is the lower bound.** It returns the smallest index for which the predicate is true, or `n`, which is the same contract as `bisectLeft`.
-- **A slice of `point{hash, owner}` structs** rather than two parallel lists; insertion uses `append` plus `copy` to shift the tail, the idiomatic Go way to insert into a slice.
-- **Errors are values.** `Lookup` and `LookupN` return `(value, error)`, with `ErrEmptyRing`, `ErrNodeExists`, `ErrNodeMissing`, and `ErrBadParameter` as sentinels for `errors.Is`. `Assign` panics on an empty ring because it is a demo and test helper, not an API.
-- **`uint64` compares unsigned natively**, so there is no `compareUnsigned` anywhere.
+The three-line `append`/`copy`/assign sequence inserts a point at `pos`: grow the slice by one, shift the tail right, write the new element. A duplicate node returns `ErrNodeExists`.
+
+```go
+func PointHash(node string, replica int) uint64 { return HashKey(fmt.Sprintf("%s#%d", node, replica)) }
+
+func (r *HashRing) AddNode(node string) error {
+	if r.nodes[node] {
+		return fmt.Errorf("%w: %s", ErrNodeExists, node)
+	}
+	for i := 0; i < r.VirtualNodes; i++ {
+		h := PointHash(node, i)
+		pos := r.bisectLeft(h)
+		for pos < len(r.points) && r.points[pos].hash == h && r.points[pos].owner < node {
+			pos++
+		}
+		r.points = append(r.points, point{})
+		copy(r.points[pos+1:], r.points[pos:])
+		r.points[pos] = point{h, node}
+	}
+	r.nodes[node] = true
+	return nil
+}
+```
+
+#### Step 4: Lookup, with the wrap
+
+`Lookup` returns `("", ErrEmptyRing)` for an empty ring; otherwise one search and one wrap check.
+
+```go
+func (r *HashRing) firstIndexAtOrAfter(h uint64) int {
+	pos := r.bisectLeft(h)
+	if pos == len(r.points) {
+		return 0
+	}
+	return pos
+}
+
+func (r *HashRing) Lookup(key string) (string, error) {
+	if len(r.points) == 0 {
+		return "", ErrEmptyRing
+	}
+	return r.points[r.firstIndexAtOrAfter(HashKey(key))].owner, nil
+}
+```
+
+#### Step 5: The preference list
+
+The distinct check uses a small `seen` map alongside the result slice; the walk, the modulo wrap, and the two stopping conditions are the Java's.
+
+```go
+func (r *HashRing) LookupN(key string, n int) ([]string, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("%w: n must be positive", ErrBadParameter)
+	}
+	if len(r.points) == 0 {
+		return nil, ErrEmptyRing
+	}
+	start := r.firstIndexAtOrAfter(HashKey(key))
+	result := make([]string, 0, n)
+	seen := map[string]bool{}
+	total := len(r.points)
+	for step := 0; step < total; step++ {
+		owner := r.points[(start+step)%total].owner
+		if !seen[owner] {
+			seen[owner] = true
+			result = append(result, owner)
+			if len(result) == n || len(result) == len(r.nodes) {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+```
+
+#### Step 6: Removing a node and measuring movement
+
+`kept := r.points[:0]` is the in-place filter idiom: it reuses the backing array and appends only the points that survive, which is the Go equivalent of the backwards index walk. `FractionMoved` ranges over the `before` map.
+
+```go
+func (r *HashRing) RemoveNode(node string) error {
+	if !r.nodes[node] {
+		return fmt.Errorf("%w: %s", ErrNodeMissing, node)
+	}
+	kept := r.points[:0]
+	for _, p := range r.points {
+		if p.owner != node {
+			kept = append(kept, p)
+		}
+	}
+	r.points = kept
+	delete(r.nodes, node)
+	return nil
+}
+
+func FractionMoved(before, after map[string]string) float64 {
+	if len(before) == 0 {
+		return 0
+	}
+	moved := 0
+	for k, owner := range before {
+		if after[k] != owner {
+			moved++
+		}
+	}
+	return float64(moved) / float64(len(before))
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/03-systems-data-structures/06-consistent-hashing/code/go
+go run .
+go test ./...
+```
+
+```console
+== Replication: the preference list for an account ==
+lookupN("acct-000001", 3) = [ledger-shard-c ledger-shard-d ledger-shard-e]
+lookupN("acct-000002", 3) = [ledger-shard-c ledger-shard-e ledger-shard-d]
+lookupN with n > nodes returns every node once: [ledger-shard-c ledger-shard-d ledger-shard-e ledger-shard-b ledger-shard-a]
+rejected: ring is empty
+```
+
+The hash, the owner, and every movement fraction above this match the Java run.
 
 ## Use It
 

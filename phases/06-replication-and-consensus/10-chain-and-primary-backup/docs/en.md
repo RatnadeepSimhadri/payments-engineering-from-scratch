@@ -344,68 +344,413 @@ primary-backup (1 primary + 2 backups), same workload:
 
 ### In Python
 
+`code/python/main.py` is the same design, and the demo output matches the Java line for line, including the per-replica message counts in the load table. Four things differ. **The FIFO link key is a tuple:** Java packs `(from, to)` into one `long` with a shift and a mask; Python keys the dict on `(m.from_, m.to)`, which is the same injective mapping without the bit arithmetic. The in-flight queue is `heapq` on `(deliver_at, seq, message)`, and `seq` is unique, so ties never compare messages. **Insertion order is the `dict` default:** `Sent` (a `LinkedHashMap` in Java), the client's `pending` and `replies` maps are plain dicts, which keep insertion order, so a SYNC after a reconfiguration resends updates in the order they were forwarded; balances are a `dict` printed through `fmt_map` to match `TreeMap.toString()`. **One `Message` dataclass, many factories:** the Java factory `Message.update(...)` is `Message.update_msg(...)` in Python because `update` is also a field name on the frozen dataclass; `Request`, `Update` and `Money` are frozen dataclasses, so `==` on histories is structural, which is what the Update Propagation check needs. **Errors and overflow:** an unexpected message kind raises `RuntimeError`, and `Money.plus` keeps `Math.addExact`'s 64-bit bound explicitly because Python integers never overflow.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The network keeps links FIFO
+
+The link is the tuple `(m.from_, m.to)`. `earliest` is the later of "next tick" and the link's last scheduled delivery, so a message can never overtake its predecessor on the same link; the seeded delay is added on top and recorded back into the dict. Messages to or from a crashed node are dropped before any of this.
+
 ```python
-def send(self, m: Message) -> None:
-    self.sent += 1
-    if m.to in self._down or (m.from_ >= 0 and m.from_ in self._down):
-        self.dropped += 1
-        return
-    link = (m.from_, m.to)
-    earliest = max(self._now + 1, self._last_delivery_per_link.get(link, 0))
-    at = earliest + self._rng.next_int(self._max_delay)
-    self._last_delivery_per_link[link] = at
-    heapq.heappush(self._in_flight, (at, self._seq, m))
-    self._seq += 1
+    def send(self, m: Message) -> None:
+        self.sent += 1
+        if m.to in self._down or (m.from_ >= 0 and m.from_ in self._down):
+            self.dropped += 1
+            return
+        link = (m.from_, m.to)   # Java packs the pair into one long; a tuple is the same injective key
+        earliest = max(self._now + 1, self._last_delivery_per_link.get(link, 0))
+        at = earliest + self._rng.next_int(self._max_delay)
+        self._last_delivery_per_link[link] = at
+        heapq.heappush(self._in_flight, (at, self._seq, m))
+        self._seq += 1
 ```
 
-`code/python/main.py` is the same design, and the demo output matches the Java line for line, including the per-replica message counts in the load table. What differs:
+#### Step 2: A replica's state and the apply step
 
-- **The FIFO link key is a tuple.** Java packs `(from, to)` into one `long` with a shift and a mask; Python keys the dict on `(m.from_, m.to)`, which is the same injective mapping without the bit arithmetic. The in-flight queue is `heapq` on `(deliver_at, seq, message)`; `seq` is unique, so ties never compare messages.
-- **Insertion order is the `dict` default.** `Sent` (a `LinkedHashMap` in Java), the client's `pending` and `replies` maps are plain dicts, which keep insertion order, so a SYNC after a reconfiguration resends updates in the order they were forwarded. Balances are a `dict` printed through `fmt_map` to match `TreeMap.toString()`.
-- **One `Message` dataclass, many factories.** The Java factory `Message.update(...)` is `Message.update_msg(...)` in Python because `update` is also a field name on the frozen dataclass. `Request`, `Update` and `Money` are frozen dataclasses, so `==` on histories is structural, which is what the Update Propagation check needs.
-- **Errors and overflow.** An unexpected message kind raises `RuntimeError`; `Money.plus` keeps `Math.addExact`'s 64-bit bound explicitly because Python integers never overflow.
+The replica's fields are plain attributes: `history` is a list, the two "seen" sets are Python sets, and `sent` is a dict whose insertion order stands in for `LinkedHashMap`. `_apply` is the Java method with `dict.get` defaults; `balance()` returns `ZERO_USD` for an unknown account.
 
-Run it from `code/python/`:
+```python
+    def __init__(self, id: int) -> None:
+        self.id = id
+        self.predecessor = -1
+        self.successor = -1
+        self.balances: dict[str, Money] = {}
+        self.history: list[Update] = []
+        self.seqs_seen: set[int] = set()
+        self.requests_seen: set[str] = set()
+        self.sent: dict[int, Update] = {}              # LinkedHashMap: insertion order matters for SYNC
+        self.reply_values: dict[str, Money] = {}
+        self.transfer_pending = False
+        self.in_chain = False
+        self.next_seq = 1
+
+    def _apply(self, u: Update) -> None:
+        self.history.append(u)
+        self.seqs_seen.add(u.seq)
+        self.requests_seen.add(u.request.key())
+        self.balances[u.request.account] = self.balance(u.request.account).plus(u.request.delta)
+        self.reply_values[u.request.key()] = self.balance(u.request.account)
+        self.next_seq = max(self.next_seq, u.seq + 1)
+```
+
+#### Step 3: Forward or commit
+
+`acts_as_tail()` is `is_tail() or transfer_pending`. A tail replies and acks upstream; a non-tail records the update in `sent` and forwards it with `Message.update_msg`. The UPDATE branch of `handle` calls `_apply` first and this method second.
+
+```python
+    def acts_as_tail(self) -> bool:
+        return self.is_tail() or self.transfer_pending
+
+    def _forward_or_commit(self, u: Update) -> list[Message]:
+        out: list[Message] = []
+        if self.acts_as_tail():
+            out.append(Message.reply(self.id, u.request.client_id, u.request, self.balance(u.request.account)))
+            if self.is_tail() and not self.is_head():
+                out.append(Message.ack(self.id, self.predecessor, u))
+        if not self.is_tail():
+            self.sent[u.seq] = u
+            out.append(Message.update_msg(self.id, self.successor, u))
+        return out
+```
+
+#### Step 4: Acks, queries, and the stale client
+
+`handle` is an `if`/`elif` ladder on `m.kind` rather than a `switch`. `dict.pop(seq, None)` is the `sent.remove(...) != null` test; an ACK with a negative sequence number is the "history received" signal that ends a transfer. A query at a non-tail gets `NOT_TAIL`.
+
+```python
+        elif k == MessageKind.ACK:
+            self.acks_handled += 1
+            if m.update.seq < 0:                             # the new tail has the history: hand over
+                self.transfer_pending = False
+                return out
+            if self.sent.pop(m.update.seq, None) is not None and not self.is_head():
+                out.append(Message.ack(self.id, self.predecessor, m.update))
+        elif k == MessageKind.QUERY:
+            self.queries_handled += 1
+            if self.acts_as_tail():
+                out.append(Message.reply(self.id, m.from_, m.request, self.balance(m.request.account)))
+            else:
+                out.append(Message.not_tail(self.id, m.from_, m.request))   # a stale client view; it must re-ask the master
+```
+
+#### Step 5: The three repairs, from the replica's side
+
+The `SET_LINKS` branch. `in_chain` is a single boolean expression on the note. A replica that just became tail replies for everything in `sent` (iterated over a `list(...)` copy, since the dict is cleared afterwards) and acks upstream; a replica with a new successor sends either a `STATE_TRANSFER` of its whole history (extension, with `transfer_pending` set) or a `SYNC` of `sent`.
+
+```python
+        elif k == MessageKind.SET_LINKS:
+            was_tail = self.is_tail()
+            self.predecessor = m.predecessor
+            self.successor = m.successor
+            self.in_chain = m.note != "extend-new"           # a joining tail is in the chain once its history arrives
+            if self.is_tail() and not was_tail:              # the tail failed: everything we had in flight is now committed
+                for u in list(self.sent.values()):
+                    out.append(Message.reply(self.id, u.request.client_id, u.request, self.balance(u.request.account)))
+                    if not self.is_head():
+                        out.append(Message.ack(self.id, self.predecessor, u))
+                self.sent.clear()
+            elif not self.is_tail():                         # new successor: resend what it may be missing
+                if was_tail and m.note is not None and m.note.startswith("extend"):
+                    self.transfer_pending = True             # keep answering clients until the copy lands
+                    out.append(Message.state_transfer(self.id, self.successor, self.history))
+                elif self.sent:
+                    out.append(Message.sync(self.id, self.successor, list(self.sent.values())))
+```
+
+#### Step 6: The master
+
+`fail` finds the index with `list.index`, classifies the failure with a conditional expression, deletes the slot, and republishes. `publish_links` walks the chain from the tail backwards with `range(len - 1, -1, -1)` and tags the last replica `extend-new` during an extension. The event-log append is omitted from the chunk.
+
+```python
+    def publish_links(self, note: str) -> None:
+        self.reconfigurations += 1
+        for i in range(len(self.chain) - 1, -1, -1):
+            n = "extend-new" if note == "extend" and i == len(self.chain) - 1 else note
+            self.network.send(Message.set_links(self.chain[i], self._pred(i), self._succ(i), n))
+
+    def fail(self, node_id: int) -> None:
+        if node_id not in self.chain:
+            return
+        i = self.chain.index(node_id)
+        kind = "head" if i == 0 else "tail" if i == len(self.chain) - 1 else "middle"
+        del self.chain[i]
+        if not self.chain:
+            raise RuntimeError("chain has no replicas left")
+        self.publish_links("fail " + kind)
+```
+
+#### Step 7: The checker
+
+Both invariants per adjacent live pair. Histories are lists of frozen `Update` dataclasses, so `!=` compares them structurally; `u.seq not in pred.sent` is the dict membership test that replaces `containsKey`.
+
+```python
+    def check_invariants(self) -> None:
+        self.checks += 1
+        chain = self.master.chain
+        for i in range(len(chain) - 1):
+            pred, succ = self.nodes[chain[i]], self.nodes[chain[i + 1]]
+            if self.network.is_down(pred.id) or self.network.is_down(succ.id) or pred.transfer_pending or not succ.in_chain:
+                continue   # a joining tail is not in the chain yet
+            if len(succ.history) > len(pred.history):
+                self.violations.append(f"UPDATE PROPAGATION: n{succ.id} longer than n{pred.id}")
+                return
+            for k in range(len(succ.history)):
+                if succ.history[k] != pred.history[k]:
+                    self.violations.append(f"UPDATE PROPAGATION: n{succ.id} differs from n{pred.id} at {k}")
+                    return
+            for k in range(len(succ.history), len(pred.history)):
+                u = pred.history[k]
+                if u.seq not in pred.sent:
+                    self.violations.append(f"INPROCESS REQUESTS: n{pred.id} has seq {u.seq} that n{succ.id} lacks, and it is not in Sent")
+                    return
+```
+
+#### Step 8: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/10-chain-and-primary-backup/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== A 3-replica chain: updates enter at the head, replies come from the tail (seed 1, delay 1-3) ==
+client 0: Credit alice 100.00 -> reply 100.00 USD; Debit 25.50 -> reply 74.50 USD
+client 1: Query alice issued at t=0 -> 0.00 USD (the tail had not yet seen the updates: reads show only committed state)
+client 1: Query alice after the replies -> 74.50 USD
+```
+
+The failure section ends with `invariant checks run: 111, violations: 0`, and the load table carries the same counts as the Java run.
+
 ### In Go
+
+`code/go/main.go` is the same design, and the demo output matches the Java line for line, including the per-replica message counts in the load table. Four things differ. **The FIFO link key is a `[2]int`:** Java packs `(from, to)` into one `long`; an array of two ints is a comparable map key with the same meaning and no bit arithmetic, and the in-flight queue is `container/heap` ordered by `(deliverAt, seq)`. **`Sent` is an ordered map written by hand:** Go maps have no insertion order, so `orderedUpdates` keeps a `[]int64` of sequence numbers beside the `map[int64]Update`, and a SYNC after a reconfiguration resends updates in the order they were forwarded, as `LinkedHashMap` does; the client keeps `pendingOrder` for the same reason, so retries draw network delays in the same order as the Java. **One `Message` struct with zero values for unused fields:** Java's nulls are Go zero values, an ACK's `Update` with `Seq: -1` (`historyReceived`) is the "history received" signal, and `Note` is `""` where Java has `null`; `Request`, `Update` and `Money` are comparable structs, so `==` on history entries is structural, which the Update Propagation check needs. **Errors and absence are values:** `Money.Plus` returns `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow`, `ChainClient.ReplyFor` returns `(Money, bool)` where Java returns `null`, and `Update`/`Query` return the request and the messages to send instead of appending to an `out` list; an unexpected message kind and an empty chain are programming errors and panic.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The network keeps links FIFO
+
+The link key is an array literal, which is comparable and therefore usable as a map key. A missing key reads as 0, so the `if last > earliest` lowers nothing on the first message of a link; otherwise the logic is the Java's.
 
 ```go
 func (w *Network) Send(m Message) {
-    w.Sent++
-    if w.down[m.To] || (m.From >= 0 && w.down[m.From]) {
-        w.Dropped++
-        return
-    }
-    link := [2]int{m.From, m.To}
-    earliest := w.now + 1
-    if last := w.lastDeliveryPerLink[link]; last > earliest {
-        earliest = last
-    }
-    at := earliest + w.rng.NextInt(w.maxDelay)
-    w.lastDeliveryPerLink[link] = at
-    heap.Push(&w.inFlight, envelope{at, w.seq, m})
-    w.seq++
+	w.Sent++
+	if w.down[m.To] || (m.From >= 0 && w.down[m.From]) {
+		w.Dropped++
+		return
+	}
+	link := [2]int{m.From, m.To}
+	earliest := w.now + 1
+	if last := w.lastDeliveryPerLink[link]; last > earliest {
+		earliest = last
+	}
+	at := earliest + w.rng.NextInt(w.maxDelay)
+	w.lastDeliveryPerLink[link] = at
+	heap.Push(&w.inFlight, envelope{at, w.seq, m})
+	w.seq++
 }
 ```
 
-`code/go/main.go` is the same design, and the demo output matches the Java line for line, including the per-replica message counts in the load table. What differs:
+#### Step 2: A replica's state and the apply step
 
-- **The FIFO link key is a `[2]int`.** Java packs `(from, to)` into one `long`; an array of two ints is a comparable map key with the same meaning and no bit arithmetic. The in-flight queue is `container/heap` ordered by `(deliverAt, seq)`.
-- **`Sent` is an ordered map written by hand.** Go maps have no insertion order, so `orderedUpdates` keeps a `[]int64` of sequence numbers beside the `map[int64]Update`; a SYNC after a reconfiguration resends updates in the order they were forwarded, as `LinkedHashMap` does. The client keeps `pendingOrder` for the same reason, so retries draw network delays in the same order as the Java.
-- **One `Message` struct with zero values for unused fields.** Java's nulls are Go zero values: an ACK's `Update` with `Seq: -1` (`historyReceived`) is the "history received" signal, `Note` is `""` where Java has `null`. `Request`, `Update` and `Money` are comparable structs, so `==` on history entries is structural, which the Update Propagation check needs.
-- **Errors and absence are values.** `Money.Plus` returns `(Money, error)` with `ErrCurrencyMismatch`/`ErrOverflow`; `ChainClient.ReplyFor` returns `(Money, bool)` where Java returns `null`; `Update`/`Query` return the request and the messages to send instead of appending to an `out` list. An unexpected message kind and an empty chain are programming errors and panic.
+The "seen" sets are `map[...]bool`, and `Sent` is a pointer to the hand-written `orderedUpdates`. `apply` goes through `mustPlus`, which panics on a `Money.Plus` error because a currency mismatch inside a replica's own history is a programming error; `NextSeq` is raised with an explicit comparison.
 
-Run it from `code/go/`:
+```go
+type ChainNode struct {
+	id           int
+	Predecessor  int
+	Successor    int
+	Balances     map[string]Money
+	History      []Update
+	seqsSeen     map[int64]bool
+	requestsSeen map[string]bool
+	Sent         *orderedUpdates
+	replyValues map[string]Money
+	TransferPending bool
+	InChain                                                      bool
+	NextSeq                                                      int64
+	UpdatesHandled, QueriesHandled, AcksHandled, MessagesHandled int
+}
+
+func (n *ChainNode) apply(u Update) {
+	n.History = append(n.History, u)
+	n.seqsSeen[u.Seq] = true
+	n.requestsSeen[u.Request.Key()] = true
+	n.Balances[u.Request.Account] = mustPlus(n.Balance(u.Request.Account), u.Request.Delta)
+	n.replyValues[u.Request.Key()] = n.Balance(u.Request.Account)
+	if u.Seq+1 > n.NextSeq {
+		n.NextSeq = u.Seq + 1
+	}
+}
+```
+
+#### Step 3: Forward or commit
+
+Identical structure; `n.Sent.Put(u)` appends to the ordered map, and the message constructors are unexported functions (`reply`, `ack`, `updateMsg`).
+
+```go
+func (n *ChainNode) ActsAsTail() bool { return n.IsTail() || n.TransferPending }
+
+func (n *ChainNode) forwardOrCommit(u Update) []Message {
+	out := []Message{}
+	if n.ActsAsTail() {
+		out = append(out, reply(n.id, u.Request.ClientID, u.Request, n.Balance(u.Request.Account)))
+		if n.IsTail() && !n.IsHead() {
+			out = append(out, ack(n.id, n.Predecessor, u))
+		}
+	}
+	if !n.IsTail() {
+		n.Sent.Put(u)
+		out = append(out, updateMsg(n.id, n.Successor, u))
+	}
+	return out
+}
+```
+
+#### Step 4: Acks, queries, and the stale client
+
+Two arms of the `switch` in `Handle`. `Sent.Remove` returns whether the sequence number was present, which replaces the Java `remove(...) != null`; a negative `Seq` on an ACK is the end-of-transfer signal.
+
+```go
+	case Ack:
+		n.AcksHandled++
+		if m.Update.Seq < 0 { // the new tail has the history: hand over
+			n.TransferPending = false
+			return out
+		}
+		if n.Sent.Remove(m.Update.Seq) && !n.IsHead() {
+			out = append(out, ack(n.id, n.Predecessor, m.Update))
+		}
+	case Query:
+		n.QueriesHandled++
+		if n.ActsAsTail() {
+			out = append(out, reply(n.id, m.From, m.Request, n.Balance(m.Request.Account)))
+		} else {
+			out = append(out, notTail(n.id, m.From, m.Request)) // a stale client view; it must re-ask the master
+		}
+```
+
+#### Step 5: The three repairs, from the replica's side
+
+The `SetLinks` arm. `Note` is a plain string, so the Java `note != null && note.startsWith(...)` collapses to `strings.HasPrefix`. `Sent.Values()` returns the updates in insertion order for both the new-tail replies and the `SYNC`.
+
+```go
+	case SetLinks:
+		wasTail := n.IsTail()
+		n.Predecessor = m.Predecessor
+		n.Successor = m.Successor
+		n.InChain = m.Note != "extend-new" // a joining tail is in the chain once its history arrives
+		if n.IsTail() && !wasTail {        // the tail failed: everything we had in flight is now committed
+			for _, u := range n.Sent.Values() {
+				out = append(out, reply(n.id, u.Request.ClientID, u.Request, n.Balance(u.Request.Account)))
+				if !n.IsHead() {
+					out = append(out, ack(n.id, n.Predecessor, u))
+				}
+			}
+			n.Sent.Clear()
+		} else if !n.IsTail() { // new successor: resend what it may be missing
+			if wasTail && strings.HasPrefix(m.Note, "extend") {
+				n.TransferPending = true // keep answering clients until the copy lands
+				out = append(out, stateTransfer(n.id, n.Successor, n.History))
+			} else if n.Sent.Len() > 0 {
+				out = append(out, syncMsg(n.id, n.Successor, n.Sent.Values()))
+			}
+		}
+```
+
+#### Step 6: The master
+
+`Fail` finds the index with a loop (slices have no `indexOf`), classifies the failure, removes the slot with the `append(a[:i], a[i+1:]...)` idiom, and panics on an empty chain. `PublishLinks` walks tail-first. The event-log line is omitted from the chunk.
+
+```go
+func (m *Master) PublishLinks(note string) {
+	m.Reconfigurations++
+	for i := len(m.Chain) - 1; i >= 0; i-- {
+		n := note
+		if note == "extend" && i == len(m.Chain)-1 {
+			n = "extend-new"
+		}
+		m.Network.Send(setLinks(m.Chain[i], m.pred(i), m.succ(i), n))
+	}
+}
+
+func (m *Master) Fail(id int) {
+	i := -1
+	for k, n := range m.Chain {
+		if n == id {
+			i = k
+			break
+		}
+	}
+	if i < 0 {
+		return
+	}
+	kind := "middle"
+	if i == 0 {
+		kind = "head"
+	} else if i == len(m.Chain)-1 {
+		kind = "tail"
+	}
+	m.Chain = append(m.Chain[:i], m.Chain[i+1:]...)
+	if len(m.Chain) == 0 {
+		panic("chain has no replicas left")
+	}
+	m.PublishLinks("fail " + kind)
+}
+```
+
+#### Step 7: The checker
+
+`Update` is a comparable struct, so `succ.History[k] != pred.History[k]` is the structural comparison the invariant needs. `Sent.Contains` is the `containsKey`.
+
+```go
+func (c *ChainCluster) CheckInvariants() {
+	c.Checks++
+	chain := c.Master.Chain
+	for i := 0; i+1 < len(chain); i++ {
+		pred, succ := c.Nodes[chain[i]], c.Nodes[chain[i+1]]
+		if c.Network.IsDown(pred.id) || c.Network.IsDown(succ.id) || pred.TransferPending || !succ.InChain { // a joining tail is not in the chain yet
+			continue
+		}
+		if len(succ.History) > len(pred.History) {
+			c.Violations = append(c.Violations, fmt.Sprintf("UPDATE PROPAGATION: n%d longer than n%d", succ.id, pred.id))
+			return
+		}
+		for k := range succ.History {
+			if succ.History[k] != pred.History[k] {
+				c.Violations = append(c.Violations, fmt.Sprintf("UPDATE PROPAGATION: n%d differs from n%d at %d", succ.id, pred.id, k))
+				return
+			}
+		}
+		for k := len(succ.History); k < len(pred.History); k++ {
+			u := pred.History[k]
+			if !pred.Sent.Contains(u.Seq) {
+				c.Violations = append(c.Violations, fmt.Sprintf("INPROCESS REQUESTS: n%d has seq %d that n%d lacks, and it is not in Sent", pred.id, u.Seq, succ.id))
+				return
+			}
+		}
+	}
+}
+```
+
+#### Step 8: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/10-chain-and-primary-backup/code/go
 go run .
 go test ./...
 ```
+
+```console
+  invariant checks run: 111, violations: 0
+```
+
+```console
+  n0 PRIMARY handled updates=200  queries=1000 acks=402  total=1602
+```
+
+Both lines, and everything between them, are identical to the Java run; the hand-written `orderedUpdates` is what keeps the retry and SYNC order, and therefore the message counts, the same.
 
 ## Use It
 

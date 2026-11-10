@@ -352,29 +352,199 @@ realized gain/loss: -1.50 USD
 
 ### In Python
 
-The full port is `code/python/main.py` (same `SubLedger`, `MultiCurrencyLedger` with `exchange`, `revalue`, `realize`, `position_report`, and the two invariants; tests in `code/python/test_main.py`). Three things differ:
+The Python port has the same `SubLedger` and `MultiCurrencyLedger` (`exchange`, `revalue`, `realize`, `position_report`, and the two invariants), with three differences. **Rounding negative positions:** `fractions.Fraction` would make `FxRate` exact for free, but the design keeps the `numerator`/`denominator` pair from Lesson 02, and the one place arithmetic can diverge is the final division. Positions are often negative (a short EUR position is `-100.00 EUR`), and Python's `//` floors toward negative infinity where Java's `/` truncates toward zero, so `convert` goes through `divide_rounded`, which works on magnitudes and reapplies the sign; the exponent shift is a single power of ten rather than a `multiplyExact` loop, since `int` cannot overflow. **`MixedCurrencyError` stays distinct:** it extends `LedgerError` (which extends `ValueError`), so a caller can catch the specific "one entry per currency" violation separately from a generic validation failure, exactly as the Java hierarchy allows; `Transaction.rate` is `Optional[FxRate]` with `None` for single-currency events. **Ordered dictionaries do the bookkeeping:** `dict` preserves insertion order, so the sub-ledger map, the account map, and the balance report iterate in the same order as Java's `LinkedHashMap` without extra lists. `JournalEntry` validates in a hand-written `__init__` and stores its postings as a tuple, and the property test ships a small `JavaRandom` (with `next_boolean`) so it replays the same 500 exchanges as `MainTest.java`.
 
-- **Rounding negative positions.** `fractions.Fraction` would make `FxRate` exact for free, but the design keeps the `numerator`/`denominator` pair from Lesson 02, and the one place arithmetic can diverge is the final division. Positions are often negative (a short EUR position is `-100.00 EUR`), and Python's `//` floors toward negative infinity where Java's `/` truncates toward zero, so `convert` goes through `divide_rounded`, which works on magnitudes and reapplies the sign. The exponent shift is a single power of ten rather than a `multiplyExact` loop, since `int` cannot overflow:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: An entry has one currency
+
+The hand-written `__init__` checks every posting's currency against the entry's and accumulates a single `net` int. A foreign posting raises `MixedCurrencyError`; an unbalanced entry raises `LedgerError`. `JournalEntry.of` infers the currency from the first posting, as the Java static factory does.
 
 ```python
-def convert(self, amount: Money, rounding: Rounding) -> Money:
-    from_ = amount.currency
-    if from_ == self.base:
-        to, num, den = self.quote, self.numerator, self.denominator
-    elif from_ == self.quote:
-        to, num, den = self.base, self.denominator, self.numerator
-    else:
-        raise CurrencyMismatchError(amount.currency, self.base)
-    shift = to.exponent - from_.exponent
-    if shift > 0:
-        num *= 10 ** shift
-    else:
-        den *= 10 ** (-shift)
-    return Money.of_minor(divide_rounded(amount.minor_units * num, den, rounding), to)
+@dataclass(frozen=True)
+class JournalEntry:
+    """A single-currency balanced entry. Mixing currencies inside one entry is rejected, not netted."""
+
+    id: str
+    currency: Currency
+    postings: Tuple[Posting, ...]
+
+    def __init__(self, id: str, currency: Currency, postings: Iterable[Posting]) -> None:
+        postings = tuple(postings)
+        if len(postings) < 2:
+            raise LedgerError(f"entry {id} needs at least two postings")
+        net = 0
+        for p in postings:
+            if p.amount.currency != currency:
+                raise MixedCurrencyError(id, currency, p.amount.currency)
+            net += p.signed_minor()
+        if net != 0:
+            raise LedgerError(f"entry {id} unbalanced by {Money.of_minor(net, currency)}")
+        object.__setattr__(self, "id", id)
+        object.__setattr__(self, "currency", currency)
+        object.__setattr__(self, "postings", postings)
+
+    @staticmethod
+    def of(id: str, *postings: Posting) -> "JournalEntry":
+        return JournalEntry(id, postings[0].amount.currency, postings)
 ```
 
-- **`MixedCurrencyError` stays distinct.** It extends `LedgerError` (which extends `ValueError`), so a caller can catch the specific "one entry per currency" violation separately from a generic validation failure, exactly as the Java hierarchy allows. `Transaction.rate` is `Optional[FxRate]` with `None` for single-currency events.
-- **Ordered dictionaries do the bookkeeping.** `dict` preserves insertion order, so the sub-ledger map, the account map, and the balance report iterate in the same order as Java's `LinkedHashMap` without extra lists. `JournalEntry` validates in a hand-written `__init__` and stores its postings as a tuple, and the property test ships a small `JavaRandom` (with `next_boolean`) so it replays the same 500 exchanges as `MainTest.java`.
+#### Step 2: The rate converts minor units across exponents
+
+The direction is picked with a tuple assignment, the exponent shift becomes one multiplication by `10 ** shift`, and the only rounding is `divide_rounded` at the end, which handles negative positions with truncation semantics so Python and Java agree.
+
+```python
+    def convert(self, amount: Money, rounding: Rounding) -> Money:
+        """Convert an amount of base or quote into the other currency, in minor units, rounding once."""
+        from_ = amount.currency
+        if from_ == self.base:
+            to, num, den = self.quote, self.numerator, self.denominator
+        elif from_ == self.quote:
+            to, num, den = self.base, self.denominator, self.numerator
+        else:
+            raise CurrencyMismatchError(amount.currency, self.base)
+        # minor(to) = minor(from) * rate * 10^(exp(to) - exp(from))
+        shift = to.exponent - from_.exponent
+        if shift > 0:
+            num *= 10 ** shift
+        else:
+            den *= 10 ** (-shift)
+        return Money.of_minor(divide_rounded(amount.minor_units * num, den, rounding), to)
+```
+
+#### Step 3: Sub-ledgers and the ledger that routes to them
+
+`SubLedger` is a journal list plus a `dict` of net debits; `trial_balance_net` is `sum(...)` over the values. `add_currency` builds the sub-ledger on demand and opens the clearing account (and, for a foreign currency, the functional-currency revaluation account plus zeroed `basis` and `revalued` entries).
+
+```python
+class SubLedger:
+    """One currency's journal and balances. Knows nothing about other currencies."""
+
+    def __init__(self, currency: Currency) -> None:
+        self.currency = currency
+        self._journal: List[JournalEntry] = []
+        self._net_debits: Dict[str, int] = {}
+
+    def append(self, e: JournalEntry) -> None:
+        self._journal.append(e)
+        for p in e.postings:
+            self._net_debits[p.account_id] = self._net_debits.get(p.account_id, 0) + p.signed_minor()
+
+    def trial_balance_net(self) -> int:
+        """Sum of net debits over every account in this currency. Zero, always, or the sub-ledger is corrupt."""
+        return sum(self._net_debits.values())
+```
+
+```python
+    def add_currency(self, c: Currency) -> None:
+        """Register a currency: its sub-ledger, its clearing account, and (if foreign) its revaluation adjustment account."""
+        if c in self._sub_ledgers:
+            return
+        self._sub_ledgers[c] = SubLedger(c)
+        self._open_account_internal(Account(self.clearing_id(c), f"FX Clearing {c.code}", AccountType.ASSET, c, True))
+        if c != self.functional:
+            self._open_account_internal(Account(self.revaluation_id(c), f"FX Revaluation Adjustment {c.code}",
+                                                AccountType.ASSET, self.functional, False))
+            self._basis[c] = 0
+            self._revalued[c] = 0
+```
+
+#### Step 4: Exchange through clearing, and track the basis
+
+The two single-currency legs are built with `JournalEntry.of` and wrapped in one `Transaction` carrying the rate. The basis moves only when `post` returns `True`, so a replayed transaction id does not double-count; `return self._transactions[tx_id]` hands back the stored transaction either way.
+
+```python
+        converted = rate.convert(amount, Rounding.HALF_EVEN)
+        if converted.currency != b:
+            raise CurrencyMismatchError(converted.currency, b)
+        if not converted.is_positive():
+            raise LedgerError("converted amount rounds to zero")
+        tx = Transaction(tx_id, description, (
+            JournalEntry.of(f"{tx_id}/{a.code}", Posting.debit(debit_account, amount), Posting.credit(self.clearing_id(a), amount)),
+            JournalEntry.of(f"{tx_id}/{b.code}", Posting.debit(self.clearing_id(b), converted), Posting.credit(credit_account, converted)),
+        ), rate)
+        if self.post(tx):
+            # Position outside clearing: A gains +amount, B loses -converted. Basis follows at the functional value.
+            if b == self.functional:
+                self._basis[a] += converted.minor_units
+            else:
+                self._basis[b] -= amount.minor_units
+        return self._transactions[tx_id]
+```
+
+#### Step 5: The position is computed, not stored
+
+A generator expression over the account dict, filtered to non-clearing accounts in `c`, summed from the sub-ledger. `position_report` bundles it with the stored basis and cumulative revaluation.
+
+```python
+    def position(self, c: Currency) -> Money:
+        """Net debit of every non-clearing account in a foreign currency: what we actually hold (+) or owe (-)."""
+        sub = self.sub_ledger(c)
+        acc = sum(sub.net_debit(a.id) for a in self._accounts.values() if a.currency == c and not a.clearing)
+        return Money.of_minor(acc, c)
+
+    def position_report(self, c: Currency) -> Position:
+        self._require_foreign(c)
+        return Position(c, self.position(c), Money.of_minor(self._basis[c], self.functional),
+                        Money.of_minor(self._revalued[c], self.functional))
+```
+
+#### Step 6: Revalue in the functional currency
+
+`fair` is the (possibly negative) position converted at the closing rate; `gain` is its distance from the carrying value. Only a non-zero gain posts an entry, in functional currency on both legs, and `_revalued[c]` accumulates so the next revaluation at the same rate books nothing.
+
+```python
+    def revalue(self, c: Currency, closing_rate: FxRate) -> Money:
+        self._require_foreign(c)
+        fair = closing_rate.convert(self.position(c), Rounding.HALF_EVEN)
+        gain = fair.minor_units - (self._basis[c] + self._revalued[c])
+        if gain != 0:
+            g = Money.of_minor(abs(gain), self.functional)
+            self._adjustment_counter += 1
+            id = f"reval-{self._adjustment_counter}-{c.code}"
+            if gain > 0:
+                e = JournalEntry.of(id, Posting.debit(self.revaluation_id(c), g), Posting.credit(self.UNREALIZED, g))
+            else:
+                e = JournalEntry.of(id, Posting.debit(self.UNREALIZED, g), Posting.credit(self.revaluation_id(c), g))
+            self.post(Transaction(id, f"revalue {c.code} at {closing_rate}", (e,), closing_rate))
+            self._revalued[c] += gain
+        return Money.of_minor(gain, self.functional)
+```
+
+#### Step 7: Realize a flat position
+
+The Java comments become code here: the `/pnl` entry moves `-basis` between functional clearing and `4910`, the `/unwind` entry reverses the cumulative revaluation between `4900` and `1950-c`, both inside one `Transaction` with `rate=None`, and the two stored counters are zeroed.
+
+```python
+    def realize(self, c: Currency) -> Money:
+        self._require_foreign(c)
+        if not self.position(c).is_zero():
+            raise LedgerError(f"position in {c.code} is {self.position(c)}; realize only a flat position")
+        realized_gain = -self._basis[c]
+        entries: List[JournalEntry] = []
+        self._adjustment_counter += 1
+        id = f"realize-{self._adjustment_counter}-{c.code}"
+        if realized_gain != 0:
+            g = Money.of_minor(abs(realized_gain), self.functional)
+            if realized_gain > 0:
+                entries.append(JournalEntry.of(f"{id}/pnl", Posting.debit(self.clearing_id(self.functional), g), Posting.credit(self.REALIZED, g)))
+            else:
+                entries.append(JournalEntry.of(f"{id}/pnl", Posting.debit(self.REALIZED, g), Posting.credit(self.clearing_id(self.functional), g)))
+        rev = self._revalued[c]
+        if rev != 0:
+            r = Money.of_minor(abs(rev), self.functional)
+            if rev > 0:
+                entries.append(JournalEntry.of(f"{id}/unwind", Posting.debit(self.UNREALIZED, r), Posting.credit(self.revaluation_id(c), r)))
+            else:
+                entries.append(JournalEntry.of(f"{id}/unwind", Posting.debit(self.revaluation_id(c), r), Posting.credit(self.UNREALIZED, r)))
+        if entries:
+            self.post(Transaction(id, f"realize {c.code} position", tuple(entries), None))
+        self._basis[c] = 0
+        self._revalued[c] = 0
+        return Money.of_minor(realized_gain, self.functional)
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/09-multi-currency-ledgers/code/python
@@ -382,25 +552,319 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output matches the Java run, including the JPY round trip that shows the exponent shift and the tie-to-even rounding:
+
+```console
+EUR position now 0.00 EUR; functional clearing holds 1.50 USD
+realized gain/loss: -1.50 USD
+  4900 Unrealized 0.00 USD, 4910 Realized -1.50 USD, 1950-EUR 0.00 USD, 1900-USD 0.00 USD
+  operating bank 1010-USD -1.50 USD: the 1.50 USD the round trip cost
+  every sub-ledger balances: true; clearing matches basis: true
+
+== Exponents differ: 5,000 JPY to USD at 1 USD = 157.25 JPY ==
+5000 JPY -> 31.80 USD; 31.80 USD -> 5001 JPY
+```
+
 ### In Go
 
-The full port is `code/go/main.go` (same `SubLedger`, `MultiCurrencyLedger`, `FxRate`, `Transaction`, `Position`; `Exchange`, `Revalue`, `Realize`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go` for the seeded property test. Tests are in `code/go/main_test.go`. Three things differ:
+The Go port is `code/go/main.go` (same `SubLedger`, `MultiCurrencyLedger`, `FxRate`, `Transaction`, `Position`; `Exchange`, `Revalue`, `Realize`) with `money.go` (the Lesson 01 `Money`) and `javarandom.go` for the seeded property test. Three things differ. **`ErrMixedCurrency` is its own sentinel, wrapped around `ErrLedger`:** every ledger rule returns an error that wraps `ErrLedger`; the one the lesson is about, a EUR posting inside a USD entry, wraps `ErrMixedCurrency`, which itself wraps `ErrLedger`, so `errors.Is` matches either, and the demo's `rejected:` line branches on the specific one. **Checked arithmetic everywhere `Math.*Exact` was:** `FxRate.Convert` scales by `10^(exp(to) - exp(from))` with `mulChecked`, `SubLedger.Append` checks every running total before mutating any of them, and `Exchange` only moves the basis after `Post` reports a genuinely new transaction; `int64` `/` and `%` truncate toward zero exactly like Java, so `DivideRounded` is shared with Lesson 01 and the tie-to-even cases (`1572.5 -> 1572 JPY`) agree. **Insertion order is kept by hand:** Java's `LinkedHashMap` gives `accounts()`, `currencies()`, and the sub-ledger's trial balance a stable order; Go's `map` does not, so each map has a companion slice (`accountOrder`, `currencyOrder`) and `Position`-style reports iterate the slice. `Transaction.Rate` is a `*FxRate` because single-currency transactions have no rate (Java's `null`); `Equal` methods stand in for record equality in the idempotent-replay checks.
 
-- **`ErrMixedCurrency` is its own sentinel, wrapped around `ErrLedger`.** Every ledger rule returns an error that wraps `ErrLedger`; the one the lesson is about, a EUR posting inside a USD entry, wraps `ErrMixedCurrency`, which itself wraps `ErrLedger`, so `errors.Is` matches either. The demo's `rejected:` line branches on the specific one:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: An entry has one currency
+
+`NewJournalEntry` returns `ErrMixedCurrency` (wrapped with the offending codes) on the first foreign posting and accumulates `net` with `addChecked`. `EntryOf` is the Java `JournalEntry.of`: it takes the currency from the first posting. The stored slice is a copy.
 
 ```go
-if _, err := NewJournalEntry("bad", USD, postings); errors.Is(err, ErrMixedCurrency) {
-    fmt.Println("rejected:", err)
+type JournalEntry struct {
+	ID       string
+	Currency Currency
+	Postings []Posting
+}
+
+func NewJournalEntry(id string, currency Currency, postings []Posting) (JournalEntry, error) {
+	if len(postings) < 2 {
+		return JournalEntry{}, ledgerErr("entry %s needs at least two postings", id)
+	}
+	var net int64
+	for _, p := range postings {
+		if p.Amount.Currency != currency {
+			return JournalEntry{}, fmt.Errorf("%w: entry %s is %s but has a %s posting; use one entry per currency",
+				ErrMixedCurrency, id, currency.Code, p.Amount.Currency.Code)
+		}
+		var err error
+		if net, err = addChecked(net, p.SignedMinor()); err != nil {
+			return JournalEntry{}, err
+		}
+	}
+	if net != 0 {
+		return JournalEntry{}, ledgerErr("entry %s unbalanced by %v", id, OfMinor(net, currency))
+	}
+	return JournalEntry{id, currency, append([]Posting(nil), postings...)}, nil
+}
+
+// EntryOf builds an entry in the currency of its first posting (JournalEntry.of in Java).
+func EntryOf(id string, postings ...Posting) (JournalEntry, error) {
+	if len(postings) == 0 {
+		return JournalEntry{}, ledgerErr("entry %s needs at least two postings", id)
+	}
+	return NewJournalEntry(id, postings[0].Amount.Currency, postings)
 }
 ```
 
-- **Checked arithmetic everywhere `Math.*Exact` was.** `FxRate.Convert` scales by `10^(exp(to) - exp(from))` with `mulChecked`, `SubLedger.Append` checks every running total before mutating any of them, and `Exchange` only moves the basis after `Post` reports a genuinely new transaction. `int64 / %` truncate toward zero exactly like Java, so `DivideRounded` is shared with Lesson 01 and the tie-to-even cases (`1572.5 -> 1572 JPY`) agree.
-- **Insertion order is kept by hand.** Java's `LinkedHashMap` gives `accounts()`, `currencies()`, and the sub-ledger's trial balance a stable order; Go's `map` does not, so each map has a companion slice (`accountOrder`, `currencyOrder`) and `Position`-style reports iterate the slice. `Transaction.Rate` is a `*FxRate` because single-currency transactions have no rate (Java's `null`); `Equal` methods stand in for record equality in the idempotent-replay checks.
+#### Step 2: The rate converts minor units across exponents
+
+A `switch` picks the target currency, the fraction is inverted for quote-to-base, and the exponent shift loop multiplies through `mulChecked`. `DivideRounded` truncates toward zero like Java, so negative positions need no sign fix-up.
+
+```go
+func (r FxRate) Convert(amount Money, rounding Rounding) (Money, error) {
+	from := amount.Currency
+	var to Currency
+	switch from {
+	case r.Base:
+		to = r.Quote
+	case r.Quote:
+		to = r.Base
+	default:
+		return Money{}, fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, from.Code, r.Base.Code)
+	}
+	num, den := r.Numerator, r.Denominator
+	if from != r.Base {
+		num, den = r.Denominator, r.Numerator
+	}
+	// minor(to) = minor(from) * rate * 10^(exp(to) - exp(from))
+	shift := to.Exponent - from.Exponent
+	var err error
+	for range abs64(int64(shift)) {
+		if shift > 0 {
+			num, err = mulChecked(num, 10)
+		} else {
+			den, err = mulChecked(den, 10)
+		}
+		if err != nil {
+			return Money{}, err
+		}
+	}
+	product, err := mulChecked(amount.MinorUnits, num)
+	if err != nil {
+		return Money{}, err
+	}
+	return OfMinor(DivideRounded(product, den, rounding), to), nil
+}
+```
+
+#### Step 3: Sub-ledgers and the ledger that routes to them
+
+`SubLedger` keeps `accountOrder` beside its map so `TrialBalanceNet` and the balance report iterate deterministically. `Append` dry-runs every `addChecked` before writing anything, so an overflowing entry is rejected whole. `AddCurrency` is the same on-demand registration as the Java.
+
+```go
+type SubLedger struct {
+	Currency     Currency
+	journal      []JournalEntry
+	accountOrder []string
+	netDebits    map[string]int64
+}
+
+func (s *SubLedger) Append(e JournalEntry) error {
+	for _, p := range e.Postings {
+		if _, err := addChecked(s.netDebits[p.AccountID], p.SignedMinor()); err != nil {
+			return err
+		}
+	}
+	s.journal = append(s.journal, e)
+	for _, p := range e.Postings {
+		if _, seen := s.netDebits[p.AccountID]; !seen {
+			s.accountOrder = append(s.accountOrder, p.AccountID)
+		}
+		s.netDebits[p.AccountID] += p.SignedMinor()
+	}
+	return nil
+}
+
+func (s *SubLedger) TrialBalanceNet() int64 {
+	var acc int64
+	for _, id := range s.accountOrder {
+		acc += s.netDebits[id]
+	}
+	return acc
+}
+```
+
+```go
+func (l *MultiCurrencyLedger) AddCurrency(c Currency) {
+	if _, known := l.subLedgers[c]; known {
+		return
+	}
+	l.subLedgers[c] = NewSubLedger(c)
+	l.currencyOrder = append(l.currencyOrder, c)
+	l.openAccountInternal(Account{ClearingID(c), "FX Clearing " + c.Code, Asset, c, true})
+	if c != l.Functional {
+		l.openAccountInternal(Account{RevaluationID(c), "FX Revaluation Adjustment " + c.Code, Asset, l.Functional, false})
+		l.basis[c] = 0
+		l.revalued[c] = 0
+	}
+}
+```
+
+#### Step 4: Exchange through clearing, and track the basis
+
+The two legs come from `EntryOf`, the rate is passed by address into `NewTransaction`, and `Post` returns `(posted, err)`. The basis update runs only when `posted` is true and goes through `addChecked`; the stored transaction is returned so a replay sees the same value.
+
+```go
+	legA, err := EntryOf(txID+"/"+a.Code, Posting{debitAccount, Debit, amount}, Posting{ClearingID(a), Credit, amount})
+	if err != nil {
+		return Transaction{}, err
+	}
+	legB, err := EntryOf(txID+"/"+b.Code, Posting{ClearingID(b), Debit, converted}, Posting{creditAccount, Credit, converted})
+	if err != nil {
+		return Transaction{}, err
+	}
+	tx := NewTransaction(txID, description, []JournalEntry{legA, legB}, &rate)
+	posted, err := l.Post(tx)
+	if err != nil {
+		return Transaction{}, err
+	}
+	if posted {
+		// Position outside clearing: A gains +amount, B loses -converted. Basis follows at the functional value.
+		if b == l.Functional {
+			l.basis[a], err = addChecked(l.basis[a], converted.MinorUnits)
+		} else {
+			l.basis[b], err = addChecked(l.basis[b], -amount.MinorUnits)
+		}
+		if err != nil {
+			return Transaction{}, err
+		}
+	}
+	return l.transactions[txID], nil
+```
+
+#### Step 5: The position is computed, not stored
+
+Named `PositionOf` because `Position` is the report struct. It walks `accountOrder`, filters to non-clearing accounts in `c`, and sums from the sub-ledger on every call.
+
+```go
+func (l *MultiCurrencyLedger) PositionOf(c Currency) Money {
+	var acc int64
+	for _, id := range l.accountOrder {
+		a := l.accounts[id]
+		if a.Currency == c && !a.Clearing {
+			acc += l.subLedgers[c].NetDebit(a.ID)
+		}
+	}
+	return OfMinor(acc, c)
+}
+
+func (l *MultiCurrencyLedger) PositionReport(c Currency) (Position, error) {
+	if err := l.requireForeign(c); err != nil {
+		return Position{}, err
+	}
+	return Position{c, l.PositionOf(c), OfMinor(l.basis[c], l.Functional), OfMinor(l.revalued[c], l.Functional)}, nil
+}
+```
+
+#### Step 6: Revalue in the functional currency
+
+`Convert` and both `addChecked` calls can fail, so the arithmetic is three guarded steps; the posting logic is otherwise identical, with `&closingRate` stored on the transaction.
+
+```go
+func (l *MultiCurrencyLedger) Revalue(c Currency, closingRate FxRate) (Money, error) {
+	if err := l.requireForeign(c); err != nil {
+		return Money{}, err
+	}
+	fair, err := closingRate.Convert(l.PositionOf(c), HalfEven)
+	if err != nil {
+		return Money{}, err
+	}
+	carrying, err := addChecked(l.basis[c], l.revalued[c])
+	if err != nil {
+		return Money{}, err
+	}
+	gain, err := addChecked(fair.MinorUnits, -carrying)
+	if err != nil {
+		return Money{}, err
+	}
+	if gain != 0 {
+		g := OfMinor(abs64(gain), l.Functional)
+		l.adjustmentCounter++
+		id := fmt.Sprintf("reval-%d-%s", l.adjustmentCounter, c.Code)
+		var e JournalEntry
+		if gain > 0 {
+			e, err = EntryOf(id, Posting{RevaluationID(c), Debit, g}, Posting{Unrealized, Credit, g})
+		} else {
+			e, err = EntryOf(id, Posting{Unrealized, Debit, g}, Posting{RevaluationID(c), Credit, g})
+		}
+		if err != nil {
+			return Money{}, err
+		}
+		if _, err := l.Post(NewTransaction(id, fmt.Sprintf("revalue %s at %v", c.Code, closingRate), []JournalEntry{e}, &closingRate)); err != nil {
+			return Money{}, err
+		}
+		l.revalued[c] += gain
+	}
+	return OfMinor(gain, l.Functional), nil
+}
+```
+
+#### Step 7: Realize a flat position
+
+The `/pnl` and `/unwind` entries are built conditionally, collected into one transaction with a `nil` rate, and posted together; the basis and revaluation counters are reset afterwards. Both `EntryOf` calls are checked because the postings are built from literals.
+
+```go
+	realizedGain := -l.basis[c]
+	var entries []JournalEntry
+	l.adjustmentCounter++
+	id := fmt.Sprintf("realize-%d-%s", l.adjustmentCounter, c.Code)
+	if realizedGain != 0 {
+		g := OfMinor(abs64(realizedGain), l.Functional)
+		var e JournalEntry
+		var err error
+		if realizedGain > 0 {
+			e, err = EntryOf(id+"/pnl", Posting{ClearingID(l.Functional), Debit, g}, Posting{Realized, Credit, g})
+		} else {
+			e, err = EntryOf(id+"/pnl", Posting{Realized, Debit, g}, Posting{ClearingID(l.Functional), Credit, g})
+		}
+		if err != nil {
+			return Money{}, err
+		}
+		entries = append(entries, e)
+	}
+	if rev := l.revalued[c]; rev != 0 {
+		r := OfMinor(abs64(rev), l.Functional)
+		var e JournalEntry
+		var err error
+		if rev > 0 {
+			e, err = EntryOf(id+"/unwind", Posting{Unrealized, Debit, r}, Posting{RevaluationID(c), Credit, r})
+		} else {
+			e, err = EntryOf(id+"/unwind", Posting{RevaluationID(c), Debit, r}, Posting{Unrealized, Credit, r})
+		}
+		if err != nil {
+			return Money{}, err
+		}
+		entries = append(entries, e)
+	}
+	if len(entries) > 0 {
+		if _, err := l.Post(NewTransaction(id, "realize "+c.Code+" position", entries, nil)); err != nil {
+			return Money{}, err
+		}
+	}
+	l.basis[c] = 0
+	l.revalued[c] = 0
+	return OfMinor(realizedGain, l.Functional), nil
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/09-multi-currency-ledgers/code/go
 go run .
 go test ./...
+```
+
+The output matches Java and Python line for line, ending with the exponent demonstration:
+
+```console
+== Exponents differ: 5,000 JPY to USD at 1 USD = 157.25 JPY ==
+5000 JPY -> 31.80 USD; 31.80 USD -> 5001 JPY
 ```
 
 ## Use It

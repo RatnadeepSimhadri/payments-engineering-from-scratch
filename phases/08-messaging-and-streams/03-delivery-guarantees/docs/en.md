@@ -337,61 +337,424 @@ Two things to try before moving on. Change the crash offset in `Main` to 7 (the 
 
 ### In Python
 
-```python
-class Transaction:
-    def commit(self) -> None:
-        self._require_open()
-        self._store._postings.extend(self._buffered_postings)
-        for p in self._buffered_postings:
-            self._store._processed.add(p.payment_id)
-        if self._buffered_offset >= 0:
-            self._store._committed_offset = self._buffered_offset
-        self._done = True
+The Python port (`code/python/main.py`) is the same design with four differences. **The transaction is also a context manager:** the consumer calls `tx.commit()` explicitly, exactly as the Java does, so the four strategies read the same in both languages; `__enter__`/`__exit__` are an addition, and `with store.begin() as tx:` commits on a clean exit and discards the buffer when a `CrashError` propagates, which turns the crash-discards-the-buffer rule into a language feature (the test file exercises both paths). **`Money` is `int` minor units** and `__post_init__` raises `TypeError` on a `float` (or `bool`); there is no overflow, so `Math.addExact` has no counterpart, and `Money.parse` raises `ArithmeticError` for too many decimals as the Java raises `ArithmeticException`. **Exceptions:** `CrashError` for `CrashException`, `CurrencyMismatchError`, `ValueError` for `IllegalArgumentException`, `RuntimeError` for the reused-transaction `IllegalStateException`; `Simulation.run` catches `CrashError` and restarts, like the Java `catch`. **`Strategy` is an `Enum`** iterated in declaration order (`for s in Strategy`), the same order `Strategy.values()` gives; the `post_if_new` check-and-insert is still a single `if ... in` followed by `add`, never split across calls.
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        if exc_type is None:
-            self.commit()
-        return False
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The log and the record
+
+`Record` is a frozen dataclass carrying the business key. `Log` keeps a list; `append` returns the dense offset, and `read` slices the list, returning `[]` at the end offset and raising `ValueError` outside `[0, end]`.
+
+```python
+@dataclass(frozen=True)
+class Record:
+    offset: int
+    payment_id: str
+    amount: Money
+
+
+class Log:
+    def __init__(self) -> None:
+        self._records: List[Record] = []
+
+    def append(self, payment_id: str, amount: Money) -> int:
+        offset = len(self._records)
+        self._records.append(Record(offset, payment_id, amount))
+        return offset
+
+    def end_offset(self) -> int:
+        return len(self._records)
+
+    def read(self, from_offset: int, max_records: int) -> List[Record]:
+        if from_offset < 0 or from_offset > len(self._records):
+            raise ValueError(f"offset {from_offset} out of range")
+        to = min(len(self._records), from_offset + max_records)
+        return list(self._records[from_offset:to])
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The fault injector
 
-- **The transaction is also a context manager.** The consumer calls `tx.commit()` explicitly, exactly as the Java does, so the four strategies read the same in both languages. `__enter__`/`__exit__` are an addition: `with store.begin() as tx:` commits on a clean exit and discards the buffer when a `CrashError` propagates, which turns the crash-discards-the-buffer rule into a language feature. The test file exercises both paths.
-- **`Money` is `int` minor units** and `__post_init__` raises `TypeError` on a `float` (or `bool`); there is no overflow, so `Math.addExact` has no counterpart. `Money.parse` raises `ArithmeticError` for too many decimals, as the Java raises `ArithmeticException`.
-- **Exceptions:** `CrashError` for `CrashException`, `CurrencyMismatchError`, `ValueError` for `IllegalArgumentException`, `RuntimeError` for the reused-transaction `IllegalStateException`. `Simulation.run` catches `CrashError` and restarts, like the Java `catch`.
-- **`Strategy` is an `Enum`** iterated in declaration order (`for s in Strategy`), the same order `Strategy.values()` gives; the `postIfNew` check-and-insert is still a single `if ... in` followed by `add`, never split across calls.
+The injector raises `CrashError` exactly once, the first time the chosen offset is reached, and disarms itself so the restarted consumer gets past the same offset. `FaultInjector.none()` (offset `-1`) is the no-crash baseline the tests use.
 
-Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`. The table (8/12/10/10 posted, 3/0/10/10 correct runs out of 10) matches the Java output exactly.
+```python
+class FaultInjector:
+    def __init__(self, crash_at_offset: int) -> None:
+        self._crash_at_offset = crash_at_offset
+        self._armed = True
+
+    @staticmethod
+    def none() -> "FaultInjector":
+        return FaultInjector(-1)
+
+    def after_side_effect(self, offset: int) -> None:
+        if self._armed and offset == self._crash_at_offset:
+            self._armed = False
+            raise CrashError(offset)
+
+    def fired(self) -> bool:
+        return not self._armed
+```
+
+#### Step 3: The store, with and without atomicity
+
+`post_if_new` checks `_processed` (a `set`) and inserts into both the set and the postings list in one method; the direct calls are each a separate durable write with a crash point between them. `Transaction` is a nested class that buffers and applies everything in `commit()`; a `CrashError` raised while it is open simply abandons the buffer, and `_require_open` raises `RuntimeError` if a committed transaction is reused.
+
+```python
+    def post_if_new(self, posting: Posting) -> bool:
+        if posting.payment_id in self._processed:
+            return False
+        self._processed.add(posting.payment_id)
+        self._postings.append(posting)
+        return True
+```
+
+```python
+    class Transaction:
+        def __init__(self, store: "Store") -> None:
+            self._store = store
+            self._buffered_postings: List[Posting] = []
+            self._buffered_offset = -1
+            self._done = False
+
+        def post(self, posting: Posting) -> None:
+            self._require_open()
+            self._buffered_postings.append(posting)
+
+        def commit_offset(self, next_offset: int) -> None:
+            self._require_open()
+            self._buffered_offset = next_offset
+
+        def commit(self) -> None:
+            self._require_open()
+            self._store._postings.extend(self._buffered_postings)
+            for p in self._buffered_postings:
+                self._store._processed.add(p.payment_id)
+            if self._buffered_offset >= 0:
+                self._store._committed_offset = self._buffered_offset
+            self._done = True
+```
+
+#### Step 4: The four strategies
+
+The Java `switch` becomes an `if`/`elif` chain on the enum inside `run_to_end`. The two naive orderings differ by where `commit_offset(batch_end)` sits relative to the loop; the idempotent branch swaps `post` for `post_if_new`; the transactional branch opens a transaction per record and the crash fires between `commit_offset` and `commit`, so the buffer is lost with the process.
+
+```python
+            if self._strategy is Strategy.AT_MOST_ONCE:
+                self._store.commit_offset(batch_end)
+                for r in batch:
+                    self._store.post(Posting(r.payment_id, r.amount))
+                    self._faults.after_side_effect(r.offset)
+            elif self._strategy is Strategy.AT_LEAST_ONCE:
+                for r in batch:
+                    self._store.post(Posting(r.payment_id, r.amount))
+                    self._faults.after_side_effect(r.offset)
+                self._store.commit_offset(batch_end)
+```
+
+```python
+            elif self._strategy is Strategy.AT_LEAST_ONCE_IDEMPOTENT:
+                for r in batch:
+                    self._store.post_if_new(Posting(r.payment_id, r.amount))
+                    self._faults.after_side_effect(r.offset)
+                self._store.commit_offset(batch_end)
+            elif self._strategy is Strategy.TRANSACTIONAL:
+                for r in batch:
+                    tx = self._store.begin()
+                    tx.post(Posting(r.payment_id, r.amount))
+                    tx.commit_offset(r.offset + 1)
+                    self._faults.after_side_effect(r.offset)
+                    tx.commit()
+            position = batch_end
+```
+
+#### Step 5: Measuring the damage
+
+`Simulation.run` loops `Consumer(...).run_to_end()` inside a `try`, counting each `CrashError` and constructing a fresh consumer against the same `Store`. `measure` seeds a dict with every payment id on the log at zero, counts postings per id, and classifies zeros as lost and `n > 1` as `n - 1` duplicates.
+
+```python
+    @staticmethod
+    def run(strategy: Strategy, log: Log, crash_at_offset: int, batch_size: int) -> Outcome:
+        store = Store()
+        faults = FaultInjector(crash_at_offset)
+        crashes = 0
+        while True:
+            try:
+                Consumer(strategy, log, store, faults, batch_size).run_to_end()
+                break
+            except CrashError:
+                crashes += 1  # the process is gone; a fresh one starts from store.committed_offset()
+        return Simulation.measure(strategy, log, store, crashes)
+
+    @staticmethod
+    def measure(strategy: Strategy, log: Log, store: Store, crashes: int) -> Outcome:
+        counts: Dict[str, int] = {}
+        for r in log.read(0, log.end_offset()):
+            counts[r.payment_id] = 0
+        for p in store.postings():
+            counts[p.payment_id] = counts.get(p.payment_id, 0) + 1
+        duplicates = lost = 0
+        for c in counts.values():
+            if c == 0:
+                lost += 1
+            if c > 1:
+                duplicates += c - 1
+        return Outcome(strategy, len(store.postings()), duplicates, lost, crashes, store.balance(USD))
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/08-messaging-and-streams/03-delivery-guarantees/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The table (8/12/10/10 posted, 3/0/10/10 correct runs out of 10) and the ledger totals match the Java output exactly:
+
+```console
+== Crash after the side effect for offset 5, before its commit; then restart ==
+  strategy                   posted  duplicates  lost  crashes  ledger total
+  AT_MOST_ONCE               8       0           2     1        115.84 USD  <- money missing
+  AT_LEAST_ONCE              12      2           0     1        179.98 USD  <- money counted twice
+  AT_LEAST_ONCE_IDEMPOTENT   10      0           0     1        149.65 USD  <- matches
+  TRANSACTIONAL              10      0           0     1        149.65 USD  <- matches
+```
 
 ### In Go
 
+The Go port (`code/go/main.go` and `code/go/money.go`) keeps the design and changes how the crash travels. **The crash is a returned error, not a thrown one:** `FaultInjector.AfterSideEffect` returns `ErrCrash` wrapped with the offset; every strategy branch in `RunToEnd` returns it immediately, which is the Go spelling of "the process is gone". `Run` restarts a fresh consumer while `errors.Is(err, ErrCrash)` and panics on any other error, because in this single-threaded simulation nothing else can fail. Returning early is also what discards the buffered `Transaction`: the struct is simply never committed. **Errors are values elsewhere too:** `Log.Read`, `Store.CommitOffset`, `NewConsumer`, and the three `Transaction` methods return `error`; a reused transaction returns the sentinel `ErrTransactionDone` where Java throws `IllegalStateException`, and `PostIfNew` keeps the check-and-insert as one method on one map. **`Money` is `int64` minor units** (the Phase 10, Lesson 01 Go `Money`, in `money.go`): `Parse` and `Plus` return `(Money, error)`, overflow is checked by `addChecked`, and a currency mix wraps `ErrCurrencyMismatch`; `Store.Balance` panics on a mismatch because every posting in this lesson carries the same currency, so it is a bug, not a condition. **`Strategy` is a typed constant** with a `String()` method printing the Java names, and the `Strategies` slice stands in for `Strategy.values()` so the demo iterates in the same order.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The log and the record
+
+`Log` wraps a slice; `Append` returns the dense `int64` offset and `Read` returns a copy of the sub-slice (so a caller cannot alias the log's backing array) or an error outside `[0, end]`. The builtin `min` is Go 1.21+.
+
 ```go
-case Transactional:
-    for _, r := range batch {
-        tx := c.store.Begin()
-        if err := tx.Post(Posting{r.PaymentID, r.Amount}); err != nil {
-            return err
-        }
-        if err := tx.CommitOffset(r.Offset + 1); err != nil {
-            return err
-        }
-        if err := c.faults.AfterSideEffect(r.Offset); err != nil {
-            return err // the buffered transaction dies with the process
-        }
-        if err := tx.Commit(); err != nil {
-            return err
-        }
-    }
+type Record struct {
+	Offset    int64
+	PaymentID string
+	Amount    Money
+}
+
+type Log struct {
+	records []Record
+}
+
+func (l *Log) Append(paymentID string, amount Money) int64 {
+	offset := int64(len(l.records))
+	l.records = append(l.records, Record{offset, paymentID, amount})
+	return offset
+}
+
+func (l *Log) EndOffset() int64 { return int64(len(l.records)) }
+
+func (l *Log) Read(fromOffset int64, maxRecords int) ([]Record, error) {
+	if fromOffset < 0 || fromOffset > int64(len(l.records)) {
+		return nil, fmt.Errorf("offset %d out of range", fromOffset)
+	}
+	to := min(int64(len(l.records)), fromOffset+int64(maxRecords))
+	return append([]Record{}, l.records[fromOffset:to]...), nil
+}
 ```
 
-Differences, all in `code/go/main.go` and `code/go/money.go`:
+#### Step 2: The fault injector
 
-- **The crash is a returned error, not a thrown one.** `FaultInjector.AfterSideEffect` returns `ErrCrash` wrapped with the offset; every strategy branch in `RunToEnd` returns it immediately, which is the Go spelling of "the process is gone". `Run` restarts a fresh consumer while `errors.Is(err, ErrCrash)` and panics on any other error, because in this single-threaded simulation nothing else can fail. Returning early is also what discards the buffered `Transaction`: the struct is simply never committed.
-- **Errors are values elsewhere too.** `Log.Read`, `Store.CommitOffset`, `NewConsumer`, and the three `Transaction` methods return `error`; a reused transaction returns the sentinel `ErrTransactionDone` where Java throws `IllegalStateException`. `PostIfNew` keeps the check-and-insert as one method on one map, never split across calls.
-- **`Money` is `int64` minor units** (the Phase 10, Lesson 01 Go `Money`, in `money.go`): `Parse` and `Plus` return `(Money, error)`, overflow is checked by `addChecked`, and a currency mix wraps `ErrCurrencyMismatch`. `Store.Balance` panics on a mismatch because every posting in this lesson carries the same currency, so it is a bug, not a condition.
-- **`Strategy` is a typed constant** with a `String()` method printing the Java names, and the `Strategies` slice stands in for `Strategy.values()` so the demo iterates in the same order.
+Same one-shot arming, but the crash is an error value wrapping the `ErrCrash` sentinel. The caller has to check it and return; that explicit `if err != nil { return err }` after every side effect is what the Java `throw` did implicitly.
 
-Run it from `code/go/` with `go run .`; test with `go test ./...`. The table (8/12/10/10 posted, 3/0/10/10 correct runs out of 10) and the ledger totals match the Java output exactly.
+```go
+var ErrCrash = errors.New("process crashed")
+
+type FaultInjector struct {
+	crashAtOffset int64
+	armed         bool
+}
+
+func NewFaultInjector(crashAtOffset int64) *FaultInjector {
+	return &FaultInjector{crashAtOffset: crashAtOffset, armed: true}
+}
+
+func NoFaults() *FaultInjector { return NewFaultInjector(-1) }
+
+func (f *FaultInjector) AfterSideEffect(offset int64) error {
+	if f.armed && offset == f.crashAtOffset {
+		f.armed = false
+		return fmt.Errorf("%w after the side effect for offset %d, before the commit", ErrCrash, offset)
+	}
+	return nil
+}
+```
+
+#### Step 3: The store, with and without atomicity
+
+`processed` is a `map[string]bool`; `PostIfNew` checks and inserts in one method. `Transaction` is a top-level struct (Go has no nested classes) created by `Store.Begin` with `bufferedOffset: -1`; each method returns `ErrTransactionDone` once `done` is set, and `Commit` applies the buffer to the store's three durable fields in one place.
+
+```go
+func (s *Store) PostIfNew(posting Posting) bool {
+	if s.processed[posting.PaymentID] {
+		return false
+	}
+	s.processed[posting.PaymentID] = true
+	s.postings = append(s.postings, posting)
+	return true
+}
+```
+
+```go
+func (t *Transaction) Post(posting Posting) error {
+	if t.done {
+		return ErrTransactionDone
+	}
+	t.bufferedPostings = append(t.bufferedPostings, posting)
+	return nil
+}
+
+func (t *Transaction) CommitOffset(nextOffset int64) error {
+	if t.done {
+		return ErrTransactionDone
+	}
+	t.bufferedOffset = nextOffset
+	return nil
+}
+
+func (t *Transaction) Commit() error {
+	if t.done {
+		return ErrTransactionDone
+	}
+	t.store.postings = append(t.store.postings, t.bufferedPostings...)
+	for _, p := range t.bufferedPostings {
+		t.store.processed[p.PaymentID] = true
+	}
+	if t.bufferedOffset >= 0 {
+		t.store.committedOffset = t.bufferedOffset
+	}
+	t.done = true
+	return nil
+}
+```
+
+#### Step 4: The four strategies
+
+A `switch` on the typed constant. Each branch is the Java one with error propagation added; the position of `CommitOffset(batchEnd)` relative to the loop is still the whole difference between the two naive strategies. In the transactional branch the early `return err` after `AfterSideEffect` is what abandons `tx`.
+
+```go
+		case AtMostOnce:
+			if err := c.store.CommitOffset(batchEnd); err != nil {
+				return err
+			}
+			for _, r := range batch {
+				c.store.Post(Posting{r.PaymentID, r.Amount})
+				if err := c.faults.AfterSideEffect(r.Offset); err != nil {
+					return err
+				}
+			}
+		case AtLeastOnce:
+			for _, r := range batch {
+				c.store.Post(Posting{r.PaymentID, r.Amount})
+				if err := c.faults.AfterSideEffect(r.Offset); err != nil {
+					return err
+				}
+			}
+			if err := c.store.CommitOffset(batchEnd); err != nil {
+				return err
+			}
+```
+
+```go
+		case AtLeastOnceIdempotent:
+			for _, r := range batch {
+				c.store.PostIfNew(Posting{r.PaymentID, r.Amount})
+				if err := c.faults.AfterSideEffect(r.Offset); err != nil {
+					return err
+				}
+			}
+			if err := c.store.CommitOffset(batchEnd); err != nil {
+				return err
+			}
+		case Transactional:
+			for _, r := range batch {
+				tx := c.store.Begin()
+				if err := tx.Post(Posting{r.PaymentID, r.Amount}); err != nil {
+					return err
+				}
+				if err := tx.CommitOffset(r.Offset + 1); err != nil {
+					return err
+				}
+				if err := c.faults.AfterSideEffect(r.Offset); err != nil {
+					return err // the buffered transaction dies with the process
+				}
+				if err := tx.Commit(); err != nil {
+					return err
+				}
+			}
+```
+
+#### Step 5: Measuring the damage
+
+`Run` loops until `RunToEnd` returns `nil`, counting crashes and panicking on any error that is not `ErrCrash`. `Measure` seeds the counts map from the log, increments per posting, and classifies; the `counts` map is unordered, but only its values are summed, so order does not matter.
+
+```go
+func Run(strategy Strategy, log *Log, crashAtOffset int64, batchSize int) Outcome {
+	store := NewStore()
+	faults := NewFaultInjector(crashAtOffset)
+	crashes := 0
+	for {
+		consumer, err := NewConsumer(strategy, log, store, faults, batchSize)
+		if err != nil {
+			panic(err)
+		}
+		err = consumer.RunToEnd()
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrCrash) {
+			panic(err)
+		}
+		crashes++ // the process is gone; a fresh one starts from store.CommittedOffset()
+	}
+	return Measure(strategy, log, store, crashes)
+}
+
+func Measure(strategy Strategy, log *Log, store *Store, crashes int) Outcome {
+	all, _ := log.Read(0, int(log.EndOffset()))
+	counts := map[string]int{}
+	for _, r := range all {
+		counts[r.PaymentID] = 0
+	}
+	for _, p := range store.Postings() {
+		counts[p.PaymentID]++
+	}
+	duplicates, lost := 0, 0
+	for _, c := range counts {
+		if c == 0 {
+			lost++
+		}
+		if c > 1 {
+			duplicates += c - 1
+		}
+	}
+	return Outcome{strategy, len(store.Postings()), duplicates, lost, crashes, store.Balance(USD)}
+}
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/08-messaging-and-streams/03-delivery-guarantees/code/go
+go run .
+go test ./...
+```
+
+The table and the ledger totals match the Java and Python output exactly:
+
+```console
+== Crash after the side effect for offset 5, before its commit; then restart ==
+  strategy                   posted  duplicates  lost  crashes  ledger total
+  AT_MOST_ONCE               8       0           2     1        115.84 USD  <- money missing
+  AT_LEAST_ONCE              12      2           0     1        179.98 USD  <- money counted twice
+  AT_LEAST_ONCE_IDEMPOTENT   10      0           0     1        149.65 USD  <- matches
+  TRANSACTIONAL              10      0           0     1        149.65 USD  <- matches
+```
 
 ## Use It
 

@@ -397,46 +397,575 @@ Note the `dump()` output: DE2 is printed masked. The message object holds the fu
 
 ### In Python
 
+The Python port keeps the same names (`FieldSpec`, `Iso8583Spec`, `Bitmap`, `Iso8583Message`) with three differences. **`bytes` versus `str`:** Python distinguishes the two, and the wire is `bytes`; `encode` returns `bytes` and `decode` takes `bytes` and calls `.decode("ascii", errors="strict")`, so a non-ASCII byte fails at the boundary instead of becoming a stray code point inside a field. **A plain `dict` plus `sorted`:** there is no `TreeMap`; the field map is a `dict` and every walk sorts the keys, which for fifteen elements is free and keeps the ordering rule visible at the point of use. **`int(prefix, 16)` raises `ValueError`:** `Bitmap.from_hex` catches it and re-raises `Iso8583Error`, with `from None` to drop the misleading inner traceback. `Iso8583Error` subclasses `ValueError` so callers who only know the standard hierarchy still catch it.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The dictionary row
+
+`FieldType` uses the prefix width as the enum value and exposes it as a property. `FieldSpec` is a frozen dataclass; `__post_init__` carries the dictionary-row sanity checks and `validate` the per-value checks, plus a printable-ASCII sweep that the Java leaves implicit.
+
 ```python
-def encode(self) -> bytes:
-    ...
-    for n, value in sorted(self._fields.items()):
-        fs = self.spec.require(n)
-        fs.validate(value)
-        if fs.type is not FieldType.FIXED:
-            out.append(str(len(value)).zfill(fs.type.prefix_digits))
-        out.append(value)
-    return "".join(out).encode("ascii")
+class FieldType(Enum):
+    FIXED = 0
+    LLVAR = 2
+    LLLVAR = 3
+
+    @property
+    def prefix_digits(self) -> int:
+        return self.value
+
+
+@dataclass(frozen=True)
+class FieldSpec:
+    number: int
+    type: FieldType
+    length: int
+    numeric: bool
+    name: str
+
+    def validate(self, value: str) -> None:
+        """Reject a value that does not fit this element. Called on set and again on encode."""
+        label = f"DE{self.number} ({self.name})"
+        if not value:
+            raise Iso8583Error(f"{label} must not be empty")
+        if self.type is FieldType.FIXED and len(value) != self.length:
+            raise Iso8583Error(f"{label} must be exactly {self.length} chars, got {len(value)}")
+        if self.type is not FieldType.FIXED and len(value) > self.length:
+            raise Iso8583Error(f"{label} exceeds max length {self.length}: {len(value)}")
+        if self.numeric and not value.isdigit():
+            raise Iso8583Error(f"{label} must be numeric")
+        if any(not 0x20 <= ord(ch) <= 0x7E for ch in value):
+            raise Iso8583Error(f"DE{self.number} contains a non-ASCII character")
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The bitmap
 
-- **`bytes` versus `str`.** Python distinguishes the two, and the wire is `bytes`. `encode` returns `bytes` and `decode` takes `bytes` and calls `.decode("ascii", errors="strict")`, so a non-ASCII byte fails at the boundary instead of becoming a stray code point inside a field.
-- **A plain `dict` plus `sorted`.** There is no `TreeMap`; the field map is a `dict` and every walk sorts the keys. For fifteen elements that is free, and it keeps the ordering rule visible at the point of use.
-- **`int(prefix, 16)` raises `ValueError`.** `Bitmap.from_hex` catches it and re-raises `Iso8583Error`, with `from None` to drop the misleading inner traceback. `Iso8583Error` subclasses `ValueError` so callers who only know the standard hierarchy still catch it.
+A 65-element list indexed from 1. `to_hex` builds each byte with the same `1 << (7 - i)` weighting and formats it with `:02X`; `from_hex` turns the `ValueError` from `int(..., 16)` into an `Iso8583Error`.
+
+```python
+class Bitmap:
+    def __init__(self) -> None:
+        self._bits = [False] * 65  # index 1..64
+
+    def set(self, bit: int) -> None:
+        self._bits[bit] = True
+
+    def is_set(self, bit: int) -> bool:
+        return self._bits[bit]
+
+    def to_hex(self) -> str:
+        """16 uppercase hex characters, the ASCII variant of the 8 binary bytes."""
+        out = []
+        for b in range(8):
+            value = 0
+            for i in range(8):
+                if self._bits[b * 8 + i + 1]:
+                    value |= 1 << (7 - i)
+            out.append(f"{value:02X}")
+        return "".join(out)
+
+    @staticmethod
+    def from_hex(hex_text: str) -> "Bitmap":
+        if len(hex_text) != 16:
+            raise Iso8583Error(f"bitmap must be 16 hex characters, got {len(hex_text)}")
+        bm = Bitmap()
+        for b in range(8):
+            try:
+                value = int(hex_text[b * 2 : b * 2 + 2], 16)
+            except ValueError:
+                raise Iso8583Error(f"bitmap is not hexadecimal: {hex_text}") from None
+            for i in range(8):
+                if value & (1 << (7 - i)):
+                    bm._bits[b * 8 + i + 1] = True
+        return bm
+```
+
+#### Step 3: The message and the MTI
+
+A (mutable) dataclass whose `_fields` dict is excluded from `__init__`. The MTI is validated in `__post_init__`; the digit accessors index the string; `set` validates through the spec and returns `self` for chaining.
+
+```python
+@dataclass
+class Iso8583Message:
+    mti: str
+    spec: Iso8583Spec
+    _fields: dict[int, str] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if len(self.mti) != 4 or not self.mti.isdigit():
+            raise Iso8583Error(f"MTI must be four digits: {self.mti!r}")
+
+    def mti_class(self) -> int:
+        """1 = authorization, 2 = financial, 4 = reversal, 8 = network management."""
+        return int(self.mti[1])
+
+    def mti_function(self) -> int:
+        """0 = request, 1 = request response, 2 = advice, 3 = advice response, 4 = notification."""
+        return int(self.mti[2])
+
+    def response_mti(self) -> str:
+        """0100 -> 0110, 0200 -> 0210, 0420 -> 0430. Only requests and advices have a response."""
+        function = self.mti_function()
+        if function not in (0, 2):
+            raise Iso8583Error(f"MTI {self.mti} is not a request or advice")
+        return self.mti[:2] + str(function + 1) + self.mti[3]
+
+    def set(self, number: int, value: str) -> "Iso8583Message":
+        self.spec.require(number).validate(value)
+        self._fields[number] = value
+        return self
+```
+
+#### Step 4: Money in, DE4 and DE49 out
+
+`int(...)` accepts leading zeros, and the f-string widths `012d` and `03d` do the zero-padding. `currency_from_numeric` is a module-level lookup because `Currency` is a plain dataclass.
+
+```python
+    def amount(self) -> Money:
+        """DE4 (12 digits, minor units) interpreted in the currency named by DE49. The only place money is typed."""
+        return Money.of_minor(int(self.get(4)), currency_from_numeric(self.get(49)))
+
+    def set_amount(self, money: Money) -> "Iso8583Message":
+        if money.minor_units < 0:
+            raise Iso8583Error("DE4 cannot carry a negative amount; use the MTI class instead")
+        self.set(4, f"{money.minor_units:012d}")
+        self.set(49, f"{money.currency.numeric_code:03d}")
+        return self
+```
+
+#### Step 5: Encode
+
+Parts are collected in a list and joined once. `sorted(self._fields.items())` supplies the ascending order the `TreeMap` gave for free, `zfill` writes the length prefix, and the final `.encode("ascii")` produces the wire bytes.
+
+```python
+    def encode(self) -> bytes:
+        """The MTI, the bitmaps, then every present element in ascending order. ASCII variant."""
+        primary, secondary = Bitmap(), Bitmap()
+        need_secondary = False
+        for n in self._fields:
+            if n <= 64:
+                primary.set(n)
+            else:
+                secondary.set(n - 64)
+                need_secondary = True
+        if need_secondary:
+            primary.set(1)
+        out = [self.mti, primary.to_hex()]
+        if need_secondary:
+            out.append(secondary.to_hex())
+        for n, value in sorted(self._fields.items()):
+            fs = self.spec.require(n)
+            fs.validate(value)
+            if fs.type is not FieldType.FIXED:
+                out.append(str(len(value)).zfill(fs.type.prefix_digits))
+            out.append(value)
+        return "".join(out).encode("ascii")
+```
+
+#### Step 6: Decode, with every failure named
+
+The header is parsed in fixed order after a strict ASCII decode; the `present` list merges both bitmaps. Then the element loop, with the same named failures as Java: a non-digit prefix, an announced length above the dictionary maximum, a truncated value, and trailing bytes. `msg.set` re-validates every value.
+
+```python
+    @staticmethod
+    def decode(raw: bytes, spec: Iso8583Spec) -> "Iso8583Message":
+        s = raw.decode("ascii", errors="strict")
+        if len(s) < 4 + 16:
+            raise Iso8583Error(f"message too short for MTI and primary bitmap: {len(s)} bytes")
+        msg = Iso8583Message(s[:4], spec)
+        pos = 4
+        primary = Bitmap.from_hex(s[pos : pos + 16])
+        pos += 16
+        present = [False] * 129
+        for bit in range(2, 65):
+            present[bit] = primary.is_set(bit)
+        if primary.is_set(1):
+            if len(s) < pos + 16:
+                raise Iso8583Error("bit 1 set but no secondary bitmap follows")
+            secondary = Bitmap.from_hex(s[pos : pos + 16])
+            pos += 16
+            if secondary.is_set(1):
+                raise Iso8583Error("tertiary bitmap (bit 65) is not supported")
+            for bit in range(2, 65):
+                present[64 + bit] = secondary.is_set(bit)
+```
+
+```python
+        for n in range(2, 129):
+            if not present[n]:
+                continue
+            fs = spec.require(n)
+            length = fs.length
+            if fs.type is not FieldType.FIXED:
+                digits = fs.type.prefix_digits
+                if pos + digits > len(s):
+                    raise Iso8583Error(f"truncated length prefix for DE{n}")
+                prefix = s[pos : pos + digits]
+                if not prefix.isdigit():
+                    raise Iso8583Error(f"length prefix for DE{n} is not numeric: {prefix}")
+                length = int(prefix)
+                if length > fs.length:
+                    raise Iso8583Error(f"DE{n} announces {length} chars, max is {fs.length}")
+                pos += digits
+            if pos + length > len(s):
+                raise Iso8583Error(f"truncated: DE{n} needs {length} chars, {len(s) - pos} remain")
+            msg.set(n, s[pos : pos + length])
+            pos += length
+        if pos != len(s):
+            raise Iso8583Error(f"{len(s) - pos} trailing bytes after the last data element")
+        return msg
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/11-payment-rails/03-iso-8583/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The encoded bytes and every rejection message match the Java run:
+
+```console
+== Malformed input is rejected, never guessed ==
+rejected: truncated: DE7 needs 10 chars, 4 remain
+rejected: 3 trailing bytes after the last data element
+rejected: bitmap is not hexadecimal: ZZ38040008C08000
+rejected: DE2 announces 99 chars, max is 19
+rejected: DE4 (amount, transaction) must be exactly 12 chars, got 5
+```
 
 ### In Go
 
+The Go port keeps the design (`FieldSpec`, `Spec`, `Bitmap`, `Message`) with four differences. **Errors are values, wrapped around one sentinel:** every failure is `fmt.Errorf("%w: ...", ErrMalformed, ...)` through the `malformed` helper, so a caller can `errors.Is(err, ErrMalformed)` without parsing the message and still read the specific reason; the tests use exactly that check. **No method chaining:** because `Set` returns an `error`, the fluent `set(...).set(...)` style of the Java and Python versions is replaced by a small `setAll` helper in `main` and explicit error checks in the tests. **A fixed-size array for the bitmap:** `[65]bool` is a value type, so `var bm Bitmap` is a complete, zeroed bitmap with no allocation, and `Encode` builds two of them on the stack. **`strconv.ParseUint(hex, 16, 8)`** parses one byte of the bitmap and rejects anything outside `00`..`FF`, which replaces Java's `Integer.parseInt(s, 16)` plus the range that two hex characters already imply.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The dictionary row
+
+`FieldType` is an `int` whose value *is* the prefix width. `NewFieldSpec` validates the row with a tagless `switch`, and `Validate` does the same for a value, returning a wrapped `ErrMalformed` on the first failing case.
+
 ```go
-func (m *Message) Set(number int, value string) error {
-    fs, err := m.spec.Require(number)
-    if err != nil {
-        return err
-    }
-    if err := fs.Validate(value); err != nil {
-        return err
-    }
-    m.fields[number] = value
-    return nil
+type FieldType int
+
+const (
+	Fixed  FieldType = 0
+	LLVar  FieldType = 2
+	LLLVar FieldType = 3
+)
+
+// PrefixDigits is the width of the length prefix (0 for fixed fields).
+func (t FieldType) PrefixDigits() int { return int(t) }
+
+type FieldSpec struct {
+	Number  int
+	Type    FieldType
+	Length  int
+	Numeric bool
+	Name    string
+}
+
+// Validate rejects a value that does not fit this element. Called on Set and again on Encode.
+func (f FieldSpec) Validate(value string) error {
+	label := fmt.Sprintf("DE%d (%s)", f.Number, f.Name)
+	switch {
+	case value == "":
+		return malformed("%s must not be empty", label)
+	case f.Type == Fixed && len(value) != f.Length:
+		return malformed("%s must be exactly %d chars, got %d", label, f.Length, len(value))
+	case f.Type != Fixed && len(value) > f.Length:
+		return malformed("%s exceeds max length %d: %d", label, f.Length, len(value))
+	case f.Numeric && !allDigits(value):
+		return malformed("%s must be numeric", label)
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] > 0x7E {
+			return malformed("DE%d contains a non-ASCII character", f.Number)
+		}
+	}
+	return nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The bitmap
 
-- **Errors are values, wrapped around one sentinel.** Every failure is `fmt.Errorf("%w: ...", ErrMalformed, ...)`, so a caller can `errors.Is(err, ErrMalformed)` without parsing the message and still read the specific reason. The tests use exactly that check.
-- **No method chaining.** Because `Set` returns an `error`, the fluent `set(...).set(...)` style of the Java and Python versions is replaced by a small `setAll` helper in `main` and explicit error checks in the tests. The design is the same; the surface is Go's.
-- **A fixed-size array for the bitmap.** `[65]bool` is a value type, so `var bm Bitmap` is a complete, zeroed bitmap with no allocation, and `Encode` builds two of them on the stack.
-- **`strconv.ParseUint(hex, 16, 8)`** parses one byte of the bitmap and rejects anything outside `00`..`FF`, which replaces Java's `Integer.parseInt(s, 16)` plus the range that two hex characters already imply.
+The `[65]bool` array lives inside the struct by value. `ToHex` writes into a `strings.Builder`; `BitmapFromHex` parses two characters at a time with `ParseUint(..., 16, 8)` and returns a pointer so the decoder can share it.
+
+```go
+type Bitmap struct {
+	bits [65]bool // index 1..64
+}
+
+func (b *Bitmap) Set(bit int)        { b.bits[bit] = true }
+func (b *Bitmap) IsSet(bit int) bool { return b.bits[bit] }
+
+// ToHex renders 16 uppercase hex characters, the ASCII variant of the 8 binary bytes.
+func (b *Bitmap) ToHex() string {
+	var sb strings.Builder
+	for by := 0; by < 8; by++ {
+		value := 0
+		for i := 0; i < 8; i++ {
+			if b.bits[by*8+i+1] {
+				value |= 1 << (7 - i)
+			}
+		}
+		fmt.Fprintf(&sb, "%02X", value)
+	}
+	return sb.String()
+}
+
+// BitmapFromHex parses 16 hex characters.
+func BitmapFromHex(hex string) (*Bitmap, error) {
+	if len(hex) != 16 {
+		return nil, malformed("bitmap must be 16 hex characters, got %d", len(hex))
+	}
+	bm := &Bitmap{}
+	for by := 0; by < 8; by++ {
+		value, err := strconv.ParseUint(hex[by*2:by*2+2], 16, 8)
+		if err != nil {
+			return nil, malformed("bitmap is not hexadecimal: %s", hex)
+		}
+		for i := 0; i < 8; i++ {
+			if value&(1<<(7-i)) != 0 {
+				bm.bits[by*8+i+1] = true
+			}
+		}
+	}
+	return bm, nil
+}
+```
+
+#### Step 3: The message and the MTI
+
+`NewMessage` validates the MTI and allocates the field map. The digit accessors subtract `'0'` from a byte of the string, `ResponseMTI` returns an error for a message that is already a response, and `Set` threads the spec lookup and the validation errors.
+
+```go
+type Message struct {
+	MTI    string
+	spec   *Spec
+	fields map[int]string
+}
+
+// NewMessage validates the MTI.
+func NewMessage(mti string, spec *Spec) (*Message, error) {
+	if len(mti) != 4 || !allDigits(mti) {
+		return nil, malformed("MTI must be four digits: %q", mti)
+	}
+	return &Message{MTI: mti, spec: spec, fields: map[int]string{}}, nil
+}
+
+// MTIClass: 1 = authorization, 2 = financial, 4 = reversal, 8 = network management.
+func (m *Message) MTIClass() int { return int(m.MTI[1] - '0') }
+
+// MTIFunction: 0 = request, 1 = request response, 2 = advice, 3 = advice response, 4 = notification.
+func (m *Message) MTIFunction() int { return int(m.MTI[2] - '0') }
+
+// ResponseMTI: 0100 -> 0110, 0200 -> 0210, 0420 -> 0430. Only requests and advices have a response.
+func (m *Message) ResponseMTI() (string, error) {
+	fn := m.MTIFunction()
+	if fn != 0 && fn != 2 {
+		return "", malformed("MTI %s is not a request or advice", m.MTI)
+	}
+	return m.MTI[:2] + strconv.Itoa(fn+1) + m.MTI[3:], nil
+}
+
+// Set validates against the spec and stores the on-the-wire string.
+func (m *Message) Set(number int, value string) error {
+	fs, err := m.spec.Require(number)
+	if err != nil {
+		return err
+	}
+	if err := fs.Validate(value); err != nil {
+		return err
+	}
+	m.fields[number] = value
+	return nil
+}
+```
+
+#### Step 4: Money in, DE4 and DE49 out
+
+`Amount` reads both elements, resolves the numeric currency, and parses DE4 with `strconv.ParseInt`, which accepts leading zeros; a parse failure is reported as a malformed message. `SetAmount` pads with `%012d` and `%03d`.
+
+```go
+func (m *Message) Amount() (Money, error) {
+	de4, err := m.Get(4)
+	if err != nil {
+		return Money{}, err
+	}
+	de49, err := m.Get(49)
+	if err != nil {
+		return Money{}, err
+	}
+	currency, err := CurrencyFromNumeric(de49)
+	if err != nil {
+		return Money{}, err
+	}
+	minor, err := strconv.ParseInt(de4, 10, 64)
+	if err != nil {
+		return Money{}, malformed("DE4 is not numeric: %s", de4)
+	}
+	return OfMinor(minor, currency), nil
+}
+
+// SetAmount writes DE4 zero-padded to 12 digits and DE49 as the numeric currency code.
+func (m *Message) SetAmount(money Money) error {
+	if money.MinorUnits < 0 {
+		return malformed("DE4 cannot carry a negative amount; use the MTI class instead")
+	}
+	if err := m.Set(4, fmt.Sprintf("%012d", money.MinorUnits)); err != nil {
+		return err
+	}
+	return m.Set(49, fmt.Sprintf("%03d", money.Currency.NumericCode))
+}
+```
+
+#### Step 5: Encode
+
+Two stack-allocated bitmaps, a `strings.Builder`, and `FieldNumbers()` (the sorted keys of the map) for ascending order. `%0*d` takes the prefix width as an argument, and the result is converted to `[]byte` once at the end.
+
+```go
+func (m *Message) Encode() ([]byte, error) {
+	var primary, secondary Bitmap
+	needSecondary := false
+	for n := range m.fields {
+		if n <= 64 {
+			primary.Set(n)
+		} else {
+			secondary.Set(n - 64)
+			needSecondary = true
+		}
+	}
+	if needSecondary {
+		primary.Set(1)
+	}
+	var out strings.Builder
+	out.WriteString(m.MTI)
+	out.WriteString(primary.ToHex())
+	if needSecondary {
+		out.WriteString(secondary.ToHex())
+	}
+	for _, n := range m.FieldNumbers() {
+		fs, err := m.spec.Require(n)
+		if err != nil {
+			return nil, err
+		}
+		value := m.fields[n]
+		if err := fs.Validate(value); err != nil {
+			return nil, err
+		}
+		if fs.Type != Fixed {
+			fmt.Fprintf(&out, "%0*d", fs.Type.PrefixDigits(), len(value))
+		}
+		out.WriteString(value)
+	}
+	return []byte(out.String()), nil
+}
+```
+
+#### Step 6: Decode, with every failure named
+
+`Decode` is a package-level function. The header parse is the same fixed sequence; `present` is a `[129]bool` array.
+
+```go
+func Decode(raw []byte, spec *Spec) (*Message, error) {
+	s := string(raw)
+	if len(s) < 4+16 {
+		return nil, malformed("message too short for MTI and primary bitmap: %d bytes", len(s))
+	}
+	msg, err := NewMessage(s[:4], spec)
+	if err != nil {
+		return nil, err
+	}
+	pos := 4
+	primary, err := BitmapFromHex(s[pos : pos+16])
+	if err != nil {
+		return nil, err
+	}
+	pos += 16
+	var present [129]bool
+	for bit := 2; bit <= 64; bit++ {
+		present[bit] = primary.IsSet(bit)
+	}
+	if primary.IsSet(1) {
+		if len(s) < pos+16 {
+			return nil, malformed("bit 1 set but no secondary bitmap follows")
+		}
+		secondary, err := BitmapFromHex(s[pos : pos+16])
+		if err != nil {
+			return nil, err
+		}
+		pos += 16
+		if secondary.IsSet(1) {
+			return nil, malformed("tertiary bitmap (bit 65) is not supported")
+		}
+		for bit := 2; bit <= 64; bit++ {
+			present[64+bit] = secondary.IsSet(bit)
+		}
+	}
+```
+
+The element loop checks the prefix with `allDigits` before `strconv.Atoi` (whose error can then be ignored), caps the announced length at the dictionary maximum, and re-validates through `msg.Set`.
+
+```go
+	for n := 2; n <= 128; n++ {
+		if !present[n] {
+			continue
+		}
+		fs, err := spec.Require(n)
+		if err != nil {
+			return nil, err
+		}
+		length := fs.Length
+		if fs.Type != Fixed {
+			digits := fs.Type.PrefixDigits()
+			if pos+digits > len(s) {
+				return nil, malformed("truncated length prefix for DE%d", n)
+			}
+			prefix := s[pos : pos+digits]
+			if !allDigits(prefix) {
+				return nil, malformed("length prefix for DE%d is not numeric: %s", n, prefix)
+			}
+			length, _ = strconv.Atoi(prefix)
+			if length > fs.Length {
+				return nil, malformed("DE%d announces %d chars, max is %d", n, length, fs.Length)
+			}
+			pos += digits
+		}
+		if pos+length > len(s) {
+			return nil, malformed("truncated: DE%d needs %d chars, %d remain", n, length, len(s)-pos)
+		}
+		if err := msg.Set(n, s[pos:pos+length]); err != nil {
+			return nil, err
+		}
+		pos += length
+	}
+	if pos != len(s) {
+		return nil, malformed("%d trailing bytes after the last data element", len(s)-pos)
+	}
+	return msg, nil
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/11-payment-rails/03-iso-8583/code/go
+go run .
+go test ./...
+```
+
+The encoded bytes match the Java run; every error message carries the `iso8583:` prefix of the `ErrMalformed` sentinel it wraps:
+
+```console
+== Malformed input is rejected, never guessed ==
+rejected: iso8583: truncated: DE7 needs 10 chars, 4 remain
+rejected: iso8583: 3 trailing bytes after the last data element
+rejected: iso8583: bitmap is not hexadecimal: ZZ38040008C08000
+rejected: iso8583: DE2 announces 99 chars, max is 19
+rejected: iso8583: DE4 (amount, transaction) must be exactly 12 chars, got 5
+```
 
 ## Use It
 

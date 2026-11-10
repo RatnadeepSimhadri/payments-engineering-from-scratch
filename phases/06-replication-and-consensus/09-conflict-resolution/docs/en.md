@@ -337,62 +337,387 @@ The test prints `38 passed, 0 failed`.
 
 ### In Python
 
+`code/python/main.py` keeps every type and method name (in snake_case), and the demo prints the same lines as the Java. Four things differ. **Identity versus equality:** Java's `maximal` uses `other != candidate`, a reference comparison, and `out.contains(candidate)`, an `equals` comparison; Python spells those `is not` and `not in`, and swapping them would be a silent bug, because two equal siblings arriving from two replicas would obsolete each other. **Values are frozen dataclasses:** `Dot`, `Versioned`, `CaseFile` (with a `frozenset` of notes) and `Cart` (a `dict` of quantities) get structural `==` for free, which is what `merge_from` uses to skip siblings it already holds; `VersionVector` wraps a `dict` and returns new vectors from `increment` and `merge`, so it is immutable in practice. **`MergeFunction` is a tiny class around a callable** so the call site still reads `fn.merge(siblings)`; `Cart.UNION_MAX` and `CaseFile.UNION_NOTES_STRICTEST_STATUS` are attached after the class bodies because they build instances of the class. **Printing:** Java's `TreeMap` and `TreeSet` print sorted, and `fmt_map` and `fmt_set` reproduce `{A=1, B=1}` and `[a, b]`; a missing key is `None` where the Java returns `null`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Version vector comparison
+
+The key union is `set(self._clocks) | set(other._clocks)`, sorted so the walk is deterministic; `get` returns 0 for a missing replica, which is what makes `{A=1}` sort `BEFORE` `{A=1, B=1}`. `increment` and `merge` copy first and return the copy, so a vector a client holds is never mutated by the store.
+
 ```python
-@staticmethod
-def maximal(all_: list) -> list:
-    out: list = []
-    for candidate in all_:
-        obsolete = any(other is not candidate and candidate.obsoleted_by(other) for other in all_)
-        if not obsolete and candidate not in out:
-            out.append(candidate)
-    return out
+    def increment(self, replica: str) -> "VersionVector":
+        out = self.copy()
+        out._clocks[replica] = out._clocks.get(replica, 0) + 1
+        return out
+
+    def merge(self, other: "VersionVector") -> "VersionVector":
+        out = self.copy()
+        for k, v in other._clocks.items():
+            out._clocks[k] = max(out._clocks.get(k, v), v)
+        return out
+
+    def compare(self, other: "VersionVector") -> Ordering:
+        less = greater = False
+        for k in sorted(set(self._clocks) | set(other._clocks)):
+            a, b = self.get(k), other.get(k)
+            if a < b:
+                less = True
+            if a > b:
+                greater = True
+        if less and greater:
+            return Ordering.CONCURRENT
+        if less:
+            return Ordering.BEFORE
+        if greater:
+            return Ordering.AFTER
+        return Ordering.EQUAL
 ```
 
-`code/python/main.py` keeps every type and method name (in snake_case); the demo prints the same lines as the Java. What differs:
+#### Step 2: LWW, with the loss counted
 
-- **Identity versus equality.** Java's `maximal` uses `other != candidate`, a reference comparison, and `out.contains(candidate)`, an `equals` comparison. Python spells those `is not` and `not in`. Swapping them would be a silent bug: two equal siblings arriving from two replicas would obsolete each other.
-- **Values are frozen dataclasses.** `Dot`, `Versioned`, `CaseFile` (with a `frozenset` of notes) and `Cart` (a `dict` of quantities) get structural `==` for free, which is what `merge_from` uses to skip siblings it already holds. `VersionVector` wraps a `dict` and returns new vectors from `increment` and `merge`, so it is immutable in practice.
-- **`MergeFunction` is a tiny class around a callable** so the call site still reads `fn.merge(siblings)`; `Cart.UNION_MAX` and `CaseFile.UNION_NOTES_STRICTEST_STATUS` are attached after the class bodies because they build instances of the class.
-- **Printing.** Java's `TreeMap` and `TreeSet` print sorted; `fmt_map` and `fmt_set` reproduce `{A=1, B=1}` and `[a, b]`. A missing key is `None` where the Java returns `null`.
+`Entry.beats` takes an `Optional` and treats `None` as "nothing to beat", then compares timestamp and writer. `put` counts a discard both when the incoming entry replaces something and when it loses.
 
-Run it from `code/python/`:
+```python
+    def beats(self, other: Optional["Entry[V]"]) -> bool:
+        if other is None:
+            return True
+        if self.timestamp != other.timestamp:
+            return self.timestamp > other.timestamp
+        return self.writer > other.writer
+```
+
+```python
+    def put(self, key: str, value: V, timestamp: int, writer: str) -> None:
+        incoming = Entry(value, timestamp, writer)
+        current = self._entries.get(key)
+        if incoming.beats(current):
+            if current is not None:
+                self._discarded += 1
+            self._entries[key] = incoming
+        else:
+            self._discarded += 1
+```
+
+#### Step 3: Dots and versioned values
+
+`Dot` is a frozen, ordered dataclass; `Versioned` is a frozen generic dataclass whose equality covers value, dot, and context. `version()` merges the dot into the context only when the context does not already cover it, and `obsoleted_by` is the one-line dotted-version-vector rule.
+
+```python
+@dataclass(frozen=True, order=True)
+class Dot:
+    replica: str
+    seq: int
+
+
+@dataclass(frozen=True)
+class Versioned(Generic[V]):
+    value: V
+    dot: Dot
+    context: VersionVector
+
+    def version(self) -> VersionVector:
+        v = self.context.copy()
+        return v if v.get(self.dot.replica) >= self.dot.seq else v.merge(VersionVector({self.dot.replica: self.dot.seq}))
+
+    def obsoleted_by(self, other: "Versioned[V]") -> bool:
+        return other.context.get(self.dot.replica) >= self.dot.seq
+```
+
+#### Step 4: The sibling store's write path
+
+The counter is bumped before the dot is minted (Java's `++counter`). Survivors are selected with a comprehension over the existing siblings, the new write is appended, and its full version is returned as the client's next context. `put_blind` passes an empty vector and therefore keeps everything.
+
+```python
+    def put(self, key: str, value: V, context: VersionVector) -> VersionVector:
+        self._counter += 1
+        write = Versioned(value, Dot(self._replica, self._counter), context.copy())
+        kept = [s for s in self._data.get(key, []) if not s.obsoleted_by(write)]
+        kept.append(write)
+        self._data[key] = kept
+        return write.version()
+
+    def put_blind(self, key: str, value: V) -> VersionVector:
+        return self.put(key, value, VersionVector())
+```
+
+#### Step 5: Anti-entropy and pruning
+
+`merge_from` walks the other replica's keys in sorted order, unions the sibling lists using dataclass equality (`not in`) to skip duplicates, and prunes with `maximal`. In `maximal`, `other is not candidate` is the reference test and `candidate not in out` the equality test, exactly the two different comparisons the Java makes.
+
+```python
+    def merge_from(self, other: "SiblingStore[V]") -> None:
+        for key in sorted(other._data):
+            all_ = list(self._data.get(key, []))
+            for s in other._data[key]:
+                if s not in all_:
+                    all_.append(s)
+            self._data[key] = SiblingStore.maximal(all_)
+
+    @staticmethod
+    def maximal(all_: list) -> list:
+        out: list = []
+        for candidate in all_:
+            obsolete = any(other is not candidate and candidate.obsoleted_by(other) for other in all_)
+            if not obsolete and candidate not in out:
+                out.append(candidate)
+        return out
+```
+
+#### Step 6: Resolution with an application merge
+
+`resolve` returns `None` for a missing key, returns the lone value without writing when there is one sibling, and otherwise calls `fn.merge` and writes back under the read context. The case-file rule is a module-level function wrapped in `MergeFunction` and attached to the class; it unions the `frozenset`s of notes and picks the highest index in `SEVERITY`.
+
+```python
+    def resolve(self, key: str, fn: MergeFunction[V]) -> Optional[V]:
+        read = self.get(key)
+        if not read.siblings:
+            return None
+        merged = read.siblings[0].value if len(read.siblings) == 1 else fn.merge(read.values())
+        if len(read.siblings) > 1:
+            self.put(key, merged, read.context)
+        return merged
+```
+
+```python
+def _union_notes_strictest_status(siblings: list) -> CaseFile:
+    notes: set[str] = set()
+    status = "OPEN"
+    for c in siblings:
+        notes |= c.notes
+        if SEVERITY.index(c.status) > SEVERITY.index(status):
+            status = c.status
+    return CaseFile(status, frozenset(notes))
+
+
+CaseFile.UNION_NOTES_STRICTEST_STATUS = MergeFunction(_union_notes_strictest_status)
+```
+
+#### Step 7: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/09-conflict-resolution/code/python
 python3 main.py
 python3 -m unittest -v
 ```
 
+The output is the Java output; `fmt_map` is what makes the vectors and carts print in sorted key order:
+
+```console
+== Version vectors: what 'concurrent' means ==
+{A=1} vs {A=1, B=1} -> BEFORE
+{A=1, B=1} vs {A=2} -> CONCURRENT  (neither saw the other: a real conflict)
+merge = {A=2, B=1}  (the context a resolver writes back with)
+
+== LWW: deterministic, and it throws one write away ==
+east wrote at t=1000, west wrote at t=1002 -> merged value: "agent-2: merchant provided signed delivery receipt"
+agent-1's note is gone; nothing in the store records that it existed
+```
+
 ### In Go
 
-```go
-type MergeFunction[V any] func(siblings []V) V
+`code/go/main.go` keeps every type and method name, and the demo prints the same lines as the Java. Four things differ. **Identity versus equality:** Java's `maximal` compares `other != candidate` by reference and `out.contains(candidate)` by `equals`; Go has no reference identity for struct values, so the slice index plays the first role and a hand-written `Equal` the second. `Versioned.Equal` compares the dot and the context: a dot is minted once and always carries the same value, so this is the record equality without demanding `V comparable`, which `CaseFile` (a map of notes) could not satisfy. **Generics carry the value type:** `Versioned[V]`, `LWWStore[V]`, `SiblingStore[V]`, `ReadResult[V]` and `MergeFunction[V]` are generic, and `UnionMax` and `UnionNotesStrictestStatus` are package-level `MergeFunction` values, called as plain functions. **Absence and errors are values:** `LWWStore.Get` and `SiblingStore.Resolve` return `(V, bool)` where the Java returns `null`, `Entry.Beats` takes a found flag instead of a nullable argument, and `CaseFile.WithStatus` returns `ErrUnknownStatus` while `MustStatus` panics on it for literals in the demo. **Maps have no order and no `==`:** `VersionVector`, `Cart` and `CaseFile` wrap maps and define `Equal`, `fmtMap` and `fmtSet` sort keys to reproduce `{A=1, B=1}` and `[a, b]`, and `MergeFrom` walks the other replica's keys in sorted order so the result is the same every run.
 
-func Maximal[V any](all []Versioned[V]) []Versioned[V] {
-    out := []Versioned[V]{}
-    for i, candidate := range all {
-        obsolete := false
-        for j, other := range all {
-            if j != i && candidate.ObsoletedBy(other) { obsolete = true; break }
-        }
-        if !obsolete && !containsVersioned(out, candidate) { out = append(out, candidate) }
-    }
-    return out
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Version vector comparison
+
+The key union is collected into a `map[string]bool`; order does not matter for the two flags, so no sort is needed here. A missing replica reads as 0 from the map. The three-way result is a tagless `switch`.
+
+```go
+func (v VersionVector) Compare(other VersionVector) Ordering {
+	less, greater := false, false
+	keys := map[string]bool{}
+	for k := range v.clocks {
+		keys[k] = true
+	}
+	for k := range other.clocks {
+		keys[k] = true
+	}
+	for k := range keys {
+		a, b := v.Get(k), other.Get(k)
+		if a < b {
+			less = true
+		}
+		if a > b {
+			greater = true
+		}
+	}
+	switch {
+	case less && greater:
+		return Concurrent
+	case less:
+		return Before
+	case greater:
+		return After
+	default:
+		return Equal
+	}
 }
 ```
 
-`code/go/main.go` keeps every type and method name; the demo prints the same lines as the Java. What differs:
+#### Step 2: LWW, with the loss counted
 
-- **Identity versus equality.** Java's `maximal` compares `other != candidate` by reference and `out.contains(candidate)` by `equals`. Go has no reference identity for struct values, so the slice index plays the first role and a hand-written `Equal` the second. `Versioned.Equal` compares the dot and the context: a dot is minted once and always carries the same value, so this is the record equality without demanding `V comparable`, which `CaseFile` (a map of notes) could not satisfy.
-- **Generics carry the value type.** `Versioned[V]`, `LWWStore[V]`, `SiblingStore[V]`, `ReadResult[V]` and `MergeFunction[V]` are generic; `UnionMax` and `UnionNotesStrictestStatus` are package-level `MergeFunction` values, called as plain functions.
-- **Absence and errors are values.** `LWWStore.Get` and `SiblingStore.Resolve` return `(V, bool)` where the Java returns `null`; `Entry.Beats` takes a found flag instead of a nullable argument; `CaseFile.WithStatus` returns `ErrUnknownStatus` and `MustStatus` panics on it for literals in the demo.
-- **Maps have no order and no `==`.** `VersionVector`, `Cart` and `CaseFile` wrap maps and define `Equal`; `fmtMap` and `fmtSet` sort keys to reproduce `{A=1, B=1}` and `[a, b]`, and `MergeFrom` walks the other replica's keys in sorted order so the result is the same every run.
+The two-value map read gives `Beats` its `present` flag in place of a nullable argument; otherwise the counting is the Java's.
 
-Run it from `code/go/`:
+```go
+func (s *LWWStore[V]) Put(key string, value V, timestamp int64, writer string) {
+	incoming := Entry[V]{value, timestamp, writer}
+	current, present := s.entries[key]
+	if incoming.Beats(current, present) {
+		if present {
+			s.discarded++
+		}
+		s.entries[key] = incoming
+	} else {
+		s.discarded++
+	}
+}
+```
+
+#### Step 3: Dots and versioned values
+
+`Dot` is comparable with `==`. `Versioned[V]` is generic in the value and defines `Equal` over dot and context, the relation `containsVersioned` and `MergeFrom` rely on. `Version()` and `ObsoletedBy` are the Java expressions.
+
+```go
+type Dot struct {
+	Replica string
+	Seq     int64
+}
+
+type Versioned[V any] struct {
+	Value   V
+	Dot     Dot
+	Context VersionVector
+}
+
+func (w Versioned[V]) Version() VersionVector {
+	v := w.Context.Copy()
+	if v.Get(w.Dot.Replica) >= w.Dot.Seq {
+		return v
+	}
+	return v.Merge(VersionVectorOf(map[string]int64{w.Dot.Replica: w.Dot.Seq}))
+}
+
+func (w Versioned[V]) ObsoletedBy(other Versioned[V]) bool {
+	return other.Context.Get(w.Dot.Replica) >= w.Dot.Seq
+}
+
+func (w Versioned[V]) Equal(other Versioned[V]) bool {
+	return w.Dot == other.Dot && w.Context.Equal(other.Context)
+}
+```
+
+#### Step 4: The sibling store's write path
+
+Same algorithm; `kept` is built as a fresh slice so the stored list never aliases a client-visible one. `PutBlind` passes `NewVersionVector()`.
+
+```go
+func (s *SiblingStore[V]) Put(key string, value V, context VersionVector) VersionVector {
+	s.counter++
+	write := Versioned[V]{value, Dot{s.replica, s.counter}, context.Copy()}
+	kept := []Versioned[V]{}
+	for _, sib := range s.data[key] {
+		if !sib.ObsoletedBy(write) {
+			kept = append(kept, sib)
+		}
+	}
+	kept = append(kept, write)
+	s.data[key] = kept
+	return write.Version()
+}
+
+func (s *SiblingStore[V]) PutBlind(key string, value V) VersionVector {
+	return s.Put(key, value, NewVersionVector())
+}
+```
+
+#### Step 5: Anti-entropy and pruning
+
+`MergeFrom` copies our sibling slice (`append([]Versioned[V](nil), ...)`) before appending the other side's, using `containsVersioned` for the `equals` check. `Maximal` uses the slice indexes `i` and `j` where Java compares references, so equal siblings in different positions do not obsolete each other.
+
+```go
+func (s *SiblingStore[V]) MergeFrom(other *SiblingStore[V]) {
+	for _, key := range sortedKeys(other.data) {
+		all := append([]Versioned[V](nil), s.data[key]...)
+		for _, sib := range other.data[key] {
+			if !containsVersioned(all, sib) {
+				all = append(all, sib)
+			}
+		}
+		s.data[key] = Maximal(all)
+	}
+}
+
+func Maximal[V any](all []Versioned[V]) []Versioned[V] {
+	out := []Versioned[V]{}
+	for i, candidate := range all {
+		obsolete := false
+		for j, other := range all {
+			if j != i && candidate.ObsoletedBy(other) {
+				obsolete = true
+				break
+			}
+		}
+		if !obsolete && !containsVersioned(out, candidate) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+```
+
+#### Step 6: Resolution with an application merge
+
+`Resolve` returns the zero value and `false` for a missing key. `MergeFunction[V]` is a function type, so the merge is `fn(read.Values())`, and the case-file rule is a package-level variable of that type that unions note maps and picks the highest `severityIndex`.
+
+```go
+func (s *SiblingStore[V]) Resolve(key string, fn MergeFunction[V]) (V, bool) {
+	read := s.Get(key)
+	if len(read.Siblings) == 0 {
+		var zero V
+		return zero, false
+	}
+	merged := read.Siblings[0].Value
+	if len(read.Siblings) > 1 {
+		merged = fn(read.Values())
+		s.Put(key, merged, read.Context)
+	}
+	return merged, true
+}
+```
+
+```go
+var UnionNotesStrictestStatus MergeFunction[CaseFile] = func(siblings []CaseFile) CaseFile {
+	notes := map[string]bool{}
+	status := "OPEN"
+	for _, c := range siblings {
+		for n := range c.Notes {
+			notes[n] = true
+		}
+		if severityIndex(c.Status) > severityIndex(status) {
+			status = c.Status
+		}
+	}
+	return CaseFile{status, notes}
+}
+```
+
+#### Step 7: Run it
 
 ```bash
+cd phases/06-replication-and-consensus/09-conflict-resolution/code/go
 go run .
 go test ./...
 ```
+
+```console
+== The shopping-cart anomaly from the Dynamo paper ==
+A removed pen, B concurrently added a book -> union/max merge: {book=2, pen=2}
+the deleted pen is back: union of states cannot see a deletion (an OR-Set, Lesson 08, can)
+```
+
+The rest of the output matches the Java run line for line.
 
 ## Use It
 

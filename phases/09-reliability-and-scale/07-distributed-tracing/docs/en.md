@@ -339,18 +339,192 @@ The second block is the dropped-header failure: the trace is one span short and 
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`Optional.empty()` is `None`:** `parse_traceparent` returns `Optional[SpanContext]`, so the fall-back-to-a-new-root decision in `start_from_carrier` is an `is not None` test; the `SpanContext` record is a frozen dataclass whose `__post_init__` raises `ValueError` where Java throws `IllegalArgumentException`, and the two lifecycle guards (`duration_millis` on an open span, `export` of an open span) raise `RuntimeError` for `IllegalStateException`. **Ids come from `java.util.Random.nextBytes`, not `random.randbytes`:** `JavaRandom.next_bytes` consumes each 32-bit draw least-significant byte first, exactly as the JDK does, so seed 42 produces the same trace id `359d41ba...` as the Java demo and `bytes.hex()` gives the lowercase form the spec requires. **Ordered collections are plain `dict` and `list`:** `LinkedHashMap` attributes and `LinkedHashSet` trace ids become insertion-ordered dicts (`dict.fromkeys` for the de-duplicated id list); the span sort is `sorted(..., key=lambda s: (s.start_millis, s.span_id))`, the same two-key order as the Java comparator. **Carrier maps are `dict[str, str]`:** in a real Python service the same dict is `request.headers` or a Kafka record's header list, and the context would travel between `asyncio` tasks in a `contextvars.ContextVar`, which is the same loss-across-an-executor trap as Java's `ThreadLocal`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Ids
+
+`JavaRandom.next_bytes` reproduces the JDK's byte order so the seeded ids match. `_hex` loops until the buffer is not all zeros (`any(buf)`) and returns `bytes.hex()`, which is already lowercase.
+
 ```python
-def start_from_carrier(self, name: str, carrier: dict[str, str]) -> Span:
-    parent = SpanContext.parse_traceparent(carrier.get(SpanContext.HEADER))
-    return self.start_child(name, parent) if parent is not None else self.start_root(name)
+    def next_bytes(self, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            rnd = self.next(32) & 0xFFFFFFFF
+            for _ in range(min(n - len(out), 4)):
+                out.append(rnd & 0xFF)
+                rnd >>= 8
+        return bytes(out)
+
+
+class IdGenerator:
+    def __init__(self, seed: int) -> None:
+        self._random = JavaRandom(seed)
+
+    def trace_id(self) -> str:
+        return self._hex(16)
+
+    def span_id(self) -> str:
+        return self._hex(8)
+
+    def _hex(self, n: int) -> str:
+        while True:
+            buf = self._random.next_bytes(n)
+            if any(buf):
+                return buf.hex()
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The context and the header
 
-- **`Optional.empty()` is `None`.** `parse_traceparent` returns `Optional[SpanContext]`, so the fall-back-to-a-new-root decision in `start_from_carrier` is an `is not None` test; the `SpanContext` record is a frozen dataclass whose `__post_init__` raises `ValueError` where Java throws `IllegalArgumentException`, and the two lifecycle guards (`duration_millis` on an open span, `export` of an open span) raise `RuntimeError` for `IllegalStateException`.
-- **Ids come from `java.util.Random.nextBytes`, not `random.randbytes`.** `JavaRandom.next_bytes` consumes each 32-bit draw least-significant byte first, exactly as the JDK does, so seed 42 produces the same trace id `359d41ba...` as the Java demo and `bytes.hex()` gives the lowercase form the spec requires.
-- **Ordered collections are plain `dict` and `list`.** `LinkedHashMap` attributes and `LinkedHashSet` trace ids become insertion-ordered dicts (`dict.fromkeys` for the de-duplicated id list); the span sort is `sorted(..., key=lambda s: (s.start_millis, s.span_id))`, the same two-key order as the Java comparator.
-- **Carrier maps are `dict[str, str]`.** In a real Python service the same dict is `request.headers` or a Kafka record's header list, and the context would travel between `asyncio` tasks in a `contextvars.ContextVar`, which is the same loss-across-an-executor trap as Java's `ThreadLocal`.
+The parser returns `None` on any violation rather than raising, because the caller's correct reaction is "start a new trace". Each check is one line of the spec; `str.split("-")` keeps empty trailing fields like Java's `split("-", -1)`, and `int(parts[3], 16) & 0x01` reads the flags as a bit field.
+
+```python
+    def to_traceparent(self) -> str:
+        return f"00-{self.trace_id}-{self.span_id}-{'01' if self.sampled else '00'}"
+
+    @staticmethod
+    def parse_traceparent(header: Optional[str]) -> Optional["SpanContext"]:
+        if header is None:
+            return None
+        parts = header.strip().split("-")
+        if len(parts) < 4:
+            return None
+        version = parts[0]
+        if not is_hex(version, 2) or version == "ff":
+            return None
+        if version == "00" and len(parts) != 4:  # version 00 has exactly four fields
+            return None
+        if not is_hex(parts[1], 32) or parts[1] == "0" * 32:
+            return None
+        if not is_hex(parts[2], 16) or parts[2] == "0" * 16:
+            return None
+        if not is_hex(parts[3], 2):
+            return None
+        sampled = (int(parts[3], 16) & 0x01) == 1
+        return SpanContext(parts[1], parts[2], sampled)
+```
+
+#### Step 3: Spans and the tracer
+
+`start_from_carrier` is the whole receiving side of propagation in one conditional expression. A span is exported only when `end` is called, so a crashed process loses its open spans; the clock is injected and advanced by exact amounts.
+
+```python
+    def start_root(self, name: str) -> Span:
+        return Span(self._ids.trace_id(), self._ids.span_id(), None, self._service, name, self._clock.now_millis())
+
+    def start_child(self, name: str, parent: SpanContext) -> Span:
+        return Span(parent.trace_id, self._ids.span_id(), parent.span_id, self._service, name, self._clock.now_millis())
+
+    def start_from_carrier(self, name: str, carrier: dict[str, str]) -> Span:
+        parent = SpanContext.parse_traceparent(carrier.get(SpanContext.HEADER))
+        return self.start_child(name, parent) if parent is not None else self.start_root(name)
+
+    def end(self, span: Span) -> None:
+        span.end_millis = self._clock.now_millis()
+        self._collector.export(span)
+```
+
+#### Step 4: Propagating through a service
+
+Each outbound call gets a fresh carrier from `Propagator.inject` with this span's context, so the callee's parent is `authorize`. The `clock.advance` calls between children are the payments service's own work (3 + 1 + 1 + 2 + 1 = 8 ms of exclusive time), and `amount.minor` is set as a string of minor units, never a float.
+
+```python
+    def payments(self, carrier: dict[str, str], payment_id: str, amount_minor: int, currency: str) -> None:
+        t = self.tracer("payments")
+        s = t.start_from_carrier("authorize", carrier)
+        s.set_attribute("payment.id", payment_id)
+        s.set_attribute("amount.minor", str(amount_minor))
+        s.set_attribute("currency", currency)
+        self.clock.advance(3)  # load merchant config, idempotency check
+        decision = self.risk(Propagator.inject(s.context(True), carrier.get(SpanContext.STATE_HEADER)), payment_id)
+        s.set_attribute("risk.decision", decision)
+        self.clock.advance(1)
+        self.ledger(Propagator.inject(s.context(True), None), payment_id, amount_minor)
+        self.clock.advance(1)
+        self.processor(Propagator.inject(s.context(True), None), payment_id)
+        self.clock.advance(2)
+        self.notifications(Propagator.inject(s.context(True), None), payment_id)
+        self.clock.advance(1)
+        t.end(s)
+```
+
+#### Step 4b: Nested spans inside one service
+
+An in-process child: `start_child` takes the parent's context directly, no carrier involved. The 18 ms inside `model.infer` is what the timeline attributes to inference rather than to `score`.
+
+```python
+    def risk(self, carrier: dict[str, str], payment_id: str) -> str:
+        t = self.tracer("risk")
+        s = t.start_from_carrier("score", carrier)
+        self.clock.advance(4)  # feature lookup
+        model = t.start_child("model.infer", s.context(True))
+        self.clock.advance(18)  # the slow part
+        t.end(model)
+        self.clock.advance(1)
+        t.end(s)
+        return "APPROVE"
+```
+
+#### Step 5: Reassembling the tree and computing exclusive time
+
+The constructor sorts by `(start_millis, span_id)`, indexes by id with a dict comprehension, then classifies each span as root, attached child, or orphan. `exclusive_millis` sweeps a cursor across the children sorted by start so overlapping siblings are counted once and a child that outlives its parent is clipped.
+
+```python
+    def __init__(self, trace_id: str, spans: list[Span]) -> None:
+        self.trace_id = trace_id
+        self.spans = sorted(spans, key=lambda s: (s.start_millis, s.span_id))
+        self.by_id: dict[str, Span] = {s.span_id: s for s in self.spans}
+        self.children: dict[str, list[Span]] = {}
+        self.roots: list[Span] = []
+        self.orphans: list[Span] = []
+        for s in self.spans:
+            if s.is_root():
+                self.roots.append(s)
+            elif s.parent_span_id in self.by_id:
+                self.children.setdefault(s.parent_span_id, []).append(s)
+            else:
+                self.orphans.append(s)  # parent never arrived: a service dropped the header or its span was lost
+
+    def exclusive_millis(self, s: Span) -> int:
+        kids = sorted(self.children_of(s), key=lambda k: k.start_millis)
+        covered = 0
+        cursor = s.start_millis
+        for k in kids:
+            start, end = max(cursor, k.start_millis), min(s.end_millis, k.end_millis)
+            if end > start:
+                covered += end - start
+                cursor = end
+        return s.duration_millis() - covered
+```
+
+#### Step 6: The timeline
+
+The same Gantt-in-text: indentation is depth, `//` scales start and length to the root, a span shorter than one column still gets one `#`, and orphans are listed after the tree. The rows are f-strings collected in a list and joined once.
+
+```python
+    def render_timeline(self, width: int) -> str:
+        if not self.roots:
+            return f"(no root span for trace {self.trace_id})"
+        root = self.roots[0]
+        origin, total = root.start_millis, max(1, root.duration_millis())
+        out = [f"trace {self.trace_id}  total {total} ms\n",
+               f"{'service / span':<46} {'start':>7} {'dur':>6}  timeline\n"]
+        for s in self.spans:
+            if not s.is_root() and s.parent_span_id not in self.by_id:
+                continue  # orphans listed separately
+            label = "  " * self.depth(s) + s.service + " / " + s.name
+            start = (s.start_millis - origin) * width // total
+            length = max(1, s.duration_millis() * width // total)
+            bar = " " * min(start, width) + "#" * min(length, width - min(start, width))
+            flag = "  ERROR" if s.status == "ERROR" else ""
+            out.append(f"{label:<46} {s.start_millis - origin:5d} ms {s.duration_millis():4d} ms  {bar}{flag}\n")
+        for o in self.orphans:
+            out.append(f"ORPHAN {o.service} / {o.name} (parent {o.parent_span_id} never arrived)\n")
+        return "".join(out)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/07-distributed-tracing/code/python
@@ -358,29 +532,280 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The trace id, the timeline, and the dropped-header section match the Java run character for character:
+
+```console
+spans exported: 8, root duration: 92 ms
+sum of exclusive times: 92 ms  (equals root duration when children are sequential)
+hottest span: processor-adapter / network.roundtrip with 45 ms exclusive
+
+== The same payment when notifications drops the header (seed 42) ==
+spans in trace 359d41ba...: 7 (one fewer)
+total traces in collector: 2 (the notification span became its own root)
+```
+
 ### In Go
 
+The Go port (`code/go/main.go` and `javarandom.go`) keeps the design with four differences. **`Optional` is a second return value:** `ParseTraceparent` returns `(SpanContext, bool)`; a missing header is the empty string a `map[string]string` lookup yields, so the fall-back-to-a-new-root decision is one `if ... ok` and no `null` is ever handled. `NewSpanContext` returns `(SpanContext, error)` where the Java record constructor throws; `Span.Context` builds the struct directly because its ids are already known-good. A root span's parent is `""` rather than `null`, so `IsRoot` is a string comparison. **Lifecycle guards are errors:** `DurationMillis` returns `(int64, error)` and `Collector.Export` returns `error`, both wrapping the sentinel `ErrSpanOpen` so tests use `errors.Is`. Inside `TraceTree` every span came from the collector and is therefore ended, so `mustDuration` panics on an open one: that would be a bug in the tree, not a condition for a caller. **Ids come from `java.util.Random.nextBytes`:** `JavaRandom.NextBytes` consumes each 32-bit draw least-significant byte first, exactly as the JDK does, and `hex.EncodeToString` gives the lowercase form the spec requires, so seed 42 produces the same trace id `359d41ba...` as the Java demo and the whole timeline matches character for character; `TestIds` pins that id. **Ordered collections are explicit:** `LinkedHashMap` attributes become a `map` plus an `attrKeys` slice (`AttributeKeys()` exposes the order); `LinkedHashSet` trace ids become a first-seen `[]string`; the span sort is `sort.SliceStable` on `(StartMillis, SpanId)`, the same two-key order as the Java comparator. In a real Go service the carrier is `http.Header` and the context travels in a `context.Context`; a goroutine started with `context.Background()` instead of the request's context is the dropped-header failure the demo shows.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Ids
+
+`NextBytes` fills a caller-supplied buffer in the JDK's byte order; `hex` retries on an all-zero buffer and encodes with `encoding/hex`, which is lowercase.
+
 ```go
-// StartFromCarrier starts a span from a carrier; if the header is missing or malformed, a new trace begins.
-func (t *Tracer) StartFromCarrier(name string, carrier map[string]string) *Span {
-    if parent, ok := ParseTraceparent(carrier[Header]); ok {
-        return t.StartChild(name, parent)
-    }
-    return t.StartRoot(name)
+func (r *JavaRandom) NextBytes(buf []byte) {
+	for i := 0; i < len(buf); {
+		rnd := r.next(32)
+		for n := min(len(buf)-i, 4); n > 0; n-- {
+			buf[i] = byte(rnd)
+			rnd >>= 8
+			i++
+		}
+	}
+}
+
+type IdGenerator struct{ random *JavaRandom }
+
+func (g *IdGenerator) TraceId() string { return g.hex(16) }
+func (g *IdGenerator) SpanId() string  { return g.hex(8) }
+
+func (g *IdGenerator) hex(n int) string {
+	for {
+		buf := make([]byte, n)
+		g.random.NextBytes(buf)
+		allZero := true
+		for _, b := range buf {
+			if b != 0 {
+				allZero = false
+			}
+		}
+		if !allZero {
+			return hex.EncodeToString(buf)
+		}
+	}
 }
 ```
 
-Differences, all in `code/go/main.go` and `javarandom.go`:
+#### Step 2: The context and the header
 
-- **`Optional` is a second return value.** `ParseTraceparent` returns `(SpanContext, bool)`; a missing header is the empty string a `map[string]string` lookup yields, so the fall-back-to-a-new-root decision is one `if ... ok` and no `null` is ever handled. `NewSpanContext` returns `(SpanContext, error)` where the Java record constructor throws; `Span.Context` builds the struct directly because its ids are already known-good. A root span's parent is `""` rather than `null`, so `IsRoot` is a string comparison.
-- **Lifecycle guards are errors.** `DurationMillis` returns `(int64, error)` and `Collector.Export` returns `error`, both wrapping the sentinel `ErrSpanOpen` so tests use `errors.Is`. Inside `TraceTree` every span came from the collector and is therefore ended, so `mustDuration` panics on an open one: that would be a bug in the tree, not a condition for a caller.
-- **Ids come from `java.util.Random.nextBytes`.** `JavaRandom.NextBytes` consumes each 32-bit draw least-significant byte first, exactly as the JDK does, and `hex.EncodeToString` gives the lowercase form the spec requires, so seed 42 produces the same trace id `359d41ba...` as the Java demo and the whole timeline matches character for character. `TestIds` pins that id.
-- **Ordered collections are explicit.** `LinkedHashMap` attributes become a `map` plus an `attrKeys` slice (`AttributeKeys()` exposes the order); `LinkedHashSet` trace ids become a first-seen `[]string`; the span sort is `sort.SliceStable` on `(StartMillis, SpanId)`, the same two-key order as the Java comparator. In a real Go service the carrier is `http.Header` and the context travels in a `context.Context`; a goroutine started with `context.Background()` instead of the request's context is the dropped-header failure the demo shows.
+Every rejection is `return SpanContext{}, false`. `strings.Split` keeps empty trailing fields, `zeroTraceId` and `zeroSpanId` are package constants, and `strconv.ParseUint(..., 16, 8)` reads the flag byte so `flags&0x01` can test the sampled bit.
+
+```go
+func (c SpanContext) ToTraceparent() string {
+	flags := "00"
+	if c.Sampled {
+		flags = "01"
+	}
+	return "00-" + c.TraceId + "-" + c.SpanId + "-" + flags
+}
+
+func ParseTraceparent(header string) (SpanContext, bool) {
+	h := strings.TrimSpace(header)
+	parts := strings.Split(h, "-")
+	if len(parts) < 4 {
+		return SpanContext{}, false
+	}
+	version := parts[0]
+	if !IsHex(version, 2) || version == "ff" {
+		return SpanContext{}, false
+	}
+	if version == "00" && len(parts) != 4 { // version 00 has exactly four fields
+		return SpanContext{}, false
+	}
+	if !IsHex(parts[1], 32) || parts[1] == zeroTraceId {
+		return SpanContext{}, false
+	}
+	if !IsHex(parts[2], 16) || parts[2] == zeroSpanId {
+		return SpanContext{}, false
+	}
+	if !IsHex(parts[3], 2) {
+		return SpanContext{}, false
+	}
+	flags, err := strconv.ParseUint(parts[3], 16, 8)
+	if err != nil {
+		return SpanContext{}, false
+	}
+	return SpanContext{parts[1], parts[2], flags&0x01 == 1}, true
+}
+```
+
+#### Step 3: Spans and the tracer
+
+A root's parent is `""`. `StartFromCarrier` reads `carrier[Header]` (empty string when absent) and branches on the parser's `ok`. `End` panics if `Export` fails, because it set `EndMillis` the line before, so the error is unreachable.
+
+```go
+func (t *Tracer) StartRoot(name string) *Span {
+	return NewSpan(t.ids.TraceId(), t.ids.SpanId(), "", t.service, name, t.clock.NowMillis())
+}
+
+func (t *Tracer) StartChild(name string, parent SpanContext) *Span {
+	return NewSpan(parent.TraceId, t.ids.SpanId(), parent.SpanId, t.service, name, t.clock.NowMillis())
+}
+
+func (t *Tracer) StartFromCarrier(name string, carrier map[string]string) *Span {
+	if parent, ok := ParseTraceparent(carrier[Header]); ok {
+		return t.StartChild(name, parent)
+	}
+	return t.StartRoot(name)
+}
+
+func (t *Tracer) End(span *Span) {
+	span.EndMillis = t.clock.NowMillis()
+	if err := t.collector.Export(span); err != nil {
+		panic(err)
+	}
+}
+```
+
+#### Step 4: Propagating through a service
+
+`Inject` is a package function returning a fresh `map[string]string`; an absent tracestate is `""`. The attribute is `strconv.FormatInt(amountMinor, 10)`, a string of minor units. The clock advances are the same 3 + 1 + 1 + 2 + 1 ms of exclusive time.
+
+```go
+func (p *PaymentSystem) payments(carrier map[string]string, paymentId string, amountMinor int64, currency string) {
+	t := p.Tracer("payments")
+	s := t.StartFromCarrier("authorize", carrier)
+	s.SetAttribute("payment.id", paymentId)
+	s.SetAttribute("amount.minor", strconv.FormatInt(amountMinor, 10))
+	s.SetAttribute("currency", currency)
+	p.Clock.Advance(3) // load merchant config, idempotency check
+	decision := p.risk(Inject(s.Context(true), carrier[StateHeader]), paymentId)
+	s.SetAttribute("risk.decision", decision)
+	p.Clock.Advance(1)
+	p.ledger(Inject(s.Context(true), ""), paymentId, amountMinor)
+	p.Clock.Advance(1)
+	p.processor(Inject(s.Context(true), ""), paymentId)
+	p.Clock.Advance(2)
+	p.notifications(Inject(s.Context(true), ""), paymentId)
+	p.Clock.Advance(1)
+	t.End(s)
+}
+```
+
+#### Step 4b: Nested spans inside one service
+
+`StartChild` with the parent's context, in-process, no carrier.
+
+```go
+func (p *PaymentSystem) risk(carrier map[string]string, paymentId string) string {
+	t := p.Tracer("risk")
+	s := t.StartFromCarrier("score", carrier)
+	p.Clock.Advance(4) // feature lookup
+	model := t.StartChild("model.infer", s.Context(true))
+	p.Clock.Advance(18) // the slow part
+	t.End(model)
+	p.Clock.Advance(1)
+	t.End(s)
+	return "APPROVE"
+}
+```
+
+#### Step 5: Reassembling the tree and computing exclusive time
+
+`sort.SliceStable` with the two-key comparator, then a tagless `switch` classifies each span. `ExclusiveMillis` copies the children before sorting so the tree's own slice is untouched, and uses the builtins `max`/`min` for the sweep; `mustDuration` is safe because every span in a tree has ended.
+
+```go
+func NewTraceTree(traceId string, spans []*Span) *TraceTree {
+	t := &TraceTree{TraceId: traceId, Spans: append([]*Span(nil), spans...), ById: map[string]*Span{}, children: map[string][]*Span{}}
+	sort.SliceStable(t.Spans, func(i, j int) bool {
+		a, b := t.Spans[i], t.Spans[j]
+		if a.StartMillis != b.StartMillis {
+			return a.StartMillis < b.StartMillis
+		}
+		return a.SpanId < b.SpanId
+	})
+	for _, s := range t.Spans {
+		t.ById[s.SpanId] = s
+	}
+	for _, s := range t.Spans {
+		switch {
+		case s.IsRoot():
+			t.Roots = append(t.Roots, s)
+		case t.ById[s.ParentSpanId] != nil:
+			t.children[s.ParentSpanId] = append(t.children[s.ParentSpanId], s)
+		default:
+			t.Orphans = append(t.Orphans, s) // parent never arrived: a service dropped the header or its span was lost
+		}
+	}
+	return t
+}
+
+func (t *TraceTree) ExclusiveMillis(s *Span) int64 {
+	kids := append([]*Span(nil), t.ChildrenOf(s)...)
+	sort.SliceStable(kids, func(i, j int) bool { return kids[i].StartMillis < kids[j].StartMillis })
+	var covered int64
+	cursor := s.StartMillis
+	for _, k := range kids {
+		from, to := max(cursor, k.StartMillis), min(s.EndMillis, k.EndMillis)
+		if to > from {
+			covered += to - from
+			cursor = to
+		}
+	}
+	return mustDuration(s) - covered
+}
+```
+
+#### Step 6: The timeline
+
+`strings.Builder` and `fmt.Fprintf` with the same format verbs as `String.format`; `strings.Repeat` draws the indentation and the bar. The width is converted to `int64` once so the scaling arithmetic stays in one type.
+
+```go
+func (t *TraceTree) RenderTimeline(width int) string {
+	if len(t.Roots) == 0 {
+		return "(no root span for trace " + t.TraceId + ")"
+	}
+	root := t.Roots[0]
+	origin, total := root.StartMillis, max(1, mustDuration(root))
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "trace %s  total %d ms\n", t.TraceId, total)
+	fmt.Fprintf(&sb, "%-46s %7s %6s  %s\n", "service / span", "start", "dur", "timeline")
+	w := int64(width)
+	for _, s := range t.Spans {
+		if !s.IsRoot() && t.ById[s.ParentSpanId] == nil {
+			continue // orphans listed separately
+		}
+		label := strings.Repeat("  ", t.Depth(s)) + s.Service + " / " + s.Name
+		from := (s.StartMillis - origin) * w / total
+		length := max(1, mustDuration(s)*w/total)
+		bar := strings.Repeat(" ", int(min(from, w))) + strings.Repeat("#", int(min(length, w-min(from, w))))
+		suffix := ""
+		if s.Status == "ERROR" {
+			suffix = "  ERROR"
+		}
+		fmt.Fprintf(&sb, "%-46s %5d ms %4d ms  %s%s\n", label, s.StartMillis-origin, mustDuration(s), bar, suffix)
+	}
+	for _, o := range t.Orphans {
+		fmt.Fprintf(&sb, "ORPHAN %s / %s (parent %s never arrived)\n", o.Service, o.Name, o.ParentSpanId)
+	}
+	return sb.String()
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/07-distributed-tracing/code/go
 go run .
 go test ./...
+```
+
+The trace id and the whole timeline match the Java run character for character:
+
+```console
+== One payment through six services (seed 42) ==
+trace 359d41baf78afe0de1bbe7ae28c0450c  total 92 ms
+service / span                                   start    dur  timeline
+api-gateway / POST /charges                        0 ms   92 ms  ################################################
+  payments / authorize                             2 ms   89 ms   ##############################################
+    risk / score                                   5 ms   23 ms    ############
+      risk / model.infer                           9 ms   18 ms      #########
+    ledger / post-hold                            29 ms    6 ms                 ###
+    processor-adapter / iso8583.auth              36 ms   49 ms                    #########################
+      processor-adapter / network.roundtrip       38 ms   45 ms                     #######################
+    notifications / enqueue-webhook               87 ms    3 ms                                               #
 ```
 
 ## Use It

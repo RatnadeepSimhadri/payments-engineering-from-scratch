@@ -374,12 +374,232 @@ The last line is the one to keep. "Still running after close = 0" is the propert
 
 ### In Python
 
-`code/python/main.py` keeps the thread-based design class for class (`CancellationToken`, `Subtask`, `StructuredScope`, `authorize`) rather than switching to `asyncio`, so the walkthrough above reads the same. Four things differ.
+The Python port (`code/python/main.py`) keeps the thread-based design class for class (`CancellationToken`, `Subtask`, `StructuredScope`, `authorize`) rather than switching to `asyncio`, so the walkthrough reads the same. Four things differ. **There is no thread interrupt.** Python cannot interrupt a thread blocked in `Condition.wait` or `Lock.acquire`, so `Subtask.interrupt()` only sets a flag a body may poll. That loses nothing here because every blocking body in the lesson waits through `wait_for_signal_or_cancel`, which registers an `on_cancel` callback that notifies its condition: the token is the one signal Python has, and it is enough. A body that blocks in something the token cannot wake (a socket read with no timeout) would make `join` wait, which is the same honesty the Java scope has about non-interruptible calls. **Durations are integer nanoseconds.** `Deadline.after(clock, millis(200))` takes an `int`, not a `timedelta`, because `timedelta` stops at microseconds and the clock is in nanoseconds. `NONE` is `2**63 - 1` and `add_exact` reproduces `Math.addExact`'s overflow error, since a Python `int` would otherwise grow without complaint. **Exceptions.** `IllegalStateException` becomes `RuntimeError`, `ExecutionException` is a small class whose original failure is `__cause__` (raised with `raise ... from`), and the deadline surfaces as the built-in `TimeoutError`. `CancelledException` keeps its name. **The scope is a context manager.** `with StructuredScope(...) as scope:` is the `try`-with-resources; `__exit__` calls `close()`, so an early `return` inside the block still cancels and joins. The executor is `ThreadPerTaskExecutor`, one new thread per task, the closest standard-library match for `newVirtualThreadPerTaskExecutor`; a fixed `ThreadPoolExecutor` would deadlock the fan-out if it had fewer workers than blocked siblings.
 
-- **There is no thread interrupt.** Python cannot interrupt a thread blocked in `Condition.wait` or `Lock.acquire`, so `Subtask.interrupt()` only sets a flag a body may poll. That loses nothing here because every blocking body in the lesson waits through `wait_for_signal_or_cancel`, which registers an `on_cancel` callback that notifies its condition: the token is the one signal Python has, and it is enough. A body that blocks in something the token cannot wake (a socket read with no timeout) would make `join` wait, which is the same honesty the Java scope has about non-interruptible calls.
-- **Durations are integer nanoseconds.** `Deadline.after(clock, millis(200))` takes an `int`, not a `timedelta`, because `timedelta` stops at microseconds and the clock is in nanoseconds. `NONE` is `2**63 - 1` and `add_exact` reproduces `Math.addExact`'s overflow error, since a Python `int` would otherwise grow without complaint.
-- **Exceptions.** `IllegalStateException` becomes `RuntimeError`, `ExecutionException` is a small class whose original failure is `__cause__` (raised with `raise ... from`), and the deadline surfaces as the built-in `TimeoutError`. `CancelledException` keeps its name.
-- **The scope is a context manager.** `with StructuredScope(...) as scope:` is the `try`-with-resources; `__exit__` calls `close()`, so an early `return` inside the block still cancels and joins.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A clock and a deadline
+
+`ManualClock` guards an `int` with a lock (there is no `AtomicLong`); `Deadline` is a frozen dataclass over `at_nanos`. `after` goes through `add_exact` so that a budget added to a huge clock value fails the way `Math.addExact` does instead of silently producing a bigger Python int. `earliest` and `is_expired` are the Java expressions with `INT64_MAX` standing in for `Long.MAX_VALUE`.
+
+```python
+class ManualClock(Clock):
+    def __init__(self) -> None:
+        self._now = 0
+        self._lock = threading.Lock()
+
+    def nanos(self) -> int:
+        with self._lock:
+            return self._now
+
+    def advance(self, d_nanos: int) -> None:
+        with self._lock:
+            self._now += d_nanos
+
+
+@dataclass(frozen=True)
+class Deadline:
+    at_nanos: int
+
+    @staticmethod
+    def after(clock: Clock, d_nanos: int) -> "Deadline":
+        return Deadline(add_exact(clock.nanos(), d_nanos))
+
+    def earliest(self, other: "Deadline") -> "Deadline":
+        return self if self.at_nanos <= other.at_nanos else other
+
+    def is_expired(self, clock: Clock) -> bool:
+        return self.at_nanos != INT64_MAX and clock.nanos() >= self.at_nanos
+```
+
+#### Step 2: The cancellation token tree
+
+The `compareAndSet(null, why)` becomes a check-and-set under `_lock`; the lock is released before callbacks and children run, so a callback that cancels something else cannot deadlock. Iterating `list(self._callbacks)` snapshots the list the way `CopyOnWriteArrayList` iteration does. `is_cancelled` performs the lazy deadline conversion, and `on_cancel` after cancellation runs the callback at once.
+
+```python
+    def child(self, own: Deadline = Deadline.NONE) -> "CancellationToken":
+        """A child whose deadline is the earlier of its own and its parent's."""
+        c = CancellationToken(self, self._clock, self._deadline.earliest(own))
+        self._children.append(c)
+        if self.is_cancelled():
+            c.cancel(self._reason)
+        return c
+
+    def cancel(self, why: str) -> bool:
+        """Idempotent. The first reason wins; callbacks run exactly once, then children are cancelled."""
+        if why is None:
+            raise TypeError("why")
+        with self._lock:                       # compareAndSet(null, why)
+            if self._reason is not None:
+                return False
+            self._reason = why
+        for r in list(self._callbacks):        # snapshot, like iterating a CopyOnWriteArrayList
+            r()
+        for c in list(self._children):
+            c.cancel(why)
+        return True
+
+    def is_cancelled(self) -> bool:
+        """True once cancelled explicitly or once the deadline has passed on the clock."""
+        if self._reason is None and self._deadline.is_expired(self._clock):
+            self.cancel("deadline exceeded")
+        return self._reason is not None
+
+    def on_cancel(self, callback: Callable[[], Any]) -> None:
+        """Registers cleanup. If already cancelled the callback runs now, so registration can never miss it."""
+        self._callbacks.append(callback)
+        if self.is_cancelled():
+            callback()
+```
+
+#### Step 3: The subtask handle
+
+`State` is a nested `Enum`; `get` raises `RuntimeError` unless the state is `SUCCESS`, so a value can never be read from a task the scope gave up on. `started`/`finished`/`interrupt` keep the Java shape around `_runner`, but because a Python thread cannot be interrupted, `interrupt` sets a `threading.Event` that a cooperative body may poll, and only while the body is running.
+
+```python
+class Subtask(Generic[T]):
+    class State(Enum):
+        UNAVAILABLE = "UNAVAILABLE"
+        SUCCESS = "SUCCESS"
+        FAILED = "FAILED"
+        CANCELLED = "CANCELLED"
+
+    def started(self, t: threading.Thread) -> None:
+        with self._lock:
+            self._runner = t
+
+    def finished(self) -> None:
+        with self._lock:
+            self._runner = None
+
+    def interrupt(self) -> None:
+        """Python threads cannot be interrupted; this sets a flag a body may poll, only while it is running."""
+        with self._lock:
+            if self._runner is not None:
+                self._interrupted.set()
+
+    def get(self) -> T:
+        if self._state is not Subtask.State.SUCCESS:
+            raise RuntimeError(f"{self._name} is {self._state.value}, not SUCCESS")
+        return self._value  # type: ignore[return-value]
+```
+
+#### Step 4: Forking inside a scope
+
+`fork` builds a closure `run` and hands it to the executor. The `except` ladder is the Java `catch` ordering: cancellation-shaped exceptions become `CANCELLED`; anything else (`BaseException`, the `Throwable` of Python) is `FAILED` only if the token was still live. `_running` is guarded by the `_completion` condition rather than an atomic, and the `finally` notifies waiters on every path.
+
+```python
+        def run() -> None:
+            subtask.started(threading.current_thread())
+            try:
+                if self._token.is_cancelled():
+                    subtask.cancelled()
+                else:
+                    subtask.succeed(body(self._token))
+            except (CancelledException, InterruptedError):
+                subtask.cancelled()
+            except BaseException as t:  # Throwable
+                if self._token.is_cancelled():
+                    subtask.cancelled()
+                else:
+                    subtask.fail(t)
+                    self._on_failure(subtask)
+            finally:
+                subtask.finished()
+                with self._completion:
+                    self._running -= 1
+                    self._completion.notify_all()
+
+        self._executor.execute(run)
+        return subtask
+```
+
+`_on_failure` records the first failure under its own lock, cancels the token (which runs cleanups and cancels child tokens), and sets the interrupt flags. Only the token signal reaches a blocked body in Python; the flag is for bodies that poll.
+
+```python
+    def _on_failure(self, failed: Subtask[Any]) -> None:
+        with self._failure_lock:
+            if self._first_failure is None:
+                self._first_failure = failed
+        self._token.cancel(f"{self._name}: {failed.name()} failed: {failed.exception()!r}")
+        self._interrupt_running()
+```
+
+#### Step 5: Join, rethrow, and the close guarantee
+
+`join` polls in 5 ms real-time slices on the `_completion` condition, checking the token each lap so a manual clock advanced by another thread is noticed. `throw_if_failed` raises `ExecutionException` with the body's exception chained as `__cause__`, or the built-in `TimeoutError` for a deadline. `close` is what `__exit__` calls: cancel if not joined, then join anyway.
+
+```python
+    def join(self) -> None:
+        self._joined = True
+        while self.active() > 0:
+            if self._token.is_cancelled():
+                self._interrupt_running()
+            with self._completion:
+                if self._running > 0:
+                    self._completion.wait(0.005)
+        for s in self._subtasks:
+            if s.state() is Subtask.State.UNAVAILABLE:
+                s.cancelled()
+
+    def throw_if_failed(self) -> None:
+        """After join: re-raises the first failure. A cancelled-by-deadline scope raises TimeoutError."""
+        if not self._joined:
+            raise RuntimeError(f"{self._name}: throw_if_failed before join")
+        f = self._first_failure
+        if f is not None:
+            raise ExecutionException(f"{f.name()} failed") from f.exception()
+        if self._token.is_cancelled() and self._token.reason().startswith("deadline"):
+            raise TimeoutError(f"{self._name}: {self._token.reason()}")
+
+    def close(self) -> None:
+        """Leaving the scope without joining is a bug; close cancels what is left and waits for it anyway."""
+        if self._closed:
+            return
+        self._closed = True
+        if not self._joined:
+            self._token.cancel(f"{self._name}: scope closed without join")
+            self.join()
+```
+
+#### Step 6: The authorization fan-out
+
+The three bodies are nested functions that close over `log`, `balance`, and the latch; `with StructuredScope(...)` is the try-with-resources. `wait_for_signal_or_cancel` is where Python's lack of interrupt is paid for: it registers an `on_cancel` callback that notifies a private condition, so the blocked body wakes the instant the token is cancelled, and polls every 5 ms as a safety net.
+
+```python
+    with StructuredScope("authorize", pool, parent, Deadline.after(clock, budget_nanos), clock) as scope:
+        def fraud_check(token: CancellationToken) -> bool:
+            siblings_started.await_()
+            if fraud_fails:
+                raise RuntimeError("velocity rule tripped")
+            return True
+
+        def balance_check(token: CancellationToken) -> bool:
+            token.on_cancel(lambda: log.append("balance-check: released hold"))
+            siblings_started.count_down()
+            wait_for_signal_or_cancel(token)
+            return balance.covers(amount)
+
+        def fx_quote(token: CancellationToken) -> int:
+            token.on_cancel(lambda: log.append("fx-quote: closed quote stream"))
+            siblings_started.count_down()
+            if slow_bank is not None:
+                slow_bank.advance(budget_nanos + millis(1))   # the bank is slower than our budget
+            wait_for_signal_or_cancel(token)
+            return 10_000
+
+        fraud = scope.fork("fraud-check", fraud_check)
+        funds = scope.fork("balance-check", balance_check)
+        fx = scope.fork("fx-quote", fx_quote)
+        scope.join()
+        try:
+            scope.throw_if_failed()
+        except ExecutionException as e:
+            return f"DECLINED ({e.__cause__})"
+        except TimeoutError as e:
+            return f"TIMEOUT ({e})"
+        return f"APPROVED at rate {fx.get()}" if fraud.get() and funds.get() else "DECLINED (insufficient funds)"
+```
 
 ```python
 def wait_for_signal_or_cancel(token: CancellationToken) -> None:
@@ -396,7 +616,7 @@ def wait_for_signal_or_cancel(token: CancellationToken) -> None:
     token.throw_if_cancelled()
 ```
 
-The executor is `ThreadPerTaskExecutor`, one new thread per task, the closest standard-library match for `newVirtualThreadPerTaskExecutor`; a fixed `ThreadPoolExecutor` would deadlock the fan-out if it had fewer workers than blocked siblings. The demo output is identical to Java's.
+#### Step 7: Run it
 
 ```bash
 cd phases/04-concurrency/11-structured-concurrency-and-cancellation/code/python
@@ -404,32 +624,349 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run:
+
+```console
+== Deadlines compose by taking the earliest ==
+request budget  = 200 ms
+bank-call asked = 800 ms, got 200 ms (inherited)
+after 250 ms: request cancelled? true (deadline exceeded)
+              bank-call cancelled? true, root cancelled? false
+
+== One sibling fails: the others are cancelled and clean up ==
+DECLINED (velocity rule tripped)
+  cleanup: balance-check: released hold
+  cleanup: fx-quote: closed quote stream
+
+== The bank is slower than the budget: deadline cancels everything ==
+TIMEOUT (authorize: deadline exceeded)
+  cleanup: balance-check: released hold
+  cleanup: fx-quote: closed quote stream
+
+== Leaving a scope without join still waits for every child ==
+scope cancelled on close: leaky: scope closed without join
+subtasks cancelled = 3 of 3; completed normally = 0; still running after close = 0
+```
+
 ### In Go
 
-`code/go/main.go` keeps the same names (`Deadline`, `CancellationToken`, `Subtask`, `StructuredScope`, `Authorize`) but this is the language the lesson was describing all along, so three things get simpler and one needs care.
+The Go port (`code/go/main.go`) keeps the same names (`Deadline`, `CancellationToken`, `Subtask`, `StructuredScope`, `Authorize`), but this is the language the lesson was describing all along, so three things get simpler and one needs care. **The token is a `context.Context`.** `CancellationToken` implements `Done()`, `Err()`, `Deadline()` and `Value()`, so a body can hand it to any API that takes a `ctx`, and `context.WithCancel(token)` derives a standard child that follows it (the tests prove this). `Err()` returns `context.DeadlineExceeded` or `context.Canceled` exactly as the standard package would; `Reason()` keeps the first-reason-wins string. The lesson builds its own token instead of calling `context.WithDeadline` for one reason: the deadline lives on the injected clock, so the tests advance a `ManualClock` instead of sleeping. **There is no interrupt, and nothing is lost.** A body ends because `<-token.Done()` fires. That is why `ManualClock.Advance` notifies every token with a deadline (eager expiry closes `Done()`), while a deadline on the `SystemClock` arms a `time.AfterFunc`. `Subtask.interrupt()` has no counterpart; the Java comment about non-interruptible calls becomes the Go rule that a blocking call without a `ctx` cannot be cancelled. **The scope is a `sync.WaitGroup` plus goroutines.** `Fork` is a generic function (`Fork[T](scope, name, body)`) because Go methods cannot have type parameters; each body gets its own goroutine, the equivalent of the virtual-thread-per-task executor, and `Join` is `wg.Wait()`. A body's `panic` is recovered and recorded as a `FAILED` subtask. `defer scope.Close()` is the try-with-resources. **Errors are values.** Bodies return `(T, error)`; `ErrCancelled` (via `*CancelledError`) marks a cooperative exit, anything else is a failure that cancels the siblings. `scope.Err()` returns an `*ExecutionError` whose `Unwrap` is the body's error, or an error matching `context.DeadlineExceeded`. Because `Advance` cancels eagerly, the slow-bank demo waits (`holdPlaced`) until the balance check has registered its cleanup before the FX task moves the clock, so the cleanup log is identical to Java's.
 
-- **The token is a `context.Context`.** `CancellationToken` implements `Done()`, `Err()`, `Deadline()` and `Value()`, so a body can hand it to any API that takes a `ctx`, and `context.WithCancel(token)` derives a standard child that follows it (the tests prove this). `Err()` returns `context.DeadlineExceeded` or `context.Canceled` exactly as the standard package would; `Reason()` keeps the first-reason-wins string. The lesson builds its own token instead of calling `context.WithDeadline` for one reason: the deadline lives on the injected clock, so the tests advance a `ManualClock` instead of sleeping.
-- **There is no interrupt, and nothing is lost.** A body ends because `<-token.Done()` fires. That is why `ManualClock.Advance` notifies every token with a deadline (eager expiry closes `Done()`), while a deadline on the `SystemClock` arms a `time.AfterFunc`. `Subtask.interrupt()` has no counterpart; the Java comment about non-interruptible calls becomes the Go rule that a blocking call without a `ctx` cannot be cancelled.
-- **The scope is a `sync.WaitGroup` plus goroutines.** `Fork` is a generic function (`Fork[T](scope, name, body)`) because Go methods cannot have type parameters; each body gets its own goroutine, the equivalent of the virtual-thread-per-task executor, and `Join` is `wg.Wait()`. A body's `panic` is recovered and recorded as a `FAILED` subtask. `defer scope.Close()` is the try-with-resources.
-- **Errors are values.** Bodies return `(T, error)`; `ErrCancelled` (via `*CancelledError`) marks a cooperative exit, anything else is a failure that cancels the siblings. `scope.Err()` returns an `*ExecutionError` whose `Unwrap` is the body's error, or an error matching `context.DeadlineExceeded`. Because `Advance` cancels eagerly, the slow-bank demo waits (`holdPlaced`) until the balance check has registered its cleanup before the FX task moves the clock, so the cleanup log is identical to Java's.
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: A clock and a deadline
+
+`ManualClock.Advance` does one extra thing the Java clock does not: it runs registered watchers, which is how tokens with deadlines learn to close their `Done()` channel eagerly. `Deadline` is a one-field struct; `DeadlineAfter` uses `addChecked` and panics on overflow, which is the Go reading of `Math.addExact` throwing. Durations are `time.Duration`, converted to `int64` nanoseconds at the boundary.
+
+```go
+func (c *ManualClock) Advance(d time.Duration) {
+	c.now.Add(int64(d))
+	c.mu.Lock()
+	watchers := append([]func(){}, c.watchers...)
+	c.mu.Unlock()
+	for _, w := range watchers {
+		w()
+	}
+}
+
+type Deadline struct{ AtNanos int64 }
+
+var DeadlineNone = Deadline{noDeadline}
+
+// DeadlineAfter is `now + d` on the clock. Like Math.addExact, an overflow is a programming error and panics.
+func DeadlineAfter(clock Clock, d time.Duration) Deadline {
+	at, err := addChecked(clock.Nanos(), int64(d))
+	if err != nil {
+		panic(err)
+	}
+	return Deadline{at}
+}
+
+func (d Deadline) Earliest(other Deadline) Deadline {
+	if d.AtNanos <= other.AtNanos {
+		return d
+	}
+	return other
+}
+
+func (d Deadline) IsExpired(clock Clock) bool {
+	return d.AtNanos != noDeadline && clock.Nanos() >= d.AtNanos
+}
+```
+
+#### Step 2: The cancellation token tree
+
+`Cancel` takes the mutex, flips `cancelled`, records the reason, and `close(t.done)` is the step that makes the token a usable `context.Context`. Callbacks, children, and any system-clock timer are copied out and the mutex released before they run. `OnCancel` checks `IsCancelled()` first so a passed deadline is converted before deciding whether to run the callback immediately.
+
+```go
+func (t *CancellationToken) Child(own Deadline) *CancellationToken {
+	c := newToken(t, t.clock, t.deadline.Earliest(own))
+	t.mu.Lock()
+	t.children = append(t.children, c)
+	t.mu.Unlock()
+	if t.IsCancelled() {
+		c.Cancel(t.Reason())
+	}
+	return c
+}
+
+// Cancel is idempotent. The first reason wins; callbacks run exactly once, then children are cancelled.
+func (t *CancellationToken) Cancel(why string) bool {
+	t.mu.Lock()
+	if t.cancelled {
+		t.mu.Unlock()
+		return false
+	}
+	t.cancelled = true
+	t.reason = why
+	close(t.done)
+	callbacks, children, timer := t.callbacks, t.children, t.timer
+	t.callbacks = nil
+	t.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+	for _, cb := range callbacks {
+		cb()
+	}
+	for _, c := range children {
+		c.Cancel(why)
+	}
+	return true
+}
+
+func (t *CancellationToken) IsCancelled() bool {
+	t.mu.Lock()
+	cancelled := t.cancelled
+	t.mu.Unlock()
+	if !cancelled && t.deadline.IsExpired(t.clock) {
+		t.Cancel(deadlineExceeded)
+		return true
+	}
+	return cancelled
+}
+```
+
+#### Step 3: The subtask handle
+
+`Subtask[T]` holds its state under a mutex; `Get` returns `(zero, ErrNotSuccess)` for anything but `Success`, the value-returning form of the Java `IllegalStateException`. There is no `runner`, `started`, or `interrupt`: a goroutine cannot be interrupted, and the token's `Done()` channel is the only way a blocked body is told to stop.
+
+```go
+type Subtask[T any] struct {
+	name    string
+	mu      sync.Mutex
+	state   State
+	value   T
+	failure error
+}
+
+func (s *Subtask[T]) Get() (T, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != Success {
+		var zero T
+		return zero, fmt.Errorf("%w: %s is %s, not SUCCESS", ErrNotSuccess, s.name, s.state)
+	}
+	return s.value, nil
+}
+```
+
+#### Step 4: Forking inside a scope
+
+`Fork` is a package-level generic function because a method cannot introduce `T`. Each body runs in its own goroutine with three `defer`s: `wg.Done`, the running counter, and a `recover` that turns a panic into a `FAILED` subtask (the uncaught-`Throwable` case). A body that returns an error goes through `settle`, which decides between `CANCELLED` and `FAILED` by inspecting the error and the token.
+
+```go
+func Fork[T any](scope *StructuredScope, taskName string, body Task[T]) (*Subtask[T], error) {
+	if scope.joined.Load() || scope.closed.Load() {
+		return nil, fmt.Errorf("%s: %w", scope.name, ErrScopeClosed)
+	}
+	st := &Subtask[T]{name: taskName}
+	scope.mu.Lock()
+	scope.subtasks = append(scope.subtasks, st)
+	scope.mu.Unlock()
+	scope.running.Add(1)
+	scope.wg.Add(1)
+	go func() {
+		defer scope.wg.Done()
+		defer scope.running.Add(-1)
+		defer func() {
+			if r := recover(); r != nil { // a panic in a body is a failure, like an uncaught Throwable
+				scope.settle(st, fmt.Errorf("panic: %v", r))
+			}
+		}()
+		if scope.token.IsCancelled() {
+			st.cancelled()
+			return
+		}
+		value, err := body(scope.token)
+		if err == nil {
+			st.succeed(value)
+			return
+		}
+		scope.settle(st, err)
+	}()
+	return st, nil
+}
+```
+
+`settle` treats `ErrCancelled`, `context.Canceled`, and `context.DeadlineExceeded` as cooperative exits; `onFailure` records the first failure and cancels the token. There is no `interruptRunning` because closing `Done()` *is* the wake-up.
+
+```go
+func (s *StructuredScope) settle(st subtask, err error) {
+	if errors.Is(err, ErrCancelled) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || s.token.IsCancelled() {
+		st.cancelled()
+		return
+	}
+	st.fail(err)
+	s.onFailure(st)
+}
+
+func (s *StructuredScope) onFailure(failed subtask) {
+	s.mu.Lock()
+	if s.firstFailure == nil {
+		s.firstFailure = failed
+	}
+	s.mu.Unlock()
+	s.token.Cancel(s.name + ": " + failed.Name() + " failed: " + failed.Exception().Error())
+}
+```
+
+#### Step 5: Join, rethrow, and the close guarantee
+
+`Join` is `wg.Wait()` with no polling loop, because a deadline reaches the bodies through the clock closing `Done()` rather than through a periodic check. `Err` is the value-returning `throwIfFailed`: an `*ExecutionError` that unwraps to the body's error, or an error that `errors.Is` `context.DeadlineExceeded`. `Close` uses an atomic CAS so it runs once, and joins after cancelling if the caller never joined.
+
+```go
+func (s *StructuredScope) Join() {
+	s.joined.Store(true)
+	s.wg.Wait()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.subtasks {
+		if st.State() == Unavailable {
+			st.cancelled()
+		}
+	}
+}
+
+func (s *StructuredScope) Err() error {
+	if !s.joined.Load() {
+		return fmt.Errorf("%s: %w", s.name, ErrNotJoined)
+	}
+	s.mu.Lock()
+	f := s.firstFailure
+	s.mu.Unlock()
+	if f != nil {
+		return &ExecutionError{f.Name(), f.Exception()}
+	}
+	if s.token.IsCancelled() && s.token.Reason() == deadlineExceeded {
+		return fmt.Errorf("%s: %s: %w", s.name, s.token.Reason(), context.DeadlineExceeded)
+	}
+	return nil
+}
+
+// Close: leaving the scope without joining is a bug; Close cancels what is left and waits for it anyway.
+func (s *StructuredScope) Close() {
+	if !s.closed.CompareAndSwap(false, true) {
+		return
+	}
+	if !s.joined.Load() {
+		s.token.Cancel(s.name + ": scope closed without join")
+		s.Join()
+	}
+}
+```
+
+#### Step 6: The authorization fan-out
+
+`defer scope.Close()` is the try-with-resources. Each body returns `(T, error)`; the fraud check returns a plain error, and the two waiters return whatever `WaitForSignalOrCancel` returns, which is a `*CancelledError` once `Done()` closes. The second `WaitGroup`, `holdPlaced`, exists only because `Advance` cancels eagerly: the FX task must not move the clock until the balance check has registered its cleanup, or the log would have one line instead of two. The result is decoded with `errors.As` and `errors.Is` where Java had two `catch` clauses.
+
+```go
+	scope := NewStructuredScope("authorize", parent, DeadlineAfter(clock, budget), clock)
+	defer scope.Close()
+	fraud, err := Fork(scope, "fraud-check", func(token *CancellationToken) (bool, error) {
+		siblingsStarted.Wait()
+		if fraudFails {
+			return false, errors.New("velocity rule tripped")
+		}
+		return true, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	funds, err := Fork(scope, "balance-check", func(token *CancellationToken) (bool, error) {
+		token.OnCancel(func() { log.Add("balance-check: released hold") })
+		holdPlaced.Done()
+		siblingsStarted.Done()
+		if err := WaitForSignalOrCancel(token); err != nil {
+			return false, err
+		}
+		return balance.Covers(amount)
+	})
+	if err != nil {
+		return "", err
+	}
+	fx, err := Fork(scope, "fx-quote", func(token *CancellationToken) (int64, error) {
+		token.OnCancel(func() { log.Add("fx-quote: closed quote stream") })
+		siblingsStarted.Done()
+		if slowBank != nil {
+			holdPlaced.Wait()                           // Advance cancels eagerly; let the sibling register its cleanup first
+			slowBank.Advance(budget + time.Millisecond) // the bank is slower than our budget
+		}
+		if err := WaitForSignalOrCancel(token); err != nil {
+			return 0, err
+		}
+		return 10_000, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	scope.Join()
+	var exec *ExecutionError
+	switch err := scope.Err(); {
+	case errors.As(err, &exec):
+		return "DECLINED (" + exec.Cause.Error() + ")", nil
+	case errors.Is(err, context.DeadlineExceeded):
+		return "TIMEOUT (" + scope.Name() + ": " + scope.CancellationReason() + ")", nil
+	case err != nil:
+		return "", err
+	}
+```
 
 ```go
 func WaitForSignalOrCancel(token *CancellationToken) error {
-    <-token.Done()
-    return token.CheckCancelled()
-}
-
-func (s *StructuredScope) Join() {
-    s.joined.Store(true)
-    s.wg.Wait()
-    // every subtask has settled; anything still UNAVAILABLE is marked CANCELLED
+	<-token.Done()
+	return token.CheckCancelled()
 }
 ```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/04-concurrency/11-structured-concurrency-and-cancellation/code/go
 go run .
 go test -race ./...
+```
+
+```console
+== Deadlines compose by taking the earliest ==
+request budget  = 200 ms
+bank-call asked = 800 ms, got 200 ms (inherited)
+after 250 ms: request cancelled? true (deadline exceeded)
+              bank-call cancelled? true, root cancelled? false
+
+== One sibling fails: the others are cancelled and clean up ==
+DECLINED (velocity rule tripped)
+  cleanup: balance-check: released hold
+  cleanup: fx-quote: closed quote stream
+
+== The bank is slower than the budget: deadline cancels everything ==
+TIMEOUT (authorize: deadline exceeded)
+  cleanup: balance-check: released hold
+  cleanup: fx-quote: closed quote stream
+
+== Leaving a scope without join still waits for every child ==
+scope cancelled on close: leaky: scope closed without join
+subtasks cancelled = 3 of 3; completed normally = 0; still running after close = 0
 ```
 
 ## Use It

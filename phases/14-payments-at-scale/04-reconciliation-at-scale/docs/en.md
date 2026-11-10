@@ -384,25 +384,253 @@ Half a second for a million records on two cores, and the time is dominated by i
 
 ### In Python
 
-`code/python/main.py` keeps the same pieces: `Rec`, `BucketKey`, `BucketDigest`, `StreamingReconciler` with its `Cursor`, `ReconciliationReport`, and `FeedGenerator`. The demo reconciles the same million records with the same seed and prints the same 510 breaks. Four things differ:
+The Python port (`code/python/main.py`, tests in `test_main.py`) keeps the same pieces: `Rec`, `BucketKey`, `BucketDigest`, `StreamingReconciler` with its `Cursor`, `ReconciliationReport`, and `FeedGenerator`. The demo reconciles the same million records with the same seed and prints the same 510 breaks. Four things differ. **The digest must be masked:** Java's `mix` relies on `long` overflow and `>>>`; Python integers never wrap, so every multiply is followed by `& 0xFFFFFFFFFFFFFFFF`, the value is kept unsigned so `>>` is a logical shift, and the running sum in `add` is masked the same way; forget one mask and the two sides' digests diverge on the first large bucket. **The seeded generator is `java.util.Random`, not `random.Random`:** `FeedGenerator` uses a 25-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop and `nextDouble`), so seed 42 produces the same feeds, the same buckets, and the same first three breaks as the Java run; a test pins the sequence to values taken from the JDK. **Hot-path types are tuples:** `BucketKey` and `BucketDigest` are `NamedTuple`s rather than frozen dataclasses, because one of each is built per record and tuple construction, equality, and ordering run in C; the report accumulates its three totals as plain minor-unit ints and exposes `matched_total`, `internal_total`, and `processor_total` as `Money` properties, since a million `Money.plus` calls would otherwise cost more than the merge itself, and the cursor caches `head.bucket()` once per record. With those changes the million-record demo runs in a few seconds on CPython, most of it in generating and sorting the feeds. **Exceptions:** the unsorted feed raises `RuntimeError` (Java's `IllegalStateException`) and a record on the wrong feed raises `ValueError` (`IllegalArgumentException`); `EnumMap` ordering in the summary is reproduced by iterating `BreakType` and `AgeBand` in declaration order. The Python tests port all 31 Java checks (58 assertions), including the seeded 100,000-record run that must surface exactly the injected number of breaks and tie out.
 
-- **The digest must be masked.** Java's `mix` relies on `long` overflow and `>>>`; Python integers never wrap, so every multiply is followed by `& 0xFFFFFFFFFFFFFFFF`, the value is kept unsigned so `>>` is a logical shift, and the running sum in `add` is masked the same way. Forget one mask and the two sides' digests diverge on the first large bucket.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Money, trimmed
+
+`Money` is a frozen dataclass with only what this lesson needs. Python ints cannot overflow, so `plus` has no `addExact`; `_require_same_currency` still raises on a mismatch, as early as the first `plus` of a foreign amount.
 
 ```python
-@staticmethod
-def mix(ref: str) -> int:
-    h = 0x9E3779B97F4A7C15
-    for b in ref.encode():
-        h = ((h ^ b) * 0xBF58476D1CE4E5B9) & MASK64
-    h ^= h >> 31
-    h = (h * 0x94D049BB133111EB) & MASK64
-    h ^= h >> 29
-    return h
+class Money:
+    minor_units: int
+    currency: Currency
+
+    @staticmethod
+    def of_minor(minor_units: int, currency: Currency) -> "Money":
+        return Money(minor_units, currency)
+
+    @staticmethod
+    def zero(currency: Currency) -> "Money":
+        return Money(0, currency)
+
+    def _require_same_currency(self, other: "Money") -> None:
+        if self.currency != other.currency:
+            raise CurrencyMismatchError(self.currency, other.currency)
+
+    def plus(self, other: "Money") -> "Money":
+        self._require_same_currency(other)
+        return Money(self.minor_units + other.minor_units, self.currency)
+
+    def minus(self, other: "Money") -> "Money":
+        self._require_same_currency(other)
+        return Money(self.minor_units - other.minor_units, self.currency)
 ```
 
-- **The seeded generator is `java.util.Random`, not `random.Random`.** `FeedGenerator` uses a 25-line `JavaRandom` (the JDK's 48-bit LCG with the exact `nextInt(bound)` rejection loop and `nextDouble`), so seed 42 produces the same feeds, the same buckets, and the same first three breaks as the Java run. A test pins the sequence to values taken from the JDK.
-- **Hot-path types are tuples.** `BucketKey` and `BucketDigest` are `NamedTuple`s rather than frozen dataclasses: one of each is built per record, and tuple construction, equality, and ordering run in C. The report accumulates its three totals as plain minor-unit ints and exposes `matched_total`, `internal_total`, and `processor_total` as `Money` properties; a million `Money.plus` calls would otherwise cost more than the merge itself. The cursor also caches `head.bucket()` once per record. With those changes the million-record demo runs in about eight seconds on CPython, roughly ten times the Java figure, most of it in generating and sorting the feeds.
-- **Exceptions.** The unsorted feed raises `RuntimeError` (Java's `IllegalStateException`) and a record on the wrong feed raises `ValueError` (`IllegalArgumentException`); `EnumMap` ordering in the summary is reproduced by iterating `BreakType` and `AgeBand` in declaration order.
+#### Step 2: The record and its bucket key
+
+`BucketKey` is a `NamedTuple`, so comparing and hashing a million keys runs in C, and tuple ordering is exactly the Java comparator chain: epoch day, currency, amount. `Rec.bucket()` computes the epoch day from `toordinal()`; `lag_days` is the booking lag.
+
+```python
+class BucketKey(NamedTuple):
+    """The join key of the streaming merge: (txDate, currency, amount). Both feeds must be sorted by this key;
+    the reconciler verifies the ordering and refuses to proceed on a violation, because a merge join over an
+    unsorted feed silently reports every record as a break. A NamedTuple so that comparing, hashing and sorting
+    a million keys run in C; a frozen dataclass with order=True does the same work in Python, several times slower."""
+
+    epoch_day: int
+    currency: str
+    amount_minor: int
+
+    def __str__(self) -> str:
+        return f"{of_epoch_day(self.epoch_day)}/{self.currency}/{self.amount_minor}"
+
+
+@dataclass(frozen=True)
+class Rec:
+    """One line of a feed. `ref` is the shared identifier both sides carry. `tx_date` is the date of the underlying
+    transaction, which both sides know and which is therefore safe to join on. `value_date` is the date this side
+    booked the record: capture date for us, settlement date for the processor."""
+
+    ref: str
+    tx_date: date
+    value_date: date
+    amount: Money
+    side: Side
+
+    def bucket(self) -> BucketKey:
+        return BucketKey(self.tx_date.toordinal() - EPOCH_ORDINAL, self.amount.currency.code, self.amount.minor_units)
+
+    def lag_days(self) -> int:
+        """Days between the transaction and this side booking it; a processor lag beyond tolerance is a TIMING break."""
+        return epoch_day(self.value_date) - epoch_day(self.tx_date)
+```
+
+#### Step 3: The digest
+
+`mix` is the SplitMix64 finaliser with a `& MASK64` after each multiply and an unsigned value so `>>` is logical. `add` masks the running hash sum too; `count` and `total_minor` travel alongside, and `EMPTY` is the zero tuple.
+
+```python
+class BucketDigest(NamedTuple):
+    """Order-independent digest of a set of references. Each reference is mixed through a 64-bit finaliser and the
+    results are summed; equal sets give equal digests regardless of order, and the count travels alongside.
+    A NamedTuple: one is built per record, and tuple construction and equality run in C."""
+
+    hash: int
+    count: int
+    total_minor: int
+
+    @staticmethod
+    def mix(ref: str) -> int:
+        """The Java version relies on long overflow; here every multiply is masked to 64 bits and the shifts are
+        logical because the value is kept unsigned. Iterating the UTF-8 bytes equals charAt for the ASCII refs."""
+        h = 0x9E3779B97F4A7C15
+        for b in ref.encode():
+            h = ((h ^ b) * 0xBF58476D1CE4E5B9) & MASK64
+        h ^= h >> 31
+        h = (h * 0x94D049BB133111EB) & MASK64
+        h ^= h >> 29
+        return h
+
+    def add(self, r: Rec) -> "BucketDigest":
+        return BucketDigest((self[0] + BucketDigest.mix(r.ref)) & MASK64, self[1] + 1, self[2] + r.amount.minor_units)
+
+
+BucketDigest.EMPTY = BucketDigest(0, 0, 0)
+```
+
+#### Step 4: The order-checking cursor
+
+`_advance` pulls the next record with `next(it, None)`, refuses a record from the wrong feed with `ValueError`, compares the new key with the last one (tuple `<`), and raises `RuntimeError` the moment a key goes backwards. It caches `head_key` so the merge loop never recomputes a bucket.
+
+```python
+    def _advance(self) -> None:
+        nxt = next(self.it, None)
+        if nxt is None:
+            self.head = None
+            self.head_key = None
+            return
+        if nxt.side is not self.side:
+            raise ValueError(f"record {nxt.ref} is on the wrong feed")
+        k = nxt.bucket()
+        if self.last is not None and k < self.last:
+            raise RuntimeError(f"{self.side} feed is not sorted: {k} after {self.last}")
+        self.last = k
+        self.head = nxt
+        self.head_key = k
+```
+
+#### Step 5: The merge loop
+
+The loop reads the cached head keys (`None` once a feed is exhausted), picks the smaller, drains both sides, accumulates counts and minor-unit totals from the digests, and takes the fast path when `da == db` with nothing deferred.
+
+```python
+        while a.head is not None or b.head is not None:
+            ka, kb = a.head_key, b.head_key  # None once that feed is exhausted
+            if ka is None:
+                key = kb
+            elif kb is None:
+                key = ka
+            else:
+                key = ka if ka <= kb else kb
+            r.buckets_seen += 1
+
+            buf_a.clear()
+            buf_b.clear()
+            late.clear()
+            da = a.drain_bucket(key, buf_a, never, late) if ka == key else BucketDigest.EMPTY
+            db = b.drain_bucket(key, buf_b, settled_late, late) if kb == key else BucketDigest.EMPTY
+            r.internal_count += da.count
+            r.processor_count += db.count + len(late)
+            r.internal_minor += da.total_minor
+            r.processor_minor += db.total_minor
+            for y in late:
+                r.processor_minor += y.amount.minor_units
+                leftover_processor.setdefault(y.ref, []).append(y)
+
+            if da == db and not late:
+                # Fast path: same count, same digest, same total -> the bucket matches as a whole.
+                r.buckets_fast_matched += 1
+                r.matched_count += da.count
+                r.matched_minor += da.total_minor
+                continue
+            r.buckets_inspected += 1
+            self._inspect_bucket(buf_a, buf_b, r, leftover_internal, leftover_processor, as_of)
+        self._classify_leftovers(leftover_internal, leftover_processor, r, as_of)
+        r.breaks.sort(key=lambda br: (br.type.value, br.ref))
+        return r
+```
+
+#### Step 6: The slow path inside one bucket
+
+`_inspect_bucket` pairs by reference with a dict, counts a matched pair once, flags a repeated reference as `DUPLICATE` immediately, and parks the rest as leftovers.
+
+```python
+    def _inspect_bucket(self, buf_a: list, buf_b: list, r: ReconciliationReport,
+                        leftover_internal: dict, leftover_processor: dict, as_of: date) -> None:
+        """Within one bucket, pair records by ref. A second copy of a ref already seen in this bucket is a DUPLICATE
+        on that side; anything unpaired is parked as a leftover for the cross-bucket pass."""
+        by_ref: dict[str, Rec] = {}
+        matched_here: set[str] = set()
+        for x in buf_a:
+            if x.ref in by_ref:
+                r.breaks.append(Break(BreakType.DUPLICATE, x.ref, x, None, StreamingReconciler.age_days(x.tx_date, as_of)))
+            else:
+                by_ref[x.ref] = x
+        for y in buf_b:
+            x = by_ref.pop(y.ref, None)
+            if x is not None:
+                r.matched_count += 1                        # count the pair once
+                r.matched_minor += x.amount.minor_units     # one amount, matched on both sides
+                matched_here.add(y.ref)
+            elif y.ref in matched_here:
+                r.breaks.append(Break(BreakType.DUPLICATE, y.ref, None, y, StreamingReconciler.age_days(y.tx_date, as_of)))
+            else:
+                leftover_processor.setdefault(y.ref, []).append(y)
+        for x in by_ref.values():
+            leftover_internal.setdefault(x.ref, []).append(x)
+```
+
+#### Step 7: The cross-bucket pass
+
+`_classify_leftovers` pairs leftovers positionally per reference: amount mismatch first, then the timing tolerance, then the unpaired tail as missing or duplicate.
+
+```python
+    def _classify_leftovers(self, li: dict, lp: dict, r: ReconciliationReport, as_of: date) -> None:
+        """Cross-bucket pass: pair leftovers by ref and name the break. Runs once, over breaks only."""
+        refs = list(li.keys())
+        for ref in lp.keys():
+            if ref not in li:
+                refs.append(ref)
+        for ref in refs:
+            xs = li.get(ref, [])
+            ys = lp.get(ref, [])
+            pairs = min(len(xs), len(ys))
+            for i in range(pairs):
+                x, y = xs[i], ys[i]
+                age = StreamingReconciler.age_days(x.tx_date, as_of)
+                if x.amount != y.amount:
+                    r.breaks.append(Break(BreakType.AMOUNT_MISMATCH, ref, x, y, age))
+                elif abs(epoch_day(x.value_date) - epoch_day(y.value_date)) <= self.timing_tolerance_days:
+                    # Same ref, same amount, dates within tolerance: matched, but recorded for visibility.
+                    r.matched_count += 1
+                    r.matched_minor += x.amount.minor_units
+                else:
+                    r.breaks.append(Break(BreakType.TIMING, ref, x, y, age))
+            for i in range(pairs, len(xs)):
+                x = xs[i]
+                t = BreakType.DUPLICATE if (i > 0 or pairs > 0) else BreakType.MISSING_AT_PROCESSOR
+                r.breaks.append(Break(t, ref, x, None, StreamingReconciler.age_days(x.tx_date, as_of)))
+            for i in range(pairs, len(ys)):
+                y = ys[i]
+                t = BreakType.DUPLICATE if (i > 0 or pairs > 0) else BreakType.MISSING_INTERNAL
+                r.breaks.append(Break(t, ref, None, y, StreamingReconciler.age_days(y.tx_date, as_of)))
+```
+
+#### Step 8: The tie-out and the summary
+
+`ties_out` compares the `Money` properties, so a one-cent discrepancy anywhere fails the equation.
+
+```python
+    def ties_out(self) -> bool:
+        """The tie-out: every record on each side is either matched or inside exactly one break.
+        A report that does not tie out has lost or double-counted a record and must not be published."""
+        return (self.internal_total == self.matched_total.plus(self.internal_in_breaks())
+                and self.processor_total == self.matched_total.plus(self.processor_in_breaks()))
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/14-payments-at-scale/04-reconciliation-at-scale/code/python
@@ -410,30 +638,321 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The Python tests port all 31 Java checks (58 assertions), including the seeded 100,000-record run that must surface exactly the injected number of breaks and tie out.
+The timings are CPython's; the counts and totals are the Java run's:
+
+```console
+== 1,000,000 records, seeded, 0.1% injected breaks ==
+generated 500,000 + 500,018 records in 4019 ms (510 break situations injected)
+reconciled in 3561 ms
+as of 2026-03-31
+internal:  500,000 records  125447340.36 USD
+processor: 500,018 records  125452155.51 USD
+```
 
 ### In Go
 
-`code/go/main.go` keeps the same pieces: `Rec`, `BucketKey`, `BucketDigest`, `StreamingReconciler` with its `cursor`, `ReconciliationReport`, and `FeedGenerator`; `javarandom.go` carries the JDK generator. The demo reconciles the same million records with seed 42 and prints the same 510 breaks and the same first three. Four things differ:
+The Go port (`code/go/main.go`, tests in `main_test.go`) keeps the same pieces: `Rec`, `BucketKey`, `BucketDigest`, `StreamingReconciler` with its `cursor`, `ReconciliationReport`, and `FeedGenerator`; `javarandom.go` carries the JDK generator. The demo reconciles the same million records with seed 42 and prints the same 510 breaks and the same first three. Four things differ. **The digest wraps natively on `uint64`:** Java's `mix` relies on `long` overflow and `>>>`; Go's `uint64` multiply wraps and `>>` is a logical shift, so the SplitMix64 finaliser is written exactly as in the Java with no masks, and `BucketDigest` is a comparable struct, so the fast path is `da == db`. **Feeds are iterators, failures are errors:** `Reconcile` takes two `RecIterator` closures (`func() (Rec, bool)`; `SliceIterator` wraps a slice, a production feed would wrap a `bufio.Scanner`) and returns `(*ReconciliationReport, error)`; the unsorted feed is `ErrUnsortedFeed` and a record on the wrong side is `ErrWrongFeed`, both wrapped with `%w` so the tests use `errors.Is`; inside the merge, a `need(...)` helper panics on an error and a deferred `catch` turns it back into the returned error, so the checked `Money.Plus` calls on the running totals do not each need an `if err != nil`. **Dates are UTC `time.Time`, keys are epoch days:** `EpochDay` is `LocalDate.toEpochDay`, so `BucketKey` holds three integers and compares in a few instructions; `SortFeed` sorts an index with `sort.SliceStable` (Java's `List.sort` is stable too, which decides which of two duplicate lines gets matched). **`EnumMap` order and `%,d`:** `CountByType` returns a plain map, so `Summary` iterates `BreakType` and `AgeBand` in declaration order and skips absent keys to print what the Java `EnumMap` prints; a small `commas` helper stands in for `%,d`. The Go run generates and reconciles the million records in about two seconds. The Go tests port all 31 Java checks (35 assertions), including the seeded 100,000-record run, and pass under `go test -race`.
 
-- **The digest wraps natively on `uint64`.** Java's `mix` relies on `long` overflow and `>>>`; Go's `uint64` multiply wraps and `>>` is a logical shift, so the SplitMix64 finaliser is written exactly as in the Java with no masks. `BucketDigest` is a comparable struct, so the fast path is `da == db`.
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Money, trimmed
+
+`Money` is a two-field struct; `Plus` returns `(Money, error)` with `addChecked` standing in for `Math.addExact` and the currency check first.
 
 ```go
-func Mix(ref string) uint64 {
-    h := uint64(0x9E3779B97F4A7C15)
-    for i := 0; i < len(ref); i++ {
-        h = (h ^ uint64(ref[i])) * 0xBF58476D1CE4E5B9
-    }
-    h ^= h >> 31
-    h *= 0x94D049BB133111EB
-    h ^= h >> 29
-    return h
+type Money struct {
+	MinorUnits int64
+	Currency   Currency
+}
+
+func OfMinor(minorUnits int64, currency Currency) Money { return Money{minorUnits, currency} }
+func Zero(currency Currency) Money                      { return Money{0, currency} }
+
+func (m Money) Plus(other Money) (Money, error) {
+	if err := m.requireSameCurrency(other); err != nil {
+		return Money{}, err
+	}
+	sum, err := addChecked(m.MinorUnits, other.MinorUnits)
+	return Money{sum, m.Currency}, err
 }
 ```
 
-- **Feeds are iterators, failures are errors.** `Reconcile` takes two `RecIterator` closures (`func() (Rec, bool)`; `SliceIterator` wraps a slice, a production feed would wrap a `bufio.Scanner`) and returns `(*ReconciliationReport, error)`. The unsorted feed is `ErrUnsortedFeed` and a record on the wrong side is `ErrWrongFeed`, both wrapped with `%w` so the tests use `errors.Is`. Inside the merge, a `need(...)` helper panics on an error and a deferred `catch` turns it back into the returned error, so the checked `Money.Plus` calls on the running totals do not each need an `if err != nil`.
-- **Dates are UTC `time.Time`, keys are epoch days.** `EpochDay` is `LocalDate.toEpochDay`, so `BucketKey` holds three integers and compares in a few instructions; `SortFeed` sorts an index with `sort.SliceStable` (Java's `List.sort` is stable too, which decides which of two duplicate lines gets matched).
-- **`EnumMap` order and `%,d`.** `CountByType` returns a plain map, so `Summary` iterates `BreakType` and `AgeBand` in declaration order and skips absent keys to print what the Java `EnumMap` prints; a small `commas` helper stands in for `%,d`. The Go run generates and reconciles the million records in about two seconds.
+#### Step 2: The record and its bucket key
+
+`Rec.Bucket()` builds a three-integer `BucketKey` from the epoch day; `Compare` is the Java comparator chain as a tagless `switch`, and because the struct is comparable the merge loop can also test `a.key() == key` directly.
+
+```go
+type Rec struct {
+	Ref       string
+	TxDate    time.Time
+	ValueDate time.Time
+	Amount    Money
+	Side      Side
+}
+
+func (r Rec) Bucket() BucketKey {
+	return BucketKey{EpochDay(r.TxDate), r.Amount.Currency.Code, r.Amount.MinorUnits}
+}
+
+// LagDays is the days between the transaction and this side booking it; a processor lag beyond tolerance is a TIMING break.
+func (r Rec) LagDays() int64 { return EpochDay(r.ValueDate) - EpochDay(r.TxDate) }
+
+// BucketKey is the join key of the streaming merge: (txDate, currency, amount). Both feeds must be sorted by
+// this key; the reconciler verifies the ordering and refuses to proceed on a violation, because a merge join
+// over an unsorted feed silently reports every record as a break.
+type BucketKey struct {
+	EpochDay    int64
+	Currency    string
+	AmountMinor int64
+}
+
+// Compare orders by epoch day, then currency, then amount.
+func (k BucketKey) Compare(other BucketKey) int {
+	switch {
+	case k.EpochDay != other.EpochDay:
+		return cmpInt64(k.EpochDay, other.EpochDay)
+	case k.Currency != other.Currency:
+		return strings.Compare(k.Currency, other.Currency)
+	default:
+		return cmpInt64(k.AmountMinor, other.AmountMinor)
+	}
+}
+```
+
+#### Step 3: The digest
+
+`Mix` is the SplitMix64 finaliser on `uint64`, written without masks because the type wraps. `Add` returns an error only from the checked total.
+
+```go
+type BucketDigest struct {
+	Hash       uint64
+	Count      int
+	TotalMinor int64
+}
+
+var EmptyDigest = BucketDigest{}
+
+// Mix is the SplitMix64 finaliser over the bytes of the ref; uint64 wraps exactly like Java's long.
+func Mix(ref string) uint64 {
+	h := uint64(0x9E3779B97F4A7C15)
+	for i := 0; i < len(ref); i++ {
+		h = (h ^ uint64(ref[i])) * 0xBF58476D1CE4E5B9
+	}
+	h ^= h >> 31
+	h *= 0x94D049BB133111EB
+	h ^= h >> 29
+	return h
+}
+
+func (d BucketDigest) Add(r Rec) (BucketDigest, error) {
+	total, err := addChecked(d.TotalMinor, r.Amount.MinorUnits)
+	if err != nil {
+		return BucketDigest{}, err
+	}
+	return BucketDigest{d.Hash + Mix(r.Ref), d.Count + 1, total}, nil
+}
+```
+
+#### Step 4: The order-checking cursor
+
+`advance` returns `ErrWrongFeed` or `ErrUnsortedFeed` wrapped with `%w`, keeps `last` as a pointer so "no key yet" is `nil`, and caches `headKey`.
+
+```go
+func (c *cursor) advance() error {
+	next, ok := c.next()
+	if !ok {
+		c.head = nil
+		return nil
+	}
+	if next.Side != c.side {
+		return fmt.Errorf("%w: record %s", ErrWrongFeed, next.Ref)
+	}
+	k := next.Bucket()
+	if c.last != nil && k.Compare(*c.last) < 0 {
+		return fmt.Errorf("%w: %v feed is not sorted: %v after %v", ErrUnsortedFeed, c.side, k, *c.last)
+	}
+	c.last = &k
+	c.head = &next
+	c.headKey = k
+	return nil
+}
+```
+
+#### Step 5: The merge loop
+
+`Reconcile` uses `defer catch(&err)` and `need(...)` so the body reads like the Java while every checked call still surfaces as the returned error. Buffers are re-sliced to zero length each round to avoid reallocating; the fast path is a struct equality.
+
+```go
+func (s *StreamingReconciler) Reconcile(internal, processor RecIterator, asOf time.Time) (r *ReconciliationReport, err error) {
+	defer catch(&err)
+	r = NewReconciliationReport(s.currency, asOf)
+	a := need(newCursor(internal, Internal))
+	b := need(newCursor(processor, Processor))
+	// Unmatched records, keyed by ref, waiting for a partner from a different bucket.
+	leftoverInternal := map[string][]Rec{}
+	leftoverProcessor := map[string][]Rec{}
+	var bufA, bufB, late []Rec
+	never := func(Rec) bool { return false }
+	settledLate := func(x Rec) bool { return x.LagDays() > s.timingToleranceDays }
+
+	for a.hasNext() || b.hasNext() {
+		var key BucketKey
+		switch {
+		case !a.hasNext():
+			key = b.key()
+		case !b.hasNext():
+			key = a.key()
+		case a.key().Compare(b.key()) <= 0:
+			key = a.key()
+		default:
+			key = b.key()
+		}
+		r.BucketsSeen++
+
+		bufA, bufB, late = bufA[:0], bufB[:0], late[:0]
+		da, db := EmptyDigest, EmptyDigest
+		if a.hasNext() && a.key() == key {
+			da = need(a.drainBucket(key, &bufA, never, &late))
+		}
+		if b.hasNext() && b.key() == key {
+			db = need(b.drainBucket(key, &bufB, settledLate, &late))
+		}
+		r.InternalCount += int64(da.Count)
+		r.ProcessorCount += int64(db.Count + len(late))
+		r.InternalTotal = need(r.InternalTotal.Plus(OfMinor(da.TotalMinor, s.currency)))
+		r.ProcessorTotal = need(r.ProcessorTotal.Plus(OfMinor(db.TotalMinor, s.currency)))
+		for _, y := range late {
+			r.ProcessorTotal = need(r.ProcessorTotal.Plus(y.Amount))
+			leftoverProcessor[y.Ref] = append(leftoverProcessor[y.Ref], y)
+		}
+
+		if da == db && len(late) == 0 {
+			// Fast path: same count, same digest, same total -> the bucket matches as a whole.
+			r.BucketsFastMatched++
+			r.MatchedCount += int64(da.Count)
+			r.MatchedTotal = need(r.MatchedTotal.Plus(OfMinor(da.TotalMinor, s.currency)))
+			continue
+		}
+		r.BucketsInspected++
+		s.inspectBucket(bufA, bufB, r, leftoverInternal, leftoverProcessor, asOf)
+	}
+	s.classifyLeftovers(leftoverInternal, leftoverProcessor, r, asOf)
+	sort.SliceStable(r.Breaks, func(i, j int) bool {
+		if r.Breaks[i].Type != r.Breaks[j].Type {
+			return r.Breaks[i].Type < r.Breaks[j].Type
+		}
+		return r.Breaks[i].Ref < r.Breaks[j].Ref
+	})
+	return r, nil
+}
+```
+
+#### Step 6: The slow path inside one bucket
+
+`inspectBucket` keeps an `order` slice beside `byRef` so leftovers are parked in feed order, which a Go map alone would not guarantee; otherwise it is the Java logic with `ptr(x)` producing the optional halves of a `Break`.
+
+```go
+func (s *StreamingReconciler) inspectBucket(bufA, bufB []Rec, r *ReconciliationReport,
+	leftoverInternal, leftoverProcessor map[string][]Rec, asOf time.Time) {
+	byRef := map[string]Rec{}
+	order := []string{} // insertion order of byRef, so leftovers are parked in feed order like the Java
+	matchedHere := map[string]bool{}
+	for _, x := range bufA {
+		if _, dup := byRef[x.Ref]; dup {
+			r.Breaks = append(r.Breaks, Break{Duplicate, x.Ref, ptr(x), nil, AgeDays(x.TxDate, asOf)})
+		} else {
+			byRef[x.Ref] = x
+			order = append(order, x.Ref)
+		}
+	}
+	for _, y := range bufB {
+		if x, ok := byRef[y.Ref]; ok {
+			delete(byRef, y.Ref)
+			r.MatchedCount++                                     // count the pair once
+			r.MatchedTotal = need(r.MatchedTotal.Plus(x.Amount)) // one amount, matched on both sides
+			matchedHere[y.Ref] = true
+		} else if matchedHere[y.Ref] {
+			r.Breaks = append(r.Breaks, Break{Duplicate, y.Ref, nil, ptr(y), AgeDays(y.TxDate, asOf)})
+		} else {
+			leftoverProcessor[y.Ref] = append(leftoverProcessor[y.Ref], y)
+		}
+	}
+	for _, ref := range order {
+		if x, ok := byRef[ref]; ok {
+			leftoverInternal[ref] = append(leftoverInternal[ref], x)
+		}
+	}
+}
+```
+
+#### Step 7: The cross-bucket pass
+
+`classifyLeftovers` pairs positionally, with the amount test before the timing test and the unpaired tail classified as missing or duplicate.
+
+```go
+func (s *StreamingReconciler) classifyLeftovers(li, lp map[string][]Rec, r *ReconciliationReport, asOf time.Time) {
+	refs := make([]string, 0, len(li)+len(lp))
+	for ref := range li {
+		refs = append(refs, ref)
+	}
+	for ref := range lp {
+		if _, both := li[ref]; !both {
+			refs = append(refs, ref)
+		}
+	}
+	for _, ref := range refs {
+		xs, ys := li[ref], lp[ref]
+		pairs := min(len(xs), len(ys))
+		for i := 0; i < pairs; i++ {
+			x, y := xs[i], ys[i]
+			age := AgeDays(x.TxDate, asOf)
+			lag := EpochDay(x.ValueDate) - EpochDay(y.ValueDate)
+			if lag < 0 {
+				lag = -lag
+			}
+			switch {
+			case x.Amount != y.Amount:
+				r.Breaks = append(r.Breaks, Break{AmountMismatch, ref, ptr(x), ptr(y), age})
+			case lag <= s.timingToleranceDays:
+				// Same ref, same amount, dates within tolerance: matched, but recorded for visibility.
+				r.MatchedCount++
+				r.MatchedTotal = need(r.MatchedTotal.Plus(x.Amount))
+			default:
+				r.Breaks = append(r.Breaks, Break{Timing, ref, ptr(x), ptr(y), age})
+			}
+		}
+		for i := pairs; i < len(xs); i++ {
+			x := xs[i]
+			t := MissingAtProcessor
+			if i > 0 || pairs > 0 {
+				t = Duplicate
+			}
+			r.Breaks = append(r.Breaks, Break{t, ref, ptr(x), nil, AgeDays(x.TxDate, asOf)})
+		}
+		for i := pairs; i < len(ys); i++ {
+			y := ys[i]
+			t := MissingInternal
+			if i > 0 || pairs > 0 {
+				t = Duplicate
+			}
+			r.Breaks = append(r.Breaks, Break{t, ref, nil, ptr(y), AgeDays(y.TxDate, asOf)})
+		}
+	}
+}
+```
+
+#### Step 8: The tie-out and the summary
+
+`TiesOut` is the same equation; `need` unwraps the two `Plus` calls because a currency mismatch here would be a bug, not a reconciliation finding.
+
+```go
+func (r *ReconciliationReport) TiesOut() bool {
+	return r.InternalTotal == need(r.MatchedTotal.Plus(r.InternalInBreaks())) &&
+		r.ProcessorTotal == need(r.MatchedTotal.Plus(r.ProcessorInBreaks()))
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/14-payments-at-scale/04-reconciliation-at-scale/code/go
@@ -441,7 +960,16 @@ go run .
 go test ./...
 ```
 
-The Go tests port all 31 Java checks (35 assertions), including the seeded 100,000-record run that must surface exactly the injected number of breaks and tie out, and pass under `go test -race`.
+The counts and totals match the Java run; the timings are Go's:
+
+```console
+== 1,000,000 records, seeded, 0.1% injected breaks ==
+generated 500,000 + 500,018 records in 1515 ms (510 break situations injected)
+reconciled in 469 ms
+as of 2026-03-31
+internal:  500,000 records  125447340.36 USD
+processor: 500,018 records  125452155.51 USD
+```
 
 ## Use It
 

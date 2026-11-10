@@ -334,28 +334,172 @@ The test harness prints `45 passed, 0 failed`.
 
 ### In Python
 
+The Python port (`code/python/main.py`) keeps `ArrayStack`, `OverflowPolicy`, and the sequence-numbered `RingBuffer`. What differs: **`%` floors in Python.** `-1 % 4` is `3` in Python but `-1` in Java and Go, so the port could drop `_rebase` and still index correctly. It keeps it anyway: `head_sequence()` is an offset other code compares, and every language must report the same offset after an `offer_first` at sequence 0. Sequences are plain `int`, so the Java `long` never needs a cast to `int` for `size()`. **`None` is the empty signal:** `poll_first`, `poll_last`, `peek_first`, and `peek_last` return `None` when empty, exactly like the Java nullable return. That works because the demo never stores `None`; a buffer that must hold `None` would need a sentinel object or an exception. **Exceptions:** `NoSuchElementException` from `pop` and `peek` on an empty stack becomes `IndexError` (what `list.pop()` raises), out-of-range `get` is `IndexError`, and a bad capacity is `ValueError`. **The model is `collections.deque`:** the model-based test replays the same 2,000 operations as Java by porting `java.util.Random(11)` exactly, then compares against `collections.deque` instead of `ArrayDeque`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The stack is a dynamic array that only touches the end
+
+The backing store is a preallocated list of `None` slots, as in the dynamic-array lesson; `push` doubles it by concatenation when full. `pop` raises `IndexError` on empty rather than returning `None`, because an empty stack during unwinding is a logic error, and it clears the vacated slot so a popped closure is not pinned.
+
 ```python
-def offer_first(self, value: T) -> bool:
-    """Enqueue at the front, stealing the slot before head. Under DROP_OLDEST when full, drops the newest."""
-    if self.is_full():
-        if self._policy is OverflowPolicy.REJECT:
-            return False
-        self._tail -= 1
-        self._slots[self.index_of(self._tail)] = None
-        self._dropped += 1
-    self._head -= 1
-    if self._head < 0:
-        self._rebase()
-    self._slots[self.index_of(self._head)] = value
-    return True
+class ArrayStack(Generic[T]):
+    def __init__(self, initial_capacity: int) -> None:
+        if initial_capacity < 1:
+            raise ValueError("initial_capacity must be >= 1")
+        self._elements: list[Optional[T]] = [None] * initial_capacity
+        self._size = 0
+
+    def push(self, value: T) -> None:
+        if self._size == len(self._elements):
+            self._elements = self._elements + [None] * len(self._elements)  # Arrays.copyOf to double
+        self._elements[self._size] = value
+        self._size += 1
+
+    def pop(self) -> T:
+        if self._size == 0:
+            raise IndexError("stack is empty")  # Java: NoSuchElementException
+        self._size -= 1
+        v = self._elements[self._size]
+        self._elements[self._size] = None  # do not pin the popped object
+        return v  # type: ignore[return-value]
 ```
 
-`code/python/main.py` keeps `ArrayStack`, `OverflowPolicy`, and the sequence-numbered `RingBuffer`. What differs:
+#### Step 2: The overflow policy is part of the type
 
-- **`%` floors in Python.** `-1 % 4` is `3` in Python but `-1` in Java and Go, so the port could drop `_rebase` and still index correctly. It keeps it anyway: `head_sequence()` is an offset other code compares, and every language must report the same offset after an `offer_first` at sequence 0. Sequences are plain `int`, so the Java `long` never needs a cast to `int` for `size()`.
-- **`None` is the empty signal.** `poll_first`, `poll_last`, `peek_first`, and `peek_last` return `None` when empty, exactly like the Java nullable return. That works because the demo never stores `None`; a buffer that must hold `None` would need a sentinel object or an exception.
-- **Exceptions.** `NoSuchElementException` from `pop` and `peek` on an empty stack becomes `IndexError` (what `list.pop()` raises), out-of-range `get` is `IndexError`, and a bad capacity is `ValueError`.
-- **The model is `collections.deque`.** The model-based test replays the same 2,000 operations as Java by porting `java.util.Random(11)` exactly, then compares against `collections.deque` instead of `ArrayDeque`.
+A two-member `Enum`. `BLOCK` is absent for the same reason as in Java: blocking needs a thread to wait, which is Phase 4.
+
+```python
+class OverflowPolicy(Enum):
+    """What a bounded buffer does when a producer offers into a full buffer. BLOCK belongs to Phase 4."""
+
+    REJECT = "REJECT"            # offer returns False; the producer must slow down or retry: backpressure
+    DROP_OLDEST = "DROP_OLDEST"  # overwrite the oldest element; the consumer loses history, the producer never waits
+```
+
+#### Step 3: Two sequence numbers, one array
+
+`_head` and `_tail` are Python ints, which never overflow, so the 292,000-year argument is moot here but the design is kept so sequences mean the same thing in all three languages. `size` is the difference, `is_full` compares it with the slot count, and `index_of` is `seq % capacity`.
+
+```python
+class RingBuffer(Generic[T]):
+    def __init__(self, capacity: int, policy: OverflowPolicy) -> None:
+        if capacity < 1:
+            raise ValueError("capacity must be >= 1")
+        if policy is None:
+            raise ValueError("policy must not be None")
+        self._slots: list[Optional[T]] = [None] * capacity
+        self._policy = policy
+        self._head = 0      # sequence of the first (oldest) element
+        self._tail = 0      # sequence one past the last (newest) element
+        self._dropped = 0   # elements overwritten under DROP_OLDEST
+
+    def size(self) -> int:
+        return self._tail - self._head
+
+    def is_empty(self) -> bool:
+        return self._head == self._tail
+
+    def is_full(self) -> bool:
+        return self._tail - self._head == len(self._slots)
+
+    def head_sequence(self) -> int:
+        return self._head
+
+    def tail_sequence(self) -> int:
+        return self._tail
+
+    def index_of(self, seq: int) -> int:
+        """The slot for a sequence number. With a power-of-two capacity this could be seq & (capacity - 1)."""
+        return seq % len(self._slots)
+```
+
+#### Step 4: Enqueue at the back, with the policy applied
+
+Identical control flow: under `DROP_OLDEST` the oldest slot is cleared and `head` advanced before the write, which turns the overwrite into an eviction; `dropped` is incremented so the consumer can see the gap.
+
+```python
+    def offer_last(self, value: T) -> bool:
+        """Enqueue at the back. Returns False only under REJECT when full. O(1), no element ever moves."""
+        if self.is_full():
+            if self._policy is OverflowPolicy.REJECT:
+                return False
+            self._slots[self.index_of(self._head)] = None  # DROP_OLDEST: the slot tail is about to reuse
+            self._head += 1
+            self._dropped += 1
+        self._slots[self.index_of(self._tail)] = value
+        self._tail += 1
+        return True
+```
+
+#### Step 5: Dequeue and peek, from either end
+
+`poll_first` returns `None` on empty (the idle state of a consumer, not an error), reads, then advances `head`; `poll_last` retreats `tail` first because it points one past the last element. `get` checks the index by hand against `size()` and raises `IndexError`.
+
+```python
+    def poll_first(self) -> Optional[T]:
+        if self.is_empty():
+            return None
+        i = self.index_of(self._head)
+        v = self._slots[i]
+        self._slots[i] = None
+        self._head += 1
+        return v
+
+    def poll_last(self) -> Optional[T]:
+        if self.is_empty():
+            return None
+        self._tail -= 1
+        i = self.index_of(self._tail)
+        v = self._slots[i]
+        self._slots[i] = None
+        return v
+
+    def get(self, i: int) -> T:
+        """O(1) random access to the i-th element from the front: the thing a linked deque cannot do."""
+        if i < 0 or i >= self.size():
+            raise IndexError(f"Index {i} out of bounds for length {self.size()}")
+        return self._slots[self.index_of(self._head + i)]  # type: ignore[return-value]
+```
+
+#### Step 6: Enqueue at the front
+
+Python's floor-mod would index a negative `head` correctly, but `_rebase` is kept so that `head_sequence()` reports the same offset as Java and Go after an `offer_first` at sequence 0. Adding `capacity` to both sequences moves every slot address by one full turn, so nothing physically moves.
+
+```python
+    def offer_first(self, value: T) -> bool:
+        """Enqueue at the front, stealing the slot before head. Under DROP_OLDEST when full, drops the newest."""
+        if self.is_full():
+            if self._policy is OverflowPolicy.REJECT:
+                return False
+            self._tail -= 1
+            self._slots[self.index_of(self._tail)] = None
+            self._dropped += 1
+        self._head -= 1
+        if self._head < 0:
+            self._rebase()
+        self._slots[self.index_of(self._head)] = value
+        return True
+
+    def _rebase(self) -> None:
+        """Keep sequences non-negative so offsets match the Java and Go versions exactly."""
+        self._head += len(self._slots)
+        self._tail += len(self._slots)
+```
+
+#### Step 7: Iteration follows sequences, not slots
+
+`__iter__` is a generator that walks from `head` to `tail` and maps each sequence to its slot, so iteration is in logical order and skips dead slots. The anonymous `Iterator` class in Java is four lines of `yield` here.
+
+```python
+    def __iter__(self) -> Iterator[T]:
+        seq = self._head
+        while seq < self._tail:
+            yield self._slots[self.index_of(seq)]  # type: ignore[misc]
+            seq += 1
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/05-stacks-queues-and-deques/code/python
@@ -363,35 +507,256 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+```console
+== Ring buffer: wraparound with capacity 4 (sequence -> slot = seq % 4) ==
+offer e0..e3   : [e0]HT [e1] [e2] [e3]   [e0, e1, e2, e3] head=0 tail=4 size=4
+offer e4 (full): accepted=false  (REJECT: producer must back off)
+poll -> e0, poll -> e1
+after 2 polls  : [.]T [.] [e2]H [e3]   [e2, e3] head=2 tail=4 size=2
+offer e4, e5   : [e4] [e5] [e2]HT [e3]   [e2, e3, e4, e5] head=2 tail=6 size=4
+get(0)=e2 get(3)=e5  (O(1) by index, through the wrap)
+
+== Deque: both ends in O(1) ==
+offerLast 2,3 then offerFirst 1,0 -> [0, 1, 2, 3] head=3 tail=7 size=4
+pollLast -> 3, pollFirst -> 0, now [1, 2] head=4 tail=6 size=2
+
+== Bounded queue semantics: a slow consumer under two policies ==
+  REJECT      : holds [payment.0, payment.1, payment.2, payment.3] head=0 tail=4 size=4; rejected=6 (the producer saw every rejection)
+  DROP_OLDEST : holds [payment.6, payment.7, payment.8, payment.9] head=6 tail=10 size=4; dropped=6 (the consumer resumes at offset 6)
+
+== Broker framing: sequences are offsets ==
+12 messages into a capacity-8 log: retained offsets 4..11, evicted 4
+a consumer at offset 2 is behind the retention window: it must reset to 4 and has lost 2 messages
+a consumer at offset 9 reads msg9 next; 3 messages of lag
+```
+
+The deque line shows the rebase at work: two `offer_first` calls from sequence 0 leave `head=3 tail=7` on a capacity-5 buffer, the same numbers Java prints.
+
 ### In Go
+
+The Go port (`code/go/main.go`) keeps `ArrayStack`, `OverflowPolicy`, and the sequence-numbered `RingBuffer`. What differs: **`(T, bool)` instead of a nullable.** A Go zero value (`0`, `""`) is a legal element, so `PollFirst`, `PollLast`, `PeekFirst`, and `PeekLast` return a second `ok` result rather than a sentinel. The same reasoning applies to `SlotsView`: a vacated slot holding `0` is indistinguishable from a live `0`, so the debug view asks the sequence range which physical slots are live instead of testing for `null`. **`%` truncates like Java:** `-1 % 4` is `-1` in Go, so `rebase` stays exactly as written; sequences never go negative and `HeadSequence` reports the same offsets as Java after an `OfferFirst` at sequence 0. **Errors are values:** `Pop` and `Peek` return `(T, error)` with `ErrEmpty`; `Get` returns `ErrIndexOutOfBounds`; the constructors return `ErrCapacity` for a capacity below 1. `OfferLast` and `OfferFirst` keep the Java `bool`, because a rejected offer is backpressure, not a failure. **The model is a slice-backed deque:** the model-based test replays the same 2,000 operations as Java by porting `java.util.Random(11)` exactly, then compares against a small `modelDeque` in the test file in place of `ArrayDeque`.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The stack is a dynamic array that only touches the end
+
+The generic struct keeps a `[]T` whose length is the capacity. `Push` doubles with `make` and `copy`; `Pop` returns `(T, error)` with `ErrEmpty` and writes the zero value into the vacated slot, which is the Go spelling of `= null` and matters just as much when `T` is a pointer or closure type.
+
+```go
+type ArrayStack[T any] struct {
+	elements []T // len(elements) is the capacity
+	size     int
+}
+
+// Push appends at the top, doubling the backing slice when full.
+func (s *ArrayStack[T]) Push(value T) {
+	if s.size == len(s.elements) {
+		grown := make([]T, len(s.elements)*2)
+		copy(grown, s.elements)
+		s.elements = grown
+	}
+	s.elements[s.size] = value
+	s.size++
+}
+
+// Pop removes the top.
+func (s *ArrayStack[T]) Pop() (T, error) {
+	var zero T
+	if s.size == 0 {
+		return zero, ErrEmpty
+	}
+	s.size--
+	v := s.elements[s.size]
+	s.elements[s.size] = zero // do not pin the popped object
+	return v, nil
+}
+```
+
+#### Step 2: The overflow policy is part of the type
+
+An `int` type with two `iota` constants. There is no `Block`, for the same reason as in Java.
+
+```go
+// OverflowPolicy is what a bounded buffer does when a producer offers into a full buffer. BLOCK belongs to Phase 4.
+type OverflowPolicy int
+
+const (
+	Reject     OverflowPolicy = iota // offer returns false; the producer must slow down or retry: backpressure
+	DropOldest                       // overwrite the oldest element; the consumer loses history but the producer never waits
+)
+```
+
+#### Step 3: Two sequence numbers, one array
+
+The sequences are `int64` exactly as in Java, with the same wraparound argument. `Size` narrows the difference to `int`, `IsFull` widens the capacity to `int64` for the comparison, and `IndexOf` does the modulo in `int64` before narrowing.
+
+```go
+type RingBuffer[T any] struct {
+	slots   []T
+	policy  OverflowPolicy
+	head    int64 // sequence of the first (oldest) element
+	tail    int64 // sequence one past the last (newest) element
+	dropped int64 // elements overwritten under DropOldest
+}
+
+// NewRingBuffer allocates capacity slots.
+func NewRingBuffer[T any](capacity int, policy OverflowPolicy) (*RingBuffer[T], error) {
+	if capacity < 1 {
+		return nil, ErrCapacity
+	}
+	return &RingBuffer[T]{slots: make([]T, capacity), policy: policy}, nil
+}
+
+func (r *RingBuffer[T]) Capacity() int       { return len(r.slots) }
+func (r *RingBuffer[T]) Size() int           { return int(r.tail - r.head) }
+func (r *RingBuffer[T]) IsEmpty() bool       { return r.head == r.tail }
+func (r *RingBuffer[T]) IsFull() bool        { return r.tail-r.head == int64(len(r.slots)) }
+func (r *RingBuffer[T]) HeadSequence() int64 { return r.head }
+func (r *RingBuffer[T]) TailSequence() int64 { return r.tail }
+
+// IndexOf is the slot for a sequence number. With a power-of-two capacity this could be int(seq & (capacity-1)).
+func (r *RingBuffer[T]) IndexOf(seq int64) int { return int(seq % int64(len(r.slots))) }
+```
+
+#### Step 4: Enqueue at the back, with the policy applied
+
+Same flow as Java; the only Go-specific line is `var zero T` to clear the evicted slot, since there is no `nil` for an arbitrary `T`.
+
+```go
+// OfferLast enqueues at the back. Returns false only under Reject when full. O(1), no element ever moves.
+func (r *RingBuffer[T]) OfferLast(value T) bool {
+	if r.IsFull() {
+		if r.policy == Reject {
+			return false
+		}
+		var zero T
+		r.slots[r.IndexOf(r.head)] = zero // DropOldest: the oldest slot is exactly the one tail is about to reuse
+		r.head++
+		r.dropped++
+	}
+	r.slots[r.IndexOf(r.tail)] = value
+	r.tail++
+	return true
+}
+```
+
+#### Step 5: Dequeue and peek, from either end
+
+The polls return `(T, bool)`: `ok == false` is the empty signal, because a zero `T` could be a real element. The asymmetry between the ends is preserved (`PollFirst` reads then advances, `PollLast` retreats then reads). `Get` returns a wrapped `ErrIndexOutOfBounds` for a bad index.
 
 ```go
 // PollFirst dequeues the oldest element; ok is false when empty.
 func (r *RingBuffer[T]) PollFirst() (T, bool) {
-    var zero T
-    if r.IsEmpty() {
-        return zero, false
-    }
-    i := r.IndexOf(r.head)
-    v := r.slots[i]
-    r.slots[i] = zero
-    r.head++
-    return v, true
+	var zero T
+	if r.IsEmpty() {
+		return zero, false
+	}
+	i := r.IndexOf(r.head)
+	v := r.slots[i]
+	r.slots[i] = zero
+	r.head++
+	return v, true
+}
+
+// PollLast dequeues the newest element; ok is false when empty.
+func (r *RingBuffer[T]) PollLast() (T, bool) {
+	var zero T
+	if r.IsEmpty() {
+		return zero, false
+	}
+	r.tail--
+	i := r.IndexOf(r.tail)
+	v := r.slots[i]
+	r.slots[i] = zero
+	return v, true
+}
+
+// Get is O(1) random access to the i-th element from the front: the thing a linked deque cannot do.
+func (r *RingBuffer[T]) Get(i int) (T, error) {
+	if i < 0 || i >= r.Size() {
+		var zero T
+		return zero, fmt.Errorf("%w: index %d size %d", ErrIndexOutOfBounds, i, r.Size())
+	}
+	return r.slots[r.IndexOf(r.head+int64(i))], nil
 }
 ```
 
-`code/go/main.go` keeps `ArrayStack`, `OverflowPolicy`, and the sequence-numbered `RingBuffer`. What differs:
+#### Step 6: Enqueue at the front
 
-- **`(T, bool)` instead of a nullable.** A Go zero value (`0`, `""`) is a legal element, so `PollFirst`, `PollLast`, `PeekFirst`, and `PeekLast` return a second `ok` result rather than a sentinel. The same reasoning applies to `SlotsView`: a vacated slot holding `0` is indistinguishable from a live `0`, so the debug view asks the sequence range which physical slots are live instead of testing for `null`.
-- **`%` truncates like Java.** `-1 % 4` is `-1` in Go, so `rebase` stays exactly as written; sequences never go negative and `HeadSequence` reports the same offsets as Java after an `OfferFirst` at sequence 0.
-- **Errors are values.** `Pop` and `Peek` return `(T, error)` with `ErrEmpty`; `Get` returns `ErrIndexOutOfBounds`; the constructors return `ErrCapacity` for a capacity below 1. `OfferLast` and `OfferFirst` keep the Java `bool`, because a rejected offer is backpressure, not a failure.
-- **The model is a slice-backed deque.** The model-based test replays the same 2,000 operations as Java by porting `java.util.Random(11)` exactly, then compares against a small `modelDeque` in the test file in place of `ArrayDeque`.
+Go's `%` truncates toward zero like Java's, so a negative `head` would produce a negative index; `rebase` is therefore required, not optional, and is written exactly as in Java.
+
+```go
+// OfferFirst enqueues at the front, stealing the slot just before head. Under DropOldest when full, drops the newest.
+func (r *RingBuffer[T]) OfferFirst(value T) bool {
+	if r.IsFull() {
+		if r.policy == Reject {
+			return false
+		}
+		r.tail--
+		var zero T
+		r.slots[r.IndexOf(r.tail)] = zero
+		r.dropped++
+	}
+	r.head-- // may go negative conceptually; see the rebase guard below
+	if r.head < 0 {
+		r.rebase()
+	}
+	r.slots[r.IndexOf(r.head)] = value
+	return true
+}
+
+// rebase keeps sequences non-negative so % is a valid index (Go's % truncates toward zero like Java's).
+func (r *RingBuffer[T]) rebase() {
+	r.head += int64(len(r.slots))
+	r.tail += int64(len(r.slots))
+}
+```
+
+#### Step 7: Iteration follows sequences, not slots
+
+Go has no iterator interface in the standard library's collections sense, so `Each` takes a visitor function and walks the sequence range. `String()` uses the same loop, which is why the printed contents are in logical order through the wrap.
+
+```go
+// Each visits every element in logical (sequence) order.
+func (r *RingBuffer[T]) Each(visit func(T)) {
+	for seq := r.head; seq < r.tail; seq++ {
+		visit(r.slots[r.IndexOf(seq)])
+	}
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/01-complexity-and-core-structures/05-stacks-queues-and-deques/code/go
 go run .
 go test ./...
 ```
+
+```console
+== Ring buffer: wraparound with capacity 4 (sequence -> slot = seq % 4) ==
+offer e0..e3   : [e0]HT [e1] [e2] [e3]   [e0, e1, e2, e3] head=0 tail=4 size=4
+offer e4 (full): accepted=false  (REJECT: producer must back off)
+poll -> e0, poll -> e1
+after 2 polls  : [.]T [.] [e2]H [e3]   [e2, e3] head=2 tail=4 size=2
+offer e4, e5   : [e4] [e5] [e2]HT [e3]   [e2, e3, e4, e5] head=2 tail=6 size=4
+get(0)=e2 get(3)=e5  (O(1) by index, through the wrap)
+
+== Deque: both ends in O(1) ==
+offerLast 2,3 then offerFirst 1,0 -> [0, 1, 2, 3] head=3 tail=7 size=4
+pollLast -> 3, pollFirst -> 0, now [1, 2] head=4 tail=6 size=2
+
+== Bounded queue semantics: a slow consumer under two policies ==
+  REJECT      : holds [payment.0, payment.1, payment.2, payment.3] head=0 tail=4 size=4; rejected=6 (the producer saw every rejection)
+  DROP_OLDEST : holds [payment.6, payment.7, payment.8, payment.9] head=6 tail=10 size=4; dropped=6 (the consumer resumes at offset 6)
+
+== Broker framing: sequences are offsets ==
+12 messages into a capacity-8 log: retained offsets 4..11, evicted 4
+a consumer at offset 2 is behind the retention window: it must reset to 4 and has lost 2 messages
+a consumer at offset 9 reads msg9 next; 3 messages of lag
+```
+
+The output is identical to the Java and Python runs, including the `.` for vacated slots, which `SlotsView` derives from the sequence range rather than from a nil check.
 
 ## Use It
 

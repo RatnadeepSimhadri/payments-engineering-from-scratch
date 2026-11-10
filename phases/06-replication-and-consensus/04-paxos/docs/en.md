@@ -352,7 +352,7 @@ t=4   a0 -> p4 ACCEPTED 1.4 credit:acct-42:5.00
 ...
 t=6   a0 -> p3 PROMISE 2.3 (accepted credit:acct-42:5.00 at 1.4)
 t=7   p3 -> a0 ACCEPT 2.3 credit:acct-42:5.00
-chosen = credit:acct-42:5.00 at t=4; learner learned credit:acct-42:5.00 at ballot 2.3; p3.decided=credit:acct-42:5.00 p4.decided=credit:acct-42:5.00
+chosen = credit:acct-42:5.00 at t=3; learner learned credit:acct-42:5.00 at ballot 2.3; p3.decided=credit:acct-42:5.00 p4.decided=credit:acct-42:5.00
 
 == 2. 200 seeded runs: 5 acceptors, 3 proposers, 20% message loss, delays 1..3 ==
 decided in 200/200 runs, distinct chosen values per run: never more than 1 (checked after every delivery)
@@ -369,39 +369,464 @@ Run `python3 main.py` and `go run .` in the sibling folders and diff the output:
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with five differences. **Ordering for free:** `order=True` on a frozen dataclass gives tuple comparison on `(round, proposer_id)`, which is exactly the ballot order, so `m.ballot >= self.promised` reads like the paper. **64-bit wrapping by hand:** Python integers do not overflow, so every SplitMix64 step is masked with `& 0xFFFFFFFFFFFFFFFF`; `next_long` returns the unsigned reinterpretation of Java's signed `long`, and the reference-vector test compares against the same hex constants. **`from` is a keyword,** so the message field is `from_`; everything else keeps its name in snake case. **The heap is a list of tuples:** `heapq` on `(deliver_at, seq, message)` gives the same `(deliverAt, seq)` ordering as Java's `PriorityQueue` comparator, and `seq` guarantees the tuple comparison never reaches the `Message` itself. **Invariant violations raise `RuntimeError`,** with the same meaning as Java's `IllegalStateException`: this is a bug, not a condition.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A random stream you can replay in any language
+
+The same three operations, with `& MASK64` after the addition and after each multiplication because Python's `int` never wraps on its own. The right shifts are logical as in Java's `>>>` because the state is kept non-negative. `next_double` multiplies a 53-bit integer by `2.0 ** -53`, which is exact in IEEE 754, so the drop rolls match the Java and Go runs bit for bit.
+
+```python
+MASK64 = 0xFFFFFFFFFFFFFFFF
+
+
+class Rng:
+    def __init__(self, seed: int) -> None:
+        self.state = seed & MASK64
+
+    def next_long(self) -> int:
+        self.state = (self.state + 0x9E3779B97F4A7C15) & MASK64
+        z = self.state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        return z ^ (z >> 31)
+
+    def next_int(self, bound: int) -> int:
+        return (self.next_long() >> 33) % bound
+
+    def next_double(self) -> float:
+        return (self.next_long() >> 11) * 2.0 ** -53
+```
+
+#### Step 2: Ballots and messages
+
+`Ballot` gets `<`, `>=`, and friends from `order=True`, so there is no `compareTo` to write; the module-level `NONE` is `Ballot(0, 0)`. `Message` is one frozen dataclass for all five kinds with `prior_ballot` and `value` defaulted, and five static constructors so call sites read as `Message.promise(...)`; the sender field is `from_`.
+
 ```python
 @dataclass(frozen=True, order=True)
 class Ballot:
     round: int
     proposer_id: int
+
+    def is_none(self) -> bool:
+        return self.round == 0
+
+
+NONE = Ballot(0, 0)
+
+
+class MessageKind(Enum):
+    PREPARE = "PREPARE"
+    PROMISE = "PROMISE"
+    ACCEPT = "ACCEPT"
+    ACCEPTED = "ACCEPTED"
+    NACK = "NACK"
+
+
+@dataclass(frozen=True)
+class Message:
+    kind: MessageKind
+    from_: int
+    to: int
+    ballot: Ballot
+    prior_ballot: Ballot = NONE
+    value: Optional[str] = None
+
+    @staticmethod
+    def promise(from_: int, to: int, b: Ballot, prior: Ballot, v: Optional[str]) -> "Message":
+        return Message(MessageKind.PROMISE, from_, to, b, prior, v)
+
+    @staticmethod
+    def nack(from_: int, to: int, rejected: Ballot, promised: Ballot) -> "Message":
+        return Message(MessageKind.NACK, from_, to, rejected, promised)
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 3: The acceptor, where safety lives
 
-- **Ordering for free.** `order=True` on a frozen dataclass gives tuple comparison on `(round, proposer_id)`, which is exactly the ballot order, so `m.ballot >= self.promised` reads like the paper.
-- **64-bit wrapping by hand.** Python integers do not overflow, so every SplitMix64 step is masked with `& 0xFFFFFFFFFFFFFFFF`. `next_long` returns the unsigned reinterpretation of Java's signed `long`; the reference-vector test compares against the same hex constants.
-- **`from` is a keyword.** The message field is `from_`. Everything else keeps its name in snake case.
-- **The heap is a list of tuples.** `heapq` on `(deliver_at, seq, message)` gives the same `(deliverAt, seq)` ordering as Java's `PriorityQueue` comparator; `seq` guarantees the tuple comparison never reaches the `Message` itself.
-- **Invariant violations raise `RuntimeError`.** Same semantics as Java's `IllegalStateException`: this is a bug, not a condition.
+The two comparisons are written directly as `m.ballot >= self.promised`. `accepted_value` is `Optional[str]` and starts as `None`, which is what a `PROMISE` reports when nothing has been accepted. `on_accept` raises `promised` as well, for the lost-promise case described in the Java step, and fans the `ACCEPTED` out to the proposer and every learner.
+
+```python
+    def on_prepare(self, m: Message) -> list[Message]:
+        if m.ballot >= self.promised:
+            self.promised = m.ballot
+            return [Message.promise(self.id, m.from_, m.ballot, self.accepted_ballot, self.accepted_value)]
+        return [Message.nack(self.id, m.from_, m.ballot, self.promised)]
+
+    def on_accept(self, m: Message) -> list[Message]:
+        if m.ballot >= self.promised:
+            self.promised = m.ballot
+            self.accepted_ballot = m.ballot
+            self.accepted_value = m.value
+            out = [Message.accepted(self.id, m.from_, m.ballot, m.value)]
+            for learner in self.learner_ids:
+                out.append(Message.accepted(self.id, learner, m.ballot, m.value))
+            return out
+        return [Message.nack(self.id, m.from_, m.ballot, self.promised)]
+```
+
+#### Step 4: The proposer, which must adopt what it learns
+
+`on_promise` collects promisers in a `set`, tracks the highest prior ballot with the dataclass `>`, and chooses `proposing` with a conditional expression: the prior value if any promise carried one, otherwise `wanted`. The `handle` guard compares `m.ballot != self.ballot` by value (dataclass equality) to discard stale replies, and `on_nack` jumps `round` with `max` before restarting.
+
+```python
+    def handle(self, m: Message, now: int) -> list[Message]:
+        if self.phase is Phase.DONE or m.ballot != self.ballot:
+            return []  # stale reply from an earlier round
+        if m.kind is MessageKind.PROMISE:
+            return self.on_promise(m, now)
+        if m.kind is MessageKind.ACCEPTED:
+            return self.on_accepted(m)
+        if m.kind is MessageKind.NACK:
+            return self.on_nack(m, now)
+        return []
+
+    def on_promise(self, m: Message, now: int) -> list[Message]:
+        if self.phase is not Phase.PREPARING:
+            return []
+        self.promises.add(m.from_)
+        if not m.prior_ballot.is_none() and m.prior_ballot > self.highest_prior:
+            self.highest_prior = m.prior_ballot
+            self.highest_prior_value = m.value
+        if len(self.promises) < self.quorum:
+            return []
+        self.proposing = self.highest_prior_value if self.highest_prior_value is not None else self.wanted
+        self.phase = Phase.ACCEPTING
+        self.deadline = now + self.timeout
+        return [Message.accept(self.id, a, self.ballot, self.proposing) for a in self.acceptor_ids]
+```
+
+```python
+    def on_nack(self, m: Message, now: int) -> list[Message]:
+        self.round = max(self.round, m.prior_ballot.round)
+        self.restarts += 1
+        return self.start_round(now)
+```
+
+#### Step 5: The learner and the definition of "chosen"
+
+Votes live in a `dict[Ballot, set[int]]`; `setdefault` is the `computeIfAbsent`. A frozen dataclass is hashable, which is what lets a `Ballot` be a dict key. Learning a second distinct value raises `RuntimeError`. `chosen_value` on the cluster is the god's-eye oracle, counting acceptors per accepted ballot with `dict.get(..., 0) + 1`.
+
+```python
+    def handle(self, m: Message, now: int) -> list[Message]:
+        if m.kind is not MessageKind.ACCEPTED:
+            return []
+        voters = self.votes.setdefault(m.ballot, set())
+        voters.add(m.from_)
+        if len(voters) >= self.quorum:
+            if self.learned is not None and self.learned != m.value:
+                raise RuntimeError(f"SAFETY VIOLATION: learner {self.id} learned {self.learned} then {m.value}")
+            self.learned = m.value
+            self.learned_ballot = m.ballot
+        return []
+```
+
+```python
+    def chosen_value(self) -> Optional[str]:
+        counts: dict[Ballot, int] = {}
+        for a in self.acceptors:
+            if a.accepted_ballot.is_none():
+                continue
+            counts[a.accepted_ballot] = counts.get(a.accepted_ballot, 0) + 1
+            if counts[a.accepted_ballot] >= self.acceptor_count // 2 + 1:
+                return a.accepted_value
+        return None
+```
+
+#### Step 6: The simulated network
+
+`send` draws the drop roll and then the delay, in that order, before deciding whether to drop, so the RNG stays aligned with the Java run. The in-flight queue is a `heapq` list of `(deliver_at, seq, message)` tuples. `tick` visits nodes in `sorted(self.nodes)` order, which is the `TreeMap` iteration order the Java relies on, then pops everything due.
+
+```python
+    def send(self, m: Message) -> None:
+        self.sent += 1
+        if m.from_ in self.isolated or m.to in self.isolated:
+            self.dropped += 1
+            return
+        roll = self.rng.next_double()
+        delay = 1 + self.rng.next_int(self.max_delay)
+        if roll < self.drop_rate:
+            self.dropped += 1
+            return
+        heapq.heappush(self.in_flight, (self.now + delay, self.seq, m))
+        self.seq += 1
+
+    def tick(self) -> None:
+        self.now += 1
+        for node_id in sorted(self.nodes):
+            self.send_all(self.nodes[node_id].tick(self.now))
+        while self.in_flight and self.in_flight[0][0] <= self.now:
+            self.deliver(heapq.heappop(self.in_flight))
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/06-replication-and-consensus/04-paxos/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The trace and the summary lines are the Java output, including the seeded-run histogram:
+
+```console
+chosen = credit:acct-42:5.00 at t=3; learner learned credit:acct-42:5.00 at ballot 2.3; p3.decided=credit:acct-42:5.00 p4.decided=credit:acct-42:5.00
+
+== 2. 200 seeded runs: 5 acceptors, 3 proposers, 20% message loss, delays 1..3 ==
+decided in 200/200 runs, distinct chosen values per run: never more than 1 (checked after every delivery)
+winners: {A=35, B=62, C=103}; mean ticks to choose: 16.0; highest round seen: 18
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`) keeps the design and changes four things. **No null strings:** `""` stands for "no value" in `AcceptedValue`, `Learned`, `Decided`, and `ChosenValue()`; proposers never propose the empty string, and the demo prints `(none)` for it, the same text the other two languages print. **`container/heap`** needs the five-method boilerplate (`Len`, `Less`, `Swap`, `Push`, `Pop`), and `Less` compares `(DeliverAt, Seq)` to match the Java comparator. **Node order is explicit:** Java's `TreeMap` and Python's `sorted(self.nodes)` visit nodes by id on every tick; Go's map iteration is randomized, so `Network` keeps a sorted `order` slice, and forgetting this makes the three languages diverge on the first timeout. **Safety violations panic:** a learner that learns two values or a cluster that chooses two values has no useful error to return, so it panics and the test recovers. `go test -race ./...` passes because nothing here is concurrent, which is the whole point of simulating the network.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A random stream you can replay in any language
+
+`uint64` arithmetic wraps by definition, so the Go version is the Java version with the masks and the `>>>` operator removed; `>>` on an unsigned type is already a logical shift. `NextDouble` multiplies by the constant `1.0 / (1 << 53)`, which Go folds exactly at compile time.
+
 ```go
-func (a *Acceptor) onPrepare(m Message) []Message {
-    if m.Ballot.Compare(a.Promised) >= 0 {
-        a.Promised = m.Ballot
-        return []Message{PromiseMsg(a.id, m.From, m.Ballot, a.AcceptedBallot, a.AcceptedValue)}
-    }
-    return []Message{NackMsg(a.id, m.From, m.Ballot, a.Promised)}
+type Rng struct{ state uint64 }
+
+func NewRng(seed int64) *Rng { return &Rng{state: uint64(seed)} }
+
+func (r *Rng) NextLong() uint64 {
+	r.state += 0x9E3779B97F4A7C15
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
+func (r *Rng) NextInt(bound int) int { return int((r.NextLong() >> 33) % uint64(bound)) }
+
+func (r *Rng) NextDouble() float64 { return float64(r.NextLong()>>11) * (1.0 / (1 << 53)) }
+```
+
+#### Step 2: Ballots and messages
+
+Go structs have no `Comparable`, so `Ballot.Compare` returns -1, 0, or 1 by hand and callers write `Compare(...) >= 0`. The struct is comparable with `==`, which is what the proposer's stale-reply guard and the learner's map key need. `MessageKind` is an `iota` enum, and the five constructors carry a `Msg` suffix because `Accept`/`Accepted` are already the kind names.
+
+```go
+type Ballot struct {
+	Round      int
+	ProposerID int
+}
+
+var None = Ballot{0, 0}
+
+func (b Ballot) IsNone() bool { return b.Round == 0 }
+
+func (b Ballot) Compare(o Ballot) int {
+	switch {
+	case b.Round != o.Round:
+		if b.Round < o.Round {
+			return -1
+		}
+		return 1
+	case b.ProposerID != o.ProposerID:
+		if b.ProposerID < o.ProposerID {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+type Message struct {
+	Kind        MessageKind
+	From, To    int
+	Ballot      Ballot
+	PriorBallot Ballot
+	Value       string
+}
+
+func PromiseMsg(from, to int, b, prior Ballot, v string) Message {
+	return Message{Promise, from, to, b, prior, v}
+}
+func NackMsg(from, to int, rejected, promised Ballot) Message {
+	return Message{Nack, from, to, rejected, promised, ""}
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 3: The acceptor, where safety lives
 
-- **No null strings.** `""` stands for "no value" in `AcceptedValue`, `Learned`, `Decided`, and `ChosenValue()`. Proposers never propose the empty string, and the demo prints `(none)` for it, the same text the other two languages print.
-- **`container/heap`** needs the five-method boilerplate (`Len`, `Less`, `Swap`, `Push`, `Pop`); `Less` compares `(DeliverAt, Seq)` to match the Java comparator.
-- **Node order is explicit.** Java's `TreeMap` and Python's `sorted(self.nodes)` visit nodes by id on every tick; Go's map iteration is randomized, so `Network` keeps a sorted `order` slice. Forget this and the three languages diverge on the first timeout.
-- **Safety violations panic.** A learner that learns two values or a cluster that chooses two values has no useful error to return, so it panics; the test recovers. `go test -race ./...` passes because nothing here is concurrent, which is the whole point of simulating the network.
+The same two handlers with `Compare(...) >= 0` in place of `compareTo`. `AcceptedValue` is `""` until something is accepted, and that empty string travels in the `PROMISE` as "nothing accepted". Replies are returned as a `[]Message` slice that the network sends.
+
+```go
+func (a *Acceptor) onPrepare(m Message) []Message {
+	if m.Ballot.Compare(a.Promised) >= 0 {
+		a.Promised = m.Ballot
+		return []Message{PromiseMsg(a.id, m.From, m.Ballot, a.AcceptedBallot, a.AcceptedValue)}
+	}
+	return []Message{NackMsg(a.id, m.From, m.Ballot, a.Promised)}
+}
+
+func (a *Acceptor) onAccept(m Message) []Message {
+	if m.Ballot.Compare(a.Promised) >= 0 {
+		a.Promised = m.Ballot
+		a.AcceptedBallot = m.Ballot
+		a.AcceptedValue = m.Value
+		out := []Message{AcceptedMsg(a.id, m.From, m.Ballot, m.Value)}
+		for _, l := range a.learnerIDs {
+			out = append(out, AcceptedMsg(a.id, l, m.Ballot, m.Value))
+		}
+		return out
+	}
+	return []Message{NackMsg(a.id, m.From, m.Ballot, a.Promised)}
+}
+```
+
+#### Step 4: The proposer, which must adopt what it learns
+
+Promisers are tracked in a `map[int]bool` whose `len` is the count. The adopt-or-propose decision is an `if` on `highestPriorValue != ""`, the empty-string stand-in for `null`. `Handle` drops anything whose ballot is not the current one using struct equality, and `onNack` raises `Round` to the promised round before restarting.
+
+```go
+func (p *Proposer) Handle(m Message, now int) []Message {
+	if p.Phase == Done || m.Ballot != p.Ballot {
+		return nil // stale reply from an earlier round
+	}
+	switch m.Kind {
+	case Promise:
+		return p.onPromise(m, now)
+	case Accepted:
+		return p.onAccepted(m)
+	case Nack:
+		return p.onNack(m, now)
+	}
+	return nil
+}
+
+func (p *Proposer) onPromise(m Message, now int) []Message {
+	if p.Phase != Preparing {
+		return nil
+	}
+	p.promises[m.From] = true
+	if !m.PriorBallot.IsNone() && m.PriorBallot.Compare(p.highestPrior) > 0 {
+		p.highestPrior = m.PriorBallot
+		p.highestPriorValue = m.Value
+	}
+	if len(p.promises) < p.quorum {
+		return nil
+	}
+	if p.highestPriorValue != "" {
+		p.Proposing = p.highestPriorValue
+	} else {
+		p.Proposing = p.Wanted
+	}
+	p.Phase = Accepting
+	p.deadline = now + p.timeout
+	out := make([]Message, 0, len(p.acceptorIDs))
+	for _, a := range p.acceptorIDs {
+		out = append(out, AcceptMsg(p.id, a, p.Ballot, p.Proposing))
+	}
+	return out
+}
+```
+
+```go
+func (p *Proposer) onNack(m Message, now int) []Message {
+	if m.PriorBallot.Round > p.Round {
+		p.Round = m.PriorBallot.Round
+	}
+	p.Restarts++
+	return p.startRound(now)
+}
+```
+
+#### Step 5: The learner and the definition of "chosen"
+
+`votes` is a `map[Ballot]map[int]bool`, created lazily per ballot because a nil inner map cannot be written to. A second distinct value panics. `ChosenValue` counts acceptors per accepted ballot in a `map[Ballot]int` (incrementing a missing key starts from zero) and returns `""` when no majority exists.
+
+```go
+func (l *Learner) Handle(m Message, now int) []Message {
+	if m.Kind != Accepted {
+		return nil
+	}
+	voters := l.votes[m.Ballot]
+	if voters == nil {
+		voters = map[int]bool{}
+		l.votes[m.Ballot] = voters
+	}
+	voters[m.From] = true
+	if len(voters) >= l.quorum {
+		if l.Learned != "" && l.Learned != m.Value {
+			panic(fmt.Sprintf("SAFETY VIOLATION: learner %d learned %s then %s", l.id, l.Learned, m.Value))
+		}
+		l.Learned = m.Value
+		l.LearnedBallot = m.Ballot
+	}
+	return nil
+}
+```
+
+```go
+func (c *PaxosCluster) ChosenValue() string {
+	counts := map[Ballot]int{}
+	for _, a := range c.Acceptors {
+		if a.AcceptedBallot.IsNone() {
+			continue
+		}
+		counts[a.AcceptedBallot]++
+		if counts[a.AcceptedBallot] >= c.AcceptorCount/2+1 {
+			return a.AcceptedValue
+		}
+	}
+	return ""
+}
+```
+
+#### Step 6: The simulated network
+
+`Send` draws the roll and the delay in the Java order and pushes an `Envelope` onto the `container/heap`. `Tick` walks `n.order`, the sorted id slice maintained by `Add`, instead of ranging over the map, so timeouts fire in id order on every run; it then pops due envelopes with the type assertion `heap.Pop(...).(Envelope)`.
+
+```go
+func (n *Network) Send(m Message) {
+	n.Sent++
+	if n.isolated[m.From] || n.isolated[m.To] {
+		n.Dropped++
+		return
+	}
+	roll := n.rng.NextDouble()
+	delay := 1 + n.rng.NextInt(n.maxDelay)
+	if roll < n.dropRate {
+		n.Dropped++
+		return
+	}
+	heap.Push(&n.inFlight, Envelope{n.now + delay, n.seq, m})
+	n.seq++
+}
+
+func (n *Network) Tick() {
+	n.now++
+	for _, id := range n.order {
+		n.SendAll(n.nodes[id].Tick(n.now))
+	}
+	for len(n.inFlight) > 0 && n.inFlight[0].DeliverAt <= n.now {
+		n.deliver(heap.Pop(&n.inFlight).(Envelope))
+	}
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/06-replication-and-consensus/04-paxos/code/go
+go run .
+go test ./...
+```
+
+Identical to the Python and Java runs, histogram included:
+
+```console
+chosen = credit:acct-42:5.00 at t=3; learner learned credit:acct-42:5.00 at ballot 2.3; p3.decided=credit:acct-42:5.00 p4.decided=credit:acct-42:5.00
+
+== 2. 200 seeded runs: 5 acceptors, 3 proposers, 20% message loss, delays 1..3 ==
+decided in 200/200 runs, distinct chosen values per run: never more than 1 (checked after every delivery)
+winners: {A=35, B=62, C=103}; mean ticks to choose: 16.0; highest round seen: 18
+```
 
 ## Use It
 

@@ -344,34 +344,171 @@ rejected: USD/EUR rate from ecb-ref is 3660s old; max 300s
 
 ### In Python
 
-The full port is `code/python/main.py` with the same classes (`CurrencyRegistry`, `FxRate`, `Conversion`, `FxConverter`, `RateTable`) and tests in `code/python/test_main.py`. Four things differ:
+The Python port keeps the same classes (`CurrencyRegistry`, `FxRate`, `Conversion`, `FxConverter`, `RateTable`) with four differences. **The rational is still an `int` pair, reduced in `__post_init__`:** `fractions.Fraction` would reduce for free, but keeping `numerator`/`denominator` as fields keeps the design identical to Java and makes the "no intermediate rounding" argument visible in `cross()` and `convert()`; a frozen dataclass cannot assign in `__post_init__`, so the reduction uses `object.__setattr__`. **No `multiplyExact`:** `amount * numerator * 10^quoteExp` cannot overflow a Python `int`, so the checked multiplications disappear. The one place integer semantics matter is `divide_rounded`, which (as in Lesson 01) divides magnitudes with `divmod` and reapplies the sign, because `-1842478 // 1000` floors to `-1843` where Java truncates to `-1842`; `-19.99 USD` therefore converts to `-18.42 EUR` in both languages, which the tests check. **Exceptions map to built-ins:** `UnknownCurrencyError` and `CurrencyMismatchError` extend `ValueError` (Java's `IllegalArgumentException`), `StaleRateError` extends `RuntimeError` (Java's `IllegalStateException`), and `NumberFormatException` becomes a plain `ValueError`; `Conversion.from` is spelled `from_` because `from` is a keyword. **Insertion-ordered `dict`** gives the registry and the rate table the same iteration order as Java's `LinkedHashMap` with no extra bookkeeping.
 
-- **The rational is still an `int` pair, reduced in `__post_init__`.** `fractions.Fraction` would do the reduction for free, but keeping `numerator`/`denominator` as fields keeps the design identical to Java and makes the "no intermediate rounding" argument visible in `cross()` and `convert()`. A frozen dataclass cannot assign in `__post_init__`, so the reduction uses `object.__setattr__`:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The registry holds the exponent
+
+`CurrencyInfo` is a frozen dataclass whose `currency()` method builds the validated `Currency` from Lesson 01. The registry keeps two plain dicts; `register` constructs the `Currency` first so a bad code or exponent raises before anything is stored, then refuses duplicate alphabetic and numeric codes with `ValueError`. Because both duplicate checks run before either insert, a rejected row leaves the registry untouched, which is what the Java version achieves by removing the `byCode` entry on failure.
 
 ```python
-@dataclass(frozen=True)
-class FxRate:
-    base: Currency
-    quote: Currency
-    numerator: int
-    denominator: int
-    source: str
-    observed_at_epoch_seconds: int
-    spread_bps: int
+class CurrencyRegistry:
+    def __init__(self) -> None:
+        self._by_code: Dict[str, CurrencyInfo] = {}
+        self._by_numeric: Dict[int, CurrencyInfo] = {}
 
+    def register(self, code: str, numeric_code: int, exponent: int, name: str) -> CurrencyInfo:
+        info = CurrencyInfo(code, numeric_code, exponent, name)
+        info.currency()  # validates code and exponent
+        if code in self._by_code:
+            raise ValueError(f"already registered: {code}")
+        if numeric_code in self._by_numeric:
+            raise ValueError(f"numeric code already registered: {numeric_code}")
+        self._by_code[code] = info
+        self._by_numeric[numeric_code] = info
+        return info
+
+    def currency(self, code: str) -> Currency:
+        return self.info(code).currency()
+
+    def info(self, code: str) -> CurrencyInfo:
+        info = self._by_code.get(code)
+        if info is None:
+            raise UnknownCurrencyError(code)
+        return info
+
+    def parse(self, amount: str, code: str) -> Money:
+        """Parse a decimal string in a currency known to the registry. Unknown code: rejected before the amount is read."""
+        return Money.parse(amount, self.currency(code))
+```
+
+#### Step 2: The rate is a reduced rational with provenance
+
+The record becomes a frozen dataclass with the same seven fields. Validation and gcd reduction happen in `__post_init__`, and because the instance is frozen the reduced values are written back with `object.__setattr__`. `of` is the Lesson 01 parser applied to a rate: `partition(".")` splits once, the denominator is `10 ** len(frac)`, and the numerator is the digits with the point removed; `"0.50"` and `"0.5"` reduce to the same `FxRate` and compare equal.
+
+```python
     def __post_init__(self) -> None:
         if self.base == self.quote:
             raise ValueError(f"base and quote must differ: {self.base.code}")
         if self.numerator <= 0 or self.denominator <= 0:
             raise ValueError("rate must be positive")
+        if self.spread_bps < 0 or self.spread_bps >= 10_000:
+            raise ValueError("spread must be 0..9999 bps")
         g = gcd(self.numerator, self.denominator)
         object.__setattr__(self, "numerator", self.numerator // g)
         object.__setattr__(self, "denominator", self.denominator // g)
+
+    @staticmethod
+    def of(base: Currency, quote: Currency, decimal_rate: str, source: str,
+           observed_at_epoch_seconds: int, spread_bps: int) -> "FxRate":
+        """Build a mid rate from a decimal string such as "0.9217" or "149.37" without going through a float."""
+        s = decimal_rate.strip()
+        whole, _, frac = s.partition(".")
+        whole = whole or "0"
+        if not whole.isdigit() or (frac and not frac.isdigit()) or not (whole + frac):
+            raise ValueError(f"not a decimal rate: {decimal_rate}")
+        den = 10 ** len(frac)
+        num = int(whole + frac)
+        return FxRate(base, quote, num, den, source, observed_at_epoch_seconds, spread_bps)
 ```
 
-- **No `multiplyExact`.** `amount * numerator * 10^quoteExp` cannot overflow a Python `int`, so the checked multiplications disappear. The one place integer semantics matter is `divide_rounded`, which (as in Lesson 01) divides magnitudes with `divmod` and reapplies the sign, because `-1842478 // 1000` floors to `-1843` where Java truncates to `-1842`. `-19.99 USD` therefore converts to `-18.42 EUR` in both languages, which the tests check.
-- **Exceptions map to built-ins.** `UnknownCurrencyError` and `CurrencyMismatchError` extend `ValueError` (Java's `IllegalArgumentException`), `StaleRateError` extends `RuntimeError` (Java's `IllegalStateException`), and `NumberFormatException` becomes a plain `ValueError`. `Conversion.from` is spelled `from_` because `from` is a keyword.
-- **Insertion-ordered `dict`** gives the registry and the rate table the same iteration order as Java's `LinkedHashMap` with no extra bookkeeping.
+#### Step 3: Spread, inversion, and cross rates without rounding
+
+All three derived rates are built by constructing a new `FxRate`, so each one is reduced and validated again on the way out. The spread arithmetic is the same `(20000 ± bps) / 20000` as Java, but with plain `*` because the product cannot overflow. `cross` additionally rejects two rates with the same quote (a EUR/EUR cross), and its provenance is honest: both sources joined with `+`, the older timestamp, the wider spread.
+
+```python
+    def invert(self) -> "FxRate":
+        """The same rate quoted the other way round: quote per base becomes base per quote. Exact, no rounding."""
+        return FxRate(self.quote, self.base, self.denominator, self.numerator, self.source,
+                      self.observed_at_epoch_seconds, self.spread_bps)
+
+    def bid(self) -> "FxRate":
+        return self._with_spread_applied(-self.spread_bps)
+
+    def ask(self) -> "FxRate":
+        return self._with_spread_applied(+self.spread_bps)
+
+    def _with_spread_applied(self, signed_bps: int) -> "FxRate":
+        # mid * (1 +- spread/2) = num/den * (20000 +- bps)/20000, all integer
+        num = self.numerator * (20_000 + signed_bps)
+        den = self.denominator * 20_000
+        return FxRate(self.base, self.quote, num, den, self.source, self.observed_at_epoch_seconds, 0)
+
+    def cross(self, other: "FxRate") -> "FxRate":
+        if self.base != other.base:
+            raise ValueError(f"cross rate needs a shared base: {self.base.code} vs {other.base.code}")
+        if self.quote == other.quote:
+            raise ValueError("cross rate between identical quotes")
+        num = other.numerator * self.denominator
+        den = other.denominator * self.numerator
+        return FxRate(self.quote, other.quote, num, den, self.source + "+" + other.source,
+                      min(self.observed_at_epoch_seconds, other.observed_at_epoch_seconds),
+                      max(self.spread_bps, other.spread_bps))
+```
+
+#### Step 4: Conversion rounds once and reports the remainder
+
+`convert` is a static method on `FxConverter`. The numerator and denominator are formed in one expression each; the two `minor_units_per_major()` calls carry the exponent change, and `divide_rounded` is the single rounding. The remainder `num - rounded * den` is reduced by the gcd with `//`, which is safe here because `g` divides the remainder exactly, so floor division and Java's truncating division agree even for a negative remainder.
+
+```python
+class FxConverter:
+    @staticmethod
+    def convert(amount: Money, rate: FxRate, rounding: Rounding) -> Conversion:
+        if amount.currency != rate.base:
+            raise CurrencyMismatchError(amount.currency, rate.base)
+        num = amount.minor_units * rate.numerator * rate.quote.minor_units_per_major()
+        den = rate.denominator * rate.base.minor_units_per_major()
+        rounded = divide_rounded(num, den, rounding)
+        # exact - rounded, as a fraction of one quote minor unit: (num - rounded*den) / den
+        remainder_num = num - rounded * den
+        g = gcd(remainder_num, den)
+        # g divides remainder_num exactly, so floor division equals Java's truncating division here
+        return Conversion(amount, Money.of_minor(rounded, rate.quote), rate, rounding, remainder_num // g, den // g)
+```
+
+#### Step 5: The round trip and its residue
+
+The same five lines. `out.to` is the converted amount (the field is `to`, and the input is `from_`), the inverse rate converts it back, and `amount.minus(back.to)` is the signed residue in the original currency. The tests pin `0.01 USD` for 19.99, `-0.01 USD` for 0.06, and zero for an exactly representable `1/2` rate.
+
+```python
+    @staticmethod
+    def round_trip(amount: Money, rate: FxRate, rounding: Rounding) -> RoundTrip:
+        out = FxConverter.convert(amount, rate, rounding)
+        back = FxConverter.convert(out.to, rate.invert(), rounding)
+        residue = amount.minus(back.to)
+        return RoundTrip(out, back, residue)
+```
+
+#### Step 6: The rate table knows one base
+
+`put` refuses any rate whose base is not the table's base, and `rate` checks freshness on every path before inverting or crossing. `_direct` raises a plain `ValueError` for a missing pair; `require_fresh` raises `StaleRateError`, which names the pair, the source, and the age so the operator knows which feed to chase.
+
+```python
+    def put(self, rate: FxRate) -> None:
+        if rate.base != self._base_currency:
+            raise ValueError(f"table quotes against {self._base_currency.code}; got {rate.pair()}")
+        self._rates[rate.quote.code] = rate
+
+    def rate(self, from_: Currency, to: Currency, now_epoch_seconds: int) -> FxRate:
+        if from_ == to:
+            raise ValueError(f"no rate needed for {from_.code}")
+        if from_ == self._base_currency:
+            return self._direct(to).require_fresh(now_epoch_seconds, self._max_age_seconds)
+        if to == self._base_currency:
+            return self._direct(from_).require_fresh(now_epoch_seconds, self._max_age_seconds).invert()
+        a = self._direct(from_).require_fresh(now_epoch_seconds, self._max_age_seconds)
+        b = self._direct(to).require_fresh(now_epoch_seconds, self._max_age_seconds)
+        return a.cross(b)
+
+    def _direct(self, quote: Currency) -> FxRate:
+        r: Optional[FxRate] = self._rates.get(quote.code)
+        if r is None:
+            raise ValueError(f"no {self._base_currency.code}/{quote.code} rate loaded")
+        return r
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/02-currency-and-fx/code/python
@@ -379,30 +516,274 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The output is identical to the Java run, section for section:
+
+```console
+== ISO 4217 registry: the exponent is data ==
+USD numeric=840 exponent=2  1 major = 100 minor  (US Dollar)
+JPY numeric=392 exponent=0  1 major = 1 minor  (Yen)
+KWD numeric=414 exponent=3  1 major = 1000 minor  (Kuwaiti Dinar)
+CLF numeric=990 exponent=4  1 major = 10000 minor  (Unidad de Fomento)
+numeric 978 -> EUR
+rejected: unknown currency code: USX
+
+== A rate is an exact rational with provenance ==
+USD/EUR 0.921700 (9217/10000) from ecb-ref
+inverted: EUR/USD 1.084952 (10000/9217) from ecb-ref   (exact: 10000/9217, not 1.0849...)
+bid 0.919396  mid 0.921700  ask 0.924004  (50 bps spread)
+```
+
 ### In Go
 
-The full port is `code/go/main.go` (registry, `FxRate`, `Conversion`, `Convert`, `RoundTrip`, `RateTable`) plus `code/go/money.go`, which is the Phase 10, Lesson 01 `Money` unchanged. Tests are in `code/go/main_test.go`. Three things differ:
+The Go port is `code/go/main.go` (registry, `FxRate`, `Conversion`, `Convert`, `RoundTrip`, `RateTable`) plus `code/go/money.go`, the Phase 10, Lesson 01 `Money` unchanged. Three things differ. **Errors are values, and each failure the lesson warns about has a sentinel:** `Convert` returns `(Conversion, error)`, `FxRateOf`/`NewFxRate` return `(FxRate, error)`, and the table's `Rate` returns `(FxRate, error)`; `ErrUnknownCurrency`, `ErrStaleRate`, and `ErrCurrencyMismatch` are wrapped with `%w` so callers and tests use `errors.Is`. **Overflow is checked by hand:** every `Math.multiplyExact` in the Java (`cross`, `withSpreadApplied`, `convert`) becomes a call to `mulChecked`, which returns `ErrOverflow` instead of wrapping; `int64` `/` and `%` truncate toward zero exactly like Java, so `DivideRounded` is the same code and `-19.99 USD` converts to `-18.42 EUR` without a sign fix-up. **Insertion order is explicit:** Go's `map` iterates in random order, so `CurrencyRegistry` and `RateTable` keep a `[]string` of keys next to the map to reproduce `LinkedHashMap` ordering in `All()`. The reduction of the rational happens in `NewFxRate`, the Go stand-in for the record's compact constructor, so an `FxRate` built any other way is a bug by construction.
 
-- **Errors are values, and each failure the lesson warns about has a sentinel.** `Convert` returns `(Conversion, error)`, `FxRateOf`/`NewFxRate` return `(FxRate, error)`, and the table's `Rate` returns `(FxRate, error)`. `ErrUnknownCurrency`, `ErrStaleRate`, and `ErrCurrencyMismatch` are wrapped with `%w` so callers and tests use `errors.Is`:
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The registry holds the exponent
+
+The registry is a struct of two maps plus the `order` slice. `Register` validates through `NewCurrency` (the Lesson 01 validating constructor) and returns an error for a duplicate alphabetic or numeric code before touching either map, so a rejected row leaves no partial state. `Currency` wraps `ErrUnknownCurrency` with the offending code; `errors.Is(err, ErrUnknownCurrency)` is how the tests check it.
 
 ```go
-func (r FxRate) RequireFresh(nowEpochSeconds, maxAgeSeconds int64) (FxRate, error) {
-    age := nowEpochSeconds - r.ObservedAtEpochSeconds
-    if age > maxAgeSeconds {
-        return FxRate{}, fmt.Errorf("%w: %s rate from %s is %ds old; max %ds",
-            ErrStaleRate, r.Pair(), r.Source, age, maxAgeSeconds)
-    }
-    return r, nil
+type CurrencyRegistry struct {
+	order     []string
+	byCode    map[string]CurrencyInfo
+	byNumeric map[int]CurrencyInfo
+}
+
+func (r *CurrencyRegistry) Register(code string, numericCode, exponent int, name string) (CurrencyInfo, error) {
+	if _, err := NewCurrency(code, exponent); err != nil { // validates code and exponent
+		return CurrencyInfo{}, err
+	}
+	info := CurrencyInfo{code, numericCode, exponent, name}
+	if _, dup := r.byCode[code]; dup {
+		return CurrencyInfo{}, fmt.Errorf("already registered: %s", code)
+	}
+	if _, dup := r.byNumeric[numericCode]; dup {
+		return CurrencyInfo{}, fmt.Errorf("numeric code already registered: %d", numericCode)
+	}
+	r.byCode[code] = info
+	r.byNumeric[numericCode] = info
+	r.order = append(r.order, code)
+	return info, nil
+}
+
+func (r *CurrencyRegistry) Currency(code string) (Currency, error) {
+	info, ok := r.byCode[code]
+	if !ok {
+		return Currency{}, fmt.Errorf("%w: %s", ErrUnknownCurrency, code)
+	}
+	return info.Currency(), nil
 }
 ```
 
-- **Overflow is checked by hand.** Every `Math.multiplyExact` in the Java (`cross`, `withSpreadApplied`, `convert`) becomes a call to `mulChecked`, which returns `ErrOverflow` instead of wrapping. `int64` `/` and `%` truncate toward zero exactly like Java, so `DivideRounded` is the same code and `-19.99 USD` converts to `-18.42 EUR` without a sign fix-up.
-- **Insertion order is explicit.** Go's `map` iterates in random order, so `CurrencyRegistry` and `RateTable` keep a `[]string` of keys next to the map to reproduce `LinkedHashMap` ordering in `All()`. The reduction of the rational happens in `NewFxRate`, the Go stand-in for the record's compact constructor, so an `FxRate` built any other way is a bug by construction.
+#### Step 2: The rate is a reduced rational with provenance
+
+`FxRate` is a value struct, and `NewFxRate` is the only sanctioned way to build one: it validates the pair, the sign, and the spread, then divides both terms by the gcd. `FxRateOf` parses the decimal string with `strings.Cut`, builds the power-of-ten denominator through `mulChecked` (a 30-digit fraction would overflow `int64`), and parses the digits with `strconv.ParseInt`, which also fails on overflow.
+
+```go
+func NewFxRate(base, quote Currency, numerator, denominator int64, source string, observedAt int64, spreadBps int) (FxRate, error) {
+	if base == quote {
+		return FxRate{}, fmt.Errorf("base and quote must differ: %s", base.Code)
+	}
+	if numerator <= 0 || denominator <= 0 {
+		return FxRate{}, errors.New("rate must be positive")
+	}
+	if spreadBps < 0 || spreadBps >= 10_000 {
+		return FxRate{}, errors.New("spread must be 0..9999 bps")
+	}
+	g := gcd(numerator, denominator)
+	return FxRate{base, quote, numerator / g, denominator / g, source, observedAt, spreadBps}, nil
+}
+
+func FxRateOf(base, quote Currency, decimalRate, source string, observedAt int64, spreadBps int) (FxRate, error) {
+	s := strings.TrimSpace(decimalRate)
+	whole, frac, _ := strings.Cut(s, ".")
+	if whole == "" {
+		whole = "0"
+	}
+	if !digitsOnly(whole) || !digitsOnly(frac) || whole+frac == "" {
+		return FxRate{}, fmt.Errorf("not a decimal rate: %q", decimalRate)
+	}
+	den := int64(1)
+	for range len(frac) {
+		var err error
+		if den, err = mulChecked(den, 10); err != nil {
+			return FxRate{}, err
+		}
+	}
+	num, err := strconv.ParseInt(whole+frac, 10, 64)
+	if err != nil {
+		return FxRate{}, fmt.Errorf("not a decimal rate: %q", decimalRate)
+	}
+	return NewFxRate(base, quote, num, den, source, observedAt, spreadBps)
+}
+```
+
+#### Step 3: Spread, inversion, and cross rates without rounding
+
+`Invert` cannot fail (swapping a valid pair gives a valid pair), so it returns a bare `FxRate`. `Bid`, `Ask`, and `Cross` multiply, so each goes through `mulChecked` and returns `(FxRate, error)`; the final `NewFxRate` call re-reduces the result. The derived spread is `0` so applying it twice is impossible, and `Cross` carries both sources, the older timestamp, and the wider spread.
+
+```go
+func (r FxRate) Invert() FxRate {
+	return FxRate{r.Quote, r.Base, r.Denominator, r.Numerator, r.Source, r.ObservedAtEpochSeconds, r.SpreadBps}
+}
+
+func (r FxRate) Bid() (FxRate, error) { return r.withSpreadApplied(-int64(r.SpreadBps)) }
+
+func (r FxRate) Ask() (FxRate, error) { return r.withSpreadApplied(+int64(r.SpreadBps)) }
+
+func (r FxRate) withSpreadApplied(signedBps int64) (FxRate, error) {
+	// mid * (1 +- spread/2) = num/den * (20000 +- bps)/20000, all integer
+	num, err := mulChecked(r.Numerator, 20_000+signedBps)
+	if err != nil {
+		return FxRate{}, err
+	}
+	den, err := mulChecked(r.Denominator, 20_000)
+	if err != nil {
+		return FxRate{}, err
+	}
+	return NewFxRate(r.Base, r.Quote, num, den, r.Source, r.ObservedAtEpochSeconds, 0)
+}
+
+func (r FxRate) Cross(other FxRate) (FxRate, error) {
+	if r.Base != other.Base {
+		return FxRate{}, fmt.Errorf("cross rate needs a shared base: %s vs %s", r.Base.Code, other.Base.Code)
+	}
+	if r.Quote == other.Quote {
+		return FxRate{}, errors.New("cross rate between identical quotes")
+	}
+	num, err := mulChecked(other.Numerator, r.Denominator)
+	if err != nil {
+		return FxRate{}, err
+	}
+	den, err := mulChecked(other.Denominator, r.Numerator)
+	if err != nil {
+		return FxRate{}, err
+	}
+	return NewFxRate(r.Quote, other.Quote, num, den, r.Source+"+"+other.Source,
+		min(r.ObservedAtEpochSeconds, other.ObservedAtEpochSeconds), max(r.SpreadBps, other.SpreadBps))
+}
+```
+
+#### Step 4: Conversion rounds once and reports the remainder
+
+`Convert` is a package-level function. Each of the Java `multiplyExact` calls is a `mulChecked` with an early return, and the remainder subtraction goes through `addChecked`, so a ten-billion-dollar conversion fails with `ErrOverflow` rather than a wrong number. `DivideRounded` from `money.go` is the single rounding, and `gcd` reduces the remainder for the audit record.
+
+```go
+func Convert(amount Money, rate FxRate, rounding Rounding) (Conversion, error) {
+	if amount.Currency != rate.Base {
+		return Conversion{}, fmt.Errorf("%w: cannot combine %s with %s", ErrCurrencyMismatch, amount.Currency.Code, rate.Base.Code)
+	}
+	num, err := mulChecked(amount.MinorUnits, rate.Numerator)
+	if err != nil {
+		return Conversion{}, err
+	}
+	if num, err = mulChecked(num, rate.Quote.MinorUnitsPerMajor()); err != nil {
+		return Conversion{}, err
+	}
+	den, err := mulChecked(rate.Denominator, rate.Base.MinorUnitsPerMajor())
+	if err != nil {
+		return Conversion{}, err
+	}
+	rounded := DivideRounded(num, den, rounding)
+	// exact - rounded, as a fraction of one quote minor unit: (num - rounded*den) / den
+	product, err := mulChecked(rounded, den)
+	if err != nil {
+		return Conversion{}, err
+	}
+	remainderNum, err := addChecked(num, -product)
+	if err != nil {
+		return Conversion{}, err
+	}
+	g := gcd(remainderNum, den)
+	return Conversion{amount, OfMinor(rounded, rate.Quote), rate, rounding, remainderNum / g, den / g}, nil
+}
+```
+
+#### Step 5: The round trip and its residue
+
+The result type is named `RoundTripResult` so the function can keep the Java name `RoundTrip`. Three operations can fail (two conversions and `Minus`), so the five Java lines become three guarded calls; the residue semantics are the same, signed and in the original currency.
+
+```go
+func RoundTrip(amount Money, rate FxRate, rounding Rounding) (RoundTripResult, error) {
+	out, err := Convert(amount, rate, rounding)
+	if err != nil {
+		return RoundTripResult{}, err
+	}
+	back, err := Convert(out.To, rate.Invert(), rounding)
+	if err != nil {
+		return RoundTripResult{}, err
+	}
+	residue, err := amount.Minus(back.To)
+	if err != nil {
+		return RoundTripResult{}, err
+	}
+	return RoundTripResult{out, back, residue}, nil
+}
+```
+
+#### Step 6: The rate table knows one base
+
+`Rate` has the same three paths as the Java. The lookup-then-freshness pair is factored into `fresh`, which calls `direct` and then `RequireFresh`, so every path still checks staleness before inverting or crossing. A stale rate comes back wrapped in `ErrStaleRate` with the pair, source, and age in the message; a missing pair is a plain error naming the base and quote.
+
+```go
+func (t *RateTable) Rate(from, to Currency, nowEpochSeconds int64) (FxRate, error) {
+	if from == to {
+		return FxRate{}, fmt.Errorf("no rate needed for %s", from.Code)
+	}
+	if from == t.baseCurrency {
+		return t.fresh(to, nowEpochSeconds)
+	}
+	if to == t.baseCurrency {
+		r, err := t.fresh(from, nowEpochSeconds)
+		if err != nil {
+			return FxRate{}, err
+		}
+		return r.Invert(), nil
+	}
+	a, err := t.fresh(from, nowEpochSeconds)
+	if err != nil {
+		return FxRate{}, err
+	}
+	b, err := t.fresh(to, nowEpochSeconds)
+	if err != nil {
+		return FxRate{}, err
+	}
+	return a.Cross(b)
+}
+
+func (t *RateTable) fresh(quote Currency, now int64) (FxRate, error) {
+	r, err := t.direct(quote)
+	if err != nil {
+		return FxRate{}, err
+	}
+	return r.RequireFresh(now, t.maxAgeSeconds)
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/10-money-and-ledgers/02-currency-and-fx/code/go
 go run .
 go test ./...
+```
+
+The output matches the Java and Python runs line for line; the `must` helper in `main` unwraps the `(value, error)` pairs so the demo reads like the other two.
+
+```console
+== ISO 4217 registry: the exponent is data ==
+USD numeric=840 exponent=2  1 major = 100 minor  (US Dollar)
+JPY numeric=392 exponent=0  1 major = 1 minor  (Yen)
+KWD numeric=414 exponent=3  1 major = 1000 minor  (Kuwaiti Dinar)
+CLF numeric=990 exponent=4  1 major = 10000 minor  (Unidad de Fomento)
+numeric 978 -> EUR
+rejected: unknown currency code: USX
+
+== A rate is an exact rational with provenance ==
+USD/EUR 0.921700 (9217/10000) from ecb-ref
+inverted: EUR/USD 1.084952 (10000/9217) from ecb-ref   (exact: 10000/9217, not 1.0849...)
+bid 0.919396  mid 0.921700  ask 0.924004  (50 bps spread)
 ```
 
 ## Use It

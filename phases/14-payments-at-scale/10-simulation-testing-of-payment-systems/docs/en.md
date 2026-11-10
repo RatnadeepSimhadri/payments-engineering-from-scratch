@@ -438,23 +438,317 @@ Twenty virtual days, 11,478 payments, 22 gateway crashes, 120 faults, zero viola
 
 ### In Python
 
-`code/python/main.py` is the same harness: `Rng`, `Fingerprint`, `Simulator`, `Network`, `FaultSchedule`, `Processor`, `Gateway`, `Client`, `Harness`. Seed 1 over 48 virtual hours produces the same 9,435 events and the same fingerprint `ff8801a677b7abd9` as the Java run, which is the whole point of choosing SplitMix64 and integer probabilities. What differs:
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same harness: `Rng`, `Fingerprint`, `Simulator`, `Network`, `FaultSchedule`, `Processor`, `Gateway`, `Client`, `Harness`. Seed 1 over 48 virtual hours produces the same 9,435 events and the same fingerprint `ff8801a677b7abd9` as the Java run, which is the whole point of choosing SplitMix64 and integer probabilities. What differs: **SplitMix64 must be masked.** Python integers never wrap, so every addition and multiplication in `next_long` is followed by `& 0xFFFFFFFFFFFFFFFF`, and the state is kept unsigned so that `>>` is the logical shift Java spells `>>>`; the reference vectors (`e220a8397b1dcdaf`, `6e789e6aa1b965f4`) are the check that the masking is right, and `next_long_bounded` is then a plain `%` because the value is already unsigned. **`heapq` is the event queue:** events are pushed as `(time, seq, Event)` tuples, so ordering is by virtual time with the scheduling sequence as the tie-break and the two `Event` objects themselves are never compared; `hashlib.sha256` replaces `MessageDigest`, and `Fingerprint.hex` takes `copy().hexdigest()[:16]` where Java clones the digest. **Closures replace `Runnable` and `Consumer`:** the timer in `_send_auth` and the reply callback in `Client._attempt` are nested functions that close over `p`, `armed_epoch`, and the `answered` list; in `FaultSchedule.arm` the loop variable is bound with a default argument (`lambda f=f: ...`) because a bare lambda in a loop would see the last fault for every event. **Ordering that Java gets from `TreeMap` is explicit:** `approvals_per_payment` and the per-key count in `check_safety` are sorted before iteration so the first violation reported is the same one the Java reports; everything else uses insertion-ordered dicts, which match `LinkedHashMap`; `IllegalArgumentException` becomes `ValueError`, and the quiescence guard raises `RuntimeError`. The Python tests port every Java check (63 assertions, one of them pinning the seed-1 fingerprint to the Java value).
 
-- **SplitMix64 must be masked.** Python integers never wrap, so every addition and multiplication in `next_long` is followed by `& 0xFFFFFFFFFFFFFFFF`, and the state is kept unsigned so that `>>` is the logical shift Java spells `>>>`. The reference vectors (`e220a8397b1dcdaf`, `6e789e6aa1b965f4`) are the check that the masking is right; `next_long_bounded` is then a plain `%` because the value is already unsigned.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A portable seeded generator
+
+`next_long` is SplitMix64 with `& MASK64` after the addition and each multiply; because the state stays unsigned, `>>` is the logical shift. `next_int` takes the top 32 bits, `next_long_bounded` is a plain unsigned `%`, and `split` seeds a child from one draw.
 
 ```python
-def next_long(self) -> int:
-    self.draws += 1
-    self.state = (self.state + 0x9E3779B97F4A7C15) & MASK64
-    z = self.state
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
-    return z ^ (z >> 31)
+    def __init__(self, seed: int) -> None:
+        self.state = seed & MASK64
+        self.draws = 0
+
+    def next_long(self) -> int:
+        self.draws += 1
+        self.state = (self.state + 0x9E3779B97F4A7C15) & MASK64
+        z = self.state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        return z ^ (z >> 31)
+
+    def next_int(self, bound: int) -> int:
+        """Uniform in [0, bound). Uses the top 32 bits so the result does not depend on signed-modulo semantics."""
+        if bound <= 0:
+            raise ValueError("bound must be positive")
+        return (self.next_long() >> 32) % bound
+
+    def next_long_bounded(self, bound: int) -> int:
+        """Uniform in [0, bound) for bounds beyond 32 bits (fault start times over long horizons). Unsigned modulo."""
+        if bound <= 0:
+            raise ValueError("bound must be positive")
+        return self.next_long() % bound
+
+    def between(self, lo: int, hi: int) -> int:
+        """Uniform in [lo, hi]."""
+        return lo + self.next_int(hi - lo + 1)
+
+    def chance(self, basis_points: int) -> bool:
+        """True with probability basis_points / 10000. Integer probabilities: no float compare, no platform rounding."""
+        return self.next_int(10_000) < basis_points
+
+    def split(self) -> "Rng":
+        """A statistically independent child stream; used so adding a component never shifts another's draws."""
+        return Rng(self.next_long())
 ```
 
-- **`heapq` is the event queue.** Events are pushed as `(time, seq, Event)` tuples, so ordering is by virtual time with the scheduling sequence as the tie-break and the two `Event` objects themselves are never compared. `hashlib.sha256` replaces `MessageDigest`; `Fingerprint.hex` takes `copy().hexdigest()[:16]` where Java clones the digest.
-- **Closures replace `Runnable` and `Consumer`.** The timer in `_send_auth` and the reply callback in `Client._attempt` are nested functions that close over `p`, `armed_epoch`, and the `answered` list; in `FaultSchedule.arm` the loop variable is bound with a default argument (`lambda f=f: ...`) because a bare lambda in a loop would see the last fault for every event.
-- **Ordering that Java gets from `TreeMap` is explicit.** `approvals_per_payment` and the per-key count in `check_safety` are sorted before iteration so the first violation reported is the same one the Java reports; everything else uses insertion-ordered dicts, which match `LinkedHashMap`. `IllegalArgumentException` becomes `ValueError`, and the quiescence guard raises `RuntimeError`.
+#### Step 2: The virtual clock
+
+`schedule` pushes `(time, seq, Event)` onto a `heapq`, so ties resolve in scheduling order; `step` pops, advances `now`, records the trace line, and runs the action. `run_until` also advances `now` on an idle system, and `run_until_idle` turns an endless reschedule into a `RuntimeError`.
+
+```python
+class Simulator:
+    """The virtual clock and the event loop are the same object: time is whatever the next event says it is.
+    Events are ordered by (time, seq) so two events at the same instant run in the order they were scheduled.
+    Nothing in the lesson reads time.time() or sleeps."""
+
+    def __init__(self) -> None:
+        self._queue: list = []  # heap of (time, seq, Event)
+        self._seq = 0
+        self.now = 0
+        self.processed = 0
+        self.trace = Fingerprint()
+
+    def schedule(self, delay_ms: int, label: str, action: Callable[[], None]) -> None:
+        if delay_ms < 0:
+            raise ValueError("delay must be non-negative")
+        e = Event(self.now + delay_ms, self._seq, label, action)
+        self._seq += 1
+        heapq.heappush(self._queue, (e.time, e.seq, e))
+
+    def step(self) -> bool:
+        if not self._queue:
+            return False
+        _, _, e = heapq.heappop(self._queue)
+        self.now = e.time
+        self.processed += 1
+        self.trace.add(f"{self.now} {e.label}")
+        e.action()
+        return True
+
+    def run_until(self, time_ms: int) -> None:
+        while self._queue and self._queue[0][0] <= time_ms:
+            self.step()
+        if self.now < time_ms:
+            self.now = time_ms
+
+    def run_until_idle(self, max_events: int) -> None:
+        """Drain every remaining event; the guard turns an accidental infinite loop into a test failure."""
+        budget = max_events
+        while self.step():
+            budget -= 1
+            if budget < 0:
+                raise RuntimeError("simulation did not reach quiescence")
+```
+
+#### Step 3: The network
+
+`send` checks the partition before drawing the drop chance, so a blocked message consumes no random draw; delivery is a nested closure scheduled after a drawn latency.
+
+```python
+    def send(self, frm: str, to: str, label: str, deliver: Callable[[], None]) -> None:
+        self.sent += 1
+        if f"{frm}>{to}" in self.partitioned:
+            self.blocked += 1
+            return
+        if self.rng.chance(self.cfg.drop_basis_points):
+            self.dropped += 1
+            return
+        latency = self.rng.between(self.cfg.min_latency_ms, self.cfg.max_latency_ms)
+
+        def delivered() -> None:
+            self.delivered += 1
+            deliver()
+
+        self.sim.schedule(latency, f"deliver {to}<-{frm} {label}", delivered)
+
+    def partition(self, a: str, b: str) -> None:
+        self.partitioned.add(f"{a}>{b}")
+        self.partitioned.add(f"{b}>{a}")
+
+    def heal(self, a: str, b: str) -> None:
+        self.partitioned.discard(f"{a}>{b}")
+        self.partitioned.discard(f"{b}>{a}")
+```
+
+#### Step 4: Faults as events
+
+`Fault.draw` picks the kind, a start from `next_long_bounded` (horizons exceed 32 bits), and a kind-specific duration; a `GATEWAY_CRASH` has duration 0 and is ended only by the recovery sweep.
+
+```python
+class Fault:
+    start_ms: int
+    end_ms: int
+    kind: FaultKind
+
+    @staticmethod
+    def draw(rng: Rng, horizon_ms: int) -> "Fault":
+        """Durations are kind-specific and drawn from the fault stream, so one fault more or less never shifts the workload."""
+        kind = FAULT_KINDS[rng.next_int(len(FAULT_KINDS))]
+        start = rng.next_long_bounded(horizon_ms)
+        if kind in (FaultKind.PARTITION_CLIENT_GATEWAY, FaultKind.PARTITION_GATEWAY_PROCESSOR):
+            duration = rng.between(5, 120) * 1000
+        elif kind is FaultKind.PROCESSOR_OUTAGE:
+            duration = rng.between(5, 90) * 1000
+        elif kind is FaultKind.PROCESSOR_SLOW:
+            duration = rng.between(1, 10) * MINUTE
+        else:
+            duration = 0
+        return Fault(start, min(horizon_ms, start + duration), kind)
+```
+
+#### Step 5: The processor and its idempotency
+
+`receive` swallows requests while down, dedupes on `auth_key`, appends every fresh approval to `approvals`, and schedules the reply after `extra_latency_ms` through two nested lambdas (think time, then the network).
+
+```python
+    def receive(self, req: AuthRequest, gateway: "Gateway") -> None:
+        self.received += 1
+        if self.down:
+            self.swallowed += 1  # an outage looks like a timeout to the caller
+            return
+        decision = self.decisions.get(req.auth_key)
+        if decision is not None:
+            self.replayed += 1
+        else:
+            approved = not self.rng.chance(self.decline_basis_points)
+            decision = AuthResponse(req.auth_key, req.payment_id, approved)
+            self.decisions[req.auth_key] = decision
+            if approved:
+                self.approvals.append(decision)
+        reply = decision
+        self.sim.schedule(self.extra_latency_ms, f"processor-respond {req.payment_id}",
+                          lambda: self.net.send(Processor.NAME, Gateway.NAME, f"auth-response {reply.payment_id}",
+                                                lambda: gateway.on_auth_response(reply)))
+```
+
+#### Step 6: The gateway, its crash, and its recovery
+
+`_send_auth` arms a timeout closure that checks all three guards (epoch, status, attempt) before re-driving. `crash` bumps the epoch, discards the volatile `_waiting` table, and schedules `recover`, which re-drives every `PENDING` payment unless the planted defect skips it.
+
+```python
+    def _send_auth(self, p: Payment) -> None:
+        p.attempts += 1
+        if self.defect is Defect.FRESH_AUTH_KEY_ON_RETRY and p.attempts > 1:
+            p.auth_key = f"auth-{p.payment_id}-{p.attempts}"
+        self.auth_sends += 1
+        req = AuthRequest(p.auth_key, p.payment_id, p.customer_id, p.amount, p.attempts)
+        self.net.send(Gateway.NAME, Processor.NAME, f"auth-request {p.payment_id} a{p.attempts}",
+                      lambda: self.processor.receive(req, self))
+        armed_epoch, armed_attempt = self._epoch, p.attempts
+
+        def timeout() -> None:
+            if armed_epoch != self._epoch or p.status is not Status.PENDING or p.attempts != armed_attempt:
+                return
+            self.auth_timeouts += 1
+            self._send_auth(p)  # same auth_key: the processor will dedupe
+
+        self.sim.schedule(self.processor_timeout_ms, f"auth-timeout {p.payment_id} a{armed_attempt}", timeout)
+
+    def crash(self) -> None:
+        """Lose everything in memory; durable state stays. Schedule the recovery sweep that re-drives in-flight payments."""
+        self.crashes += 1
+        self._epoch += 1
+        self._crash_armed = False
+        self._waiting = {}
+        if self.defect is Defect.RECOVERY_SKIPS_PENDING:
+            return
+
+        def recover() -> None:
+            for p in list(self.payments.values()):
+                if p.status is Status.PENDING:
+                    self.recovered += 1
+                    self._send_auth(p)
+
+        self.sim.schedule(self.recovery_delay_ms, "gateway-recover", recover)
+```
+
+#### Step 7: The client that retries
+
+`_attempt` closes over a one-element `answered` list (so the nested `record` can mutate it), records the outcome or a disagreement, and on timeout either gives up into `unknown` or schedules a linear-backoff retry with the same key.
+
+```python
+    def _attempt(self, req: PaymentRequest, n: int) -> None:
+        answered = [False]
+
+        def on_reply(status: Status) -> None:
+            def record() -> None:
+                answered[0] = True
+                previous = self.outcomes.get(req.key)
+                if previous is None:
+                    self.outcomes[req.key] = status
+                elif previous is not status:
+                    self.disagreements.append(f"{req.key} saw {previous} then {status}")
+
+            self.net.send(Gateway.NAME, self.name, f"payment-reply {req.key} {status}", record)
+
+        self.net.send(self.name, Gateway.NAME, f"payment {req.key} a{n}", lambda: self.gateway.handle(req, on_reply))
+
+        def timeout() -> None:
+            if answered[0] or req.key in self.outcomes:
+                return
+            if n >= self.cfg.max_attempts:
+                self.unknown.add(req.key)
+                return
+            self.retries += 1
+            self.sim.schedule(self.cfg.backoff_ms * n, f"client-retry {req.key} a{n + 1}", lambda: self._attempt(req, n + 1))
+
+        self.sim.schedule(self.cfg.timeout_ms, f"client-timeout {req.key} a{n}", timeout)
+```
+
+#### Step 8: The harness and its two checkers
+
+`run` splits the master `Rng` four times in a fixed order, arms the fault schedule and workload, schedules the daily `check` event, runs to the horizon and then to idle, and runs `check_quiescent` only then. `find_failing_seed` returns the first failing report or `None`.
+
+```python
+    def run(cfg: SimConfig) -> SimReport:
+        sim = Simulator()
+        master = Rng(cfg.seed)
+        net_rng, processor_rng, fault_rng, workload_rng = master.split(), master.split(), master.split(), master.split()
+        net = Network(sim, net_rng, NetworkConfig.LAN)
+        processor = Processor(sim, net, processor_rng, 500)  # 5% declines
+        gateway = Gateway(sim, net, processor, cfg.defect, 3_000, 2_000)
+        clients = [Client(f"client-{i}", sim, net, gateway, ClientConfig.DEFAULT) for i in range(cfg.clients)]
+        schedule = FaultSchedule.generate(fault_rng, cfg.horizon_ms(), cfg.faults)
+        schedule.arm(sim, net, processor, gateway)
+
+        # Workload: each client's next payment is drawn from the workload stream; the stream never sees faults.
+        issued = [0]
+        for c in clients:
+            Harness._schedule_next_payment(sim, c, workload_rng, cfg, issued)
+
+        violations: list[str] = []
+        first_violation = [-1]
+
+        def check() -> None:
+            if violations:
+                return
+            violations.extend(Harness.check_safety(gateway, processor, clients))
+            if violations:
+                first_violation[0] = sim.now
+
+        t = Harness.CHECK_INTERVAL
+        while t <= cfg.horizon_ms():
+            sim.schedule(t, "invariant-check", check)
+            t += Harness.CHECK_INTERVAL
+        sim.run_until(cfg.horizon_ms())
+        sim.run_until_idle(5_000_000)  # drain: no new payments, faults all ended
+
+        if not violations:
+            violations.extend(Harness.check_safety(gateway, processor, clients))
+            violations.extend(Harness.check_quiescent(gateway, processor))
+            if violations:
+                first_violation[0] = sim.now
+        approved = sum(1 for p in gateway.payments.values() if p.status is Status.APPROVED)
+        declined = sum(1 for p in gateway.payments.values() if p.status is Status.DECLINED)
+        unknown = sum(len(c.unknown) for c in clients)
+        retries = sum(c.retries for c in clients)
+        return SimReport(cfg.seed, cfg.virtual_hours, sim.processed, len(gateway.payments), approved, declined, gateway.pending_count(),
+                         unknown, retries, gateway.auth_timeouts, net.dropped, net.blocked, gateway.crashes, len(schedule.faults),
+                         gateway.ledger.trial_balance(), first_violation[0], tuple(violations), sim.trace.hex())
+
+    def find_failing_seed(cfg: SimConfig, first_seed: int, max_seeds: int) -> Optional[SimReport]:
+        """Try seeds in order until one fails; the report carries everything needed to replay it."""
+        for seed in range(first_seed, first_seed + max_seeds):
+            r = Harness.run(cfg.with_seed(seed))
+            if not r.passed():
+                return r
+        return None
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/14-payments-at-scale/10-simulation-testing-of-payment-systems/code/python
@@ -462,28 +756,371 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-The Python tests port every Java check (63 assertions, one of them pinning the seed-1 fingerprint to the Java value) and the demo output is identical to the Java run, fingerprints included.
+The output is identical to the Java run, fingerprints included:
+
+```console
+== SplitMix64: the same seed is the same universe, on every machine and every run ==
+seed 0 first draw = e220a8397b1dcdaf (reference value e220a8397b1dcdaf)
+
+== Same seed twice: identical event trace ==
+seed=1 hours=48 events=9435 payments=1147 approved=1083 declined=64 pending=0 unknown=0 retries=35 authTimeouts=61 dropped=51 blocked=4 crashes=2 faults=12 trial=0.00 USD violations=0 fp=ff8801a677b7abd9
+fingerprints equal: true
+```
 
 ### In Go
 
-`code/go/main.go` is the same harness: `Rng`, `Fingerprint`, `Simulator`, `Network`, `FaultSchedule`, `Processor`, `Gateway`, `Client`, `Harness`, with the Phase 10 `Money` in `money.go`. Seed 1 over 48 virtual hours produces the same 9,435 events and the same fingerprint `ff8801a677b7abd9` as the Java and Python runs, and the planted defects fall on the same seeds (1 and 4). What differs:
+The Go port (`code/go/main.go`, tests in `main_test.go`) is the same harness: `Rng`, `Fingerprint`, `Simulator`, `Network`, `FaultSchedule`, `Processor`, `Gateway`, `Client`, `Harness`, with the Phase 10 `Money` in `money.go`. Seed 1 over 48 virtual hours produces the same 9,435 events and the same fingerprint `ff8801a677b7abd9` as the Java and Python runs, and the planted defects fall on the same seeds (1 and 4). What differs: **SplitMix64 on `uint64` needs no masks and no `>>>`:** unsigned multiplication wraps and `>>` is the logical shift, so `NextLong` is the six lines of the paper verbatim; `NextInt` takes the top 32 bits with `%` on unsigned words and `NextLongBounded` is a plain unsigned remainder, which is what `Long.remainderUnsigned` spells out in Java. **`container/heap` is the event queue:** `eventHeap` orders by `(Time, Seq)`, so ties run in scheduling order exactly as the Java comparator does; `crypto/sha256` replaces `MessageDigest`, and because `hash.Hash.Sum` leaves the running state untouched, `Fingerprint.Hex` needs no clone. **Errors are values, programming errors panic:** `Transfer` returns `ErrNonPositiveTransfer`, `Ledger.Post` returns `ErrUnbalancedEntry`, `RunUntilIdle` returns `ErrNoQuiescence`, and `FindFailingSeed` returns `(SimReport, bool)` where Java returns `null`, checked with `errors.Is`; a negative delay or a non-positive RNG bound is a bug in the caller, so `Schedule` and `NextInt` panic as the Java throws `IllegalArgumentException`, and `Money.Plus` on amounts the harness itself produced goes through `need`. **Insertion order is explicit, and there are no goroutines:** `Gateway.PaymentIds` and `Client.OutcomeKeys` keep the `LinkedHashMap` order next to the maps, `ApprovalsPerPayment` returns its ids sorted (the `TreeMap`), so the first violation reported is the one the Java reports; closures capture the per-iteration loop variable (Go 1.22) where Python needed a default argument; every component runs on the one event loop, and `go test -race` passes trivially because nothing is shared. The Go tests port all 36 Java checks (43 assertions, one of them pinning the seed-1 fingerprint and event count).
 
-- **SplitMix64 on `uint64` needs no masks and no `>>>`.** Unsigned multiplication wraps and `>>` is the logical shift, so `NextLong` is the six lines of the paper verbatim. `NextInt` takes the top 32 bits with `%` on unsigned words and `NextLongBounded` is a plain unsigned remainder, which is what `Long.remainderUnsigned` spells out in Java.
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A portable seeded generator
+
+`NextLong` on `uint64` is the paper's six lines; `NextInt` and `NextLongBounded` panic on a bad bound and otherwise reduce unsigned values, and `Split` seeds a child stream.
 
 ```go
+type Rng struct {
+	state uint64
+	Draws int64
+}
+
+func NewRng(seed uint64) *Rng { return &Rng{state: seed} }
+
 func (r *Rng) NextLong() uint64 {
-    r.Draws++
-    r.state += 0x9E3779B97F4A7C15
-    z := r.state
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
+	r.Draws++
+	r.state += 0x9E3779B97F4A7C15
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
+// NextInt is uniform in [0, bound). Uses the top 32 bits so the result does not depend on signed-modulo semantics.
+// A non-positive bound is a programming error and panics, as the Java throws IllegalArgumentException.
+func (r *Rng) NextInt(bound int) int {
+	if bound <= 0 {
+		panic("bound must be positive")
+	}
+	return int((r.NextLong() >> 32) % uint64(bound))
+}
+
+// NextLongBounded is uniform in [0, bound) for bounds beyond 32 bits (fault start times over long horizons).
+func (r *Rng) NextLongBounded(bound int64) int64 {
+	if bound <= 0 {
+		panic("bound must be positive")
+	}
+	return int64(r.NextLong() % uint64(bound))
+}
+
+// Between is uniform in [lo, hi].
+func (r *Rng) Between(lo, hi int) int { return lo + r.NextInt(hi-lo+1) }
+
+// Chance is true with probability basisPoints / 10000. Integer probabilities: no float compare, no rounding.
+func (r *Rng) Chance(basisPoints int) bool { return r.NextInt(10_000) < basisPoints }
+
+// Split is a statistically independent child stream; used so adding a component never shifts another's draws.
+func (r *Rng) Split() *Rng { return NewRng(r.NextLong()) }
+```
+
+#### Step 2: The virtual clock
+
+`Schedule` pushes onto a `container/heap` ordered by `(Time, Seq)` and panics on a negative delay; `Step`, `RunUntil`, and `RunUntilIdle` match the Java, with the budget overrun returned as `ErrNoQuiescence`.
+
+```go
+type Simulator struct {
+	queue     eventHeap
+	seq       int64
+	Now       int64
+	Processed int64
+	Trace     *Fingerprint
+}
+
+func NewSimulator() *Simulator { return &Simulator{Trace: NewFingerprint()} }
+
+// Schedule runs action after delayMs of virtual time. A negative delay is a programming error and panics.
+func (s *Simulator) Schedule(delayMs int64, label string, action func()) {
+	if delayMs < 0 {
+		panic("delay must be non-negative")
+	}
+	heap.Push(&s.queue, &Event{s.Now + delayMs, s.seq, label, action})
+	s.seq++
+}
+
+func (s *Simulator) Step() bool {
+	if len(s.queue) == 0 {
+		return false
+	}
+	e := heap.Pop(&s.queue).(*Event)
+	s.Now = e.Time
+	s.Processed++
+	s.Trace.Add(fmt.Sprintf("%d %s", s.Now, e.Label))
+	e.Action()
+	return true
+}
+
+func (s *Simulator) RunUntil(timeMs int64) {
+	for len(s.queue) > 0 && s.queue.peek().Time <= timeMs {
+		s.Step()
+	}
+	if s.Now < timeMs {
+		s.Now = timeMs
+	}
+}
+
+// RunUntilIdle drains every remaining event; the guard turns an accidental infinite loop into an error.
+func (s *Simulator) RunUntilIdle(maxEvents int64) error {
+	budget := maxEvents
+	for s.Step() {
+		budget--
+		if budget < 0 {
+			return ErrNoQuiescence
+		}
+	}
+	return nil
 }
 ```
 
-- **`container/heap` is the event queue.** `eventHeap` orders by `(Time, Seq)`, so ties run in scheduling order exactly as the Java comparator does; `crypto/sha256` replaces `MessageDigest`, and because `hash.Hash.Sum` leaves the running state untouched, `Fingerprint.Hex` needs no clone.
-- **Errors are values, programming errors panic.** `Transfer` returns `ErrNonPositiveTransfer`, `Ledger.Post` returns `ErrUnbalancedEntry`, `RunUntilIdle` returns `ErrNoQuiescence`, and `FindFailingSeed` returns `(SimReport, bool)` where Java returns `null`; the tests use `errors.Is`. A negative delay or a non-positive RNG bound is a bug in the caller, so `Schedule` and `NextInt` panic as the Java throws `IllegalArgumentException`. `Money.Plus` on amounts the harness itself produced goes through `need`, which panics on the error that cannot happen.
-- **Insertion order is explicit, and there are no goroutines.** `Gateway.PaymentIds` and `Client.OutcomeKeys` keep the `LinkedHashMap` order next to the maps, `ApprovalsPerPayment` returns its ids sorted (the `TreeMap`), so the first violation reported is the one the Java reports. Closures capture the per-iteration loop variable (Go 1.22) where Python needed a default argument. Every component runs on the one event loop; `go test -race` passes trivially because nothing is shared, which is the point.
+#### Step 3: The network
+
+`Send` checks the partition map before the drop draw and schedules delivery as a closure that bumps `Delivered` first.
+
+```go
+func (n *Network) Send(from, to, label string, deliver func()) {
+	n.Sent++
+	if n.partitioned[from+">"+to] {
+		n.Blocked++
+		return
+	}
+	if n.rng.Chance(n.cfg.DropBasisPoints) {
+		n.Dropped++
+		return
+	}
+	latency := n.rng.Between(n.cfg.MinLatencyMs, n.cfg.MaxLatencyMs)
+	n.sim.Schedule(int64(latency), "deliver "+to+"<-"+from+" "+label, func() { n.Delivered++; deliver() })
+}
+
+func (n *Network) Partition(a, b string) {
+	n.partitioned[a+">"+b] = true
+	n.partitioned[b+">"+a] = true
+}
+
+func (n *Network) Heal(a, b string) { delete(n.partitioned, a+">"+b); delete(n.partitioned, b+">"+a) }
+```
+
+#### Step 4: Faults as events
+
+`DrawFault` picks the kind from the name table, the start from `NextLongBounded`, and the duration from a `switch`; the end is clamped to the horizon with the built-in `min`.
+
+```go
+type Fault struct {
+	StartMs int64
+	EndMs   int64
+	Kind    FaultKind
+}
+
+const Minute = int64(60_000)
+
+// DrawFault: durations are kind-specific and drawn from the fault stream, so one fault more or less never shifts
+// the workload.
+func DrawFault(rng *Rng, horizonMs int64) Fault {
+	kind := FaultKind(rng.NextInt(len(faultKindNames)))
+	start := rng.NextLongBounded(horizonMs)
+	var duration int64
+	switch kind {
+	case PartitionClientGateway, PartitionGatewayProcessor:
+		duration = int64(rng.Between(5, 120)) * 1000
+	case ProcessorOutage:
+		duration = int64(rng.Between(5, 90)) * 1000
+	case ProcessorSlow:
+		duration = int64(rng.Between(1, 10)) * Minute
+	case GatewayCrash:
+		duration = 0
+	}
+	return Fault{start, min(horizonMs, start+duration), kind}
+}
+```
+
+#### Step 5: The processor and its idempotency
+
+`Receive` swallows while `Down`, dedupes on `AuthKey` with the map's `ok`, appends fresh approvals, and schedules the reply through two nested closures.
+
+```go
+func (p *Processor) Receive(req AuthRequest, gateway *Gateway) {
+	p.Received++
+	if p.Down { // an outage looks like a timeout to the caller
+		p.Swallowed++
+		return
+	}
+	decision, ok := p.Decisions[req.AuthKey]
+	if ok {
+		p.Replayed++
+	} else {
+		approved := !p.rng.Chance(p.declineBasisPoints)
+		decision = AuthResponse{req.AuthKey, req.PaymentId, approved}
+		p.Decisions[req.AuthKey] = decision
+		if approved {
+			p.Approvals = append(p.Approvals, decision)
+		}
+	}
+	reply := decision
+	p.sim.Schedule(int64(p.ExtraLatencyMs), "processor-respond "+req.PaymentId, func() {
+		p.net.Send(ProcessorName, GatewayName, "auth-response "+reply.PaymentId, func() { gateway.OnAuthResponse(reply) })
+	})
+}
+```
+
+#### Step 6: The gateway, its crash, and its recovery
+
+`sendAuth` captures `armedEpoch` and `armedAttempt` for the timeout closure's three guards. `Crash` bumps the epoch, resets the `waiting` map, and schedules the recovery sweep over `PaymentIds` (insertion order) unless the defect skips it.
+
+```go
+func (g *Gateway) sendAuth(p *Payment) {
+	p.Attempts++
+	if g.defect == FreshAuthKeyOnRetry && p.Attempts > 1 {
+		p.AuthKey = fmt.Sprintf("auth-%s-%d", p.PaymentId, p.Attempts)
+	}
+	g.AuthSends++
+	req := AuthRequest{p.AuthKey, p.PaymentId, p.CustomerId, p.Amount, p.Attempts}
+	g.net.Send(GatewayName, ProcessorName, fmt.Sprintf("auth-request %s a%d", p.PaymentId, p.Attempts), func() { g.processor.Receive(req, g) })
+	armedEpoch, armedAttempt := g.epoch, p.Attempts
+	g.sim.Schedule(g.ProcessorTimeoutMs, fmt.Sprintf("auth-timeout %s a%d", p.PaymentId, armedAttempt), func() {
+		if armedEpoch != g.epoch || p.Status != Pending || p.Attempts != armedAttempt {
+			return
+		}
+		g.AuthTimeouts++
+		g.sendAuth(p) // same authKey: the processor will dedupe
+	})
+}
+
+func (g *Gateway) Crash() {
+	g.Crashes++
+	g.epoch++
+	g.crashArmed = false
+	g.waiting = map[string][]func(){}
+	if g.defect == RecoverySkipsPending {
+		return
+	}
+	g.sim.Schedule(g.RecoveryDelayMs, "gateway-recover", func() {
+		for _, id := range g.PaymentIds {
+			if p := g.Payments[id]; p.Status == Pending {
+				g.Recovered++
+				g.sendAuth(p)
+			}
+		}
+	})
+}
+```
+
+#### Step 7: The client that retries
+
+`attempt` closes over a plain `answered` bool (Go closures capture variables by reference), records outcomes with `OutcomeKeys` for insertion order, and retries with linear backoff or gives up into `Unknown`.
+
+```go
+func (c *Client) attempt(req PaymentRequest, n int) {
+	answered := false
+	c.net.Send(c.Name, GatewayName, fmt.Sprintf("payment %s a%d", req.Key, n), func() {
+		c.gateway.Handle(req, func(status Status) {
+			c.net.Send(GatewayName, c.Name, fmt.Sprintf("payment-reply %s %v", req.Key, status), func() {
+				answered = true
+				if previous, seen := c.Outcomes[req.Key]; !seen {
+					c.Outcomes[req.Key] = status
+					c.OutcomeKeys = append(c.OutcomeKeys, req.Key)
+				} else if previous != status {
+					c.Disagreements = append(c.Disagreements, fmt.Sprintf("%s saw %v then %v", req.Key, previous, status))
+				}
+			})
+		})
+	})
+	c.sim.Schedule(c.cfg.TimeoutMs, fmt.Sprintf("client-timeout %s a%d", req.Key, n), func() {
+		if _, known := c.Outcomes[req.Key]; answered || known {
+			return
+		}
+		if n >= c.cfg.MaxAttempts {
+			c.Unknown[req.Key] = true
+			return
+		}
+		c.Retries++
+		c.sim.Schedule(c.cfg.BackoffMs*int64(n), fmt.Sprintf("client-retry %s a%d", req.Key, n+1), func() { c.attempt(req, n+1) })
+	})
+}
+```
+
+#### Step 8: The harness and its two checkers
+
+`Run` splits the master `Rng` four times in the same order, schedules the daily check closure, runs to the horizon, drains with `need(0, RunUntilIdle(...))`, and runs the quiescence check last. `FindFailingSeed` returns `(SimReport, bool)`.
+
+```go
+func (harness) Run(cfg SimConfig) SimReport {
+	sim := NewSimulator()
+	master := NewRng(cfg.Seed)
+	netRng, processorRng, faultRng, workloadRng := master.Split(), master.Split(), master.Split(), master.Split()
+	net := NewNetwork(sim, netRng, LAN)
+	processor := NewProcessor(sim, net, processorRng, 500) // 5% declines
+	gateway := NewGateway(sim, net, processor, cfg.Defect, 3_000, 2_000)
+	clients := make([]*Client, 0, cfg.Clients)
+	for i := 0; i < cfg.Clients; i++ {
+		clients = append(clients, NewClient(fmt.Sprintf("client-%d", i), sim, net, gateway, DefaultClientConfig))
+	}
+	schedule := GenerateFaultSchedule(faultRng, cfg.HorizonMs(), cfg.Faults)
+	schedule.Arm(sim, net, processor, gateway)
+
+	// Workload: each client's next payment is drawn from the workload stream; the stream never sees faults.
+	issued := 0
+	for _, c := range clients {
+		scheduleNextPayment(sim, c, workloadRng, cfg, &issued)
+	}
+
+	violations := []string{}
+	firstViolation := int64(-1)
+	for t := CheckInterval; t <= cfg.HorizonMs(); t += CheckInterval {
+		sim.Schedule(t, "invariant-check", func() {
+			if len(violations) > 0 {
+				return
+			}
+			violations = append(violations, CheckSafety(gateway, processor, clients)...)
+			if len(violations) > 0 {
+				firstViolation = sim.Now
+			}
+		})
+	}
+	sim.RunUntil(cfg.HorizonMs())
+	need(0, sim.RunUntilIdle(5_000_000)) // drain: no new payments, faults all ended
+
+	if len(violations) == 0 {
+		violations = append(violations, CheckSafety(gateway, processor, clients)...)
+		violations = append(violations, CheckQuiescent(gateway, processor)...)
+		if len(violations) > 0 {
+			firstViolation = sim.Now
+		}
+	}
+	approved, declined, unknown, retries := 0, 0, 0, 0
+	for _, p := range gateway.Payments {
+		switch p.Status {
+		case Approved:
+			approved++
+		case Declined:
+			declined++
+		}
+	}
+	for _, c := range clients {
+		unknown += len(c.Unknown)
+		retries += c.Retries
+	}
+	return SimReport{cfg.Seed, cfg.VirtualHours, sim.Processed, len(gateway.Payments), approved, declined, gateway.PendingCount(),
+		unknown, retries, gateway.AuthTimeouts, net.Dropped, net.Blocked, gateway.Crashes, len(schedule.Faults),
+		gateway.Ledger.TrialBalance(), firstViolation, violations, sim.Trace.Hex()}
+}
+
+func (h harness) FindFailingSeed(cfg SimConfig, firstSeed uint64, maxSeeds int) (SimReport, bool) {
+	for seed := firstSeed; seed < firstSeed+uint64(maxSeeds); seed++ {
+		if r := h.Run(cfg.WithSeed(seed)); !r.Passed() {
+			return r, true
+		}
+	}
+	return SimReport{}, false
+}
+```
+
+#### Step 9: Run it
 
 ```bash
 cd phases/14-payments-at-scale/10-simulation-testing-of-payment-systems/code/go
@@ -491,7 +1128,17 @@ go run .
 go test ./...
 ```
 
-The Go tests port all 36 Java checks (43 assertions, one of them pinning the seed-1 fingerprint and event count to the Java values) and the demo output is identical to the Java run, fingerprints included.
+The output is identical to the Java run; the planted defects fall on the same seeds:
+
+```console
+== Plant a defect; the harness finds a failing seed and prints how to replay it ==
+FRESH_AUTH_KEY_ON_RETRY -> seed 1 breaks [no-double-authorization]
+  [no-double-authorization] pay-000020 approved 2 times by the processor
+  reproduce with: Harness.run(SimConfig.standard(1, 24)); first violation at t=86400000ms: [no-double-authorization] pay-000020 approved 2 times by the processor
+RECOVERY_SKIPS_PENDING -> seed 4 breaks [no-stuck-payments]
+  [no-stuck-payments] pay-000124 still PENDING after quiescence (1 auth attempts)
+  reproduce with: Harness.run(SimConfig.standard(4, 24)); first violation at t=87057653ms: [no-stuck-payments] pay-000124 still PENDING after quiescence (1 auth attempts)
+```
 
 ## Use It
 

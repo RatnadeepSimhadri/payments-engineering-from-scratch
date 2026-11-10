@@ -396,55 +396,559 @@ The test run prints `passed 44, failed 0`.
 
 ### In Python
 
-```python
-class Account:
-    def __init__(self, account_id, currency, clock):
-        ...
-        self._lock = threading.RLock()
+The Python port keeps the same `ManualClock`, `Hold`, `Account`, and `race_authorizations`, with four differences. **`threading.RLock`, not `Lock`:** `authorize` calls `available_balance` calls `held_total` calls `expire_stale`, and each takes the lock; a plain `Lock` would deadlock on the second acquisition, and `RLock` is Python's reentrant monitor, the equivalent of Java's `synchronized` on `this`. **The GIL does not save you:** Python runs one bytecode at a time, but `amount > available` and `self._holds[hold_id] = h` are different bytecodes with a context switch allowed between them, so the race test fails without the lock on CPython just as it does in Java. **Comparison uses `>`**, via `functools.total_ordering` on `Money`, where Java uses `compareTo`; both raise on a currency mismatch. **`ManualClock` has its own lock** because the race test reads `now()` from fifty threads; a bare `int` read is atomic in CPython today but the lesson does not rely on an implementation detail. The exceptions (`InsufficientAvailableError`, `OverCaptureError`, `HoldNotActiveError`, `UnknownHoldError`, `DuplicateHoldError`) all extend `HoldError`.
 
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The injected clock
+
+There is no interface to declare; any object with `now()` works, and `ManualClock` is the one the demo and tests use. A `threading.Lock` guards the integer so a reader and the writer never interleave, and negative advances are refused for the same test-aid reason as in Java.
+
+```python
+class ManualClock:
+    """A clock the test moves by hand, in whole seconds. Expiry is a function of this value only."""
+
+    def __init__(self, start: int) -> None:
+        self._now = start
+        self._lock = threading.Lock()
+
+    def now(self) -> int:
+        with self._lock:
+            return self._now
+
+    def advance(self, seconds: int) -> None:
+        if seconds < 0:
+            raise ValueError("clocks do not run backwards in this lesson")
+        with self._lock:
+            self._now += seconds
+```
+
+#### Step 2: The hold
+
+`Hold` is an ordinary mutable class. The constructor validates id, amount, and expiry; `is_stale` is the pure `(status, now)` function. The transitions are prefixed with an underscore to signal that only `Account` may call them, which is the Python spelling of Java's package-private methods.
+
+```python
+class Hold:
+    def __init__(self, hold_id: str, amount: Money, created_at: int, expires_at: int) -> None:
+        if not hold_id or not hold_id.strip():
+            raise ValueError("hold id required")
+        if not amount.is_positive():
+            raise ValueError(f"hold amount must be positive, got {amount}")
+        if expires_at <= created_at:
+            raise ValueError("hold must expire after it is created")
+        self.id = hold_id
+        self.amount = amount
+        self.created_at = created_at
+        self.expires_at = expires_at
+        self.status = HoldStatus.ACTIVE
+        self.captured = Money.zero(amount.currency)
+
+    def is_active(self) -> bool:
+        return self.status is HoldStatus.ACTIVE
+
+    def is_stale(self, now: int) -> bool:
+        """True when the clock has passed the expiry and the hold is still marked active."""
+        return self.status is HoldStatus.ACTIVE and now >= self.expires_at
+
+    # Transitions. Only Account calls these, after it has checked the invariant.
+    def _increment(self, extra: Money) -> None:
+        self.amount = self.amount.plus(extra)
+
+    def _mark_captured(self, captured: Money) -> None:
+        self.captured = captured
+        self.status = HoldStatus.CAPTURED
+
+    def _mark_voided(self) -> None:
+        self.status = HoldStatus.VOIDED
+
+    def _mark_expired(self) -> None:
+        self.status = HoldStatus.EXPIRED
+```
+
+#### Step 3: The account, and the three balances
+
+Every public method is a `with self._lock:` block, and because the lock is an `RLock`, `available_balance` -> `held_total` -> `expire_stale` re-enters it without deadlock. The holds live in a plain `dict`, which iterates in insertion order like the Java `LinkedHashMap`.
+
+```python
+    def expire_stale(self) -> int:
+        """Sweep: any ACTIVE hold whose expiry has passed becomes EXPIRED and stops reducing available."""
+        with self._lock:
+            now = self._clock.now()
+            released = 0
+            for h in self._holds.values():
+                if h.is_stale(now):
+                    h._mark_expired()
+                    released += 1
+                    self._events.append(f"t={now} EXPIRED {h.id} released {h.amount}")
+            return released
+
+    def ledger_balance(self) -> Money:
+        """The settled balance. Holds never change this number."""
+        with self._lock:
+            return self._ledger
+
+    def held_total(self) -> Money:
+        with self._lock:
+            self.expire_stale()
+            total = Money.zero(self.currency)
+            for h in self._holds.values():
+                if h.is_active():
+                    total = total.plus(h.amount)
+            return total
+
+    def available_balance(self) -> Money:
+        """What may still be promised to someone else: ledger minus everything already promised."""
+        with self._lock:
+            return self._ledger.minus(self.held_total())
+```
+
+#### Step 4: Authorize is check-then-reserve under one lock
+
+The check and the insert sit inside one `with self._lock:` block, so no other thread can slip between `amount > available` and `self._holds[hold_id] = h`. The GIL would not guarantee that on its own. `increment` grows an existing active hold under the identical check.
+
+```python
     def authorize(self, hold_id: str, amount: Money, ttl_seconds: int) -> Hold:
+        """Place a hold. Rejected if it would push available below zero. The ledger does not move."""
         with self._lock:
             self._require_positive(amount)
             if hold_id in self._holds:
                 raise DuplicateHoldError(hold_id)
             available = self.available_balance()
-            ...
+            if amount > available:
+                raise InsufficientAvailableError(amount, available)
+            now = self._clock.now()
+            h = Hold(hold_id, amount, now, now + ttl_seconds)
+            self._holds[hold_id] = h
+            self._events.append(f"t={now} AUTHORIZE {hold_id} {amount} until t={h.expires_at}")
+            return h
+
+    def increment(self, hold_id: str, extra: Money) -> Hold:
+        """Hold stacking by incremental authorization: the same hold grows, subject to the same check."""
+        with self._lock:
+            self._require_positive(extra)
+            h = self._require_active(hold_id)
+            available = self.available_balance()
+            if extra > available:
+                raise InsufficientAvailableError(extra, available)
+            h._increment(extra)
+            self._events.append(f"t={self._clock.now()} INCREMENT {hold_id} +{extra} -> {h.amount}")
+            return h
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 5: Capture, void, and the settled debit
 
-- **`threading.RLock`, not `Lock`.** `authorize` calls `available_balance` calls `held_total` calls `expire_stale`, and each takes the lock. A plain `Lock` would deadlock on the second acquisition; `RLock` is Python's reentrant monitor, the equivalent of Java's `synchronized` on `this`.
-- **The GIL does not save you.** Python runs one bytecode at a time, but `amount > available` and `self._holds[hold_id] = h` are different bytecodes with a context switch allowed between them. The race test fails without the lock on CPython just as it does in Java.
-- **Comparison uses `>`**, via `functools.total_ordering` on `Money`, where Java uses `compareTo`. Both raise on a currency mismatch.
-- **`ManualClock` has its own lock** because the race test reads `now()` from fifty threads; a bare `int` read is atomic in CPython today but the lesson does not rely on an implementation detail.
+`capture` has no available check (the money was reserved at authorization) and moves the ledger by the captured amount only; `void_hold` changes nothing but the status; `debit` is the unauthorized settled movement that must fit inside available. `_require_active` sweeps expiries and raises `HoldNotActiveError` naming the actual status.
+
+```python
+    def debit(self, amount: Money) -> None:
+        """A settled debit that was never authorized (a fee, a direct debit). Must fit inside available."""
+        with self._lock:
+            self._require_positive(amount)
+            available = self.available_balance()
+            if amount > available:
+                raise InsufficientAvailableError(amount, available)
+            self._ledger = self._ledger.minus(amount)
+            self._events.append(f"t={self._clock.now()} DEBIT {amount}")
+```
+
+```python
+    def capture(self, hold_id: str, amount: Money) -> Money:
+        """Capture the final amount. Ledger moves by `amount`; the remainder of the hold is released."""
+        with self._lock:
+            self._require_positive(amount)
+            h = self._require_active(hold_id)
+            if amount > h.amount:
+                raise OverCaptureError(hold_id, amount, h.amount)
+            self._ledger = self._ledger.minus(amount)
+            h._mark_captured(amount)
+            released = h.amount.minus(amount)
+            self._events.append(f"t={self._clock.now()} CAPTURE {hold_id} {amount} released {released}")
+            return released
+
+    def void_hold(self, hold_id: str) -> Money:
+        """Void (authorization reversal): the hold is cancelled and its whole amount returns to available."""
+        with self._lock:
+            h = self._require_active(hold_id)
+            h._mark_voided()
+            self._events.append(f"t={self._clock.now()} VOID {hold_id} released {h.amount}")
+            return h.amount
+```
+
+#### Step 6: The invariant as an oracle
+
+The oracle recomputes the active-hold sum with its own loop (comparing `status is HoldStatus.ACTIVE` rather than calling `is_active`) and checks it against `available_balance()`. Dataclass equality on `Money` gives the `equals` comparison.
+
+```python
+    def check_invariant(self) -> bool:
+        """Recompute the invariant from scratch. Tests call this after every operation."""
+        with self._lock:
+            self.expire_stale()
+            total = Money.zero(self.currency)
+            for h in self._holds.values():
+                if h.status is HoldStatus.ACTIVE:
+                    total = total.plus(h.amount)
+            available = self.available_balance()
+            return available == self._ledger.minus(total) and not available.is_negative()
+```
+
+#### Step 7: The race
+
+A `threading.Barrier(threads)` replaces the `CountDownLatch`: every worker blocks in `start.wait()` until the last one arrives, then all are released together. The tallies are lists guarded by their own `Lock`, standing in for the two `AtomicInteger`s.
+
+```python
+def race_authorizations(account: Account, threads: int, amount: Money) -> tuple[int, int]:
+    start = threading.Barrier(threads)
+    accepted: list[int] = []
+    rejected: list[int] = []
+    tally = threading.Lock()
+
+    def worker(i: int) -> None:
+        start.wait()
+        try:
+            account.authorize(f"race-{i}", amount, 3600)
+            with tally:
+                accepted.append(i)
+        except InsufficientAvailableError:
+            with tally:
+                rejected.append(i)
+
+    workers = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    return len(accepted), len(rejected)
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/10-money-and-ledgers/07-holds-and-available-balance/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output matches the Java run line for line:
+
+```console
+== Expiry: the clock moves 8 days; nobody captured the hotel hold ==
+8 days later (hotel hold expired on read)    ledger=457.83 USD  held=0.00 USD    available=457.83 USD  invariant=true
+rejected: hold auth-hotel is EXPIRED, not ACTIVE
+
+== Concurrency: 50 threads race to authorize 20.00 against 500.00 ==
+accepted=25 rejected=25 available=0.00 USD invariant=true
+
+final: 102.83 USD ledger, 102.83 USD available, invariant=true
+```
 
 ### In Go
 
+The Go port keeps the design and differs in four places. **`sync.Mutex` is not reentrant:** `Authorize` holds the lock and must compute available, but calling the exported `AvailableBalance` would try to lock again and deadlock. So the file has pairs: `AvailableBalance` (locks, delegates) and `availableLocked` (assumes the lock is held), likewise `heldTotalLocked`, `expireStaleLocked`, `holdLocked`, `requireActiveLocked`; the naming convention is the documentation, and Go has no way to enforce it. **Errors are values and wrap sentinels:** `ErrInsufficientAvailable`, `ErrOverCapture`, `ErrHoldNotActive`, `ErrUnknownHold`, `ErrDuplicateHold`, `ErrInvalidAmount`, and `ErrCurrencyMismatch` all support `errors.Is`, which is how the tests assert the failure kind and how the race counts rejections. **Map iteration is random**, so the account keeps an `order` slice of hold ids for deterministic sweeps, event logs, and `ActiveHolds()`. **`go test -race ./...` is part of the contract:** the race detector flags unsynchronized access to `ManualClock.now` from fifty goroutines, which is why the clock has its own mutex; run the tests with `-race` or the concurrency test proves less than it claims.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The injected clock
+
+`Clock` is a one-method interface and `ManualClock` its test implementation. Instead of `volatile` plus `synchronized`, both `Now` and `Advance` take the same `sync.Mutex`, which is what keeps `go test -race` quiet when fifty goroutines read the clock. `Advance` returns an error for a negative step rather than panicking.
+
 ```go
-type Account struct {
-    mu     sync.Mutex
-    ledger Money
-    holds  map[string]*Hold
-    order  []string
-    ...
+type Clock interface {
+	Now() int64
 }
 
-func (a *Account) Authorize(id string, amount Money, ttlSeconds int64) (*Hold, error) {
-    if err := a.requirePositive(amount); err != nil { return nil, err }
-    a.mu.Lock()
-    defer a.mu.Unlock()
-    ...
-    available := a.availableLocked()
-    ...
+type ManualClock struct {
+	mu  sync.Mutex
+	now int64
+}
+
+func NewManualClock(start int64) *ManualClock { return &ManualClock{now: start} }
+
+func (c *ManualClock) Now() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *ManualClock) Advance(seconds int64) error {
+	if seconds < 0 {
+		return errors.New("clocks do not run backwards in this lesson")
+	}
+	c.mu.Lock()
+	c.now += seconds
+	c.mu.Unlock()
+	return nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: The hold
 
-- **`sync.Mutex` is not reentrant.** `Authorize` holds the lock and must compute available, but calling the exported `AvailableBalance` would try to lock again and deadlock. So the file has pairs: `AvailableBalance` (locks, delegates) and `availableLocked` (assumes the lock is held), likewise `heldTotalLocked`, `expireStaleLocked`, `holdLocked`, `requireActiveLocked`. The naming convention is the documentation; Go has no way to enforce it.
-- **Errors are values and wrap sentinels.** `ErrInsufficientAvailable`, `ErrOverCapture`, `ErrHoldNotActive`, `ErrUnknownHold`, `ErrDuplicateHold`, `ErrInvalidAmount`, and `ErrCurrencyMismatch` all support `errors.Is`, which is how the tests assert the failure kind and how the race counts rejections.
-- **Map iteration is random**, so the account keeps an `order` slice of hold ids for deterministic sweeps, event logs, and `ActiveHolds()`.
-- **`go test -race ./...` is part of the contract.** The race detector flags unsynchronized access to `ManualClock.now` from fifty goroutines, which is why the clock has its own mutex. Run the tests with `-race` or the concurrency test proves less than it claims.
+`HoldStatus` is an `int` with `iota` constants and a `String()` method that prints the Java names. `Hold` has exported fields that `Account` mutates directly (there are no `markX` methods; `Account` writes `h.Status = Captured` under its lock), and the unexported `newHold` constructor carries the three validation rules.
+
+```go
+type HoldStatus int
+
+const (
+	Active HoldStatus = iota
+	Captured
+	Voided
+	Expired
+)
+
+func (s HoldStatus) String() string {
+	return [...]string{"ACTIVE", "CAPTURED", "VOIDED", "EXPIRED"}[s]
+}
+
+type Hold struct {
+	ID        string
+	Amount    Money
+	CreatedAt int64
+	ExpiresAt int64
+	Status    HoldStatus
+	Captured  Money
+}
+
+func newHold(id string, amount Money, createdAt, expiresAt int64) (*Hold, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, errors.New("hold id required")
+	}
+	if !amount.IsPositive() {
+		return nil, fmt.Errorf("hold amount must be positive, got %s", amount)
+	}
+	if expiresAt <= createdAt {
+		return nil, errors.New("hold must expire after it is created")
+	}
+	return &Hold{ID: id, Amount: amount, CreatedAt: createdAt, ExpiresAt: expiresAt, Status: Active, Captured: Zero(amount.Currency)}, nil
+}
+
+func (h *Hold) IsActive() bool { return h.Status == Active }
+
+// IsStale is true when the clock has passed the expiry and the hold is still marked active.
+func (h *Hold) IsStale(now int64) bool { return h.Status == Active && now >= h.ExpiresAt }
+```
+
+#### Step 3: The account, and the three balances
+
+This is where the non-reentrant mutex shows. Each exported read locks and delegates to a `...Locked` twin; the twins call each other freely because the lock is already held. `order` is the insertion-ordered slice of hold ids that every sweep iterates.
+
+```go
+type Account struct {
+	ID       string
+	Currency Currency
+	mu       sync.Mutex
+	clock    Clock
+	ledger   Money
+	holds    map[string]*Hold
+	order    []string // insertion order, so iteration is deterministic
+	events   []string
+}
+
+func (a *Account) ExpireStale() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.expireStaleLocked()
+}
+
+func (a *Account) expireStaleLocked() int {
+	now := a.clock.Now()
+	released := 0
+	for _, id := range a.order {
+		h := a.holds[id]
+		if h.IsStale(now) {
+			h.Status = Expired
+			released++
+			a.events = append(a.events, fmt.Sprintf("t=%d EXPIRED %s released %s", now, h.ID, h.Amount))
+		}
+	}
+	return released
+}
+
+func (a *Account) heldTotalLocked() Money {
+	a.expireStaleLocked()
+	total := Zero(a.Currency)
+	for _, id := range a.order {
+		if h := a.holds[id]; h.IsActive() {
+			total = must(total.Plus(h.Amount))
+		}
+	}
+	return total
+}
+
+func (a *Account) AvailableBalance() Money {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.availableLocked()
+}
+
+func (a *Account) availableLocked() Money { return must(a.ledger.Minus(a.heldTotalLocked())) }
+```
+
+#### Step 4: Authorize is check-then-reserve under one lock
+
+`requirePositive` reads only immutable fields, so it runs before the lock is taken; everything that touches shared state sits between `a.mu.Lock()` and the deferred unlock. `amount.Compare(available) > 0` is the `compareTo` check, and the new hold is appended to `order` as well as the map.
+
+```go
+func (a *Account) Authorize(id string, amount Money, ttlSeconds int64) (*Hold, error) {
+	if err := a.requirePositive(amount); err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, exists := a.holds[id]; exists {
+		return nil, fmt.Errorf("%w: %s", ErrDuplicateHold, id)
+	}
+	available := a.availableLocked()
+	if amount.Compare(available) > 0 {
+		return nil, fmt.Errorf("%w: requested %s but only %s is available", ErrInsufficientAvailable, amount, available)
+	}
+	now := a.clock.Now()
+	h, err := newHold(id, amount, now, now+ttlSeconds)
+	if err != nil {
+		return nil, err
+	}
+	a.holds[id] = h
+	a.order = append(a.order, id)
+	a.events = append(a.events, fmt.Sprintf("t=%d AUTHORIZE %s %s until t=%d", now, id, amount, h.ExpiresAt))
+	return h, nil
+}
+
+func (a *Account) Increment(id string, extra Money) (*Hold, error) {
+	if err := a.requirePositive(extra); err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	h, err := a.requireActiveLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	available := a.availableLocked()
+	if extra.Compare(available) > 0 {
+		return nil, fmt.Errorf("%w: requested %s but only %s is available", ErrInsufficientAvailable, extra, available)
+	}
+	h.Amount = must(h.Amount.Plus(extra))
+	a.events = append(a.events, fmt.Sprintf("t=%d INCREMENT %s +%s -> %s", a.clock.Now(), id, extra, h.Amount))
+	return h, nil
+}
+```
+
+#### Step 5: Capture, void, and the settled debit
+
+`Capture` sets `h.Captured` and `h.Status` directly under the account lock, moves the ledger by the captured amount, and returns the released remainder; `VoidHold` flips the status only. `Debit` (not shown; same shape as `Authorize` without a hold) checks available first. `requireActiveLocked` wraps `ErrHoldNotActive` with the hold's current status.
+
+```go
+func (a *Account) Capture(id string, amount Money) (Money, error) {
+	if err := a.requirePositive(amount); err != nil {
+		return Money{}, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	h, err := a.requireActiveLocked(id)
+	if err != nil {
+		return Money{}, err
+	}
+	if amount.Compare(h.Amount) > 0 {
+		return Money{}, fmt.Errorf("%w: hold %s: cannot capture %s against a hold of %s", ErrOverCapture, id, amount, h.Amount)
+	}
+	a.ledger = must(a.ledger.Minus(amount))
+	h.Captured = amount
+	h.Status = Captured
+	released := must(h.Amount.Minus(amount))
+	a.events = append(a.events, fmt.Sprintf("t=%d CAPTURE %s %s released %s", a.clock.Now(), id, amount, released))
+	return released, nil
+}
+
+func (a *Account) VoidHold(id string) (Money, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	h, err := a.requireActiveLocked(id)
+	if err != nil {
+		return Money{}, err
+	}
+	h.Status = Voided
+	a.events = append(a.events, fmt.Sprintf("t=%d VOID %s released %s", a.clock.Now(), id, h.Amount))
+	return h.Amount, nil
+}
+
+func (a *Account) requireActiveLocked(id string) (*Hold, error) {
+	a.expireStaleLocked()
+	h, err := a.holdLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	if !h.IsActive() {
+		return nil, fmt.Errorf("%w: hold %s is %s", ErrHoldNotActive, id, h.Status)
+	}
+	return h, nil
+}
+```
+
+#### Step 6: The invariant as an oracle
+
+The oracle recomputes the active sum from `order` and compares with `==`, which works because `Money` is a comparable value struct.
+
+```go
+func (a *Account) CheckInvariant() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.expireStaleLocked()
+	total := Zero(a.Currency)
+	for _, id := range a.order {
+		if h := a.holds[id]; h.Status == Active {
+			total = must(total.Plus(h.Amount))
+		}
+	}
+	available := a.availableLocked()
+	return available == must(a.ledger.Minus(total)) && !available.IsNegative()
+}
+```
+
+#### Step 7: The race
+
+A closed channel is Go's latch: every goroutine blocks on `<-start` until `close(start)` releases them all at once. A `sync.WaitGroup` replaces `join`, a small `tally` mutex replaces the atomics, and `errors.Is(err, ErrInsufficientAvailable)` is how a rejection is recognised.
+
+```go
+func RaceAuthorizations(account *Account, goroutines int, amount Money) (accepted, rejected int) {
+	var wg sync.WaitGroup
+	var tally sync.Mutex
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			_, err := account.Authorize(id, amount, 3600)
+			tally.Lock()
+			defer tally.Unlock()
+			switch {
+			case err == nil:
+				accepted++
+			case errors.Is(err, ErrInsufficientAvailable):
+				rejected++
+			}
+		}(fmt.Sprintf("race-%d", i))
+	}
+	close(start)
+	wg.Wait()
+	return accepted, rejected
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/10-money-and-ledgers/07-holds-and-available-balance/code/go
+go run .
+go test -race ./...
+```
+
+The output matches the Java run except that the race heading says goroutines:
+
+```console
+== Concurrency: 50 goroutines race to authorize 20.00 against 500.00 ==
+accepted=25 rejected=25 available=0.00 USD invariant=true
+
+final: 102.83 USD ledger, 102.83 USD available, invariant=true
+```
 
 ## Use It
 

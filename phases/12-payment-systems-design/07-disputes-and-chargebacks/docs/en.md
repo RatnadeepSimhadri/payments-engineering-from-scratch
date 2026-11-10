@@ -359,20 +359,205 @@ The demo also prints the reason-code table, the full transition history of `dp_1
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **Evidence requirements are `frozenset`s, printed in declaration order:** `EvidenceType` members carry their position as the value, and every message or table row goes through `format_groups`, because `frozenset` iteration order changes under hash randomization, the same determinism bug Step 1 fixed in Java with `EnumSet`; `missing_for` returns a `list[frozenset]` that tests compare with `==`. **The rule table is a tuple of frozen dataclasses** on `DisputeService.RULES`, with `from_state`/`to_state` because `from` is a keyword; `resolve` finds the row with `next(...)` and raises `IllegalDisputeTransitionError` (a `RuntimeError`) before any mutation, exactly where the Java threw. **Dates are `datetime.date`:** `_deadline_for` adds a `timedelta`, "after the deadline" is `today > deadline`, and `days_between(a, b)` is `(b - a).days`; `DeadlinePolicy.days` is a plain dict keyed by `DisputeState`. **The exhaustive negative test uses `subTest`** over the 112 (state, event) pairs not in the table, so a failure names the pair; `IllegalStateException` (duplicate id) is `RuntimeError` and `IllegalArgumentException` is `ValueError`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Reason codes as data
+
+`Requirement` is a type alias for `frozenset[EvidenceType]`; `ReasonCode.__post_init__` freezes each requirement so the dataclass stays hashable. `format_groups` sorts each group by the enum's position before printing, which is how the Python port gets the deterministic output the Java `EnumSet` gave.
+
 ```python
 Requirement = frozenset[EvidenceType]
 
-def format_groups(groups) -> str:
-    # Java's EnumSet prints in declaration order; a frozenset does not, so sort by the enum's position.
+
+def format_groups(groups: list[Requirement] | tuple[Requirement, ...]) -> str:
+    """Java's EnumSet prints in declaration order; a frozenset does not, so sort by the enum's position."""
     return "[" + ", ".join("[" + ", ".join(t.name for t in sorted(g, key=lambda t: t.value)) + "]" for g in groups) + "]"
+
+
+@dataclass(frozen=True)
+class ReasonCode:
+    network: str
+    code: str
+    title: str
+    category: ReasonCategory
+    requirements: tuple[Requirement, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "requirements", tuple(frozenset(r) for r in self.requirements))
+
+    def key(self) -> str:
+        return f"{self.network} {self.code}"
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: The evidence bundle
 
-- **Evidence requirements are `frozenset`s, printed in declaration order.** `EvidenceType` members carry their position as the value, and every message or table row goes through `format_groups`, because `frozenset` iteration order changes under hash randomization: the same determinism bug Step 1 fixed in Java with `EnumSet`. `missing_for` returns a `list[frozenset]` that tests compare with `==`.
-- **The rule table is a tuple of frozen dataclasses** on `DisputeService.RULES`, with `from_state`/`to_state` because `from` is a keyword; `resolve` finds the row with `next(...)` and raises `IllegalDisputeTransitionError` (a `RuntimeError`) before any mutation, exactly where the Java threw.
-- **Dates are `datetime.date`.** `deadline_for` adds a `timedelta`, "after the deadline" is `today > deadline`, and `days_between(a, b)` is `(b - a).days`. `DeadlinePolicy.days` is a plain dict keyed by `DisputeState`.
-- **The exhaustive negative test uses `subTest`** over the 112 (state, event) pairs not in the table, so a failure names the pair; `IllegalStateException` (duplicate id) is `RuntimeError` and `IllegalArgumentException` is `ValueError`.
+`missing_for` is a list comprehension that keeps each requirement no item satisfies; `has` is an `any` over the items. `liability_shift` is scoped to the `FRAUD` category exactly as in Java.
+
+```python
+class EvidenceBundle:
+    items: tuple[EvidenceItem, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "items", tuple(self.items))
+
+    @staticmethod
+    def of(*items: EvidenceItem) -> "EvidenceBundle":
+        return EvidenceBundle(tuple(items))
+
+    def has(self, t: EvidenceType) -> bool:
+        return any(i.type is t for i in self.items)
+
+    def missing_for(self, reason: ReasonCode) -> list[Requirement]:
+        """Requirements not met by any item: each entry is a set of which at least one must be present."""
+        return [req for req in reason.requirements if not any(self.has(t) for t in req)]
+
+    def liability_shift(self, reason: ReasonCode) -> bool:
+        """A fraud claim against a transaction the issuer itself authenticated with 3-D Secure shifts liability to the issuer."""
+        return reason.category is ReasonCategory.FRAUD and self.has(EvidenceType.THREE_DS_AUTHENTICATION)
+```
+
+#### Step 3: The table
+
+Eighteen `DisputeRule` rows in a class-level tuple, in the same order as the Java `List.of`. No two rows share a `(from_state, kind)` pair, so `resolve` takes the first match.
+
+```python
+    RULES: tuple[DisputeRule, ...] = (
+        DisputeRule(DisputeState.INQUIRY, DisputeEventKind.RESPOND_INQUIRY, DisputeGuard.EVIDENCE_COMPLETE_IN_TIME, DisputeState.INQUIRY_RESPONDED),
+        DisputeRule(DisputeState.INQUIRY, DisputeEventKind.CHARGEBACK_RECEIVED, DisputeGuard.ALWAYS, DisputeState.CHARGEBACK),
+        DisputeRule(DisputeState.INQUIRY_RESPONDED, DisputeEventKind.INQUIRY_CLOSED, DisputeGuard.ALWAYS, DisputeState.CLOSED_NO_CHARGEBACK),
+        DisputeRule(DisputeState.INQUIRY_RESPONDED, DisputeEventKind.CHARGEBACK_RECEIVED, DisputeGuard.ALWAYS, DisputeState.CHARGEBACK),
+        DisputeRule(DisputeState.CHARGEBACK, DisputeEventKind.ACCEPT, DisputeGuard.ALWAYS, DisputeState.LOST),
+        DisputeRule(DisputeState.CHARGEBACK, DisputeEventKind.SUBMIT_REPRESENTMENT, DisputeGuard.EVIDENCE_COMPLETE_IN_TIME, DisputeState.REPRESENTED),
+        DisputeRule(DisputeState.CHARGEBACK, DisputeEventKind.DEADLINE_PASSED, DisputeGuard.DEADLINE_ELAPSED, DisputeState.LOST),
+        DisputeRule(DisputeState.REPRESENTED, DisputeEventKind.ISSUER_ACCEPTED, DisputeGuard.ALWAYS, DisputeState.WON),
+        DisputeRule(DisputeState.REPRESENTED, DisputeEventKind.PRE_ARB_RECEIVED, DisputeGuard.ALWAYS, DisputeState.PRE_ARBITRATION),
+        DisputeRule(DisputeState.REPRESENTED, DisputeEventKind.DEADLINE_PASSED, DisputeGuard.DEADLINE_ELAPSED, DisputeState.WON),
+        DisputeRule(DisputeState.PRE_ARBITRATION, DisputeEventKind.ACCEPT, DisputeGuard.ALWAYS, DisputeState.LOST),
+        DisputeRule(DisputeState.PRE_ARBITRATION, DisputeEventKind.RESPOND_PRE_ARB, DisputeGuard.EVIDENCE_COMPLETE_IN_TIME, DisputeState.PRE_ARB_RESPONDED),
+        DisputeRule(DisputeState.PRE_ARBITRATION, DisputeEventKind.DEADLINE_PASSED, DisputeGuard.DEADLINE_ELAPSED, DisputeState.LOST),
+        DisputeRule(DisputeState.PRE_ARB_RESPONDED, DisputeEventKind.ISSUER_WITHDREW, DisputeGuard.ALWAYS, DisputeState.WON),
+        DisputeRule(DisputeState.PRE_ARB_RESPONDED, DisputeEventKind.ARBITRATION_FILED, DisputeGuard.ALWAYS, DisputeState.ARBITRATION),
+        DisputeRule(DisputeState.PRE_ARB_RESPONDED, DisputeEventKind.DEADLINE_PASSED, DisputeGuard.DEADLINE_ELAPSED, DisputeState.WON),
+        DisputeRule(DisputeState.ARBITRATION, DisputeEventKind.RULING_FOR_MERCHANT, DisputeGuard.ALWAYS, DisputeState.WON),
+        DisputeRule(DisputeState.ARBITRATION, DisputeEventKind.RULING_FOR_ISSUER, DisputeGuard.ALWAYS, DisputeState.LOST),
+    )
+```
+
+#### Step 4: Resolve with guards
+
+`resolve` raises the same three refusals with the same messages: terminal, no row, guard failed. The date guards compare `datetime.date` objects with `>`; the evidence guard checks time before completeness, and the incomplete-evidence message goes through `format_groups`.
+
+```python
+    def resolve(self, d: Dispute, e: DisputeEvent) -> DisputeRule:
+        """Pick the rule, check its guard, or explain precisely why not. Pure: never mutates."""
+        if d.state.is_terminal():
+            raise IllegalDisputeTransitionError(f"{d.id} is {d.state.name} (terminal); {e.kind.name} refused")
+        rule = next((r for r in DisputeService.RULES if r.from_state is d.state and r.kind is e.kind), None)
+        if rule is None:
+            raise IllegalDisputeTransitionError(f"{d.id}: {e.kind.name} is not legal from {d.state.name}")
+        today = self._clock.today()
+        if rule.guard is DisputeGuard.DEADLINE_ELAPSED and (d.deadline is None or not today > d.deadline):
+            raise IllegalDisputeTransitionError(f"{d.id}: DEADLINE_PASSED on {today} but the deadline is {d.deadline}")
+        if rule.guard is DisputeGuard.EVIDENCE_COMPLETE_IN_TIME:
+            if d.deadline is not None and today > d.deadline:
+                raise IllegalDisputeTransitionError(f"{d.id}: {e.kind.name} on {today} is after the deadline {d.deadline}")
+            if e.evidence is None:
+                raise IllegalDisputeTransitionError(f"{d.id}: {e.kind.name} needs an evidence bundle")
+            missing = e.evidence.missing_for(d.reason)
+            if missing:
+                raise IllegalDisputeTransitionError(
+                    f"{d.id}: evidence for {d.reason.key()} is incomplete; missing one of {format_groups(missing)}")
+        return rule
+```
+
+#### Step 5: Apply: money, state, deadline, history
+
+Duplicate first, `resolve` second (it raises before anything changes), then `_post_money`, state, entry date, new deadline, evidence, the applied-id set, and the history row. The deadline is derived from today, so each cycle gets its full window.
+
+```python
+    def apply(self, dispute_id: str, e: DisputeEvent) -> ApplyOutcome:
+        d = self.dispute(dispute_id)
+        if e.event_id in d.applied_event_ids:
+            return ApplyOutcome.DUPLICATE
+        rule = self.resolve(d, e)  # raises before any mutation
+        frm = d.state
+        today = self._clock.today()
+        self._post_money(d, frm, rule.to_state)
+        d.state = rule.to_state
+        d.state_entered_on = today
+        d.deadline = None if rule.to_state.is_terminal() else self._deadline_for(rule.to_state, today)
+        if e.evidence is not None:
+            d.evidence = e.evidence
+        d.applied_event_ids.add(e.event_id)
+        d.history.append(DisputeTransition(len(d.history), today, e.event_id, e.kind, frm, rule.to_state, e.note))
+        return ApplyOutcome.APPLIED
+```
+
+#### Step 6: The sweep
+
+`sweep_deadlines` iterates a snapshot of the disputes (`list(...)`) and is an ordinary caller of `apply`; the deterministic event id, built from the dispute, state, and deadline, is what makes a second sweep on the same day a no-op.
+
+```python
+    def sweep_deadlines(self) -> list[str]:
+        """Apply DEADLINE_PASSED to every open dispute whose deadline is before today and whose state has a
+        deadline rule. The event id names the state and the deadline, so running the sweep twice is harmless.
+        INQUIRY has a deadline but no rule: it is reported overdue, and only the issuer can move it."""
+        fired: list[str] = []
+        today = self._clock.today()
+        for d in list(self._disputes.values()):
+            if d.state.is_terminal() or d.deadline is None or not today > d.deadline:
+                continue
+            has_rule = any(r.from_state is d.state and r.kind is DisputeEventKind.DEADLINE_PASSED for r in DisputeService.RULES)
+            if not has_rule:
+                fired.append(f"{d.id} overdue in {d.state.name} (no automatic outcome)")
+                continue
+            before = d.state
+            self.apply(d.id, DisputeEvent.of(f"deadline:{d.id}:{d.state.name}:{d.deadline}", DisputeEventKind.DEADLINE_PASSED,
+                                             f"deadline {d.deadline} passed"))
+            fired.append(f"{d.id} {before.name} -> {d.state.name}")
+        return fired
+```
+
+#### Step 7: Posting the money
+
+`_post_money` is an `if`/`elif` chain over the transition. The branches and postings match the Java, including the arbitration fee when a dispute is lost from `ARBITRATION`; the early `return` covers every transition that moves no money.
+
+```python
+    def _post_money(self, d: Dispute, frm: DisputeState, to: DisputeState) -> None:
+        """The money that moves on each transition. The first chargeback debits the merchant (plus a fee);
+        a representment brings the funds back from the scheme into a hold, not to the merchant; the
+        outcome either releases the hold to the merchant or returns it to the scheme."""
+        p: list[Posting] = []
+        if to is DisputeState.CHARGEBACK:
+            what = "chargeback debited"
+            p.append(Posting.debit(DisputeService.MERCHANT, d.amount))
+            p.append(Posting.credit(DisputeService.SCHEME, d.amount))
+            p.append(Posting.debit(DisputeService.MERCHANT, self._chargeback_fee))
+            p.append(Posting.credit(DisputeService.FEES, self._chargeback_fee))
+        elif to is DisputeState.REPRESENTED:
+            what = "representment: funds re-credited, held"
+            p.append(Posting.debit(DisputeService.SCHEME, d.amount))
+            p.append(Posting.credit(DisputeService.HOLD, d.amount))
+        elif to is DisputeState.WON and frm is not DisputeState.CHARGEBACK:
+            what = "won: hold released to merchant"
+            p.append(Posting.debit(DisputeService.HOLD, d.amount))
+            p.append(Posting.credit(DisputeService.MERCHANT, d.amount))
+        elif to is DisputeState.LOST and frm is not DisputeState.CHARGEBACK:
+            what = "lost after representment: hold returned to scheme"
+            p.append(Posting.debit(DisputeService.HOLD, d.amount))
+            p.append(Posting.credit(DisputeService.SCHEME, d.amount))
+            if frm is DisputeState.ARBITRATION:
+                p.append(Posting.debit(DisputeService.MERCHANT, self._arbitration_fee))
+                p.append(Posting.credit(DisputeService.SCHEME, self._arbitration_fee))
+        else:
+            return  # inquiry steps, pre-arbitration, arbitration filing, and LOST from CHARGEBACK move no money
+        self._entry_seq += 1
+        self._ledger.post(JournalEntry(f"je_{self._entry_seq:03d}", self._clock.today(), f"{d.id} {what}", tuple(p)))
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/07-disputes-and-chargebacks/code/python
@@ -380,38 +565,312 @@ python3 main.py
 python3 -m unittest -v
 ```
 
-### In Go
+The output is identical to the Java run, including the sweep sections:
 
-```go
-// ErrIllegalTransition is the sentinel every refused transition matches with errors.Is; the error's
-// text is the precise reason, as the Java exception message was.
-var ErrIllegalTransition = errors.New("illegal dispute transition")
+```console
+== Missed deadline: a fraud chargeback nobody answers ==
+day 20 sweep: []
+day 21 sweep: [dp_2 CHARGEBACK -> LOST]
+day  21  after the sweep                          state LOST              deadline -          hold 0.00 USD    merchant -95.00 USD
 
-type transitionError struct{ msg string }
-
-func (e *transitionError) Error() string        { return e.msg }
-func (e *transitionError) Is(target error) bool { return target == ErrIllegalTransition }
-
-func (s *DisputeService) Apply(disputeID string, e DisputeEvent) (ApplyOutcome, error) {
-    ...
-    rule, err := s.Resolve(d, e) // fails before any mutation
-    if err != nil {
-        return DUPLICATE, err
-    }
+== 3-D Secure: a fraud claim on an authenticated payment ==
+liability shift: true
+day 35 sweep: [dp_3 REPRESENTED -> WON]
 ```
 
-Differences, all in `code/go/main.go`, `money.go`, and `main_test.go`:
+### In Go
 
-- **Refusals are one sentinel with many messages.** `Resolve` and `Apply` return an error that `errors.Is(err, ErrIllegalTransition)` recognises while `err.Error()` still says exactly why (`"dp_1: evidence for VISA 13.1 is incomplete; missing one of [[PROOF_OF_DELIVERY, SIGNED_DELIVERY]]"`), so the demo prints the same line as Java. `SweepDeadlines` returns `([]string, error)`, `OpenChargeback` and `OpenInquiry` return `(*Dispute, error)`, and duplicate ids wrap `ErrIllegalState`.
-- **`null` is a pointer.** `Dispute.Deadline` is `*time.Time` (a state with no deadline), `DisputeEvent.Evidence` is `*EvidenceBundle` (an event with no bundle, which the `EVIDENCE_COMPLETE_IN_TIME` guard rejects), and the opening `DisputeTransition` has `nil` `Kind` and `From`, printed as `OPENED` and `-`.
-- **`EnumSet` becomes a sorted slice.** A `Requirement` is a `[]EvidenceType` that `OneOf` sorts into declaration order, so `[REFUND_POLICY, REFUND_ISSUED]` prints the way Java's `EnumSet` iterates even though the rule lists them the other way round; `Requirement.Equal` compares two groups element by element where Java used `Set.equals`. `ReasonTable` is an ordered slice indexed by `reasonByKey`, and `RULES` is a slice searched by `findRule`.
-- **Dates are midnight-UTC `time.Time`.** `Date(2026, time.February, 2)` stands in for `LocalDate.of`, `AddDate(0, 0, days)` for `plusDays`, `After` for `isAfter`, and `DaysBetween` for `ChronoUnit.DAYS.between`.
-- **The exhaustive tests are loops over explicit slices.** Go's `iota` has no `values()`, so `DisputeStates` and `DisputeEventKinds` are the slices the test walks to prove that all 18 rules fire and all 112 other pairs are refused without touching the ledger or the history.
+The Go port (`code/go/main.go`, `money.go`, tests in `main_test.go`) keeps the design with five differences. **Refusals are one sentinel with many messages:** `Resolve` and `Apply` return an error that `errors.Is(err, ErrIllegalTransition)` recognises while `err.Error()` still says exactly why, so the demo prints the same line as Java; `SweepDeadlines` returns `([]string, error)`, `OpenChargeback` and `OpenInquiry` return `(*Dispute, error)`, and duplicate ids wrap `ErrIllegalState`. **`null` is a pointer:** `Dispute.Deadline` is `*time.Time`, `DisputeEvent.Evidence` is `*EvidenceBundle` (which the `EVIDENCE_COMPLETE_IN_TIME` guard rejects when `nil`), and the opening `DisputeTransition` has `nil` `Kind` and `From`, printed as `OPENED` and `-`. **`EnumSet` becomes a sorted slice:** a `Requirement` is a `[]EvidenceType` that `OneOf` sorts into declaration order, so `[REFUND_POLICY, REFUND_ISSUED]` prints the way Java's `EnumSet` iterates even though the rule lists them the other way round; `Requirement.Equal` compares element by element where Java used `Set.equals`; `ReasonTable` is an ordered slice indexed by `reasonByKey`, and `RULES` is a slice searched by `findRule`. **Dates are midnight-UTC `time.Time`:** `Date(2026, time.February, 2)` stands in for `LocalDate.of`, `AddDate(0, 0, days)` for `plusDays`, `After` for `isAfter`, and `DaysBetween` for `ChronoUnit.DAYS.between`. **The exhaustive tests are loops over explicit slices:** Go's `iota` has no `values()`, so `DisputeStates` and `DisputeEventKinds` are the slices the test walks to prove that all 18 rules fire and all 112 other pairs are refused.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Reason codes as data
+
+`Requirement` is a named slice type; `OneOf` copies and sorts it so printing is deterministic, `String` and `formatRequirements` produce the bracketed form the messages use, and `Equal` is the structural comparison the tests need. `ReasonCode` holds a slice of requirements; "at least one of" per requirement, "all of" across the list.
+
+```go
+type Requirement []EvidenceType
+
+func OneOf(types ...EvidenceType) Requirement {
+	r := append(Requirement(nil), types...)
+	sort.Slice(r, func(i, j int) bool { return r[i] < r[j] })
+	return r
+}
+
+func (r Requirement) String() string {
+	parts := make([]string, len(r))
+	for i, t := range r {
+		parts[i] = t.String()
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func (r Requirement) Equal(other Requirement) bool {
+	if len(r) != len(other) {
+		return false
+	}
+	for i := range r {
+		if r[i] != other[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func formatRequirements(reqs []Requirement) string {
+	parts := make([]string, len(reqs))
+	for i, r := range reqs {
+		parts[i] = r.String()
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+type ReasonCode struct {
+	Network      string
+	Code         string
+	Title        string
+	Category     ReasonCategory
+	Requirements []Requirement
+}
+
+func (rc ReasonCode) Key() string { return rc.Network + " " + rc.Code }
+```
+
+#### Step 2: The evidence bundle
+
+`MissingFor` is two nested loops with a `satisfied` flag, returning the unmet requirements in order; `LiabilityShift` is category-scoped. Methods take a pointer receiver because an event may carry a `nil` bundle.
+
+```go
+func (b *EvidenceBundle) Has(t EvidenceType) bool {
+	for _, i := range b.Items {
+		if i.Type == t {
+			return true
+		}
+	}
+	return false
+}
+
+// MissingFor: requirements not met by any item: each entry is a set of which at least one must be present.
+func (b *EvidenceBundle) MissingFor(reason ReasonCode) []Requirement {
+	var missing []Requirement
+	for _, req := range reason.Requirements {
+		satisfied := false
+		for _, t := range req {
+			if b.Has(t) {
+				satisfied = true
+				break
+			}
+		}
+		if !satisfied {
+			missing = append(missing, req)
+		}
+	}
+	return missing
+}
+
+// LiabilityShift: a fraud claim against a transaction the issuer itself authenticated with 3-D Secure shifts liability to the issuer.
+func (b *EvidenceBundle) LiabilityShift(reason ReasonCode) bool {
+	return reason.Category == FRAUD && b.Has(THREE_DS_AUTHENTICATION)
+}
+```
+
+#### Step 3: The table
+
+`RULES` is a package-level slice of struct literals; `findRule` is the linear search that returns the first `(From, Kind)` match and a `bool`.
+
+```go
+var RULES = []DisputeRule{
+	{INQUIRY, RESPOND_INQUIRY, EVIDENCE_COMPLETE_IN_TIME, INQUIRY_RESPONDED},
+	{INQUIRY, CHARGEBACK_RECEIVED, ALWAYS, CHARGEBACK},
+	{INQUIRY_RESPONDED, INQUIRY_CLOSED, ALWAYS, CLOSED_NO_CHARGEBACK},
+	{INQUIRY_RESPONDED, CHARGEBACK_RECEIVED, ALWAYS, CHARGEBACK},
+	{CHARGEBACK, ACCEPT, ALWAYS, LOST},
+	{CHARGEBACK, SUBMIT_REPRESENTMENT, EVIDENCE_COMPLETE_IN_TIME, REPRESENTED},
+	{CHARGEBACK, DEADLINE_PASSED, DEADLINE_ELAPSED, LOST},
+	{REPRESENTED, ISSUER_ACCEPTED, ALWAYS, WON},
+	{REPRESENTED, PRE_ARB_RECEIVED, ALWAYS, PRE_ARBITRATION},
+	{REPRESENTED, DEADLINE_PASSED, DEADLINE_ELAPSED, WON},
+	{PRE_ARBITRATION, ACCEPT, ALWAYS, LOST},
+	{PRE_ARBITRATION, RESPOND_PRE_ARB, EVIDENCE_COMPLETE_IN_TIME, PRE_ARB_RESPONDED},
+	{PRE_ARBITRATION, DEADLINE_PASSED, DEADLINE_ELAPSED, LOST},
+	{PRE_ARB_RESPONDED, ISSUER_WITHDREW, ALWAYS, WON},
+	{PRE_ARB_RESPONDED, ARBITRATION_FILED, ALWAYS, ARBITRATION},
+	{PRE_ARB_RESPONDED, DEADLINE_PASSED, DEADLINE_ELAPSED, WON},
+	{ARBITRATION, RULING_FOR_MERCHANT, ALWAYS, WON},
+	{ARBITRATION, RULING_FOR_ISSUER, ALWAYS, LOST},
+}
+
+func findRule(from DisputeState, kind DisputeEventKind) (DisputeRule, bool) {
+	for _, r := range RULES {
+		if r.From == from && r.Kind == kind {
+			return r, true
+		}
+	}
+	return DisputeRule{}, false
+}
+```
+
+#### Step 4: Resolve with guards
+
+`Resolve` returns `(DisputeRule, error)`; `illegal(...)` builds a `transitionError` that matches `ErrIllegalTransition`. The deadline guard dereferences `*d.Deadline` only after the `nil` check, and `fmtDeadline` prints `null` for a missing deadline so the message matches Java's.
+
+```go
+func (s *DisputeService) Resolve(d *Dispute, e DisputeEvent) (DisputeRule, error) {
+	if d.State.IsTerminal() {
+		return DisputeRule{}, illegal("%s is %v (terminal); %v refused", d.ID, d.State, e.Kind)
+	}
+	rule, ok := findRule(d.State, e.Kind)
+	if !ok {
+		return DisputeRule{}, illegal("%s: %v is not legal from %v", d.ID, e.Kind, d.State)
+	}
+	today := s.clock.Today()
+	if rule.Guard == DEADLINE_ELAPSED && (d.Deadline == nil || !today.After(*d.Deadline)) {
+		return DisputeRule{}, illegal("%s: DEADLINE_PASSED on %s but the deadline is %s", d.ID, fmtDate(today), fmtDeadline(d.Deadline))
+	}
+	if rule.Guard == EVIDENCE_COMPLETE_IN_TIME {
+		if d.Deadline != nil && today.After(*d.Deadline) {
+			return DisputeRule{}, illegal("%s: %v on %s is after the deadline %s", d.ID, e.Kind, fmtDate(today), fmtDate(*d.Deadline))
+		}
+		if e.Evidence == nil {
+			return DisputeRule{}, illegal("%s: %v needs an evidence bundle", d.ID, e.Kind)
+		}
+		if missing := e.Evidence.MissingFor(d.Reason); len(missing) > 0 {
+			return DisputeRule{}, illegal("%s: evidence for %s is incomplete; missing one of %s", d.ID, d.Reason.Key(), formatRequirements(missing))
+		}
+	}
+	return rule, nil
+}
+
+func fmtDeadline(t *time.Time) string {
+	if t == nil {
+		return "null"
+	}
+	return fmtDate(*t)
+}
+```
+
+#### Step 5: Apply: money, state, deadline, history
+
+`Apply` returns `(ApplyOutcome, error)` and checks in the same order: duplicate, `Resolve`, `postMoney`, then the mutations. Because the history row stores `*DisputeEventKind` and `*DisputeState`, the kind and from-state are copied to locals first so each row gets its own pointer.
+
+```go
+func (s *DisputeService) Apply(disputeID string, e DisputeEvent) (ApplyOutcome, error) {
+	d, err := s.Dispute(disputeID)
+	if err != nil {
+		return DUPLICATE, err
+	}
+	if d.appliedEventIDs[e.EventID] {
+		return DUPLICATE, nil
+	}
+	rule, err := s.Resolve(d, e) // fails before any mutation
+	if err != nil {
+		return DUPLICATE, err
+	}
+	from := d.State
+	if err := s.postMoney(d, from, rule.To); err != nil {
+		return DUPLICATE, err
+	}
+	today := s.clock.Today()
+	d.State = rule.To
+	d.StateEnteredOn = today
+	if rule.To.IsTerminal() {
+		d.Deadline = nil
+	} else {
+		d.Deadline = s.deadlineFor(rule.To, today)
+	}
+	if e.Evidence != nil {
+		d.Evidence = e.Evidence
+	}
+	d.appliedEventIDs[e.EventID] = true
+	kind := e.Kind
+	d.History = append(d.History, DisputeTransition{len(d.History), today, e.EventID, &kind, &from, rule.To, e.Note})
+	return APPLIED, nil
+}
+```
+
+#### Step 6: The sweep
+
+`SweepDeadlines` walks `s.order` (insertion order, because a Go map is unordered) and uses `findRule` to decide whether the state has an automatic outcome; any error from `Apply` is returned with what fired so far.
+
+```go
+func (s *DisputeService) SweepDeadlines() ([]string, error) {
+	fired := []string{}
+	today := s.clock.Today()
+	for _, id := range s.order {
+		d := s.disputes[id]
+		if d.State.IsTerminal() || d.Deadline == nil || !today.After(*d.Deadline) {
+			continue
+		}
+		if _, hasRule := findRule(d.State, DEADLINE_PASSED); !hasRule {
+			fired = append(fired, fmt.Sprintf("%s overdue in %v (no automatic outcome)", d.ID, d.State))
+			continue
+		}
+		before := d.State
+		deadline := fmtDate(*d.Deadline)
+		if _, err := s.Apply(d.ID, EventOf(fmt.Sprintf("deadline:%s:%v:%s", d.ID, d.State, deadline), DEADLINE_PASSED, "deadline "+deadline+" passed")); err != nil {
+			return fired, err
+		}
+		fired = append(fired, fmt.Sprintf("%s %v -> %v", d.ID, before, d.State))
+	}
+	return fired, nil
+}
+```
+
+#### Step 7: Posting the money
+
+`postMoney` is a tagless `switch` with the same four money-moving arms and a `default` that returns `nil` for everything else. The entry goes through `NewJournalEntry`, so an unbalanced posting set would surface as an error rather than a corrupt ledger.
+
+```go
+func (s *DisputeService) postMoney(d *Dispute, from, to DisputeState) error {
+	var p []Posting
+	var what string
+	switch {
+	case to == CHARGEBACK:
+		what = "chargeback debited"
+		p = []Posting{Debit(MERCHANT, d.Amount), Credit(SCHEME, d.Amount), Debit(MERCHANT, s.chargebackFee), Credit(FEES, s.chargebackFee)}
+	case to == REPRESENTED:
+		what = "representment: funds re-credited, held"
+		p = []Posting{Debit(SCHEME, d.Amount), Credit(HOLD, d.Amount)}
+	case to == WON && from != CHARGEBACK:
+		what = "won: hold released to merchant"
+		p = []Posting{Debit(HOLD, d.Amount), Credit(MERCHANT, d.Amount)}
+	case to == LOST && from != CHARGEBACK:
+		what = "lost after representment: hold returned to scheme"
+		p = []Posting{Debit(HOLD, d.Amount), Credit(SCHEME, d.Amount)}
+		if from == ARBITRATION {
+			p = append(p, Debit(MERCHANT, s.arbitrationFee), Credit(SCHEME, s.arbitrationFee))
+		}
+	default:
+		return nil // inquiry steps, pre-arbitration, arbitration filing, and LOST from CHARGEBACK move no money
+	}
+	s.entrySeq++
+	e, err := NewJournalEntry(fmt.Sprintf("je_%03d", s.entrySeq), s.clock.Today(), d.ID+" "+what, p)
+	if err != nil {
+		return err
+	}
+	return s.ledger.Post(e)
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/12-payment-systems-design/07-disputes-and-chargebacks/code/go
 go run .
 go test ./...
+```
+
+The output is identical to the Java run:
+
+```console
+== Missed deadline: a fraud chargeback nobody answers ==
+day 20 sweep: []
+day 21 sweep: [dp_2 CHARGEBACK -> LOST]
+day  21  after the sweep                          state LOST              deadline -          hold 0.00 USD    merchant -95.00 USD
+
+== 3-D Secure: a fraud claim on an authenticated payment ==
+liability shift: true
+day 35 sweep: [dp_3 REPRESENTED -> WON]
 ```
 
 ## Use It

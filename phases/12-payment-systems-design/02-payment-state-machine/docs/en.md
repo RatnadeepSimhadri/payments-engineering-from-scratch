@@ -372,39 +372,591 @@ The test harness enumerates all seventy-two `(state, event)` pairs: ten legal pa
 
 ### In Python
 
+The Python port (`code/python/main.py`, tests in `test_main.py`) is the same design with four differences. **Exceptions are subclasses of `RuntimeError`:** `IllegalTransitionError` and `ConcurrencyConflictError` both extend it, replay corruption raises a bare `RuntimeError`, and the tests use `assertRaises` with the specific class where one exists. **The table is a tuple of frozen dataclasses** (`RULES`), and `Rule` uses `from_state`/`to_state` because `from` is a keyword. **`history()` and `uncommitted()` return tuples**, so a caller cannot append to the aggregate's log from outside; the Java version wraps with `Collections.unmodifiableList` for the same reason. **The exhaustive negative test uses `subTest`**, so a failure names the exact `(state, kind)` pair rather than stopping at the first one.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: States, events, and the terminal predicate
+
+`PaymentState` and `EventKind` are `Enum`s with string values; `is_terminal` is a method on the state enum. `PaymentEvent` is a frozen dataclass whose `__post_init__` enforces the amount rule the Java compact constructor enforces, raising `ValueError`; `amount` defaults to `None`, and the two static factories `of` and `refund_requested` are the only constructors the rest of the code uses.
+
 ```python
-def apply(self, event: PaymentEvent, reason: str) -> ApplyOutcome:
-    if event.event_id in self._applied_event_ids:
-        return ApplyOutcome.DUPLICATE
-    rule = TransitionTable.resolve(self, event)      # raises IllegalTransitionError before any mutation
-    ...
+class PaymentState(Enum):
+    CREATED = "created"
+    REQUIRES_ACTION = "requires_action"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    REFUNDING = "refunding"
+    REFUNDED = "refunded"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+    def is_terminal(self) -> bool:
+        return self in (PaymentState.REFUNDED, PaymentState.FAILED, PaymentState.CANCELED)
+
+@dataclass(frozen=True)
+class PaymentEvent:
+    """Carries an id so a redelivered callback is recognised; an amount only for refund requests."""
+
+    event_id: str
+    kind: EventKind
+    amount: Money | None = None
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind is EventKind.REFUND_REQUESTED and self.amount is None:
+            raise ValueError("REFUND_REQUESTED needs an amount")
+        if self.kind is not EventKind.REFUND_REQUESTED and self.amount is not None:
+            raise ValueError(f"{self.kind.name} does not carry an amount")
+
+    @staticmethod
+    def of(event_id: str, kind: EventKind, detail: str = "") -> "PaymentEvent":
+        return PaymentEvent(event_id, kind, None, detail)
+
+    @staticmethod
+    def refund_requested(event_id: str, amount: Money) -> "PaymentEvent":
+        return PaymentEvent(event_id, EventKind.REFUND_REQUESTED, amount)
 ```
 
-Differences, all in `code/python/main.py` and `test_main.py`:
+#### Step 2: The transition table as data
 
-- **Exceptions are subclasses of `RuntimeError`.** `IllegalTransitionError` and `ConcurrencyConflictError` both extend `RuntimeError`; replay corruption raises a bare `RuntimeError`. Tests use `assertRaises` with the specific class where one exists.
-- **The table is a tuple of frozen dataclasses** (`RULES`), and `Rule` uses `from_state`/`to_state` because `from` is a keyword.
-- **`history()` and `uncommitted()` return tuples**, so a caller cannot append to the aggregate's log from outside; the Java version wraps with `Collections.unmodifiableList` for the same reason.
-- **The exhaustive negative test uses `subTest`**, so a failure names the exact `(state, kind)` pair rather than stopping at the first one.
+`Guard` is an enum and `Rule` a frozen dataclass; `RULES` is a module-level tuple, which is immutable the way `List.of` is. The rows are the same eleven as the Java table in the same order, which matters because `resolve` tries candidates in table order and reports the first guard when none holds.
+
+```python
+class Guard(Enum):
+    ALWAYS = "always"
+    REFUND_WITHIN_BALANCE = "refund_within_balance"
+    REFUND_LEAVES_BALANCE = "refund_leaves_balance"
+    REFUND_CLEARS_BALANCE = "refund_clears_balance"
+
+
+@dataclass(frozen=True)
+class Rule:
+    from_state: PaymentState
+    kind: EventKind
+    guard: Guard
+    to_state: PaymentState
+
+
+class IllegalTransitionError(RuntimeError):
+    pass
+
+
+RULES: tuple[Rule, ...] = (
+    Rule(PaymentState.CREATED, EventKind.CONFIRM, Guard.ALWAYS, PaymentState.PROCESSING),
+    Rule(PaymentState.CREATED, EventKind.CANCEL, Guard.ALWAYS, PaymentState.CANCELED),
+    Rule(PaymentState.PROCESSING, EventKind.REQUIRE_ACTION, Guard.ALWAYS, PaymentState.REQUIRES_ACTION),
+    Rule(PaymentState.PROCESSING, EventKind.PROCESSOR_APPROVED, Guard.ALWAYS, PaymentState.SUCCEEDED),
+    Rule(PaymentState.PROCESSING, EventKind.PROCESSOR_DECLINED, Guard.ALWAYS, PaymentState.FAILED),
+    Rule(PaymentState.REQUIRES_ACTION, EventKind.ACTION_COMPLETED, Guard.ALWAYS, PaymentState.PROCESSING),
+    Rule(PaymentState.REQUIRES_ACTION, EventKind.CANCEL, Guard.ALWAYS, PaymentState.CANCELED),
+    Rule(PaymentState.SUCCEEDED, EventKind.REFUND_REQUESTED, Guard.REFUND_WITHIN_BALANCE, PaymentState.REFUNDING),
+    Rule(PaymentState.REFUNDING, EventKind.REFUND_SUCCEEDED, Guard.REFUND_LEAVES_BALANCE, PaymentState.SUCCEEDED),
+    Rule(PaymentState.REFUNDING, EventKind.REFUND_SUCCEEDED, Guard.REFUND_CLEARS_BALANCE, PaymentState.REFUNDED),
+    Rule(PaymentState.REFUNDING, EventKind.REFUND_FAILED, Guard.ALWAYS, PaymentState.SUCCEEDED),
+)
+```
+
+#### Step 3: Resolving an event against the table
+
+`resolve` and `holds` are static methods on `TransitionTable`. The three refusals, terminal, no row, guard failed, raise `IllegalTransitionError` with the same three messages as Java; `holds` is an `if` chain over the guard enum with `compare_to` doing the money comparison. The guard-failure message is computed inline rather than in a separate `guardFailure` helper.
+
+```python
+class TransitionTable:
+    RULES = RULES
+
+    @staticmethod
+    def has_row(from_state: PaymentState, kind: EventKind) -> bool:
+        return any(r.from_state is from_state and r.kind is kind for r in RULES)
+
+    @staticmethod
+    def holds(guard: Guard, p: "Payment", e: PaymentEvent) -> bool:
+        if guard is Guard.ALWAYS:
+            return True
+        if guard is Guard.REFUND_WITHIN_BALANCE:
+            assert e.amount is not None
+            return e.amount.is_positive() and p.refunded.plus(e.amount).compare_to(p.amount) <= 0
+        settled = p.refunded.plus(p.pending_refund)
+        if guard is Guard.REFUND_LEAVES_BALANCE:
+            return settled.compare_to(p.amount) < 0
+        return settled == p.amount  # REFUND_CLEARS_BALANCE
+
+    @staticmethod
+    def resolve(p: "Payment", event: PaymentEvent) -> Rule:
+        if p.state.is_terminal():
+            raise IllegalTransitionError(f"{p.id} is {p.state.name} (terminal); {event.kind.name} refused")
+        candidates = [r for r in RULES if r.from_state is p.state and r.kind is event.kind]
+        if not candidates:
+            raise IllegalTransitionError(f"{p.id}: {event.kind.name} is not legal from {p.state.name}")
+        for r in candidates:
+            if TransitionTable.holds(r.guard, p, event):
+                return r
+        guard = candidates[0].guard
+        if guard is Guard.REFUND_WITHIN_BALANCE and event.amount is not None and not event.amount.is_positive():
+            why = "refund amount must be positive"
+        elif guard is Guard.REFUND_WITHIN_BALANCE:
+            why = f"refund {event.amount} exceeds refundable {p.refundable()}"
+        else:
+            why = "balance guard failed"
+        raise IllegalTransitionError(
+            f"{p.id}: {event.kind.name} from {p.state.name} refused by guard {guard.name} ({why})"
+        )
+```
+
+#### Step 4: The aggregate and the one place state changes
+
+`apply` checks the duplicate set first, lets `resolve` raise before anything is touched, then builds the `Transition` and hands it to `_mutate`. `_mutate` is the only method that assigns `state`, `version`, `refunded`, or `pending_refund`; the leading underscore is the Python convention for what Java spells `private`, and `replay` calls it too.
+
+```python
+    def apply(self, event: PaymentEvent, reason: str) -> ApplyOutcome:
+        """Exactly one of: state moves and one transition is recorded; DUPLICATE and nothing changes;
+        IllegalTransitionError and nothing changes."""
+        if event.event_id in self._applied_event_ids:
+            return ApplyOutcome.DUPLICATE
+        rule = TransitionTable.resolve(self, event)  # raises before any mutation
+        t = Transition(self.id, self.version + 1, event.event_id, event.kind, self.state, rule.to_state,
+                       event.amount, reason, self._clock.now_millis())
+        self._mutate(t)
+        self._uncommitted.append(t)
+        return ApplyOutcome.APPLIED
+
+    def _mutate(self, t: Transition) -> None:
+        """The single place state changes; shared by apply() and replay() so they agree by construction."""
+        if t.kind is EventKind.REFUND_REQUESTED:
+            assert t.amount is not None
+            self.pending_refund = self.pending_refund.plus(t.amount)
+        elif t.kind is EventKind.REFUND_SUCCEEDED:
+            self.refunded = self.refunded.plus(self.pending_refund)
+            self.pending_refund = Money.zero(self.amount.currency)
+        elif t.kind is EventKind.REFUND_FAILED:
+            self.pending_refund = Money.zero(self.amount.currency)
+        self.state = t.to_state
+        self.version = t.version
+        self._applied_event_ids.add(t.event_id)
+        self._history.append(t)
+```
+
+#### Step 5: Replay with integrity checks
+
+`replay` is a `@staticmethod` that builds a fresh `Payment` and feeds each transition through `_mutate` after the two structural checks: contiguous versions, and `from_state` equal to the current state. Enum identity is compared with `is`. Guards are not re-evaluated, for the reason given in the Java step; corruption raises `RuntimeError`.
+
+```python
+    @staticmethod
+    def replay(id: str, amount: Money, transitions: list[Transition] | tuple[Transition, ...], clock: Clock) -> "Payment":
+        """Rebuild from persisted history. A version gap or a mismatched from_state is corruption."""
+        p = Payment(id, amount, clock)
+        for t in transitions:
+            if t.version != p.version + 1:
+                raise RuntimeError(f"{id}: history gap, expected v{p.version + 1} got v{t.version}")
+            if t.from_state is not p.state:
+                raise RuntimeError(f"{id}: v{t.version} claims from_state {t.from_state.name} but payment is {p.state.name}")
+            p._mutate(t)
+        return p
+```
+
+#### Step 6: The store and the version check
+
+`save` validates every uncommitted transition against `expected`, starting from the log length, before `extend`ing the list, so a batch is all-or-nothing. The conflict raises `ConcurrencyConflictError` with the same "reload and retry" message. `load` replays the log on every call, so two handlers never share a `Payment` instance.
+
+```python
+    def load(self, id: str) -> Payment:
+        if id not in self._created:
+            raise RuntimeError(f"unknown payment {id}")
+        amount, _ = self._created[id]
+        return Payment.replay(id, amount, self._log[id], self._clock)
+
+    def save(self, p: Payment) -> None:
+        """Append uncommitted transitions; each must be exactly current_version + 1. All-or-nothing."""
+        if p.id not in self._log:
+            raise RuntimeError(f"unknown payment {p.id}")
+        target = self._log[p.id]
+        expected = len(target)
+        for t in p.uncommitted():
+            if t.version != expected + 1:
+                raise ConcurrencyConflictError(
+                    f"{p.id}: expected to write v{t.version} but store is at v{len(target)}; reload and retry"
+                )
+            expected += 1
+        target.extend(p.uncommitted())
+        p.mark_committed()
+```
+
+#### Step 7: The processor adapter and the service
+
+`ProcessorAdapter` is a `typing.Protocol`, so `FakeProcessor` satisfies it structurally without inheriting. The outcome-to-kind mapping is a module-level dict rather than a `switch`. Every service method is load, apply, save, and only then call the processor; `deliver` uses the callback reference as the event id and saves only on `APPLIED`.
+
+```python
+_OUTCOME_TO_KIND = {
+    ProcessorOutcome.APPROVED: EventKind.PROCESSOR_APPROVED,
+    ProcessorOutcome.DECLINED: EventKind.PROCESSOR_DECLINED,
+    ProcessorOutcome.CHALLENGE: EventKind.REQUIRE_ACTION,
+    ProcessorOutcome.REFUND_OK: EventKind.REFUND_SUCCEEDED,
+    ProcessorOutcome.REFUND_FAILED: EventKind.REFUND_FAILED,
+}
+
+    def confirm(self, id: str, event_id: str) -> Payment:
+        p = self._store.load(id)
+        p.apply(PaymentEvent.of(event_id, EventKind.CONFIRM), "merchant confirmed")
+        self._store.save(p)  # persist PROCESSING before calling out
+        self._processor.authorize(id, p.amount)
+        return p
+
+    def pump(self) -> int:
+        """Drain due callbacks into events. The reference is the event id, so redelivery is a no-op."""
+        applied = 0
+        for cb in self._processor.due_callbacks():
+            if self.deliver(cb) is ApplyOutcome.APPLIED:
+                applied += 1
+        return applied
+
+    def deliver(self, cb: ProcessorCallback) -> ApplyOutcome:
+        p = self._store.load(cb.payment_id)
+        outcome = p.apply(PaymentEvent.of(cb.reference, _OUTCOME_TO_KIND[cb.outcome], cb.detail), f"processor: {cb.detail}")
+        if outcome is ApplyOutcome.APPLIED:
+            self._store.save(p)
+        return outcome
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/12-payment-systems-design/02-payment-state-machine/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The output matches the Java run line for line except that the terminal flag prints as Python's `True`:
+
+```console
+== Refunds: SUCCEEDED -> REFUNDING -> SUCCEEDED (partial) or REFUNDED (full) ==
+after request:   REFUNDING, refundable = 34.99 USD (15.00 pending at the processor)
+refused: pay_1001: REFUND_REQUESTED is not legal from REFUNDING
+after settle:    SUCCEEDED, refunded = 15.00 USD, refundable = 34.99 USD
+refused: pay_1001: REFUND_REQUESTED from SUCCEEDED refused by guard REFUND_WITHIN_BALANCE (refund 40.00 USD exceeds refundable 34.99 USD)
+after full:      REFUNDED (terminal: True), refunded = 49.99 USD
+```
 
 ### In Go
 
+The Go port (`code/go/main.go`, tests in `main_test.go`) keeps the design and changes how failure is reported. **Errors are values wrapped around sentinels:** `ErrIllegalTransition`, `ErrConcurrencyConflict`, and `ErrCurrencyMismatch` are package-level, and every refusal is `fmt.Errorf("%w: ...")`, so tests check with `errors.Is` and still get the precise message. **Event validation happens in `Apply`, not at construction**, because a Go struct literal cannot run a constructor; `NewEvent` and `NewRefundRequested` build valid events and `validate` catches a hand-built invalid one. **`PaymentEvent.Amount` and `Transition.Amount` are `*Money`** so "no amount" is representable, the role `null` plays in Java and `None` in Python. **`Replay` returns `(*Payment, error)`** rather than panicking on corruption, and `Load` propagates it, so a corrupt history surfaces at the call site that tried to use the payment.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: States, events, and the terminal predicate
+
+`PaymentState` and `EventKind` are `int` types with `iota` constants and a `String` method that prints the Java name, so the demo output matches. `AllStates` and `AllKinds` exist so the exhaustive test can enumerate the 72 pairs. `PaymentEvent` carries `*Money`; `validate` is the deferred constructor check.
+
 ```go
-func (p *Payment) Apply(e PaymentEvent, reason string) (ApplyOutcome, error) {
-    if err := e.validate(); err != nil { return Duplicate, err }
-    if p.appliedIDs[e.EventID] { return Duplicate, nil }
-    rule, err := Resolve(p, e)
-    if err != nil { return Duplicate, err }
-    ...
+type PaymentState int
+
+const (
+	Created PaymentState = iota
+	RequiresAction
+	Processing
+	Succeeded
+	Refunding
+	Refunded
+	Failed
+	Canceled
+)
+
+var AllStates = []PaymentState{Created, RequiresAction, Processing, Succeeded, Refunding, Refunded, Failed, Canceled}
+
+func (s PaymentState) String() string {
+	return [...]string{"CREATED", "REQUIRES_ACTION", "PROCESSING", "SUCCEEDED", "REFUNDING", "REFUNDED", "FAILED", "CANCELED"}[s]
+}
+
+type PaymentEvent struct {
+	EventID string
+	Kind    EventKind
+	Amount  *Money
+	Detail  string
+}
+
+func NewEvent(eventID string, kind EventKind, detail string) PaymentEvent {
+	return PaymentEvent{EventID: eventID, Kind: kind, Detail: detail}
+}
+
+func NewRefundRequested(eventID string, amount Money) PaymentEvent {
+	return PaymentEvent{EventID: eventID, Kind: RefundRequested, Amount: &amount}
+}
+
+func (e PaymentEvent) validate() error {
+	if e.EventID == "" {
+		return errors.New("event id required")
+	}
+	if e.Kind == RefundRequested && e.Amount == nil {
+		return errors.New("REFUND_REQUESTED needs an amount")
+	}
+	if e.Kind != RefundRequested && e.Amount != nil {
+		return fmt.Errorf("%s does not carry an amount", e.Kind)
+	}
+	return nil
 }
 ```
 
-Differences, all in `code/go/main.go` and `main_test.go`:
+#### Step 2: The transition table as data
 
-- **Errors are values wrapped around sentinels.** `ErrIllegalTransition`, `ErrConcurrencyConflict`, and `ErrCurrencyMismatch` are package-level; every refusal is `fmt.Errorf("%w: ...")` so tests check with `errors.Is` and still get the precise message.
-- **Event validation happens in `Apply`, not at construction**, because a Go struct literal cannot run a constructor. `NewEvent` and `NewRefundRequested` build valid events; `validate` catches a hand-built invalid one.
-- **`PaymentEvent.Amount` and `Transition.Amount` are `*Money`** so "no amount" is representable, the role `null` plays in Java and `None` in Python.
-- **`Replay` returns `(*Payment, error)`** rather than panicking on corruption, and `Load` propagates it, so a corrupt history surfaces at the call site that tried to use the payment.
+`Rule` can use `From` and `To` as field names because they are not keywords in Go. `Rules` is a package-level slice of struct literals in the same order as the Java list, and the two sentinel errors are declared right beside it.
+
+```go
+type Guard int
+
+const (
+	Always Guard = iota
+	RefundWithinBalance
+	RefundLeavesBalance
+	RefundClearsBalance
+)
+
+func (g Guard) String() string {
+	return [...]string{"ALWAYS", "REFUND_WITHIN_BALANCE", "REFUND_LEAVES_BALANCE", "REFUND_CLEARS_BALANCE"}[g]
+}
+
+type Rule struct {
+	From  PaymentState
+	Kind  EventKind
+	Guard Guard
+	To    PaymentState
+}
+
+var Rules = []Rule{
+	{Created, Confirm, Always, Processing},
+	{Created, Cancel, Always, Canceled},
+	{Processing, RequireAction, Always, RequiresAction},
+	{Processing, ProcessorApproved, Always, Succeeded},
+	{Processing, ProcessorDeclined, Always, Failed},
+	{RequiresAction, ActionCompleted, Always, Processing},
+	{RequiresAction, Cancel, Always, Canceled},
+	{Succeeded, RefundRequested, RefundWithinBalance, Refunding},
+	{Refunding, RefundSucceeded, RefundLeavesBalance, Succeeded},
+	{Refunding, RefundSucceeded, RefundClearsBalance, Refunded},
+	{Refunding, RefundFailed, Always, Succeeded},
+}
+
+var ErrIllegalTransition = errors.New("illegal transition")
+var ErrConcurrencyConflict = errors.New("concurrency conflict")
+```
+
+#### Step 3: Resolving an event against the table
+
+`Resolve` returns `(Rule, error)`; each refusal wraps `ErrIllegalTransition` with `%w` and the same message text as Java. `guardHolds` returns `(bool, error)` because `Plus` can fail on a currency mismatch; the money comparisons are done on `MinorUnits` directly, and `RefundClearsBalance` is the `default` arm.
+
+```go
+func guardHolds(g Guard, p *Payment, e PaymentEvent) (bool, error) {
+	switch g {
+	case Always:
+		return true, nil
+	case RefundWithinBalance:
+		after, err := p.Refunded.Plus(*e.Amount)
+		if err != nil {
+			return false, err
+		}
+		return e.Amount.IsPositive() && after.MinorUnits <= p.Amount.MinorUnits, nil
+	case RefundLeavesBalance:
+		return mustPlus(p.Refunded, p.PendingRefund).MinorUnits < p.Amount.MinorUnits, nil
+	default: // RefundClearsBalance
+		return mustPlus(p.Refunded, p.PendingRefund) == p.Amount, nil
+	}
+}
+
+// Resolve picks the one rule whose guard holds, or returns ErrIllegalTransition with the precise reason.
+func Resolve(p *Payment, e PaymentEvent) (Rule, error) {
+	if p.State.IsTerminal() {
+		return Rule{}, fmt.Errorf("%w: %s is %s (terminal); %s refused", ErrIllegalTransition, p.ID, p.State, e.Kind)
+	}
+	var candidates []Rule
+	for _, r := range Rules {
+		if r.From == p.State && r.Kind == e.Kind {
+			candidates = append(candidates, r)
+		}
+	}
+	if len(candidates) == 0 {
+		return Rule{}, fmt.Errorf("%w: %s: %s is not legal from %s", ErrIllegalTransition, p.ID, e.Kind, p.State)
+	}
+	for _, r := range candidates {
+		ok, err := guardHolds(r.Guard, p, e)
+		if err != nil {
+			return Rule{}, err
+		}
+		if ok {
+			return r, nil
+		}
+	}
+	g := candidates[0].Guard
+	why := "balance guard failed"
+	if g == RefundWithinBalance && !e.Amount.IsPositive() {
+		why = "refund amount must be positive"
+	} else if g == RefundWithinBalance {
+		why = fmt.Sprintf("refund %s exceeds refundable %s", *e.Amount, p.Refundable())
+	}
+	return Rule{}, fmt.Errorf("%w: %s: %s from %s refused by guard %s (%s)", ErrIllegalTransition, p.ID, e.Kind, p.State, g, why)
+}
+```
+
+#### Step 4: The aggregate and the one place state changes
+
+`Apply` returns `(ApplyOutcome, error)`: it validates the event first (there was no constructor to do it), then the duplicate check, then `Resolve`, and only then `mutate`. `mutate` is unexported and is the one place `State`, `Version`, `Refunded`, and `PendingRefund` are assigned; `mustPlus` is safe here because both operands share the payment's currency by construction.
+
+```go
+func (p *Payment) Apply(e PaymentEvent, reason string) (ApplyOutcome, error) {
+	if err := e.validate(); err != nil {
+		return Duplicate, err
+	}
+	if p.appliedIDs[e.EventID] {
+		return Duplicate, nil
+	}
+	rule, err := Resolve(p, e)
+	if err != nil {
+		return Duplicate, err
+	}
+	t := Transition{p.ID, p.Version + 1, e.EventID, e.Kind, p.State, rule.To, e.Amount, reason, p.clock.NowMillis()}
+	p.mutate(t)
+	p.uncommitted = append(p.uncommitted, t)
+	return Applied, nil
+}
+
+// mutate is the single place state changes; Apply and Replay share it so they agree by construction.
+func (p *Payment) mutate(t Transition) {
+	switch t.Kind {
+	case RefundRequested:
+		p.PendingRefund = mustPlus(p.PendingRefund, *t.Amount)
+	case RefundSucceeded:
+		p.Refunded = mustPlus(p.Refunded, p.PendingRefund)
+		p.PendingRefund = Zero(p.Amount.Currency)
+	case RefundFailed:
+		p.PendingRefund = Zero(p.Amount.Currency)
+	}
+	p.State = t.ToState
+	p.Version = t.Version
+	p.appliedIDs[t.EventID] = true
+	p.history = append(p.history, t)
+}
+```
+
+#### Step 5: Replay with integrity checks
+
+`Replay` returns an error on the first structural fault: a version gap or a `FromState` that does not chain. It calls `mutate` for each surviving transition and never re-runs the guards.
+
+```go
+func Replay(id string, amount Money, transitions []Transition, clock Clock) (*Payment, error) {
+	p, err := NewPayment(id, amount, clock)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range transitions {
+		if t.Version != p.Version+1 {
+			return nil, fmt.Errorf("%s: history gap, expected v%d got v%d", id, p.Version+1, t.Version)
+		}
+		if t.FromState != p.State {
+			return nil, fmt.Errorf("%s: v%d claims fromState %s but payment is %s", id, t.Version, t.FromState, p.State)
+		}
+		p.mutate(t)
+	}
+	return p, nil
+}
+```
+
+#### Step 6: The store and the version check
+
+`Save` compares each uncommitted `Version` to `expected`, initialised from the log length, before appending anything; the conflict wraps `ErrConcurrencyConflict`. `Load` calls `Replay` on every call and propagates its error.
+
+```go
+func (s *PaymentStore) Load(id string) (*Payment, error) {
+	c, ok := s.created[id]
+	if !ok {
+		return nil, fmt.Errorf("unknown payment %s", id)
+	}
+	return Replay(id, c.amount, s.log[id], s.clock)
+}
+
+// Save appends the uncommitted transitions; each must be exactly CurrentVersion+1. All-or-nothing.
+func (s *PaymentStore) Save(p *Payment) error {
+	target, ok := s.log[p.ID]
+	if !ok {
+		return fmt.Errorf("unknown payment %s", p.ID)
+	}
+	expected := len(target)
+	for _, t := range p.uncommitted {
+		if t.Version != expected+1 {
+			return fmt.Errorf("%w: %s: expected to write v%d but store is at v%d; reload and retry",
+				ErrConcurrencyConflict, p.ID, t.Version, len(target))
+		}
+		expected++
+	}
+	s.log[p.ID] = append(target, p.uncommitted...)
+	p.MarkCommitted()
+	return nil
+}
+```
+
+#### Step 7: The processor adapter and the service
+
+`ProcessorAdapter` is an interface that `*FakeProcessor` satisfies. Because every step returns an error, the load-apply-save sequence is factored into `applyAndSave`; `Confirm` calls it and then `Authorize`, so `PROCESSING` is persisted before the call-out. `outcomeToKind` is a map, and `Deliver` saves only when the outcome is `Applied`.
+
+```go
+func (s *PaymentService) applyAndSave(id string, e PaymentEvent, reason string) (*Payment, error) {
+	p, err := s.store.Load(id)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.Apply(e, reason); err != nil {
+		return nil, err
+	}
+	if err := s.store.Save(p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (s *PaymentService) Confirm(id, eventID string) (*Payment, error) {
+	p, err := s.applyAndSave(id, NewEvent(eventID, Confirm, ""), "merchant confirmed")
+	if err != nil {
+		return nil, err
+	}
+	s.processor.Authorize(id, p.Amount) // only after PROCESSING is persisted
+	return p, nil
+}
+
+var outcomeToKind = map[ProcessorOutcome]EventKind{
+	OutcomeApproved: ProcessorApproved, OutcomeDeclined: ProcessorDeclined, OutcomeChallenge: RequireAction,
+	OutcomeRefundOK: RefundSucceeded, OutcomeRefundFailed: RefundFailed,
+}
+
+func (s *PaymentService) Deliver(cb ProcessorCallback) (ApplyOutcome, error) {
+	p, err := s.store.Load(cb.PaymentID)
+	if err != nil {
+		return Duplicate, err
+	}
+	outcome, err := p.Apply(NewEvent(cb.Reference, outcomeToKind[cb.Outcome], cb.Detail), "processor: "+cb.Detail)
+	if err != nil {
+		return Duplicate, err
+	}
+	if outcome == Applied {
+		if err := s.store.Save(p); err != nil {
+			return Duplicate, err
+		}
+	}
+	return outcome, nil
+}
+```
+
+#### Step 8: Run it
+
+```bash
+cd phases/12-payment-systems-design/02-payment-state-machine/code/go
+go run .
+go test ./...
+```
+
+The output is identical to the Java run; the optimistic-concurrency section reads:
+
+```console
+== Optimistic concurrency: two handlers load pay_2002 at v0; only one may write v1 ==
+handler A saved CONFIRM as v1
+handler B refused: pay_2002: expected to write v1 but store is at v1; reload and retry
+stored state is PROCESSING; B reloads and finds CANCEL is now illegal: canApply=false
+```
 
 ## Use It
 

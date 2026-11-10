@@ -348,23 +348,174 @@ Read the skewed table row by row. The centralized bucket admits 1,099 of an idea
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **No overflow, same integers:** `Math.multiplyExact` and `Math.addExact` become plain `*` and `+` because Python ints never wrap; the milli-token representation stays an `int` throughout (never `float`), and every division in `sync` and `available_tokens` is `//` on non-negative operands, so it matches Java's truncation. **The load generator is `java.util.Random`, not `random.Random`:** `JavaRandom.next_double` reproduces `nextDouble()` from the 48-bit LCG, so seed 7 offers the same 3,893 even-load and 4,024 skewed requests and every row in the three tables matches the Java output. **Collections:** `ArrayDeque<Long>` is `collections.deque` with `popleft`; the `long[]` demand and usage arrays are `list[int]`; `computeIfAbsent` is `setdefault` or an explicit `if key not in` check where the constructor needs `now_millis`. **`IllegalArgumentException` is `ValueError`**, and the `Clock`/`RateLimiter` interfaces are `abc.ABC` classes with one abstract method each.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Integer token bucket with lazy refill
+
+The same milli-token arithmetic; the clock is a parameter so tests can advance it by exactly 100 ms. `refill` ignores a clock that appears to go backwards, and the multiplications are plain because Python ints cannot wrap.
+
 ```python
-def refill(self, now_millis: int) -> None:
-    """Lazy refill: add rate * elapsed, clamp to capacity. Called before every decision."""
-    if now_millis <= self._last_refill_millis:
-        return
-    elapsed = now_millis - self._last_refill_millis
-    added = elapsed * self._rate_per_second
-    self._tokens_milli = min(self._capacity_milli, self._tokens_milli + added)
-    self._last_refill_millis = now_millis
+class TokenBucket:
+    def __init__(self, capacity: int, rate_per_second: int, now_millis: int) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        if rate_per_second < 0:
+            raise ValueError("rate must be non-negative")
+        self._capacity_milli = capacity * 1000
+        self._rate_per_second = rate_per_second  # tokens per second == milli-tokens per millisecond
+        self._tokens_milli = self._capacity_milli  # a new bucket starts full: the burst allowance is immediate
+        self._last_refill_millis = now_millis
+
+    def refill(self, now_millis: int) -> None:
+        if now_millis <= self._last_refill_millis:
+            return
+        elapsed = now_millis - self._last_refill_millis
+        added = elapsed * self._rate_per_second
+        self._tokens_milli = min(self._capacity_milli, self._tokens_milli + added)
+        self._last_refill_millis = now_millis
+
+    def try_acquire(self, tokens: int, now_millis: int) -> bool:
+        self.refill(now_millis)
+        needed = tokens * 1000
+        if self._tokens_milli >= needed:
+            self._tokens_milli -= needed
+            return True
+        return False
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: The shared store and the decision record
 
-- **No overflow, same integers.** `Math.multiplyExact` and `Math.addExact` become plain `*` and `+` because Python ints never wrap; the milli-token representation stays an `int` throughout (never `float`), and every division in `sync` and `available_tokens` is `//` on non-negative operands, so it matches Java's truncation.
-- **The load generator is `java.util.Random`, not `random.Random`.** `JavaRandom.next_double` reproduces `nextDouble()` from the 48-bit LCG, so seed 7 offers the same 3,893 even-load and 4,024 skewed requests and every row in the three tables matches the Java output.
-- **Collections.** `ArrayDeque<Long>` is `collections.deque` with `popleft`; the `long[]` demand and usage arrays are `list[int]`; `computeIfAbsent` is `setdefault` or an explicit `if key not in` check where the constructor needs `now_millis`.
-- **`IllegalArgumentException` is `ValueError`**, and the `Clock`/`RateLimiter` interfaces are `abc.ABC` classes with one abstract method each.
+`Decision` is a frozen dataclass. The store counts every call and hands back mutable objects the limiters change in place: a `TokenBucket`, a `deque` (`setdefault` creates it), or a `list[int]` of per-node usage. `bucket` cannot use `setdefault` because constructing a bucket needs `now_millis`.
+
+```python
+@dataclass(frozen=True)
+class Decision:
+    allowed: bool
+    latency_millis: int
+    store_calls: int
+
+
+class SharedStore:
+    def __init__(self, rtt_millis: int) -> None:
+        self._rtt_millis = rtt_millis
+        self._buckets: dict[str, TokenBucket] = {}
+        self._logs: dict[str, deque[int]] = {}
+        self._usage_reports: dict[str, list[int]] = {}  # key -> per-node counts
+        self._calls = 0
+
+    def bucket(self, key: str, capacity: int, rate: int, now_millis: int) -> TokenBucket:
+        self._calls += 1
+        if key not in self._buckets:
+            self._buckets[key] = TokenBucket(capacity, rate, now_millis)
+        return self._buckets[key]
+
+    def log(self, key: str) -> deque[int]:
+        self._calls += 1
+        return self._logs.setdefault(key, deque())
+
+    def usage(self, key: str, nodes: int) -> list[int]:
+        self._calls += 1
+        if key not in self._usage_reports:
+            self._usage_reports[key] = [0] * nodes
+        return self._usage_reports[key]
+```
+
+#### Step 3: The centralized limiter
+
+Three lines, as in Java; `node` is ignored because the store does not care who asked. Every decision costs one round trip.
+
+```python
+    def try_acquire(self, node: int, key: str, now_millis: int) -> Decision:
+        bucket = self._store.bucket(key, self._capacity, self._rate_per_second, now_millis)
+        ok = bucket.try_acquire(1, now_millis)
+        return Decision(ok, self._store.rtt_millis(), 1)
+```
+
+#### Step 4: Local buckets with proportional resync
+
+The request path counts demand and syncs when the interval has elapsed. In `sync`, `//` is Java's integer division on non-negative operands, `refill` is called before `set_rate_per_second` so tokens earned at the old rate are banked, and the shares may sum to slightly less than the limit by design.
+
+```python
+    def try_acquire(self, node: int, key: str, now_millis: int) -> Decision:
+        buckets = self._buckets_for(key, now_millis)
+        demand = self._demand_since_sync[key]
+        demand[node] += 1
+        store_calls = 0
+        latency = 0
+        if now_millis - self._last_sync[key] >= self._sync_interval_millis:
+            store_calls = self.sync(key, buckets, demand, now_millis)
+            latency = self._store.rtt_millis()  # the sync is off the request path in production; charged here for honesty
+        ok = buckets[node].try_acquire(1, now_millis)
+        return Decision(ok, latency, store_calls)
+
+    def sync(self, key: str, buckets: list[TokenBucket], demand: list[int], now_millis: int) -> int:
+        shared = self._store.usage(key, self._nodes)
+        total = 0
+        for i in range(self._nodes):
+            shared[i] = demand[i]
+            total += demand[i]
+        floor = max(1, self._rate_per_second // (4 * self._nodes))
+        remaining = self._rate_per_second - floor * self._nodes
+        for i in range(self._nodes):
+            share = floor + (remaining // self._nodes if total == 0 else remaining * shared[i] // total)
+            buckets[i].refill(now_millis)
+            buckets[i].set_rate_per_second(share)
+            demand[i] = 0
+        self._last_sync[key] = now_millis
+        self._syncs += 1
+        return 1
+```
+
+#### Step 5: The sliding-window log
+
+`deque` gives O(1) `popleft` for expiry from the head and `append` for admission. Only admitted requests are logged, and the `<=` on the cutoff keeps the window half-open.
+
+```python
+    def try_acquire(self, node: int, key: str, now_millis: int) -> Decision:
+        log = self._store.log(key)
+        cutoff = now_millis - self._window_millis
+        while log and log[0] <= cutoff:
+            log.popleft()
+        if len(log) < self._limit:
+            log.append(now_millis)
+            return Decision(True, self._store.rtt_millis(), 1)
+        return Decision(False, self._store.rtt_millis(), 1)
+```
+
+#### Step 6: The seeded load generator
+
+One Bernoulli trial per node per millisecond, drawn from `JavaRandom` so the arrival sequence is the Java one. Floating point appears here, in the load generator, and nowhere in the limiters; `//` indexes the per-second bucket.
+
+```python
+    def run(self, limiter: RateLimiter, clock: FakeClock, key: str, seconds: int, rate_per_second: int,
+            capacity: int) -> LoadReport:
+        random = JavaRandom(self._seed)
+        report = LoadReport(limiter.name(), seconds)
+        start = clock.now_millis()
+        for _ in range(seconds * 1000):
+            for node in range(self._nodes):
+                if self._nodes == 1:
+                    share = 1.0
+                else:
+                    share = self._hot_share if node == 0 else (1.0 - self._hot_share) / (self._nodes - 1)
+                p = self._requests_per_second * share / 1000.0
+                if random.next_double() < p:
+                    d = limiter.try_acquire(node, key, clock.now_millis())
+                    report.offered += 1
+                    report.latency_total += d.latency_millis
+                    report.store_calls += d.store_calls
+                    if d.allowed:
+                        report.admitted += 1
+                        report.admitted_per_second[(clock.now_millis() - start) // 1000] += 1
+                    else:
+                        report.rejected += 1
+            clock.advance(1)
+        return report
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/05-distributed-rate-limiting/code/python
@@ -372,33 +523,256 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Every row of the three tables matches the Java output:
+
+```console
+== A single token bucket: 100/s, capacity 100 ==
+burst admitted from a full bucket: 100
+after 10 ms: 1 token(s) refilled (100/s * 0.010 s = 1)
+after 5 s idle: 100 tokens (clamped at capacity, not 500)
+
+== Light load, 60 offered/s, nobody should be rejected (seed 7) ==
+strategy              offered  admitted  rejected     peak/s   vs ideal    mean ms
+centralized               607       607         0         67         +0       2.00
+local+sync(1000ms)        607       607         0         67         +0       0.03
+local+sync(100ms)         607       607         0         67         +0       0.28
+sliding-log               607       607         0         67         +0       2.00
+```
+
 ### In Go
 
+The Go port (`code/go/main.go` and `javarandom.go`) keeps the design with five differences. **`int64` wraps silently, so overflow is checked by hand:** `mulChecked` and `addChecked` (the Phase 10, Lesson 01 helpers) stand in for `Math.multiplyExact` and `Math.addExact`. The constructor returns `ErrOverflow` when `capacity * 1000` does not fit; inside `Refill` and `TryAcquire` an overflow is a programming error with no caller to report to, so `mustInt` panics there, which is what the Java `ArithmeticException` does too. All token math stays in `int64` milli-tokens; nothing is a `float64`. **Invalid arguments are errors, not exceptions:** `NewTokenBucket`, `NewLocalSyncLimiter`, and `SetRatePerSecond` return `error` where Java throws `IllegalArgumentException`; tests check `err != nil` or `errors.Is(err, ErrOverflow)`. `FakeClock.Advance` panics on a negative step because a clock running backwards is a bug in the test, not a condition. **The load generator is `java.util.Random`:** `JavaRandom.NextDouble` reproduces the 48-bit LCG, so seed 7 offers the same 3,893 even-load and 4,024 skewed requests and every row of the three tables matches the Java output; `TestSeededLoad` pins 1099 admitted for centralized and 1052 for `local+sync(1000ms)` under skew. **Collections:** `ArrayDeque<Long>` is a `*[]int64` the limiter mutates in place (`(*log)[1:]` is `pollFirst`, `append` is `addLast`); the `long[]` demand and usage arrays are `[]int64` slices that share their backing array exactly as the Java arrays are shared by reference; `computeIfAbsent` is an explicit `if _, ok := m[key]; !ok` because the bucket constructor needs `nowMillis`. **Formatting:** `%+10d` and `%10.2f` exist in `fmt` with the same meaning as in `String.format`, so the table prints identically.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Integer token bucket with lazy refill
+
+The constructor returns an error for a bad capacity, rate, or an overflowing `capacity * 1000`. Inside `Refill` and `TryAcquire`, `mustInt` unwraps the checked arithmetic and panics on overflow; the builtin `min` is Go 1.21+.
+
 ```go
-// Refill is lazy: add rate * elapsed, clamp to capacity. Called before every decision.
+func NewTokenBucket(capacity, ratePerSecond, nowMillis int64) (*TokenBucket, error) {
+	if capacity <= 0 {
+		return nil, errors.New("capacity must be positive")
+	}
+	if ratePerSecond < 0 {
+		return nil, errors.New("rate must be non-negative")
+	}
+	capacityMilli, err := mulChecked(capacity, 1000)
+	if err != nil {
+		return nil, err
+	}
+	return &TokenBucket{capacityMilli: capacityMilli, ratePerSecond: ratePerSecond, tokensMilli: capacityMilli, lastRefillMillis: nowMillis}, nil
+}
+
 func (b *TokenBucket) Refill(nowMillis int64) {
-    if nowMillis <= b.lastRefillMillis {
-        return
-    }
-    elapsed := nowMillis - b.lastRefillMillis
-    added := mustInt(mulChecked(elapsed, b.ratePerSecond))
-    b.tokensMilli = min(b.capacityMilli, mustInt(addChecked(b.tokensMilli, added)))
-    b.lastRefillMillis = nowMillis
+	if nowMillis <= b.lastRefillMillis {
+		return
+	}
+	elapsed := nowMillis - b.lastRefillMillis
+	added := mustInt(mulChecked(elapsed, b.ratePerSecond))
+	b.tokensMilli = min(b.capacityMilli, mustInt(addChecked(b.tokensMilli, added)))
+	b.lastRefillMillis = nowMillis
+}
+
+func (b *TokenBucket) TryAcquire(tokens, nowMillis int64) bool {
+	b.Refill(nowMillis)
+	needed := mustInt(mulChecked(tokens, 1000))
+	if b.tokensMilli >= needed {
+		b.tokensMilli -= needed
+		return true
+	}
+	return false
 }
 ```
 
-Differences, all in `code/go/main.go` and `javarandom.go`:
+#### Step 2: The shared store and the decision record
 
-- **`int64` wraps silently, so overflow is checked by hand.** `mulChecked` and `addChecked` (the Phase 10, Lesson 01 helpers) stand in for `Math.multiplyExact` and `Math.addExact`. The constructor returns `ErrOverflow` when `capacity * 1000` does not fit; inside `Refill` and `TryAcquire` an overflow is a programming error with no caller to report to, so `mustInt` panics there, which is what the Java `ArithmeticException` does too. All token math stays in `int64` milli-tokens; nothing is a `float64`.
-- **Invalid arguments are errors, not exceptions.** `NewTokenBucket`, `NewLocalSyncLimiter`, and `SetRatePerSecond` return `error` where Java throws `IllegalArgumentException`; tests check `err != nil` or `errors.Is(err, ErrOverflow)`. `FakeClock.Advance` panics on a negative step because a clock running backwards is a bug in the test, not a condition.
-- **The load generator is `java.util.Random`.** `JavaRandom.NextDouble` reproduces the 48-bit LCG, so seed 7 offers the same 3,893 even-load and 4,024 skewed requests and every row of the three tables matches the Java output; `TestSeededLoad` pins 1099 admitted for centralized and 1052 for `local+sync(1000ms)` under skew.
-- **Collections.** `ArrayDeque<Long>` is a `*[]int64` the limiter mutates in place (`(*log)[1:]` is `pollFirst`, `append` is `addLast`); the `long[]` demand and usage arrays are `[]int64` slices that share their backing array exactly as the Java arrays are shared by reference; `computeIfAbsent` is an explicit `if _, ok := m[key]; !ok` because the bucket constructor needs `nowMillis`.
-- **Formatting.** `%+10d` and `%10.2f` exist in `fmt` with the same meaning as in `String.format`, so the table prints identically.
+Three maps and a call counter. `Bucket` panics if the constructor fails because the store's callers pass validated arguments. `Log` returns a pointer to a slice so the limiter's `(*log)[1:]` and `append` are visible to the next caller, which is the in-place mutation Java gets from a shared `ArrayDeque`.
+
+```go
+type Decision struct {
+	Allowed       bool
+	LatencyMillis int64
+	StoreCalls    int
+}
+
+func (s *SharedStore) Bucket(key string, capacity, rate, nowMillis int64) *TokenBucket {
+	s.calls++
+	b, ok := s.buckets[key]
+	if !ok {
+		var err error
+		if b, err = NewTokenBucket(capacity, rate, nowMillis); err != nil {
+			panic(err)
+		}
+		s.buckets[key] = b
+	}
+	return b
+}
+
+func (s *SharedStore) Log(key string) *[]int64 {
+	s.calls++
+	l, ok := s.logs[key]
+	if !ok {
+		l = &[]int64{}
+		s.logs[key] = l
+	}
+	return l
+}
+
+func (s *SharedStore) Usage(key string, nodes int) []int64 {
+	s.calls++
+	u, ok := s.usageReports[key]
+	if !ok {
+		u = make([]int64, nodes)
+		s.usageReports[key] = u
+	}
+	return u
+}
+```
+
+#### Step 3: The centralized limiter
+
+Unchanged in shape; the `Decision` is a struct literal.
+
+```go
+func (l *CentralizedLimiter) TryAcquire(node int, key string, nowMillis int64) Decision {
+	bucket := l.store.Bucket(key, l.capacity, l.ratePerSecond, nowMillis)
+	ok := bucket.TryAcquire(1, nowMillis)
+	return Decision{ok, l.store.RttMillis(), 1}
+}
+```
+
+#### Step 4: Local buckets with proportional resync
+
+`demand` and `shared` are slices that alias the limiter's and the store's arrays, so writing through them is the Java pass-by-reference. `Sync` converts `nodes` to `int64` once for the arithmetic, uses truncating `/` like Java, calls `Refill` before `SetRatePerSecond`, and panics if the new rate is rejected because a computed share is never negative.
+
+```go
+func (l *LocalSyncLimiter) TryAcquire(node int, key string, nowMillis int64) Decision {
+	buckets := l.bucketsFor(key, nowMillis)
+	demand := l.demandSinceSync[key]
+	demand[node]++
+	storeCalls := 0
+	var latency int64
+	if nowMillis-l.lastSync[key] >= l.syncIntervalMillis {
+		storeCalls = l.Sync(key, buckets, demand, nowMillis)
+		latency = l.store.RttMillis() // the sync is off the request path in production; charged here for honesty
+	}
+	ok := buckets[node].TryAcquire(1, nowMillis)
+	return Decision{ok, latency, storeCalls}
+}
+
+func (l *LocalSyncLimiter) Sync(key string, buckets []*TokenBucket, demand []int64, nowMillis int64) int {
+	shared := l.store.Usage(key, l.nodes)
+	var total int64
+	for i := 0; i < l.nodes; i++ {
+		shared[i] = demand[i]
+		total += demand[i]
+	}
+	n := int64(l.nodes)
+	floor := max(1, l.ratePerSecond/(4*n))
+	remaining := l.ratePerSecond - floor*n
+	for i := 0; i < l.nodes; i++ {
+		var share int64
+		if total == 0 {
+			share = floor + remaining/n
+		} else {
+			share = floor + remaining*shared[i]/total
+		}
+		buckets[i].Refill(nowMillis)
+		if err := buckets[i].SetRatePerSecond(share); err != nil {
+			panic(err)
+		}
+		demand[i] = 0
+	}
+	l.lastSync[key] = nowMillis
+	l.syncs++
+	return 1
+}
+```
+
+#### Step 5: The sliding-window log
+
+Head expiry is a reslice, admission is an `append`, both through the pointer the store handed out. Same half-open cutoff.
+
+```go
+func (l *SlidingWindowLogLimiter) TryAcquire(node int, key string, nowMillis int64) Decision {
+	log := l.store.Log(key)
+	cutoff := nowMillis - l.windowMillis
+	for len(*log) > 0 && (*log)[0] <= cutoff {
+		*log = (*log)[1:]
+	}
+	if int64(len(*log)) < l.limit {
+		*log = append(*log, nowMillis)
+		return Decision{true, l.store.RttMillis(), 1}
+	}
+	return Decision{false, l.store.RttMillis(), 1}
+}
+```
+
+#### Step 6: The seeded load generator
+
+The nested ternary becomes a tagless `switch`. `NewJavaRandom(seed)` draws the same Bernoulli trials as the Java `Random`, and the `int64` division indexes the per-second bucket.
+
+```go
+func (g *LoadGenerator) Run(limiter RateLimiter, clock *FakeClock, key string, seconds int, ratePerSecond, capacity int64) *LoadReport {
+	random := NewJavaRandom(g.seed)
+	report := NewLoadReport(limiter.Name(), seconds)
+	start := clock.NowMillis()
+	for ms := 0; ms < seconds*1000; ms++ {
+		for node := 0; node < g.nodes; node++ {
+			var share float64
+			switch {
+			case g.nodes == 1:
+				share = 1.0
+			case node == 0:
+				share = g.hotShare
+			default:
+				share = (1.0 - g.hotShare) / float64(g.nodes-1)
+			}
+			p := g.requestsPerSecond * share / 1000.0
+			if random.NextDouble() < p {
+				d := limiter.TryAcquire(node, key, clock.NowMillis())
+				report.Offered++
+				report.LatencyTotal += d.LatencyMillis
+				report.StoreCalls += int64(d.StoreCalls)
+				if d.Allowed {
+					report.Admitted++
+					report.AdmittedPerSecond[(clock.NowMillis()-start)/1000]++
+				} else {
+					report.Rejected++
+				}
+			}
+		}
+		clock.Advance(1)
+	}
+	return report
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/09-reliability-and-scale/05-distributed-rate-limiting/code/go
 go run .
 go test ./...
+```
+
+Every row of the three tables matches the Java output:
+
+```console
+== Even load, 4 nodes, 400 offered/s against a 100/s limit (seed 7) ==
+strategy              offered  admitted  rejected     peak/s   vs ideal    mean ms
+centralized              3893      1099      2794        199         -1       2.00
+local+sync(1000ms)       3893      1079      2814        195        -21       0.00
+local+sync(100ms)        3893      1078      2815        194        -22       0.05
+sliding-log              3893      1000      2893        100       -100       2.00
+
+== Skewed load, node 0 takes 85% of 400 offered/s (seed 7) ==
+strategy              offered  admitted  rejected     peak/s   vs ideal    mean ms
+centralized              4024      1099      2925        199         -1       2.00
+local+sync(1000ms)       4024      1052      2972        131        -48       0.00
+local+sync(100ms)        4024      1072      2952        145        -28       0.05
+sliding-log              4024      1000      3024        100       -100       2.00
 ```
 
 ## Use It

@@ -369,20 +369,222 @@ The last line is the hand-off to Lesson 09. Keep it: it is the one-screen demons
 
 ### In Python
 
-`code/python/main.py` is the same codec, framer, envelope, simulated socket, server, and client, method for method, and the demo prints the same bytes, the same segment timings, and the same round-trip times as Java: `Rng` is SplitMix64 masked to 64 bits, so seed 42 cuts the stream into the same ten reads. Four things differ.
+The Python port (`code/python/main.py`) is the same codec, framer, envelope, simulated socket, server, and client, method for method, and the demo prints the same bytes, the same segment timings, and the same round-trip times as Java: `Rng` is SplitMix64 masked to 64 bits, so seed 42 cuts the stream into the same ten reads. Four things differ. **Integers have no width.** A Java `long` is 64 bits whether you want it or not; a Python `int` is whatever size the value needs, so the width lives in the codec. `u8`/`u16`/`u32` range-check on write exactly as in Java, `i64` writes `v & MASK64` (two's complement) and rejects values outside the `long` range, and `ByteReader.i64` decodes with `int.from_bytes(..., signed=True)`. `int.to_bytes(n, "big")` and `int.from_bytes` stand in for the shift loops; `struct.pack(">BqI")` would work too, but `struct.error` on a short buffer is the same class of leak as `ArrayIndexOutOfBoundsException`, so the explicit `_need()` check stays either way. **`bytes` are immutable and compare by value.** `Framer.feed` concatenates `self._pending + chunk` and slices, which is the same O(n) copy the Java `Arrays.copyOf` does; a production framer would keep a `bytearray` and `del buf[:consumed]`. Because `bytes` compare by value, `RpcMessage` can be a frozen dataclass whose equality includes the payload, which a Java record holding a `byte[]` cannot offer. **Two names change.** Python cannot overload one name as both a static and an instance method, so Java's static `Framer.frame(payload, maxFrame)` is `Framer.frame_with_max`, and `await` is a keyword, so the client's method is `await_`. **Exceptions.** `CodecException`, `RpcTimeoutException`, and `RpcErrorException` keep their names; `IllegalArgumentException` (unknown account, currency mismatch) is `ValueError`, and `dispatch` catches `(CodecException, ValueError)` to turn both into an `ERROR` response, as the Java `catch` does.
 
-- **Integers have no width.** A Java `long` is 64 bits whether you want it or not; a Python `int` is whatever size the value needs, so the width lives in the codec. `u8`/`u16`/`u32` range-check on write exactly as in Java, `i64` writes `v & MASK64` (two's complement) and rejects values outside the `long` range, and `ByteReader.i64` decodes with `int.from_bytes(..., signed=True)`. `int.to_bytes(n, "big")` and `int.from_bytes` stand in for the shift loops; `struct.pack(">BqI")` would work too, but `struct.error` on a short buffer is the same class of leak as `ArrayIndexOutOfBoundsException`, so the explicit `_need()` check stays either way.
-- **`bytes` are immutable and compare by value.** `Framer.feed` concatenates `self._pending + chunk` and slices, which is the same O(n) copy the Java `Arrays.copyOf` does; a production framer would keep a `bytearray` and `del buf[:consumed]`. Because `bytes` compare by value, `RpcMessage` can be a frozen dataclass whose equality includes the payload, which a Java record holding a `byte[]` cannot offer.
-- **Two names change.** Python cannot overload one name as both a static and an instance method, so Java's static `Framer.frame(payload, maxFrame)` is `Framer.frame_with_max`, and `await` is a keyword, so the client's method is `await_`.
-- **Exceptions.** `CodecException`, `RpcTimeoutException`, and `RpcErrorException` keep their names; `IllegalArgumentException` (unknown account, currency mismatch) is `ValueError`, and `dispatch` catches `(CodecException, ValueError)` to turn both into an `ERROR` response, as the Java `catch` does.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: A bounds-checked byte codec
+
+`ByteWriter` range-checks on the way in, because nothing else will: `u8(256)` is a `CodecException`, and `i64` masks a negative value to its two's-complement bytes only after confirming it fits a Java `long`. `ByteReader` calls `_need` before every read; `int.from_bytes` with `"big"` replaces the shift-and-mask loop, and `signed=True` on `i64` restores the sign that `& 0xFF` protected in Java. `string` validates the length against the buffer before slicing, so a hostile length never allocates.
 
 ```python
-def i64(self, v: int) -> "ByteWriter":
-    if not INT64_MIN <= v <= INT64_MAX:
-        raise CodecException(f"i64 out of range: {v}")
-    self._buf += (v & MASK64).to_bytes(8, "big")
-    return self
+    def i64(self, v: int) -> "ByteWriter":
+        """Two's complement, like (byte) (v >>> shift) in Java; a value outside the long range is a bug, not a wrap."""
+        if not INT64_MIN <= v <= INT64_MAX:
+            raise CodecException(f"i64 out of range: {v}")
+        self._buf += (v & MASK64).to_bytes(8, "big")
+        return self
 ```
+
+```python
+class ByteReader:
+    def _need(self, n: int) -> None:
+        if self._pos + n > len(self._buf):
+            raise CodecException(f"truncated: need {n} bytes at offset {self._pos}, have {len(self._buf) - self._pos}")
+
+    def u32(self) -> int:
+        self._need(4)
+        v = int.from_bytes(self._buf[self._pos:self._pos + 4], "big")
+        self._pos += 4
+        return v
+
+    def i64(self) -> int:
+        self._need(8)
+        v = int.from_bytes(self._buf[self._pos:self._pos + 8], "big", signed=True)
+        self._pos += 8
+        return v
+
+    def string(self) -> str:
+        n = self.u16()
+        self._need(n)
+        s = self._buf[self._pos:self._pos + n].decode("utf-8", errors="replace")   # Java substitutes U+FFFD too
+        self._pos += n
+        return s
+
+    def expect_end(self) -> None:
+        if self._pos != len(self._buf):
+            raise CodecException(f"trailing bytes: {len(self._buf) - self._pos}")
+```
+
+#### Step 2: The framer
+
+`joined = self._pending + chunk` is the `Arrays.copyOf` plus `arraycopy`; slicing `bytes` produces new immutable objects, so the emitted frames cannot alias the buffer. The length check precedes the slice that would allocate the body, and the leftover from `pos` is kept for the next `feed`.
+
+```python
+    def feed(self, chunk: bytes) -> list[bytes]:
+        """Append stream bytes and return every frame now complete. A hostile length raises before allocating."""
+        joined = self._pending + chunk
+        out: list[bytes] = []
+        pos = 0
+        while len(joined) - pos >= Framer.HEADER:
+            length = ByteReader(joined[pos:pos + Framer.HEADER]).u32()
+            if length > self.max_frame:
+                raise CodecException(f"frame length {length} exceeds max {self.max_frame}; closing connection")
+            if len(joined) - pos - Framer.HEADER < length:
+                break                                          # header complete, body not yet
+            out.append(joined[pos + Framer.HEADER:pos + Framer.HEADER + length])
+            pos += Framer.HEADER + length
+        self._pending = joined[pos:]
+        self.frames_out += len(out)
+        return out
+```
+
+#### Step 3: The envelope
+
+`RpcMessage` is a frozen dataclass; `encode` is the same fluent chain and `decode` reads it back with the two extra checks (payload length against `remaining()`, then `expect_end`). The payload is rebuilt byte by byte through `u8` so every byte goes through the bounds check.
+
+```python
+@dataclass(frozen=True)
+class RpcMessage:
+    kind: MessageKind
+    request_id: int
+    method: str
+    payload: bytes
+
+    def encode(self) -> bytes:
+        return (ByteWriter().u8(self.kind.tag).i64(self.request_id).string(self.method)
+                .u32(len(self.payload)).bytes(self.payload).to_bytes())
+
+    @staticmethod
+    def decode(data: bytes) -> "RpcMessage":
+        r = ByteReader(data)
+        kind = MessageKind.from_tag(r.u8())
+        rid = r.i64()
+        method = r.string()
+        n = r.u32()
+        if n > r.remaining():
+            raise CodecException(f"payload length {n} exceeds remaining {r.remaining()}")
+        payload = bytes(r.u8() for _ in range(n))
+        r.expect_end()
+        return RpcMessage(kind, rid, method, payload)
+```
+
+#### Step 4: Money on the wire
+
+Fourteen bytes for `100.00 USD`, exactly as in Java: `i64` minor units, a length-prefixed code, a `u8` exponent. `Currency.__post_init__` rejects an exponent outside 0..4, so a payload with exponent 7 fails at construction with `ValueError`, which `dispatch` turns into an `ERROR` reply.
+
+```python
+    @staticmethod
+    def encode_money(m: Money) -> bytes:
+        return ByteWriter().i64(m.minor_units).string(m.currency.code).u8(m.currency.exponent).to_bytes()
+
+    @staticmethod
+    def decode_money(r: ByteReader) -> Money:
+        minor = r.i64()
+        code = r.string()
+        exponent = r.u8()
+        return Money.of_minor(minor, Currency(code, exponent))
+```
+
+#### Step 5: The simulated socket
+
+`Channel.write` cuts the bytes into segments with strictly increasing arrival times drawn from the shared `Rng`; `read` drains a `deque` of everything that has arrived and glues it together with a `ByteWriter`. The `_cut` flag makes the channel half-open: writes are counted as lost and reads return `b""`, with no exception on either side.
+
+```python
+    def write(self, data: bytes, now: int) -> None:
+        self.bytes_written += len(data)
+        if self._cut:
+            self.bytes_lost += len(data)                       # half-open: the peer is gone and nobody told us
+            return
+        pos = 0
+        arrive = now
+        while pos < len(data):
+            n = min(len(data) - pos, 1 + self._rng.next_int(self._max_segment))
+            arrive += 1 + self._rng.next_int(self._max_delay)  # segments stay ordered
+            self._in_flight.append(Segment(arrive, data[pos:pos + n]))
+            pos += n
+
+    def read(self, now: int) -> bytes:
+        """Everything that has arrived by `now`, concatenated. Empty when nothing has: a non-blocking read."""
+        if self._cut:
+            return b""
+        w = ByteWriter()
+        while self._in_flight and self._in_flight[0].arrive_at <= now:
+            w.bytes(self._in_flight.popleft().data)
+        self.bytes_delivered += w.size()
+        return w.to_bytes()
+```
+
+#### Step 6: The server loop
+
+`poll` iterates over a snapshot (`list(...)`) of the framers so it can delete a link mid-loop. The two `except CodecException` blocks are the two policies: a framing error closes the connection; a decode error skips the frame. Responses wait in a `deque` until `processing_millis` have passed, then go out framed with `frame_with_max`.
+
+```python
+    def poll(self, now: int) -> None:
+        for link, framer in list(self._framers.items()):
+            chunk = link.client_to_server.read(now)
+            if not chunk:
+                continue
+            try:
+                frames = framer.feed(chunk)
+            except CodecException:
+                self.malformed_frames += 1
+                del self._framers[link]                        # a corrupt stream cannot be resynchronised: close it
+                continue
+            for f in frames:
+                try:
+                    request = RpcMessage.decode(f)
+                except CodecException:
+                    self.malformed_frames += 1
+                    continue
+                response = self.service.dispatch(request)
+                self.requests_served += 1
+                self._delayed.append((now + self.processing_millis, link, response))
+        while self._delayed and self._delayed[0][0] <= now:
+            _, link, response = self._delayed.popleft()
+            if link in self._framers:
+                link.server_to_client.write(Framer.frame_with_max(response.encode(), self._max_frame), now)
+```
+
+#### Step 7: The client: ids, deadlines, late answers
+
+`await_` (the trailing underscore dodges the keyword) pumps one simulated millisecond at a time, pops its own id from `_received`, and raises `RpcTimeoutException` at the deadline with the "outcome unknown" wording. `pump` files responses by id and then drops any id older than the call in progress, counting it as a late response; that drop is what keeps request 5's answer from being confused with request 4's.
+
+```python
+    def await_(self, rid: int, timeout_millis: int) -> RpcMessage:
+        """Java's await(): pump the world until the response for `rid` arrives or the deadline passes."""
+        deadline = self._clock.now() + timeout_millis
+        while True:
+            self.pump()
+            r = self._received.pop(rid, None)
+            if r is not None:
+                if r.kind is MessageKind.ERROR:
+                    raise RpcErrorException(f"{r.method}: {r.error_reason()}")
+                return r
+            if self._clock.now() >= deadline:
+                self.timeouts += 1
+                raise RpcTimeoutException(f"request {rid} timed out after {timeout_millis} ms on connection "
+                                          f"{self._link.connection_id} (outcome unknown)")
+            self._clock.advance(1)
+
+    def pump(self) -> None:
+        self._server.poll(self._clock.now())
+        chunk = self._link.server_to_client.read(self._clock.now())
+        if not chunk:
+            return
+        for f in self._framer.feed(chunk):
+            m = RpcMessage.decode(f)
+            if m.request_id >= self._next_request_id or m.request_id in self._received:
+                raise RuntimeError(f"response for unknown id {m.request_id}")
+            self._received[m.request_id] = m
+        # Anything buffered for an id that has already timed out is a late response: count and drop it.
+        for rid in list(self._received):
+            if rid < self._current_call_id():
+                self.late_responses += 1
+                del self._received[rid]
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/05-distributed-foundations/07-rpc-and-serialization/code/python
@@ -390,41 +592,360 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Byte for byte the Java output, including the hex dump and the ten segment reads:
+
+```console
+== The wire format: one GetBalance request, framed ==
+payload  (32 bytes): 010000000000000001000a47657442616c616e6365000000070005616c696365
+framed   (36 bytes): 00000020010000000000000001000a47657442616c616e6365000000070005616c696365
+
+== TCP does not respect your message boundaries: 3 frames, segmented into random chunks ==
+t=3   read  6 bytes -> 0 complete frame(s),  6 bytes buffered
+t=15  read 29 bytes -> 1 complete frame(s), 28 bytes buffered
+t=19  read  2 bytes -> 1 complete frame(s),  0 bytes buffered
+3 frames reassembled from 10 reads; no frame was ever half-decoded
+
+== A hostile length prefix is rejected before any allocation ==
+rejected: frame length 4294967295 exceeds max 1048576; closing connection
+
+== Timeout: the server is slow, the client gives up, the answer arrives later and is discarded ==
+t=100: request 4 timed out after 100 ms on connection 1 (outcome unknown)
+next call still gets the right answer: GetBalance(bob) = 25.00 USD; late responses discarded so far = 1
+
+== Half-open: the server vanishes mid-Credit; the client's socket shows no error, only silence ==
+reconnect -> new connection 2 (ids continue from 8, so no old reply can match)
+naive retry of Credit(bob, 50.00 USD) = 125.00 USD  <- applied 2 times for one intended credit.
+```
+
 ### In Go
 
-`code/go/main.go` is the same codec, framer, envelope, simulated socket, server, and client, method for method, and the demo prints the same bytes, segment timings, and round-trip times: `Rng` is SplitMix64 on a `uint64`, so seed 42 cuts the stream into the same ten reads. Three things differ.
+The Go port (`code/go/main.go`) is the same codec, framer, envelope, simulated socket, server, and client, method for method, and the demo prints the same bytes, segment timings, and round-trip times: `Rng` is SplitMix64 on a `uint64`, so seed 42 cuts the stream into the same ten reads. Three things differ. **Errors are values, and the codec makes them sticky.** `ByteWriter.U8(256)` cannot throw, so it records the first range error and `ToBytes()` returns it, which keeps the chained `NewByteWriter().U8(kind).I64(id).String(method)...` style. `ByteReader` works the same way: every read checks bounds, the first failure parks in `Err()`, later reads return zero values, and a decoder reads all its fields then checks once (the `bufio.Scanner` pattern). All codec failures match `ErrCodec` under `errors.Is`; `Framer.Feed` returns `([][]byte, error)` and the server closes the connection on a non-nil error. **`encoding/binary` is the shift loop.** `binary.BigEndian.AppendUint32` and `binary.BigEndian.Uint64` replace the hand-written byte shuffling; the width lives in the Go type (`uint16`, `uint32`, `int64`), and the `int64(uint64)` conversion is Java's two's-complement `i64`. Go's `/` and `%` truncate like Java's, so nothing in `Money.String` changes. **Typed errors for the two client outcomes.** `*RpcTimeoutError` (matching `ErrTimeout`) carries the request id, timeout, and connection id, and `*RpcRemoteError` (matching `ErrRemote`) carries the method and the server's reason. `IllegalArgumentException` becomes `ErrNoSuchAccount`, `ErrCurrencyMismatch`, or `ErrInvalidCurrency`, and `Dispatch` turns any of them, or a codec error, into an `ERROR` response. Go maps iterate in random order, so `RpcServer` keeps its links in a slice to poll them deterministically. A real Go port would run the client's `Await` on a `net.Conn` with `SetReadDeadline`, which is the kernel-level equivalent of the simulated clock.
 
-- **Errors are values, and the codec makes them sticky.** `ByteWriter.U8(256)` cannot throw, so it records the first range error and `ToBytes()` returns it, which keeps the chained `NewByteWriter().U8(kind).I64(id).String(method)...` style. `ByteReader` works the same way: every read checks bounds, the first failure parks in `Err()`, later reads return zero values, and a decoder reads all its fields then checks once (the `bufio.Scanner` pattern). All codec failures match `ErrCodec` under `errors.Is`; `Framer.Feed` returns `([][]byte, error)` and the server closes the connection on a non-nil error.
-- **`encoding/binary` is the shift loop.** `binary.BigEndian.AppendUint32` and `binary.BigEndian.Uint64` replace the hand-written byte shuffling; the width lives in the Go type (`uint16`, `uint32`, `int64`), and the `int64(uint64)` conversion is Java's two's-complement `i64`. Go's `/` and `%` truncate like Java's, so nothing in `Money.String` changes.
-- **Typed errors for the two client outcomes.** `*RpcTimeoutError` (matching `ErrTimeout`) carries the request id, timeout, and connection id, and `*RpcRemoteError` (matching `ErrRemote`) carries the method and the server's reason. `IllegalArgumentException` becomes `ErrNoSuchAccount`, `ErrCurrencyMismatch`, or `ErrInvalidCurrency`, and `Dispatch` turns any of them, or a codec error, into an `ERROR` response. Go maps iterate in random order, so `RpcServer` keeps its links in a slice to poll them deterministically.
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: A bounds-checked byte codec
+
+The writer's methods return the receiver so they chain, and each one checks `w.err == nil` before doing anything, so the first out-of-range value stops all later writes and surfaces from `ToBytes`. The reader mirrors it: `need` returns `false` once an error is parked, every read returns a zero value after that, and the caller checks `Err()` once at the end. `binary.BigEndian` does the byte order.
 
 ```go
-func (f *Framer) Feed(chunk []byte) ([][]byte, error) {
-    joined := append(f.pending, chunk...)
-    var out [][]byte
-    pos := 0
-    for len(joined)-pos >= Header {
-        length := int64(binary.BigEndian.Uint32(joined[pos:]))
-        if length > int64(f.MaxFrame) {
-            return nil, codecErr("frame length %d exceeds max %d; closing connection", length, f.MaxFrame)
-        }
-        if int64(len(joined)-pos-Header) < length { // header complete, body not yet
-            break
-        }
-        out = append(out, append([]byte(nil), joined[pos+Header:pos+Header+int(length)]...))
-        pos += Header + int(length)
-    }
-    f.pending = append([]byte(nil), joined[pos:]...)
-    return out, nil
+func (w *ByteWriter) U8(v int) *ByteWriter {
+	if w.err == nil && (v < 0 || v > 0xFF) {
+		w.err = codecErr("u8 out of range: %d", v)
+	}
+	if w.err == nil {
+		w.buf = append(w.buf, byte(v))
+	}
+	return w
+}
+
+func (w *ByteWriter) I64(v int64) *ByteWriter {
+	if w.err == nil {
+		w.buf = binary.BigEndian.AppendUint64(w.buf, uint64(v))
+	}
+	return w
+}
+
+// ToBytes returns a copy of what was written, or the first range error.
+func (w *ByteWriter) ToBytes() ([]byte, error) {
+	if w.err != nil {
+		return nil, w.err
+	}
+	return append([]byte(nil), w.buf...), nil
 }
 ```
 
-A real Go port would run the client's `Await` on a `net.Conn` with `SetReadDeadline`, which is the kernel-level equivalent of the simulated clock.
+```go
+func (r *ByteReader) need(n int) bool {
+	if r.err != nil {
+		return false
+	}
+	if r.pos+n > len(r.buf) {
+		r.err = codecErr("truncated: need %d bytes at offset %d, have %d", n, r.pos, len(r.buf)-r.pos)
+		return false
+	}
+	return true
+}
+
+func (r *ByteReader) U32() int64 {
+	if !r.need(4) {
+		return 0
+	}
+	v := int64(binary.BigEndian.Uint32(r.buf[r.pos:]))
+	r.pos += 4
+	return v
+}
+
+func (r *ByteReader) String() string {
+	n := r.U16()
+	if !r.need(n) {
+		return ""
+	}
+	s := string(r.buf[r.pos : r.pos+n])
+	r.pos += n
+	return s
+}
+
+// ExpectEnd records an error if bytes remain unread.
+func (r *ByteReader) ExpectEnd() {
+	if r.err == nil && r.pos != len(r.buf) {
+		r.err = codecErr("trailing bytes: %d", len(r.buf)-r.pos)
+	}
+}
+```
+
+#### Step 2: The framer
+
+`Feed` returns the completed frames and an error; a hostile length comes back as the error and the server closes the link. Each emitted frame is copied with `append([]byte(nil), ...)` so it does not alias `joined`, and the leftover is copied into `pending` for the same reason.
+
+```go
+func (f *Framer) Feed(chunk []byte) ([][]byte, error) {
+	joined := append(f.pending, chunk...)
+	var out [][]byte
+	pos := 0
+	for len(joined)-pos >= Header {
+		length := int64(binary.BigEndian.Uint32(joined[pos:]))
+		if length > int64(f.MaxFrame) {
+			return nil, codecErr("frame length %d exceeds max %d; closing connection", length, f.MaxFrame)
+		}
+		if int64(len(joined)-pos-Header) < length { // header complete, body not yet
+			break
+		}
+		out = append(out, append([]byte(nil), joined[pos+Header:pos+Header+int(length)]...))
+		pos += Header + int(length)
+	}
+	f.pending = append([]byte(nil), joined[pos:]...)
+	f.FramesOut += len(out)
+	return out, nil
+}
+```
+
+#### Step 3: The envelope
+
+`Encode` is the chained writer ending in `ToBytes()`, which returns `([]byte, error)`. `Decode` reads all four header fields, checks `r.Err()` once, validates the kind tag and the payload length, copies the payload, and checks `Err()` again after `ExpectEnd`.
+
+```go
+func (m RpcMessage) Encode() ([]byte, error) {
+	return NewByteWriter().U8(int(m.Kind)).I64(m.RequestID).String(m.Method).U32(int64(len(m.Payload))).Bytes(m.Payload).ToBytes()
+}
+
+func Decode(bytes []byte) (RpcMessage, error) {
+	r := NewByteReader(bytes)
+	tag := r.U8()
+	id := r.I64()
+	method := r.String()
+	n := r.U32()
+	if r.Err() != nil {
+		return RpcMessage{}, r.Err()
+	}
+	kind, err := KindFromTag(tag)
+	if err != nil {
+		return RpcMessage{}, err
+	}
+	if n > int64(r.Remaining()) {
+		return RpcMessage{}, codecErr("payload length %d exceeds remaining %d", n, r.Remaining())
+	}
+	payload := make([]byte, n)
+	for i := range payload {
+		payload[i] = byte(r.U8())
+	}
+	r.ExpectEnd()
+	if r.Err() != nil {
+		return RpcMessage{}, r.Err()
+	}
+	return RpcMessage{kind, id, method, payload}, nil
+}
+```
+
+#### Step 4: Money on the wire
+
+`EncodeMoney` can discard the writer's error because its inputs are already-valid `Money`. `DecodeMoney` reads three fields, checks the reader once, and then lets `NewCurrency` reject a bad exponent with `ErrInvalidCurrency`.
+
+```go
+func EncodeMoney(m Money) []byte {
+	b, _ := NewByteWriter().I64(m.MinorUnits).String(m.Currency.Code).U8(m.Currency.Exponent).ToBytes()
+	return b
+}
+
+func DecodeMoney(r *ByteReader) (Money, error) {
+	minor := r.I64()
+	code := r.String()
+	exponent := r.U8()
+	if r.Err() != nil {
+		return Money{}, r.Err()
+	}
+	currency, err := NewCurrency(code, exponent)
+	if err != nil {
+		return Money{}, err
+	}
+	return OfMinor(minor, currency), nil
+}
+```
+
+#### Step 5: The simulated socket
+
+The segment list is a slice used as a queue; `Read` reslices from the front. Each segment holds a copy of its bytes so the caller's buffer can be reused. A cut channel returns `nil` from `Read`, which `len()` treats as zero bytes.
+
+```go
+func (c *Channel) Write(bytes []byte, now int64) {
+	c.BytesWritten += int64(len(bytes))
+	if c.cut { // half-open: the peer is gone and nobody told us
+		c.BytesLost += int64(len(bytes))
+		return
+	}
+	pos := 0
+	arrive := now
+	for pos < len(bytes) {
+		n := min(len(bytes)-pos, 1+c.rng.NextInt(c.maxSegment))
+		arrive += int64(1 + c.rng.NextInt(c.maxDelay)) // segments stay ordered: each arrives after the previous
+		c.inFlight = append(c.inFlight, segment{arrive, append([]byte(nil), bytes[pos:pos+n]...)})
+		pos += n
+	}
+}
+
+// Read returns everything that has arrived by now, concatenated. Empty when nothing has: a non-blocking read.
+func (c *Channel) Read(now int64) []byte {
+	if c.cut {
+		return nil
+	}
+	var out []byte
+	for len(c.inFlight) > 0 && c.inFlight[0].arriveAt <= now {
+		out = append(out, c.inFlight[0].bytes...)
+		c.inFlight = c.inFlight[1:]
+	}
+	c.BytesDelivered += int64(len(out))
+	return out
+}
+```
+
+#### Step 6: The server loop
+
+`Poll` ranges over a copy of the `links` slice (deterministic order, and safe while `close` removes entries). `Feed`'s error closes the link; `Decode`'s error skips the frame. Encoding a response can in principle fail too, so both `Encode` and `FrameWithMax` are checked before the write.
+
+```go
+func (s *RpcServer) Poll(now int64) {
+	for _, link := range append([]*Link(nil), s.links...) {
+		chunk := link.ClientToServer.Read(now)
+		if len(chunk) == 0 {
+			continue
+		}
+		frames, err := s.framers[link].Feed(chunk)
+		if err != nil {
+			s.MalformedFrames++
+			s.close(link) // a corrupt stream cannot be resynchronised: close it
+			continue
+		}
+		for _, f := range frames {
+			request, err := Decode(f)
+			if err != nil {
+				s.MalformedFrames++
+				continue
+			}
+			response := s.Service.Dispatch(request)
+			s.RequestsServed++
+			s.delayed = append(s.delayed, delayedResponse{now + s.ProcessingMillis, link, response})
+		}
+	}
+	for len(s.delayed) > 0 && s.delayed[0].readyAt <= now {
+		d := s.delayed[0]
+		s.delayed = s.delayed[1:]
+		if _, open := s.framers[d.link]; open {
+			encoded, err := d.response.Encode()
+			if err != nil {
+				continue
+			}
+			framed, err := FrameWithMax(encoded, s.maxFrame)
+			if err != nil {
+				continue
+			}
+			d.link.ServerToClient.Write(framed, now)
+		}
+	}
+}
+```
+
+#### Step 7: The client: ids, deadlines, late answers
+
+`Await` returns one of two typed errors: `*RpcRemoteError` when the reply is an `ERROR` message, `*RpcTimeoutError` at the deadline. `Pump` returns an error for a corrupt stream or an id it never issued, and ends by discarding every buffered id older than the current call as a late response.
+
+```go
+func (c *RpcClient) Await(id int64, timeoutMillis int64) (RpcMessage, error) {
+	deadline := c.clock.Now() + timeoutMillis
+	for {
+		if err := c.Pump(); err != nil {
+			return RpcMessage{}, err
+		}
+		if r, ok := c.received[id]; ok {
+			delete(c.received, id)
+			if r.Kind == Error {
+				return RpcMessage{}, &RpcRemoteError{r.Method, r.ErrorReason()}
+			}
+			return r, nil
+		}
+		if c.clock.Now() >= deadline {
+			c.Timeouts++
+			return RpcMessage{}, &RpcTimeoutError{id, timeoutMillis, c.link.ConnectionID}
+		}
+		c.clock.Advance(1)
+	}
+}
+
+func (c *RpcClient) Pump() error {
+	c.server.Poll(c.clock.Now())
+	chunk := c.link.ServerToClient.Read(c.clock.Now())
+	if len(chunk) == 0 {
+		return nil
+	}
+	frames, err := c.framer.Feed(chunk)
+	if err != nil {
+		return err
+	}
+	for _, f := range frames {
+		m, err := Decode(f)
+		if err != nil {
+			return err
+		}
+		if _, dup := c.received[m.RequestID]; m.RequestID >= c.nextRequestID || dup {
+			return fmt.Errorf("%w: %d", ErrUnknownID, m.RequestID)
+		}
+		c.received[m.RequestID] = m
+	}
+	// Anything buffered for an id that has already timed out is a late response: count and drop it.
+	for rid := range c.received {
+		if rid < c.currentCallID() {
+			c.LateResponses++
+			delete(c.received, rid)
+		}
+	}
+	return nil
+}
+```
+
+#### Step 8: Run it
 
 ```bash
 cd phases/05-distributed-foundations/07-rpc-and-serialization/code/go
 go run .
 go test ./...
+```
+
+`diff <(go run .) <(python3 ../python/main.py)` is empty; the Go output is identical to the Java and Python runs, down to the hex dump:
+
+```console
+== The wire format: one GetBalance request, framed ==
+framed   (36 bytes): 00000020010000000000000001000a47657442616c616e6365000000070005616c696365
+  = u32 length 32 | u8 kind=1 | i64 requestId=1 | u16 len=10 'GetBalance' | u32 payloadLen=7 | u16 len=5 'alice'
+
+== A hostile length prefix is rejected before any allocation ==
+rejected: frame length 4294967295 exceeds max 1048576; closing connection
+truncated message rejected: payload length 7 exceeds remaining 4
+
+== Timeout: the server is slow, the client gives up, the answer arrives later and is discarded ==
+t=100: request 4 timed out after 100 ms on connection 1 (outcome unknown)
+next call still gets the right answer: GetBalance(bob) = 25.00 USD; late responses discarded so far = 1
+
+== Half-open: the server vanishes mid-Credit; the client's socket shows no error, only silence ==
+client: request 6 timed out after 200 ms on connection 1 (outcome unknown); only the deadline detects a half-open connection
+naive retry of Credit(bob, 50.00 USD) = 125.00 USD  <- applied 2 times for one intended credit.
 ```
 
 ## Use It

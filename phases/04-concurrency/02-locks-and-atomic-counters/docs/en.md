@@ -350,41 +350,465 @@ rejected: account acct-1 has 250500 minor units, debit of 1000000 refused
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **The GIL does not save you.** `self.balance += delta` is `LOAD_ATTR`, `BINARY_OP`, `STORE_ATTR`, and the interpreter may release the GIL between any two bytecodes. With the default switch interval of 5 ms the race is rare; the demo calls `sys.setswitchinterval(1e-6)` for the racy run and loses roughly a third of the updates. Lesson 10 covers the GIL in depth; the scripted interleaving is the proof in the tests either way. **There is no CAS.** `AtomicLong.compare_and_set` is a lock around a compare and a store. The retry loop in `AtomicCounter.add` is kept so the three implementations read the same, and `cas_retries` still counts real collisions, but the throughput is the mutex's. **`hash()` is salted.** `stable_hash` reimplements the 31-multiplier hash with 32-bit wrap-around (`& 0xFFFFFFFF`, then sign-fold) so stripe assignment matches Java and Go. **`threading.Event` is the start latch and `join()` is the done latch.** `Thread.join()` is specified to publish everything the joined thread wrote, so `observe()` after the joins is sound.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The bug, with a seam for the test
+
+`RacyCounter` takes an optional callable and stores a no-op lambda when none is given, which is Python's version of the two Java constructors. The three lines of `add` are the three bytecodes the GIL can split; the hook sits in the gap so the test decides where the switch happens instead of the interpreter.
+
 ```python
 class RacyCounter:
+    def __init__(self, between_load_and_store: Callable[[], None] | None = None) -> None:
+        self.balance = 0
+        self._between = between_load_and_store or (lambda: None)
+
     def add(self, delta: int) -> None:
-        loaded = self.balance          # LOAD_ATTR
-        self._between()
-        self.balance = loaded + delta  # STORE_ATTR
+        loaded = self.balance          # 1. load
+        self._between()                #    (another thread may run here)
+        self.balance = loaded + delta  # 2. store a value computed from a possibly stale load
+
+    def get(self) -> int:
+        return self.balance
+
+    def name(self) -> str:
+        return "racy"
 ```
 
-Differences, all in `code/python/main.py`:
+The test closes over a one-element list because the hook has to reach the counter it is installed in, and the counter does not exist until after the hook is built. `fired` is a list for the same reason: a bare `bool` would be rebound locally.
 
-- **The GIL does not save you.** `self.balance += delta` is `LOAD_ATTR`, `BINARY_OP`, `STORE_ATTR`, and the interpreter may release the GIL between any two bytecodes. With the default switch interval of 5 ms the race is rare; the demo calls `sys.setswitchinterval(1e-6)` for the racy run and loses roughly a third of the updates. Lesson 10 covers the GIL in depth. The scripted interleaving is the proof in the tests either way.
-- **There is no CAS.** `AtomicLong.compare_and_set` is a lock around a compare and a store. The retry loop in `AtomicCounter.add` is kept so the three implementations read the same, and `cas_retries` still counts real collisions, but the throughput is the mutex's.
-- **`hash()` is salted.** `stable_hash` reimplements the 31-multiplier hash with 32-bit wrap-around (`& 0xFFFFFFFF`, then sign-fold) so stripe assignment matches Java and Go.
-- **`threading.Event` is the start latch and `join()` is the done latch.** `Thread.join()` is specified to publish everything the joined thread wrote, so `observe()` after the joins is sound.
+```python
+    def test_scripted_interleaving_loses_one_update(self) -> None:
+        holder: list[RacyCounter] = []
+        fired = [False]
+
+        def interleave() -> None:
+            if not fired[0]:
+                fired[0] = True
+                holder[0].add(5)
+
+        holder.append(RacyCounter(interleave))
+        holder[0].add(5)
+        self.assertEqual(holder[0].get(), 5)  # not 10
+```
+
+#### Step 2: Fix 1, a mutex
+
+`with self._lock:` is the `try/finally` of the Java version: the lock is released on every exit path, including an exception raised inside the block. Python ints do not overflow, so there is no `addExact`, but the `get()` lock stays: a `threading.Lock` release-then-acquire is what publishes the write to the next thread, exactly as in Java.
+
+```python
+class LockedCounter:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._balance = 0
+
+    def add(self, delta: int) -> None:
+        with self._lock:
+            self._balance += delta
+
+    def get(self) -> int:
+        with self._lock:
+            return self._balance
+
+    def name(self) -> str:
+        return "locked"
+```
+
+#### Step 3: Fix 2, compare-and-swap
+
+CPython has no user-level CAS, so `AtomicLong` emulates one: `compare_and_set` is a compare and a store under a lock, and it returns `False` when another thread got there first. `AtomicCounter.add` is then the same load, compute, publish-or-retry loop as the Java, which is the point: the caller's shape does not change when the primitive does.
+
+```python
+class AtomicLong:
+    def __init__(self, value: int = 0) -> None:
+        self._lock = threading.Lock()
+        self._value = value
+
+    def get(self) -> int:
+        with self._lock:
+            return self._value
+
+    def compare_and_set(self, expected: int, new: int) -> bool:
+        with self._lock:
+            if self._value != expected:
+                return False
+            self._value = new
+            return True
+
+
+class AtomicCounter:
+    def __init__(self) -> None:
+        self._value = AtomicLong()
+        self._retries = AtomicLong()
+
+    def add(self, delta: int) -> None:
+        while True:
+            current = self._value.get()
+            if self._value.compare_and_set(current, current + delta):
+                return
+            self._retries.increment_and_get()
+```
+
+#### Step 4: Fix 3, lock striping over a per-account map
+
+`stable_hash` keeps the running value inside 32 bits with `& 0xFFFFFFFF` and folds anything at or above `0x80000000` into a negative number, which reproduces Java's `int` overflow exactly. Python's `%` always returns a non-negative result for a positive divisor, so `stripe_index` needs no `floorMod`. One lock and one plain `dict` per stripe; the dict is never touched outside its lock.
+
+```python
+def stable_hash(s: str) -> int:
+    h = 0
+    for ch in s:
+        h = (31 * h + ord(ch)) & 0xFFFFFFFF
+    return h - 0x100000000 if h >= 0x80000000 else h
+
+
+class StripedAccountMap:
+    def __init__(self, currency: Currency, stripes: int) -> None:
+        if stripes <= 0:
+            raise ValueError(f"stripes must be positive: {stripes}")
+        self.currency = currency
+        self._locks = [threading.Lock() for _ in range(stripes)]
+        self._buckets: list[dict[str, int]] = [{} for _ in range(stripes)]
+
+    def stripe_index(self, account_id: str) -> int:
+        return stable_hash(account_id) % len(self._locks)  # Python % is already non-negative here
+
+    def credit(self, account_id: str, amount: Money) -> None:
+        self._require_valid(amount)
+        s = self.stripe_index(account_id)
+        with self._locks[s]:
+            current = self._require_open(s, account_id)
+            self._buckets[s][account_id] = current + amount.minor_units
+```
+
+The debit's check and its write sit in the same `with` block, so the balance that was compared is the balance that is overwritten. `InsufficientFundsError` is a `RuntimeError` subclass carrying the same message the Java exception does.
+
+```python
+    def debit(self, account_id: str, amount: Money) -> None:
+        self._require_valid(amount)
+        s = self.stripe_index(account_id)
+        with self._locks[s]:
+            current = self._require_open(s, account_id)
+            if current < amount.minor_units:
+                raise InsufficientFundsError(account_id, current, amount.minor_units)
+            self._buckets[s][account_id] = current - amount.minor_units
+```
+
+`total()` cannot use a single `with` for a variable number of locks, so it acquires them in index order by hand and releases them in reverse inside a `finally`. The nested `sum` runs while every stripe is held, so the snapshot is consistent.
+
+```python
+    def total(self) -> Money:
+        """Takes every stripe lock in index order so the sum is a consistent snapshot."""
+        for lock in self._locks:
+            lock.acquire()
+        try:
+            return Money.of_minor(sum(sum(b.values()) for b in self._buckets), self.currency)
+        finally:
+            for lock in reversed(self._locks):
+                lock.release()
+```
+
+#### Step 5: The benchmark harness
+
+A `threading.Event` replaces the start latch: every worker blocks in `start.wait()` and `start.set()` releases them all at once. There is no done latch because `Thread.join()` already provides the happens-before edge. A worker that raises cannot fail the benchmark thread on its own, so `body` catches `BaseException`, appends it under a lock, and `run_benchmark` re-raises the first one after the joins, mirroring the Java `failure` path.
+
+```python
+def run_benchmark(name: str, threads: int, ops_per_thread: int, delta: int, worker: Worker,
+                  observe: Callable[[], int], stopwatch: Stopwatch) -> BenchmarkResult:
+    if threads <= 0 or ops_per_thread < 0:
+        raise ValueError("threads > 0, ops_per_thread >= 0")
+    start = threading.Event()
+    failures: list[BaseException] = []
+    failures_lock = threading.Lock()
+
+    def body(thread_index: int) -> None:
+        try:
+            start.wait()
+            for i in range(ops_per_thread):
+                worker(thread_index, i)
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the caller below
+            with failures_lock:
+                failures.append(exc)
+
+    pool = [threading.Thread(target=body, args=(t,), name=f"bench-{t}") for t in range(threads)]
+    for thread in pool:
+        thread.start()
+    before = stopwatch.nanos()
+    start.set()                      # all threads begin together: maximum contention
+    for thread in pool:
+        thread.join()                # join() publishes everything the thread wrote
+    after = stopwatch.nanos()
+    if failures:
+        raise RuntimeError(f"worker failed: {failures[0]!r}") from failures[0]
+    return BenchmarkResult(name, threads, ops_per_thread, delta, observe(), after - before)
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/04-concurrency/02-locks-and-atomic-counters/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+The Python demo runs 50,000 operations per thread rather than 250,000 because every operation pays for the GIL; the racy loss is large only because the switch interval was shrunk for that one run (throughput varies by machine):
+
+```console
+== A lost update, forced deterministically ==
+two credits of 0.01 USD, balance = 0.01 USD (expected 0.02 USD): the second write overwrote the first
+
+== 4 threads each credit 0.01 USD 50,000 times: expected 2000.00 USD ==
+racy             observed    1657.29 USD  lost   342.71 USD    10,238,395 ops/s   <- varies run to run; with the default 5 ms switch interval it is rare, not absent
+locked           observed    2000.00 USD  lost     0.00 USD     5,586,188 ops/s
+atomic           observed    2000.00 USD  lost     0.00 USD     2,568,512 ops/s   CAS retries: 6 (varies)
+striped-map(16)  observed    2000.00 USD  lost     0.00 USD       687,444 ops/s
+
+== Check-then-act: a debit that cannot overdraw ==
+acct-1 balance 505.00 USD on stripe 7
+rejected: account acct-1 has 50500 minor units, debit of 1000000 refused
+
+== Deterministic replay with an injected stopwatch ==
+4 threads x 1,000 ops in 2.000 ms = 2,000,000 ops/s, lost 0
+```
+
+The atomic counter is slower than the locked one here, not faster: its "CAS" is two lock acquisitions per operation. The six retries are real collisions, though, which is why the loop is kept.
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with four differences. **`-race` is part of the test command.** `go test -race ./...` instruments every memory access and fails the test on any unsynchronized pair. The racy counter is therefore run concurrently only in `main`, never in a test; the test suite reaches it through the injected hook alone. If you add a concurrent racy test, the detector will fail it, which is the detector doing its job. **`atomic.Int64` is a real CAS**, compiling to `LOCK CMPXCHG` on amd64. `sync.Mutex` is the lock; `Unlock` happens-before the next `Lock` returns (Go memory model, "Locks"). **Errors are values.** `Debit` returns `ErrInsufficientFunds` wrapped with `%w` so callers use `errors.Is`; `Credit` returns `ErrCurrencyMismatch` or `ErrNegativeAmount`. Java throws; Python raises. **A closed channel is the start latch and `sync.WaitGroup` is the done latch.** `close(start)` releases every goroutine blocked on `<-start` at once.
+
+Run it from `code/go/` with `go run .`; test with `go test -race ./...`.
+
+#### Step 1: The bug, with a seam for the test
+
+`NewRacyCounter(nil)` substitutes an empty function, which plays the role of the Java no-argument constructor. The three statements of `Add` are the load, the gap, and the store; nothing about `int64` makes `+=` atomic, and the race detector would flag two goroutines in `Add` immediately.
+
 ```go
-func (c *AtomicCounter) Add(delta int64) {
-    for {
-        current := c.value.Load()
-        if c.value.CompareAndSwap(current, current+delta) {
-            return
-        }
-        c.retries.Add(1)
-    }
+type RacyCounter struct {
+	balance             int64
+	betweenLoadAndStore func()
+}
+
+func NewRacyCounter(betweenLoadAndStore func()) *RacyCounter {
+	if betweenLoadAndStore == nil {
+		betweenLoadAndStore = func() {}
+	}
+	return &RacyCounter{betweenLoadAndStore: betweenLoadAndStore}
+}
+
+func (c *RacyCounter) Add(delta int64) {
+	loaded := c.balance        // 1. load
+	c.betweenLoadAndStore()    //    (another goroutine may run here)
+	c.balance = loaded + delta // 2. store a value computed from a possibly stale load
+}
+
+func (c *RacyCounter) Get() int64   { return c.balance }
+```
+
+Go closures capture variables, not values, so the test declares `racy` first and assigns it after the closure is built; `fired` is a plain `bool` captured the same way. Single goroutine, so `-race` stays quiet and the result is 5 on every run.
+
+```go
+func TestScriptedInterleavingLosesOneUpdate(t *testing.T) {
+	var racy *RacyCounter
+	fired := false
+	racy = NewRacyCounter(func() {
+		if !fired {
+			fired = true
+			racy.Add(5)
+		}
+	})
+	racy.Add(5)
+	if got := racy.Get(); got != 5 {
+		t.Fatalf("expected the lost update to leave 5, got %d", got)
+	}
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: Fix 1, a mutex
 
-- **`-race` is part of the test command.** `go test -race ./...` instruments every memory access and fails the test on any unsynchronized pair. The racy counter is therefore run concurrently only in `main`, never in a test; the test suite reaches it through the injected hook alone. If you add a concurrent racy test, the detector will fail it, which is the detector doing its job.
-- **`atomic.Int64` is a real CAS**, compiling to `LOCK CMPXCHG` on amd64. `sync.Mutex` is the lock; `Unlock` happens-before the next `Lock` returns (Go memory model, "Locks").
-- **Errors are values.** `Debit` returns `ErrInsufficientFunds` wrapped with `%w` so callers use `errors.Is`; `Credit` returns `ErrCurrencyMismatch` or `ErrNegativeAmount`. Java throws; Python raises.
-- **A closed channel is the start latch and `sync.WaitGroup` is the done latch.** `close(start)` releases every goroutine blocked on `<-start` at once.
+`sync.Mutex` has no reentrancy and no `finally`; `Add` unlocks explicitly because nothing between `Lock` and `Unlock` can fail (`int64` addition wraps rather than panicking), while `Get` uses `defer` so the unlock survives any future early return. The locked `Get` is still required: the Go memory model only orders a read after a write when the read's `Lock` follows the writer's `Unlock`.
+
+```go
+type LockedCounter struct {
+	mu      sync.Mutex
+	balance int64
+}
+
+func (c *LockedCounter) Add(delta int64) {
+	c.mu.Lock()
+	c.balance += delta
+	c.mu.Unlock()
+}
+
+func (c *LockedCounter) Get() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.balance
+}
+```
+
+#### Step 3: Fix 2, compare-and-swap
+
+`atomic.Int64` is the hardware CAS with a typed API: `Load`, `CompareAndSwap`, `Add`. The loop is identical to the Java one; a failed `CompareAndSwap` means another goroutine stored between the `Load` and the swap, so the loop re-reads and tries again without blocking. `retries` is itself atomic for the same reason as in Java.
+
+```go
+type AtomicCounter struct {
+	value   atomic.Int64
+	retries atomic.Int64
+}
+
+func (c *AtomicCounter) Add(delta int64) {
+	for {
+		current := c.value.Load()
+		if c.value.CompareAndSwap(current, current+delta) {
+			return
+		}
+		c.retries.Add(1)
+	}
+}
+
+func (c *AtomicCounter) Get() int64        { return c.value.Load() }
+func (c *AtomicCounter) CasRetries() int64 { return c.retries.Load() }
+```
+
+#### Step 4: Fix 3, lock striping over a per-account map
+
+`StableHash` works in `int32`, so the wrap-around that Java gets from `int` arithmetic is free. Go's `%` keeps the sign of the dividend like Java's, so `StripeIndex` adds the stripe count back when the remainder is negative, which is `floorMod` spelled out. The constructor returns an error rather than panicking on a non-positive stripe count, and `Credit` returns `ErrNoSuchAccount` where the Java threw.
+
+```go
+func StableHash(s string) int32 {
+	var h int32
+	for i := 0; i < len(s); i++ {
+		h = 31*h + int32(s[i])
+	}
+	return h
+}
+
+type StripedAccountMap struct {
+	currency Currency
+	locks    []sync.Mutex
+	buckets  []map[string]int64
+}
+
+func (m *StripedAccountMap) StripeIndex(accountID string) int {
+	h := int(StableHash(accountID)) % len(m.locks)
+	if h < 0 {
+		h += len(m.locks)
+	}
+	return h
+}
+
+func (m *StripedAccountMap) Credit(accountID string, amount Money) error {
+	if err := m.requireValid(amount); err != nil {
+		return err
+	}
+	s := m.StripeIndex(accountID)
+	m.locks[s].Lock()
+	defer m.locks[s].Unlock()
+	current, ok := m.buckets[s][accountID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrNoSuchAccount, accountID)
+	}
+	m.buckets[s][accountID] = current + amount.MinorUnits
+	return nil
+}
+```
+
+The debit's check and write happen under the deferred unlock, so the compared balance is the written balance. The insufficient-funds case wraps `ErrInsufficientFunds` with `%w`, so a caller can `errors.Is` it without parsing the message.
+
+```go
+func (m *StripedAccountMap) Debit(accountID string, amount Money) error {
+	if err := m.requireValid(amount); err != nil {
+		return err
+	}
+	s := m.StripeIndex(accountID)
+	m.locks[s].Lock()
+	defer m.locks[s].Unlock()
+	current, ok := m.buckets[s][accountID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrNoSuchAccount, accountID)
+	}
+	if current < amount.MinorUnits {
+		return fmt.Errorf("%w: account %s has %d minor units, debit of %d refused", ErrInsufficientFunds, accountID, current, amount.MinorUnits)
+	}
+	m.buckets[s][accountID] = current - amount.MinorUnits
+	return nil
+}
+```
+
+`Total` locks every stripe in index order and defers a closure that unlocks in reverse. `locks` is a `[]sync.Mutex` indexed by position rather than ranged over by value, because copying a mutex is a bug `go vet` reports.
+
+```go
+func (m *StripedAccountMap) Total() Money {
+	for i := range m.locks {
+		m.locks[i].Lock()
+	}
+	defer func() {
+		for i := len(m.locks) - 1; i >= 0; i-- {
+			m.locks[i].Unlock()
+		}
+	}()
+	var sum int64
+	for _, bucket := range m.buckets {
+		for _, v := range bucket {
+			sum += v
+		}
+	}
+	return OfMinor(sum, m.currency)
+}
+```
+
+#### Step 5: The benchmark harness
+
+The start latch is an unbuffered channel that every goroutine receives from; `close(start)` makes every pending receive return at once. The done latch is a `sync.WaitGroup` with `Add(threads)` before any goroutine starts and `defer done.Done()` inside each. `done.Wait()` returning happens-after every `Done()`, which is what makes `observe()` sound. Worker failures surface by `panic` inside `MeasureMap`'s worker rather than by a collected exception, because a benchmark goroutine that panics takes the process down loudly instead of silently passing.
+
+```go
+func RunBenchmark(name string, threads, opsPerThread int, delta int64, worker Worker, observe func() int64, stopwatch Stopwatch) (BenchmarkResult, error) {
+	if threads <= 0 || opsPerThread < 0 {
+		return BenchmarkResult{}, errors.New("threads > 0, opsPerThread >= 0")
+	}
+	start := make(chan struct{})
+	var done sync.WaitGroup
+	done.Add(threads)
+	for t := 0; t < threads; t++ {
+		go func(threadIndex int) {
+			defer done.Done()
+			<-start
+			for i := 0; i < opsPerThread; i++ {
+				worker(threadIndex, i)
+			}
+		}(t)
+	}
+	before := stopwatch.Nanos()
+	close(start) // all goroutines begin together: maximum contention
+	done.Wait()  // Done() happens-before Wait() returning, so observe() sees every write
+	after := stopwatch.Nanos()
+	return BenchmarkResult{name, threads, opsPerThread, delta, observe(), after - before}, nil
+}
+```
+
+#### Step 6: Run it
+
+```bash
+cd phases/04-concurrency/02-locks-and-atomic-counters/code/go
+go run .
+go test -race ./...
+```
+
+The output follows the Java line for line with "goroutines" in place of "threads" and the sentinel prefix on error messages. On a machine with few cores the racy counter may lose nothing at all in a given run, because goroutines are rarely preempted mid-`Add`; that is luck, not correctness, and `-race` would still flag it:
+
+```console
+== 4 goroutines each credit 0.01 USD 250,000 times: expected 10000.00 USD ==
+racy             observed   10000.00 USD  lost     0.00 USD     230,789,114 ops/s   <- varies run to run; any loss is the proof (and -race would flag it)
+locked           observed   10000.00 USD  lost     0.00 USD      41,731,094 ops/s
+atomic           observed   10000.00 USD  lost     0.00 USD      56,419,310 ops/s   CAS retries: 15,947 (varies)
+striped-map(16)  observed   10000.00 USD  lost     0.00 USD      19,727,354 ops/s
+
+== Check-then-act: a debit that cannot overdraw ==
+acct-1 balance 2505.00 USD on stripe 7
+rejected: insufficient funds: account acct-1 has 250500 minor units, debit of 1000000 refused
+map total = 10005.00 USD
+```
 
 ## Use It
 

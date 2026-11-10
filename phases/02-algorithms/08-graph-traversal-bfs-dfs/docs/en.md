@@ -336,12 +336,95 @@ The BFS and DFS orders differ at the third element, which is the whole differenc
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **`collections.deque` for the BFS queue:** `list.pop(0)` is O(n) because it shifts every element; `deque.popleft()` is O(1). On the 100,000-node chain the difference is seconds versus milliseconds. **A plain `list` is the DFS stack:** `append` and `pop()` at the end are amortised O(1), and the recursion limit (`sys.getrecursionlimit()`, default 1,000) is exactly why this lesson's DFS is iterative: the recursive version fails on the chain test at depth 1,000. **`dict` preserves insertion order** (guaranteed since Python 3.7), so the `Graph` needs no `LinkedHashMap` equivalent; `neighbors` returns a tuple so callers cannot mutate the adjacency list. **Errors:** `KeyError` for an unknown node, `ValueError` for `find_cycle` on an undirected graph, `None` instead of `Optional.empty()`.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The adjacency list
+
+A `dict[str, list[str]]` is both the node registry and the neighbour lists, and insertion order comes for free. `setdefault` is `computeIfAbsent`. `neighbors` raises `KeyError` on an unknown id and returns a tuple, the immutable view that `Collections.unmodifiableList` provides in Java.
+
+```python
+class Graph:
+    def __init__(self, directed: bool) -> None:
+        self._directed = directed
+        self._adjacency: dict[str, list[str]] = {}
+        self._edge_count = 0
+
+    def add_node(self, node_id: str) -> None:
+        self._adjacency.setdefault(node_id, [])
+
+    def add_edge(self, frm: str, to: str) -> None:
+        """Adds the endpoints if absent. For an undirected graph the edge is stored in both lists."""
+        self.add_node(frm)
+        self.add_node(to)
+        self._adjacency[frm].append(to)
+        if not self._directed and frm != to:
+            self._adjacency[to].append(frm)
+        self._edge_count += 1
+
+    def neighbors(self, node_id: str) -> Sequence[str]:
+        if node_id not in self._adjacency:
+            raise KeyError(f"unknown node: {node_id}")
+        return tuple(self._adjacency[node_id])
+```
+
+#### Step 2: BFS with distance and parent
+
+`distance` doubles as the discovered set, exactly as in Java; `v not in distance` is the mark-on-enqueue test. The queue is a `deque` so `popleft` is O(1).
+
+```python
+def bfs(g: Graph, source: str) -> BfsResult:
+    """Breadth-first from source. Each node is enqueued once, when first discovered; distance = hops."""
+    if not g.has_node(source):
+        raise KeyError(f"unknown node: {source}")
+    distance: dict[str, int] = {source: 0}
+    parent: dict[str, str] = {}
+    order: list[str] = []
+    queue: deque[str] = deque([source])
+    while queue:
+        u = queue.popleft()
+        order.append(u)
+        for v in g.neighbors(u):
+            if v not in distance:  # discovered: mark BEFORE enqueueing, never after dequeueing
+                distance[v] = distance[u] + 1
+                parent[v] = u
+                queue.append(v)
+    return BfsResult(distance, parent, order)
+```
+
+#### Step 3: Shortest-hop path
+
+`parent.get(at)` returns `None` for the source, which ends the loop. The path is collected in reverse and flipped with `[::-1]` rather than inserted at index 0 each time; an unreachable target returns an empty list.
+
+```python
+def shortest_hop_path(g: Graph, source: str, target: str) -> list[str]:
+    """Fewest-hops path from source to target by following BFS parents back; empty if unreachable."""
+    r = bfs(g, source)
+    if not r.reached(target):
+        return []
+    path: list[str] = []
+    at: Optional[str] = target
+    while at is not None:
+        path.append(at)
+        at = r.parent.get(at)
+    return path[::-1]
+```
+
+#### Step 4: Iterative DFS
+
+A list is the stack. `set.add` does not report whether the element was new, so the check and the mark are two statements. `reversed(g.neighbors(u))` is the reverse push loop that makes the preorder match a recursive DFS.
+
 ```python
 def dfs_iterative(g: Graph, source: str) -> list[str]:
-    order, visited, stack = [], set(), [source]
+    if not g.has_node(source):
+        raise KeyError(f"unknown node: {source}")
+    order: list[str] = []
+    visited: set[str] = set()
+    stack: list[str] = [source]
     while stack:
         u = stack.pop()
-        if u in visited:
+        if u in visited:  # a node may be pushed many times; it is visited once
             continue
         visited.add(u)
         order.append(u)
@@ -351,31 +434,336 @@ def dfs_iterative(g: Graph, source: str) -> list[str]:
     return order
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 5: Components on the undirected view
 
-- **`collections.deque` for the BFS queue.** `list.pop(0)` is O(n) because it shifts every element; `deque.popleft()` is O(1). On the 100,000-node chain the difference is seconds versus milliseconds.
-- **A plain `list` is the DFS stack.** `append` and `pop()` at the end are amortised O(1), and the recursion limit (`sys.getrecursionlimit()`, default 1,000) is exactly why this lesson's DFS is iterative: the recursive version fails on the chain test at depth 1,000.
-- **`dict` preserves insertion order** (guaranteed since Python 3.7), so the `Graph` needs no `LinkedHashMap` equivalent; `neighbors` returns a tuple so callers cannot mutate the adjacency list.
-- **Errors.** `KeyError` for an unknown node, `ValueError` for `find_cycle` on an undirected graph, `None` instead of `Optional.empty()`.
+Identical in shape: one BFS per unseen node on the undirected view, `set.update` to mark the whole component.
+
+```python
+def connected_components(g: Graph) -> list[list[str]]:
+    """Connected components of the undirected view, each in discovery order, components in node order."""
+    u = g.undirected_view()
+    seen: set[str] = set()
+    components: list[list[str]] = []
+    for start in u.nodes():
+        if start in seen:
+            continue
+        component = bfs(u, start).order
+        seen.update(component)
+        components.append(component)
+    return components
+```
+
+#### Step 6: Three-colour cycle detection
+
+`path` and `next_index` are two parallel lists playing the two `ArrayDeque`s. The GRAY nodes are exactly the contents of `path`, so closing the cycle is `path[path.index(v):]` plus `v` repeated. `is` comparisons on the enum members are identity tests, which is what enum comparison should be.
+
+```python
+def find_cycle(g: Graph) -> Optional[list[str]]:
+    if not g.is_directed():
+        raise ValueError("find_cycle is defined for directed graphs")
+    color = {n: Color.WHITE for n in g.nodes()}
+    for root in g.nodes():
+        if color[root] is not Color.WHITE:
+            continue
+        path: list[str] = [root]       # the GRAY nodes, root first
+        next_index: list[int] = [0]    # per frame: index of the next neighbour to examine
+        color[root] = Color.GRAY
+        while path:
+            u = path[-1]
+            i = next_index[-1]
+            ns = g.neighbors(u)
+            if i < len(ns):
+                next_index[-1] = i + 1
+                v = ns[i]
+                if color[v] is Color.GRAY:
+                    cycle = path[path.index(v):]
+                    return cycle + [v]
+                if color[v] is Color.WHITE:
+                    color[v] = Color.GRAY
+                    path.append(v)
+                    next_index.append(0)
+            else:
+                color[u] = Color.BLACK
+                path.pop()
+                next_index.pop()
+    return None
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/02-algorithms/08-graph-traversal-bfs-dfs/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== BFS from acct-A: hop distance to every reachable account ==
+visit order : ['acct-A', 'acct-B', 'acct-D', 'acct-C', 'acct-E']
+distances   : {'acct-A': 0, 'acct-B': 1, 'acct-D': 1, 'acct-C': 2, 'acct-E': 2}
+path A -> E : ['acct-A', 'acct-D', 'acct-E']
+path A -> X : []  (unreachable: empty)
+
+== Iterative DFS preorder from acct-A ==
+['acct-A', 'acct-B', 'acct-C', 'acct-D', 'acct-E']
+
+== Connected components (direction ignored) ==
+  size 5: ['acct-A', 'acct-B', 'acct-D', 'acct-C', 'acct-E']
+  size 4: ['payroll', 'acct-X', 'landlord', 'grocer']
+  size 1: ['dormant']
+
+== Directed cycle (three-colour DFS) ==
+circular flow: ['acct-A', 'acct-B', 'acct-C', 'acct-A']
+payroll graph has cycle: False
+
+== 100,000-hop chain: iterative DFS does not overflow the stack ==
+visited 100001 nodes
+```
+
+The orders are the Java orders token for token; only the list quoting differs. The chain line is the one that would fail with a recursive DFS at Python's default recursion limit.
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with four differences. **Go maps iterate in random order by design**, so the node list and the adjacency lists are slices indexed through a `map[string]int`. This is the one language where "deterministic traversal" requires a deliberate data-structure choice rather than falling out of the standard map. **Errors are values:** `Bfs`, `DfsIterative`, `Neighbors`, and `FindCycle` return `error`; `ErrUnknownNode` and `ErrCurrencyMismatch` are sentinels for `errors.Is`. `FindCycle` returns `nil, nil` for a DAG; the demo's `must` helper panics only in `main`. **Slices as queue and stack:** `queue = queue[1:]` is O(1) but leaks the consumed prefix until the slice is garbage-collected; for a long-running service use a ring buffer or `container/list`. The stack uses `append` and reslicing, which is idiomatic and fast. **Goroutine stacks grow dynamically**, so a recursive DFS fails much later than in Java or Python (at roughly 1 GB of stack), which makes the bug rarer and therefore nastier when a 10-million-node chain finally arrives.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: The adjacency list
+
+Three parallel structures replace `LinkedHashMap`: `order` is the node list in insertion order, `index` maps an id to its position, and `adjacency[i]` is node `i`'s neighbour slice. `AddNode` is idempotent through the map check; `Neighbors` returns a wrapped `ErrUnknownNode` for a bad id.
+
 ```go
 type Graph struct {
-    directed  bool
-    order     []string
-    index     map[string]int
-    adjacency [][]string
-    edgeCount int
+	directed  bool
+	order     []string
+	index     map[string]int
+	adjacency [][]string
+	edgeCount int
+}
+
+func NewGraph(directed bool) *Graph {
+	return &Graph{directed: directed, index: map[string]int{}}
+}
+
+func (g *Graph) AddNode(id string) {
+	if _, ok := g.index[id]; ok {
+		return
+	}
+	g.index[id] = len(g.order)
+	g.order = append(g.order, id)
+	g.adjacency = append(g.adjacency, nil)
+}
+
+// AddEdge adds the endpoints if absent. For an undirected graph the edge is stored in both lists.
+func (g *Graph) AddEdge(from, to string) {
+	g.AddNode(from)
+	g.AddNode(to)
+	g.adjacency[g.index[from]] = append(g.adjacency[g.index[from]], to)
+	if !g.directed && from != to {
+		g.adjacency[g.index[to]] = append(g.adjacency[g.index[to]], from)
+	}
+	g.edgeCount++
+}
+
+// Neighbors returns the out-neighbours in insertion order; the slice must not be modified.
+func (g *Graph) Neighbors(id string) ([]string, error) {
+	i, ok := g.index[id]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownNode, id)
+	}
+	return g.adjacency[i], nil
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: BFS with distance and parent
 
-- **Go maps iterate in random order by design**, so the node list and the adjacency lists are slices indexed through a `map[string]int`. This is the one language where "deterministic traversal" requires a deliberate data-structure choice rather than falling out of the standard map.
-- **Errors are values.** `Bfs`, `DfsIterative`, `Neighbors`, and `FindCycle` return `error`; `ErrUnknownNode` and `ErrCurrencyMismatch` are sentinels for `errors.Is`. `FindCycle` returns `nil, nil` for a DAG; the demo's `must` helper panics only in `main`.
-- **Slices as queue and stack.** `queue = queue[1:]` is O(1) but leaks the consumed prefix until the slice is garbage-collected; for a long-running service use a ring buffer or `container/list`. The stack uses `append` and reslicing, which is idiomatic and fast.
-- **Goroutine stacks grow dynamically**, so a recursive DFS fails much later than in Java or Python (at roughly 1 GB of stack), which makes the bug rarer and therefore nastier when a 10-million-node chain finally arrives.
+The queue is a slice consumed with `queue = queue[1:]`. `distance` is a `map[string]int` and the two-value lookup is the discovered test; the `Neighbors` error is discarded because `u` came out of the queue and therefore exists.
+
+```go
+func Bfs(g *Graph, source string) (BfsResult, error) {
+	if !g.HasNode(source) {
+		return BfsResult{}, fmt.Errorf("%w: %s", ErrUnknownNode, source)
+	}
+	distance := map[string]int{source: 0}
+	parent := map[string]string{}
+	var order []string
+	queue := []string{source}
+	for len(queue) > 0 {
+		u := queue[0]
+		queue = queue[1:]
+		order = append(order, u)
+		ns, _ := g.Neighbors(u)
+		for _, v := range ns {
+			if _, seen := distance[v]; !seen { // discovered: mark BEFORE enqueueing, never after dequeueing
+				distance[v] = distance[u] + 1
+				parent[v] = u
+				queue = append(queue, v)
+			}
+		}
+	}
+	return BfsResult{distance, parent, order}, nil
+}
+```
+
+#### Step 3: Shortest-hop path
+
+The walk-back uses the two-value map read in the loop header: `ok` is false exactly at the source, which has no parent. Prepending with `append([]string{at}, path...)` builds the path in forward order.
+
+```go
+func ShortestHopPath(g *Graph, source, target string) ([]string, error) {
+	r, err := Bfs(g, source)
+	if err != nil {
+		return nil, err
+	}
+	if !r.Reached(target) {
+		return []string{}, nil
+	}
+	var path []string
+	for at, ok := target, true; ok; at, ok = r.Parent[at] {
+		path = append([]string{at}, path...)
+	}
+	return path, nil
+}
+```
+
+#### Step 4: Iterative DFS
+
+The stack is a slice popped by reslicing. `visited` is a `map[string]bool`, whose zero value `false` means "not yet", so the lookup needs no two-value form. The reverse push loop is unchanged.
+
+```go
+func DfsIterative(g *Graph, source string) ([]string, error) {
+	if !g.HasNode(source) {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownNode, source)
+	}
+	var order []string
+	visited := map[string]bool{}
+	stack := []string{source}
+	for len(stack) > 0 {
+		u := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if visited[u] { // a node may be pushed many times; it is visited once
+			continue
+		}
+		visited[u] = true
+		order = append(order, u)
+		ns, _ := g.Neighbors(u)
+		for i := len(ns) - 1; i >= 0; i-- {
+			if !visited[ns[i]] {
+				stack = append(stack, ns[i])
+			}
+		}
+	}
+	return order, nil
+}
+```
+
+#### Step 5: Components on the undirected view
+
+Iterating `u.order` rather than a map is what keeps the component order deterministic. Each BFS order is both the component and the set of nodes to mark seen.
+
+```go
+func ConnectedComponents(g *Graph) [][]string {
+	u := g.UndirectedView()
+	seen := map[string]bool{}
+	var components [][]string
+	for _, start := range u.order {
+		if seen[start] {
+			continue
+		}
+		r, _ := Bfs(u, start)
+		for _, n := range r.Order {
+			seen[n] = true
+		}
+		components = append(components, r.Order)
+	}
+	return components
+}
+```
+
+#### Step 6: Three-colour cycle detection
+
+`color` is a `map[string]Color` whose zero value is `White`, so unvisited nodes need no initialisation pass. A `switch` on the neighbour's colour handles GRAY (close the cycle by scanning `path` for `v` and copying the suffix) and WHITE (descend); BLACK falls through. A DAG returns `nil, nil`.
+
+```go
+func FindCycle(g *Graph) ([]string, error) {
+	if !g.directed {
+		return nil, errors.New("FindCycle is defined for directed graphs")
+	}
+	color := map[string]Color{}
+	for _, root := range g.order {
+		if color[root] != White {
+			continue
+		}
+		path := []string{root} // the Gray nodes, root first
+		next := []int{0}       // per frame: index of the next neighbour to examine
+		color[root] = Gray
+		for len(path) > 0 {
+			u := path[len(path)-1]
+			i := next[len(next)-1]
+			ns, _ := g.Neighbors(u)
+			if i < len(ns) {
+				next[len(next)-1] = i + 1
+				v := ns[i]
+				switch color[v] {
+				case Gray:
+					start := 0
+					for path[start] != v {
+						start++
+					}
+					cycle := append([]string(nil), path[start:]...)
+					return append(cycle, v), nil
+				case White:
+					color[v] = Gray
+					path = append(path, v)
+					next = append(next, 0)
+				}
+			} else {
+				color[u] = Black
+				path = path[:len(path)-1]
+				next = next[:len(next)-1]
+			}
+		}
+	}
+	return nil, nil
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/02-algorithms/08-graph-traversal-bfs-dfs/code/go
+go run .
+go test ./...
+```
+
+```console
+== BFS from acct-A: hop distance to every reachable account ==
+visit order : [acct-A acct-B acct-D acct-C acct-E]
+  acct-A at 0 hops
+  acct-B at 1 hops
+  acct-D at 1 hops
+  acct-C at 2 hops
+  acct-E at 2 hops
+path A -> E : [acct-A acct-D acct-E]
+path A -> X : []  (unreachable: empty)
+
+== Iterative DFS preorder from acct-A ==
+[acct-A acct-B acct-C acct-D acct-E]
+
+== Connected components (direction ignored) ==
+  size 5: [acct-A acct-B acct-D acct-C acct-E]
+  size 4: [payroll acct-X landlord grocer]
+  size 1: [dormant]
+
+== Directed cycle (three-colour DFS) ==
+circular flow: [acct-A acct-B acct-C acct-A]
+payroll graph has cycle: false
+
+== 100,000-hop chain: iterative DFS does not overflow the stack ==
+visited 100001 nodes
+```
+
+The orders are identical to Java and Python; the distances print one per line because Go maps have no insertion order to print in, and `fmt` renders slices without commas.
 
 ## Use It
 

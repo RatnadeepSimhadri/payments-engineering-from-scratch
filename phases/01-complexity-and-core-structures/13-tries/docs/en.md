@@ -334,52 +334,443 @@ The PANs are the publicly documented sandbox test numbers (`4111111111111111`, `
 
 ### In Python
 
+The Python port (`code/python/main.py`) is the same design with four differences. **Children are a `dict`**, which preserves insertion order but not sorted order, so `_collect` iterates `sorted(node.children)` to match Java's `TreeMap`. **String comparison in `range_to_prefixes` is already lexicographic**, and `str(int(block_end) + 1).zfill(length)` does the increment with arbitrary-precision integers; a 19-digit range needs no special handling. **`isdigit()` accepts Unicode digits** such as Arabic-Indic numerals, so `require_digits` also checks `isascii()`. Java's `Character.isDigit` has the same trap and the Java code should be read with that in mind for non-ASCII input. **Errors:** `ValueError` for invalid input, a `NoRouteError` subclass of `LookupError` for a PAN nobody owns.
+
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Nodes and insert
+
+`_Node` is a mutable dataclass whose `children` dict defaults to a fresh dict per node (`field(default_factory=dict)`). `insert` iterates the key's characters directly, creating nodes as it goes, and keeps `terminal` separate from `value` so "a key ends here" is a boolean rather than a `None` check. `size` counts keys, `_node_count` counts nodes including the root.
+
 ```python
-def longest_prefix_match(self, query: str) -> Optional[Match[V]]:
-    node = self._root
-    best = Match("", node.value) if node.terminal else None
-    for i, c in enumerate(query):
-        node = node.children.get(c)
-        if node is None:
-            break
-        if node.terminal:
-            best = Match(query[: i + 1], node.value)
-    return best
+@dataclass
+class _Node(Generic[V]):
+    children: dict[str, "_Node[V]"] = field(default_factory=dict)
+    terminal: bool = False
+    value: Optional[V] = None
+
+
+class Trie(Generic[V]):
+    def __init__(self) -> None:
+        self._root: _Node[V] = _Node()
+        self._size = 0        # number of keys
+        self._node_count = 1  # including the root
+
+    def insert(self, key: str, value: V) -> Optional[V]:
+        """Insert or replace. Returns the previous value for this exact key, or None."""
+        if key is None or value is None:
+            raise TypeError("key and value must not be None")
+        node = self._root
+        for c in key:
+            nxt = node.children.get(c)
+            if nxt is None:
+                nxt = _Node()
+                node.children[c] = nxt
+                self._node_count += 1
+            node = nxt
+        old = node.value if node.terminal else None
+        if not node.terminal:
+            self._size += 1
+        node.terminal = True
+        node.value = value
+        return old
 ```
 
-Differences, all in `code/python/main.py`:
+#### Step 2: search and startsWith share one walk
 
-- **Children are a `dict`**, which preserves insertion order but not sorted order, so `_collect` iterates `sorted(node.children)` to match Java's `TreeMap`.
-- **String comparison in `range_to_prefixes` is already lexicographic**, and `str(int(block_end) + 1).zfill(length)` does the increment with arbitrary-precision integers; a 19-digit range needs no special handling.
-- **`isdigit()` accepts Unicode digits** such as Arabic-Indic numerals, so `require_digits` also checks `isascii()`. Java's `Character.isDigit` has the same trap and the Java code should be read with that in mind for non-ASCII input.
-- **Errors**: `ValueError` for invalid input, a `NoRouteError` subclass of `LookupError` for a PAN nobody owns.
+`_walk` follows one character at a time and returns `None` the moment an edge is missing; `search` adds the terminal check and `starts_with` does not. `_walk("")` returns the root.
+
+```python
+    def search(self, key: str) -> Optional[V]:
+        """Exact-match lookup: the value stored under this key, or None. "41" does not match a stored "411"."""
+        node = self._walk(key)
+        return node.value if node is not None and node.terminal else None
+
+    def starts_with(self, prefix: str) -> bool:
+        """True if any stored key begins with this prefix (including the prefix itself)."""
+        return self._walk(prefix) is not None
+
+    def _walk(self, s: str) -> Optional[_Node[V]]:
+        node: Optional[_Node[V]] = self._root
+        for c in s:
+            if node is None:
+                return None
+            node = node.children.get(c)
+        return node
+```
+
+#### Step 3: Longest-prefix match
+
+`enumerate` gives the index needed for the slice `query[: i + 1]`, which is the matched prefix. `best` is overwritten at every terminal node passed and returned when the walk ends, whether by exhausting the query or by missing an edge.
+
+```python
+    def longest_prefix_match(self, query: str) -> Optional[Match[V]]:
+        node = self._root
+        best: Optional[Match[V]] = Match("", node.value) if node.terminal else None
+        for i, c in enumerate(query):
+            node = node.children.get(c)
+            if node is None:
+                break
+            if node.terminal:
+                best = Match(query[: i + 1], node.value)
+        return best
+```
+
+#### Step 4: Delete with pruning
+
+The path is a list built on the way down. The pruning loop runs from the deepest node upward with a descending `range`; `if child.terminal or child.children` uses the truthiness of a non-empty dict for the "still has children" test, and `del path[i - 1].children[key[i - 1]]` removes the edge.
+
+```python
+    def delete(self, key: str) -> bool:
+        path = [self._root]
+        node = self._root
+        for c in key:
+            node = node.children.get(c)
+            if node is None:
+                return False
+            path.append(node)
+        if not node.terminal:
+            return False
+        node.terminal = False
+        node.value = None
+        self._size -= 1
+        for i in range(len(key), 0, -1):
+            child = path[i]
+            if child.terminal or child.children:
+                break
+            del path[i - 1].children[key[i - 1]]
+            self._node_count -= 1
+        return True
+```
+
+#### Step 5: Range decomposition
+
+Equal-length digit strings compare lexicographically in Python exactly as they do numerically, so `cur <= hi` and the block-end comparison need no conversion. The increment is the one place integers appear: `int(block_end) + 1` cannot overflow, and `zfill` restores the fixed width.
+
+```python
+def range_to_prefixes(lo: str, hi: str) -> list[str]:
+    require_digits(lo)
+    require_digits(hi)
+    if len(lo) != len(hi):
+        raise ValueError(f"lo and hi must have equal length: {lo}, {hi}")
+    if lo > hi:
+        raise ValueError(f"lo must not exceed hi: {lo} > {hi}")
+    length = len(lo)
+    out: list[str] = []
+    cur = lo
+    while cur <= hi:
+        k = 0  # number of trailing digits the prefix will leave free
+        while k < length and cur[length - 1 - k] == "0" and cur[: length - 1 - k] + "9" * (k + 1) <= hi:
+            k += 1
+        prefix = cur[: length - k]
+        out.append(prefix)
+        block_end = prefix + "9" * k
+        if block_end == "9" * length:  # the block ran to the end of the digit space
+            break
+        cur = str(int(block_end) + 1).zfill(length)
+    return out
+```
+
+#### Step 6: The router
+
+Two tries, as in Java. A missing network raises `NoRouteError` (a `LookupError`), a missing issuer routes as `UNKNOWN`, and the error message goes through `mask` so a full PAN never reaches a log line. `require_digits` rejects non-ASCII digits as well as non-digits.
+
+```python
+def require_digits(s: str) -> str:
+    if not s or not s.isdigit() or not s.isascii():
+        raise ValueError(f"expected a non-empty digit string, got {s!r}")
+    return s
+```
+
+```python
+    def route(self, pan: str) -> Route:
+        require_digits(pan)
+        if not 12 <= len(pan) <= 19:
+            raise ValueError(f"PAN must be 12-19 digits, got {len(pan)}")
+        network = self._networks.longest_prefix_match(pan)
+        if network is None:
+            raise NoRouteError(f"no network owns a prefix of {mask(pan)}")
+        issuer = self._issuers.longest_prefix_match(pan)
+        return Route(network.value, "UNKNOWN" if issuer is None else issuer.value, network.prefix)
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/01-complexity-and-core-structures/13-tries/code/python
+python3 main.py
+python3 -m unittest -v
+```
+
+```console
+== A trie of card prefixes ==
+keys=4 nodes=7
+search("411")  = (none)   (a path, not a key)
+longestPrefixMatch("4111111111111111") = "4111" -> VISA (sandbox range)
+keysWithPrefix("4") = [4, 41, 4111]
+after delete("4111"): keys=3 nodes=5 search("41")=VISA (sub-range) startsWith("41")=true
+
+== A numeric range becomes a handful of prefixes ==
+2221-2720 -> 23 prefixes: [2221, 2222, 2223, 2224, 2225, 2226, 2227, 2228, 2229, 223, 224, 225, 226, 227, 228, 229, 23, 24, 25, 26, 270, 271, 2720]
+3528-3589 -> [3528, 3529, 353, 354, 355, 356, 357, 358]
+
+== BIN routing with longest-prefix match ==
+network prefixes stored: 47
+411111******1111     -> VISA       issuer=Visa sandbox issuer         via prefix 4
+272099******9996     -> MASTERCARD issuer=UNKNOWN                     via prefix 2720
+378282*****0005      -> AMEX       issuer=Amex sandbox issuer         via prefix 37
+rejected: no network owns a prefix of 272100******0008
+```
+
+Every line matches the Java run; `keysWithPrefix` is sorted because `_collect` sorts the dict keys.
 
 ### In Go
 
+The Go port (`code/go/main.go`) is the same design with four differences. **`range` over a string yields runes and byte offsets**, so the matched prefix is `query[:i+len(string(c))]`, not `query[:i+1]`; for ASCII digits the two are the same, for anything else only the first is correct. Children are keyed by `rune`. **No null:** `Search` and `LongestPrefixMatch` return `(value, ok)`, and `Route` returns an error that wraps the sentinel `ErrNoRoute` so callers can `errors.Is` it apart from validation errors. **Map iteration order is randomised**, so `collect` copies the child runes into a slice and sorts them before recursing; without that, `KeysWithPrefix` would return a different order on every run. **`go test -race` passes** because nothing is shared; a router that reloads its table while serving needs a `sync.RWMutex` or an atomic pointer swap to a fresh trie, which is the pattern Phase 4 covers.
+
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Nodes and insert
+
+`node[V]` keeps a `map[rune]*node[V]`; `newNode` allocates the map because a nil map cannot be written to. `Insert` returns `(old, replaced)` in place of a nullable; `for _, c := range key` walks runes, which is what makes the trie correct for any UTF-8 key even though the lesson only stores digits.
+
 ```go
-func (t *Trie[V]) LongestPrefixMatch(query string) (Match[V], bool) {
-    n := t.root
-    var best Match[V]
-    found := false
-    for i, c := range query {
-        n = n.children[c]
-        if n == nil {
-            break
-        }
-        if n.terminal {
-            best, found = Match[V]{query[:i+len(string(c))], n.value}, true
-        }
-    }
-    return best, found
+type node[V any] struct {
+	children map[rune]*node[V]
+	terminal bool
+	value    V
+}
+
+func newNode[V any]() *node[V] { return &node[V]{children: make(map[rune]*node[V])} }
+
+type Trie[V any] struct {
+	root      *node[V]
+	size      int // number of keys
+	nodeCount int // including the root
+}
+
+func NewTrie[V any]() *Trie[V] { return &Trie[V]{root: newNode[V](), nodeCount: 1} }
+
+// Insert stores or replaces. It returns the previous value for this exact key and whether there was one.
+func (t *Trie[V]) Insert(key string, value V) (old V, replaced bool) {
+	n := t.root
+	for _, c := range key {
+		next, ok := n.children[c]
+		if !ok {
+			next = newNode[V]()
+			n.children[c] = next
+			t.nodeCount++
+		}
+		n = next
+	}
+	if n.terminal {
+		old, replaced = n.value, true
+	} else {
+		t.size++
+	}
+	n.terminal = true
+	n.value = value
+	return old, replaced
 }
 ```
 
-Differences, all in `code/go/main.go`:
+#### Step 2: search and startsWith share one walk
 
-- **`range` over a string yields runes and byte offsets**, so the matched prefix is `query[:i+len(string(c))]`, not `query[:i+1]`; for ASCII digits the two are the same, for anything else only the first is correct. Children are keyed by `rune`.
-- **No null**: `Search` and `LongestPrefixMatch` return `(value, ok)`, and `Route` returns an error that wraps the sentinel `ErrNoRoute` so callers can `errors.Is` it apart from validation errors.
-- **Map iteration order is randomised**, so `collect` copies the child runes into a slice and sorts them before recursing; without that, `KeysWithPrefix` would return a different order on every run.
-- **`go test -race` passes** because nothing is shared; a router that reloads its table while serving needs a `sync.RWMutex` or an atomic pointer swap to a fresh trie, which is the pattern Phase 4 covers.
+A missing map key returns a nil pointer, so `walk` can index without the two-value form. `Search` returns the zero `V` and `false` for a path that is not a key.
+
+```go
+// Search is an exact-match lookup. "41" does not match a stored "411".
+func (t *Trie[V]) Search(key string) (V, bool) {
+	n := t.walk(key)
+	if n == nil || !n.terminal {
+		var zero V
+		return zero, false
+	}
+	return n.value, true
+}
+
+// StartsWith reports whether any stored key begins with this prefix (including the prefix itself).
+func (t *Trie[V]) StartsWith(prefix string) bool { return t.walk(prefix) != nil }
+
+func (t *Trie[V]) walk(s string) *node[V] {
+	n := t.root
+	for _, c := range s {
+		if n == nil {
+			return nil
+		}
+		n = n.children[c]
+	}
+	return n
+}
+```
+
+#### Step 3: Longest-prefix match
+
+The `i` from `range` is a byte offset, so the prefix slice ends at `i+len(string(c))`, the byte after the current rune. `found` carries the "is there a match" signal that Java expresses with `null`.
+
+```go
+func (t *Trie[V]) LongestPrefixMatch(query string) (Match[V], bool) {
+	n := t.root
+	var best Match[V]
+	found := false
+	if n.terminal {
+		best, found = Match[V]{"", n.value}, true
+	}
+	for i, c := range query {
+		n = n.children[c]
+		if n == nil {
+			break
+		}
+		if n.terminal {
+			best, found = Match[V]{query[:i+len(string(c))], n.value}, true
+		}
+	}
+	return best, found
+}
+```
+
+#### Step 4: Delete with pruning
+
+The key is converted to `[]rune` once so the pruning loop can index it by position; `delete(map, key)` removes the edge. The cleared value is set to the zero `V` so the garbage collector can reclaim whatever it referenced.
+
+```go
+func (t *Trie[V]) Delete(key string) bool {
+	runes := []rune(key)
+	path := make([]*node[V], 0, len(runes)+1)
+	n := t.root
+	path = append(path, n)
+	for _, c := range runes {
+		n = n.children[c]
+		if n == nil {
+			return false
+		}
+		path = append(path, n)
+	}
+	if !n.terminal {
+		return false
+	}
+	var zero V
+	n.terminal = false
+	n.value = zero
+	t.size--
+	for i := len(runes); i > 0; i-- {
+		child := path[i]
+		if child.terminal || len(child.children) > 0 {
+			break
+		}
+		delete(path[i-1].children, runes[i-1])
+		t.nodeCount--
+	}
+	return true
+}
+```
+
+#### Step 5: Range decomposition
+
+Go string comparison is bytewise, which for equal-length digit strings is numeric comparison. The increment is a hand-written carry over a `[]byte`, because Go has no big-integer fast path; the caller guarantees the input is not all nines. Invalid input is returned as an error.
+
+```go
+func RangeToPrefixes(lo, hi string) ([]string, error) {
+	if err := requireDigits(lo); err != nil {
+		return nil, err
+	}
+	if err := requireDigits(hi); err != nil {
+		return nil, err
+	}
+	if len(lo) != len(hi) {
+		return nil, fmt.Errorf("lo and hi must have equal length: %s, %s", lo, hi)
+	}
+	if lo > hi {
+		return nil, fmt.Errorf("lo must not exceed hi: %s > %s", lo, hi)
+	}
+	length := len(lo)
+	out := []string{}
+	cur := lo
+	for cur <= hi {
+		k := 0 // number of trailing digits the prefix will leave free
+		for k < length && cur[length-1-k] == '0' && cur[:length-1-k]+strings.Repeat("9", k+1) <= hi {
+			k++
+		}
+		prefix := cur[:length-k]
+		out = append(out, prefix)
+		blockEnd := prefix + strings.Repeat("9", k)
+		if blockEnd == strings.Repeat("9", length) { // the block ran to the end of the digit space
+			break
+		}
+		cur = increment(blockEnd)
+	}
+	return out, nil
+}
+
+// increment adds one to a digit string of fixed width; the caller guarantees it is not all nines.
+func increment(digits string) string {
+	d := []byte(digits)
+	i := len(d) - 1
+	for d[i] == '9' {
+		d[i] = '0'
+		i--
+	}
+	d[i]++
+	return string(d)
+}
+```
+
+#### Step 6: The router
+
+`Route` returns `(Route, error)`. Validation failures are plain errors; a PAN nobody owns wraps `ErrNoRoute` with `%w` so the demo can `errors.Is` it. The issuer lookup's `ok` chooses between the stored name and `UNKNOWN`, and the message is masked.
+
+```go
+// ErrNoRoute is returned when no stored network prefix matches the PAN.
+var ErrNoRoute = errors.New("no route")
+
+func (r *BinRouter) Route(pan string) (Route, error) {
+	if err := requireDigits(pan); err != nil {
+		return Route{}, err
+	}
+	if len(pan) < 12 || len(pan) > 19 {
+		return Route{}, fmt.Errorf("PAN must be 12-19 digits, got %d", len(pan))
+	}
+	network, ok := r.networks.LongestPrefixMatch(pan)
+	if !ok {
+		return Route{}, fmt.Errorf("%w: no network owns a prefix of %s", ErrNoRoute, Mask(pan))
+	}
+	issuerName := "UNKNOWN"
+	if issuer, ok := r.issuers.LongestPrefixMatch(pan); ok {
+		issuerName = issuer.Value
+	}
+	return Route{network.Value, issuerName, network.Prefix}, nil
+}
+```
+
+#### Step 7: Run it
+
+```bash
+cd phases/01-complexity-and-core-structures/13-tries/code/go
+go run .
+go test ./...
+```
+
+```console
+== A trie of card prefixes ==
+keys=4 nodes=7
+search("411")  = (none)   (a path, not a key)
+longestPrefixMatch("4111111111111111") = "4111" -> VISA (sandbox range)
+keysWithPrefix("4") = [4, 41, 4111]
+after delete("4111"): keys=3 nodes=5 search("41")=VISA (sub-range) startsWith("41")=true
+
+== A numeric range becomes a handful of prefixes ==
+2221-2720 -> 23 prefixes: [2221, 2222, 2223, 2224, 2225, 2226, 2227, 2228, 2229, 223, 224, 225, 226, 227, 228, 229, 23, 24, 25, 26, 270, 271, 2720]
+3528-3589 -> [3528, 3529, 353, 354, 355, 356, 357, 358]
+
+== BIN routing with longest-prefix match ==
+network prefixes stored: 47
+411111******1111     -> VISA       issuer=Visa sandbox issuer         via prefix 4
+272099******9996     -> MASTERCARD issuer=UNKNOWN                     via prefix 2720
+378282*****0005      -> AMEX       issuer=Amex sandbox issuer         via prefix 37
+rejected: no network owns a prefix of 272100******0008
+```
+
+The Go and Python outputs are byte-identical. `keysWithPrefix` comes out sorted only because `collect` sorts the rune slice; drop that sort and the order changes between runs.
 
 ## Use It
 

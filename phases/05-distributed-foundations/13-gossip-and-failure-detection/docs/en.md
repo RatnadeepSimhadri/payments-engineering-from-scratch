@@ -335,21 +335,173 @@ seeds where every live node declared n7 DEAD: 20/20; mean detection+disseminatio
 
 ### In Python
 
-`code/python/main.py` ports the simulation class for class (`Update`, `SwimNode`, `Network`, `Cluster`) and reproduces the Java run exactly: the same event trace, `DEAD everywhere by t=188`, `36` indirect acks, and `79`/`104` ticks over the 20 lossy seeds. That only works because every source of ordering was made explicit.
+The Python port (`code/python/main.py`) ports the simulation class for class (`Update`, `SwimNode`, `Network`, `Cluster`) and reproduces the Java run exactly: the same event trace, `DEAD everywhere by t=188`, `36` indirect acks, and `79`/`104` ticks over the 20 lossy seeds. That only works because every source of ordering was made explicit. **The generator and the shuffle are ported, not borrowed.** `Rng` is SplitMix64 masked to 64 bits, and `Rng.shuffle` is the same Fisher-Yates loop as the Java one. `random.Random(seed).shuffle` draws from a different generator, so the probe order, and with it every detection time in the demo, would differ. **Java's sorted and linked maps become explicit orders.** `view` is a `TreeMap` in Java, so iteration is by member id; the Python `dict` would iterate in insertion order (`[1, 2, 0]` for the three-node test node), so `SwimNode` iterates `sorted(self.view)` wherever the order can matter (choosing probe targets and helpers). The gossip queue relies on the opposite property: `LinkedHashMap` keeps insertion order and `put` on an existing key keeps its position, and a Python `dict` does exactly the same, so `_gossip_queue[update] = sent` is a faithful port. `take_gossip` sorts with `sorted`, which is stable like `List.sort`, so ties keep queue order. `Network.tick` visits nodes in id order, as Java's `TreeMap` does, and the in-flight queue is a `heapq` keyed by `(deliver_at, seq)`. **`Update` is a frozen dataclass.** It is hashable, so it keys the gossip queue just as the Java record does; `Message.piggyback` is a tuple so a message cannot be mutated after it is sent. `Message.from_` has a trailing underscore because `from` is a keyword, and `alive_members()`/`dead_members()` return sorted lists in place of `TreeSet`. The simulation is single-threaded in both languages, so the GIL plays no part.
 
-- **The generator and the shuffle are ported, not borrowed.** `Rng` is SplitMix64 masked to 64 bits, and `Rng.shuffle` is the same Fisher-Yates loop as the Java one. `random.Random(seed).shuffle` draws from a different generator, so the probe order, and with it every detection time in the demo, would differ.
-- **Java's sorted and linked maps become explicit orders.** `view` is a `TreeMap` in Java, so iteration is by member id; the Python `dict` would iterate in insertion order (`[1, 2, 0]` for the three-node test node), so `SwimNode` iterates `sorted(self.view)` wherever the order can matter (choosing probe targets and helpers). The gossip queue relies on the opposite property: `LinkedHashMap` keeps insertion order and `put` on an existing key keeps its position, and a Python `dict` does exactly the same, so `_gossip_queue[update] = sent` is a faithful port. `take_gossip` sorts with `sorted`, which is stable like `List.sort`, so ties keep queue order. `Network.tick` visits nodes in id order, as Java's `TreeMap` does, and the in-flight queue is a `heapq` keyed by `(deliver_at, seq)`.
-- **`Update` is a frozen dataclass.** It is hashable, so it keys the gossip queue just as the Java record does; `Message.piggyback` is a tuple so a message cannot be mutated after it is sent. `Message.from_` has a trailing underscore because `from` is a keyword, and `alive_members()`/`dead_members()` return sorted lists in place of `TreeSet`.
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: Updates and their precedence
+
+A frozen dataclass, hashable so it can key the gossip queue, with `overrides` as the one home of the precedence table. `current` is `Optional`, and `None` plays Java's `null` for "no entry yet". The asymmetry is unchanged: suspect wins at equal incarnation, alive needs strictly greater.
 
 ```python
-def shuffle(self, items: list) -> None:
-    """Fisher-Yates with this generator (not random.shuffle), so permutations replay with the seed."""
-    for i in range(len(items) - 1, 0, -1):
-        j = self.next_int(i + 1)
-        items[i], items[j] = items[j], items[i]
+@dataclass(frozen=True)
+class Update:
+    member: int
+    state: MemberState
+    incarnation: int
+
+    def overrides(self, current: Optional["Update"]) -> bool:
+        if current is None:
+            return True
+        if current.state is MemberState.DEAD:
+            return False
+        if self.state is MemberState.DEAD:
+            return True
+        if self.state is MemberState.ALIVE:
+            return self.incarnation > current.incarnation
+        # SUSPECT
+        if current.state is MemberState.ALIVE:
+            return self.incarnation >= current.incarnation
+        return self.incarnation > current.incarnation
 ```
 
-The simulation is single-threaded in both languages, so the GIL plays no part.
+#### Step 2: The probe cycle
+
+One `Probe` at a time in `_current`. The ack-timeout branch fires on any tick; the period branch judges the last probe, expires suspicions, and starts the next one. `_next_seq` carries the `(id << 32) + counter` sequence that keeps relayed acks unambiguous.
+
+```python
+    def tick(self, now: int) -> list[Message]:
+        out: list[Message] = []
+        cur = self._current
+        if cur is not None and not cur.acked and not cur.indirect_sent and now >= cur.started_at + self._config.ack_timeout:
+            out.extend(self.send_indirect_probes(now))
+        if now >= self._next_period_at:
+            self._next_period_at = now + self._config.protocol_period
+            self.finish_probe(now)
+            self.expire_suspicions(now)
+            target = self.next_probe_target()
+            if target is not None:
+                self._current = Probe(target, self._next_seq, now)
+                self._next_seq += 1
+                out.append(Message.ping(self._id, target, self._current.seq, self.take_gossip()))
+        self.messages_sent += len(out)
+        return out
+```
+
+#### Step 3: Round-robin over a shuffled permutation
+
+`_view_values()` yields the view in sorted member order (the `TreeMap` order), so the candidate list is built identically to Java before `Rng.shuffle` permutes it. The permutation is rebuilt when exhausted or when it is no longer a subset of the live candidates, which the set comparison `set(self._probe_order) <= set(candidates)` expresses directly.
+
+```python
+    def next_probe_target(self) -> Optional[int]:
+        """Round-robin over a random permutation of members, reshuffled each pass: bounded worst-case detection."""
+        candidates = [u.member for u in self._view_values() if u.member != self._id and u.state is not MemberState.DEAD]
+        if not candidates:
+            return None
+        if self._probe_cursor >= len(self._probe_order) or not set(self._probe_order) <= set(candidates):
+            self._probe_order = candidates
+            self._rng.shuffle(self._probe_order)
+            self._probe_cursor = 0
+        target = self._probe_order[self._probe_cursor]
+        self._probe_cursor += 1
+        return target
+```
+
+```python
+    def shuffle(self, items: list) -> None:
+        """Fisher-Yates with this generator (not random.shuffle), so permutations replay with the seed."""
+        for i in range(len(items) - 1, 0, -1):
+            j = self.next_int(i + 1)
+            items[i], items[j] = items[j], items[i]
+```
+
+#### Step 4: Indirect probes and relaying
+
+`send_indirect_probes` picks helpers from the sorted view, shuffles with the node's `Rng`, and sends up to `indirect_probes` PING-REQs carrying the original `seq`. In `handle`, a PING-REQ is remembered in `_relaying` and forwarded as a PING; an ACK whose `seq` is being relayed (and is not our own probe's) becomes an INDIRECT-ACK back to the origin. The helper's own view is never changed by the result.
+
+```python
+    def send_indirect_probes(self, now: int) -> list[Message]:
+        """No direct ack in time: ask k other members to ping the target for us (section 3, step 2)."""
+        cur = self._current
+        cur.indirect_sent = True
+        helpers = [u.member for u in self._view_values()
+                   if u.member != self._id and u.member != cur.target and u.state is MemberState.ALIVE]
+        self._rng.shuffle(helpers)
+        return [Message.ping_req(self._id, helpers[i], cur.target, cur.seq, self.take_gossip())
+                for i in range(min(self._config.indirect_probes, len(helpers)))]
+```
+
+```python
+        elif m.kind is MessageKind.PING_REQ:
+            self._relaying[m.seq] = m.from_
+            out.append(Message.ping(self._id, m.target, m.seq, self.take_gossip()))
+        elif m.kind is MessageKind.INDIRECT_ACK:
+            if cur is not None and m.seq == cur.seq and m.target == cur.target:
+                cur.acked = True
+                self.indirect_acks += 1
+        # An ACK for a seq we are relaying belongs to someone else's probe: forward it as INDIRECT_ACK.
+        if m.kind is MessageKind.ACK and m.seq in self._relaying and (cur is None or m.seq != cur.seq):
+            origin = self._relaying.pop(m.seq)
+            out.append(Message.indirect_ack(self._id, origin, m.from_, m.seq, self.take_gossip()))
+```
+
+#### Step 5: Suspicion, expiry, and refutation
+
+Updates about myself trigger a refutation when they are at least as new as my incarnation and never enter my view as suspect or dead. Others pass through `overrides`; `setdefault` is `putIfAbsent`, so the suspicion clock starts at the first accusation only.
+
+```python
+    def apply_update(self, u: Update, now: int) -> None:
+        """Merge one update using the precedence rules; refute suspicions about myself; queue what changed."""
+        if u.member == self._id:
+            if u.state is not MemberState.ALIVE and u.incarnation >= self.incarnation:
+                self.incarnation = u.incarnation + 1          # refutation (section 4.2): I am alive, and newer
+                self.refutations += 1
+                self._tracer(now, f"n{self._id} hears it is {u.state.name}@{u.incarnation} -> refutes with "
+                                  f"incarnation {self.incarnation}")
+                alive = Update(self._id, MemberState.ALIVE, self.incarnation)
+                self.view[self._id] = alive
+                self._enqueue(alive)
+            return
+        known = self.view.get(u.member)
+        if not u.overrides(known):
+            return
+        self.view[u.member] = u
+        if u.state is MemberState.SUSPECT:
+            self.suspected_at.setdefault(u.member, now)
+        else:
+            self.suspected_at.pop(u.member, None)
+        self._enqueue(u)
+```
+
+#### Step 6: Piggyback with bounded retransmission
+
+The gossip queue is a `dict` from `Update` to send count; Python dicts preserve insertion order and keep a key's position on reassignment, exactly the two `LinkedHashMap` properties the Java relies on. `sorted(..., key=count)` is stable, so ties keep queue order, and `_enqueue` evicts any older entry for the same member first.
+
+```python
+    def _enqueue(self, u: Update) -> None:
+        for old in [k for k in self._gossip_queue if k.member == u.member]:   # one entry per member: newest wins
+            del self._gossip_queue[old]
+        self._gossip_queue[u] = 0
+
+    def take_gossip(self) -> list[Update]:
+        """Up to max_piggyback updates, fewest-transmissions first (stable); retire after lambda*log2(n) sends."""
+        n = max(2, len(self.view))
+        limit = math.ceil(self._config.retransmit_factor * (math.log(n) / math.log(2)))
+        entries = sorted(self._gossip_queue.items(), key=lambda e: e[1])
+        out: list[Update] = []
+        for update, count in entries:
+            if len(out) >= self._config.max_piggyback:
+                break
+            out.append(update)
+            sent = count + 1
+            if sent >= limit:
+                del self._gossip_queue[update]
+            else:
+                self._gossip_queue[update] = sent       # re-assigning keeps the key's position, like LinkedHashMap.put
+        return out
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/05-distributed-foundations/13-gossip-and-failure-detection/code/python
@@ -357,29 +509,272 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+Identical to the Java trace:
+
+```console
+== 8 nodes, seed 3, delay 1-2, no drops: n5 crashes at t=100 ==
+t=100  n5 crashes
+t=122  n2 got no ack from n5 (direct + 3 indirect) -> SUSPECT
+t=170  n2 suspicion of n5 expired -> DEAD
+first suspicion reached everyone by t=136, DEAD everywhere by t=188 (protocol period 12, suspicion timeout 48)
+false positives: 0
+
+== A slow link is not a dead node: n1 cannot reach n2, but n0, n3, n4 can; indirect probes save n2 ==
+after 600 ticks with the n1<->n2 link cut: n1 believes n2 is ALIVE; false positives = 0; indirect acks received by n1 = 36
+
+== Without indirect probes the same cut becomes a false suspicion, and n2 refutes it by bumping its incarnation ==
+t=79   n1 got no ack from n2 (direct + 0 indirect) -> SUSPECT
+t=111  n2 hears it is SUSPECT@0 -> refutes with incarnation 1
+
+== Convergence over 20 seeds: 12 nodes, 10% message loss, delay 1-2, one crash at t=200 ==
+seeds where every live node declared n7 DEAD: 20/20; mean detection+dissemination 79 ticks, worst 104 ticks; false positives across all seeds: 0
+```
+
 ### In Go
 
-`code/go/main.go` ports the simulation type for type (`Update`, `SwimNode`, `Network`, `Cluster`) and reproduces the Java run exactly: the same event trace, `DEAD everywhere by t=188`, `36` indirect acks, and `79`/`104` ticks over the 20 lossy seeds. As in Python, that only works because every source of ordering was made explicit, and Go adds one more.
+The Go port (`code/go/main.go`) ports the simulation type for type (`Update`, `SwimNode`, `Network`, `Cluster`) and reproduces the Java run exactly: the same event trace, `DEAD everywhere by t=188`, `36` indirect acks, and `79`/`104` ticks over the 20 lossy seeds. As in Python, that only works because every source of ordering was made explicit, and Go adds one more. **Go maps iterate in random order.** `view` is a `TreeMap` in Java, so every iteration that can change behaviour (probe candidates, indirect-probe helpers, expiring suspicions, the network visiting nodes) goes through a sorted key slice. The gossip queue is the opposite case: `LinkedHashMap` order matters, so it is a slice of `(update, sent)` entries in insertion order, `takeGossip` copies it and uses `sort.SliceStable` (ties keep queue order, like `List.sort`), and the in-flight queue is a `container/heap` keyed by `(deliverAt, seq)`. Skip any one of these and the piggyback order, and with it every detection time in the demo, differs run to run. **The generator and the shuffle are ported, not borrowed.** `Rng` is SplitMix64 on a `uint64` (so `>>>` is a plain `>>`), and `Shuffle` is the same Fisher-Yates loop as a generic function. `math/rand` would draw a different probe order. **`null` becomes a `bool`.** `Overrides(current, ok)` takes the "is there an entry" flag that Java encodes as `null`; `StateOf` returns an extra `Unknown` state for a member not in the view; `AliveMembers` and `DeadMembers` return sorted slices in place of `TreeSet`. `NewConfig` returns `ErrBadConfig` where the compact constructor throws. `Update` is a comparable struct, so it can key the `retired` and `bumped` maps in `takeGossip` just as the record keys the Java map. The port needs no goroutines: the simulation is single-threaded by design, and a production port would run `Tick` from a `time.Ticker` and `Handle` from a UDP read loop with one mutex around the view.
 
-- **Go maps iterate in random order.** `view` is a `TreeMap` in Java, so every iteration that can change behaviour (probe candidates, indirect-probe helpers, expiring suspicions, the network visiting nodes) goes through a sorted key slice. The gossip queue is the opposite case: `LinkedHashMap` order matters, so it is a slice of `(update, sent)` entries in insertion order, `takeGossip` copies it and uses `sort.SliceStable` (ties keep queue order, like `List.sort`), and the in-flight queue is a `container/heap` keyed by `(deliverAt, seq)`. Skip any one of these and the piggyback order, and with it every detection time in the demo, differs run to run.
-- **The generator and the shuffle are ported, not borrowed.** `Rng` is SplitMix64 on a `uint64` (so `>>>` is a plain `>>`), and `Shuffle` is the same Fisher-Yates loop as a generic function. `math/rand` would draw a different probe order.
-- **`null` becomes a `bool`.** `Overrides(current, ok)` takes the "is there an entry" flag that Java encodes as `null`; `StateOf` returns an extra `Unknown` state for a member not in the view; `AliveMembers` and `DeadMembers` return sorted slices in place of `TreeSet`. `NewConfig` returns `ErrBadConfig` where the compact constructor throws. `Update` is a comparable struct, so it can key the `retired` and `bumped` maps in `takeGossip` just as the record keys the Java map.
+Run it from `code/go/` with `go run .`; test with `go test ./...`.
+
+#### Step 1: Updates and their precedence
+
+A comparable three-field struct. `Overrides` takes the map's `(value, ok)` pair directly, so the "no entry" case is `!ok` rather than a nil check; the rest is the table verbatim.
 
 ```go
-func Shuffle[T any](r *Rng, list []T) {
-    for i := len(list) - 1; i > 0; i-- {
-        j := r.NextInt(i + 1)
-        list[i], list[j] = list[j], list[i]
-    }
+type Update struct {
+	Member      int
+	State       MemberState
+	Incarnation int64
+}
+
+// Overrides reports whether u should replace current; ok is false when there is no current entry.
+func (u Update) Overrides(current Update, ok bool) bool {
+	if !ok {
+		return true
+	}
+	if current.State == Dead {
+		return false
+	}
+	if u.State == Dead {
+		return true
+	}
+	if u.State == Alive {
+		return u.Incarnation > current.Incarnation
+	}
+	// SUSPECT
+	if current.State == Alive {
+		return u.Incarnation >= current.Incarnation
+	}
+	return u.Incarnation > current.Incarnation
 }
 ```
 
-The port needs no goroutines: the simulation is single-threaded by design, and a production port would run `Tick` from a `time.Ticker` and `Handle` from a UDP read loop with one mutex around the view.
+#### Step 2: The probe cycle
+
+`current` is a `*Probe`, nil between probes. The two branches are the Java ones; `nextProbeTarget` returns `(int, bool)` in place of a nullable `Integer`.
+
+```go
+func (n *SwimNode) Tick(now int) []Message {
+	var out []Message
+	if n.current != nil && !n.current.Acked && !n.current.IndirectSent && now >= n.current.StartedAt+n.config.AckTimeout {
+		out = append(out, n.sendIndirectProbes()...)
+	}
+	if now >= n.nextPeriodAt {
+		n.nextPeriodAt = now + n.config.ProtocolPeriod
+		n.finishProbe(now)
+		n.expireSuspicions(now)
+		if target, ok := n.nextProbeTarget(); ok {
+			n.current = &Probe{Target: target, Seq: n.nextSeq, StartedAt: now}
+			n.nextSeq++
+			out = append(out, PingMessage(n.id, target, n.current.Seq, n.takeGossip()))
+		}
+	}
+	n.MessagesSent += len(out)
+	return out
+}
+```
+
+#### Step 3: Round-robin over a shuffled permutation
+
+`sortedMembers()` is the sorted key slice that stands in for `TreeMap` iteration; without it the candidate order, and therefore the shuffle result, would change between runs. `Shuffle` is a generic Fisher-Yates over the node's `Rng`.
+
+```go
+func Shuffle[T any](r *Rng, list []T) {
+	for i := len(list) - 1; i > 0; i-- {
+		j := r.NextInt(i + 1)
+		list[i], list[j] = list[j], list[i]
+	}
+}
+
+// nextProbeTarget: round-robin over a random permutation of members, reshuffled each pass (section 4.3).
+func (n *SwimNode) nextProbeTarget() (int, bool) {
+	var candidates []int
+	for _, m := range n.sortedMembers() {
+		if m != n.id && n.View[m].State != Dead {
+			candidates = append(candidates, m)
+		}
+	}
+	if len(candidates) == 0 {
+		return 0, false
+	}
+	if n.probeCursor >= len(n.probeOrder) || !containsAll(candidates, n.probeOrder) {
+		n.probeOrder = candidates
+		Shuffle(n.rng, n.probeOrder)
+		n.probeCursor = 0
+	}
+	target := n.probeOrder[n.probeCursor]
+	n.probeCursor++
+	return target, true
+}
+```
+
+#### Step 4: Indirect probes and relaying
+
+Helpers come from the sorted view and are shuffled with the node's generator; `min(IndirectProbes, len(helpers))` bounds the fan-out. In `Handle`, `PingReq` records the origin in `relaying` and pings the target with the same `Seq`; the trailing `if` forwards an `Ack` for a relayed `Seq` as an `IndirectAck`, using the comma-ok map lookup inside the condition.
+
+```go
+func (n *SwimNode) sendIndirectProbes() []Message {
+	n.current.IndirectSent = true
+	var helpers []int
+	for _, m := range n.sortedMembers() {
+		if m != n.id && m != n.current.Target && n.View[m].State == Alive {
+			helpers = append(helpers, m)
+		}
+	}
+	Shuffle(n.rng, helpers)
+	var out []Message
+	for i := 0; i < min(n.config.IndirectProbes, len(helpers)); i++ {
+		out = append(out, PingReqMessage(n.id, helpers[i], n.current.Target, n.current.Seq, n.takeGossip()))
+	}
+	return out
+}
+```
+
+```go
+	case PingReq:
+		n.relaying[m.Seq] = m.From
+		out = append(out, PingMessage(n.id, m.Target, m.Seq, n.takeGossip()))
+	case IndirectAck:
+		if n.current != nil && m.Seq == n.current.Seq && m.Target == n.current.Target {
+			n.current.Acked = true
+			n.IndirectAcks++
+		}
+	}
+	// An ACK for a seq we are relaying belongs to someone else's probe: forward it as INDIRECT_ACK.
+	if origin, relayed := n.relaying[m.Seq]; m.Kind == Ack && relayed && (n.current == nil || m.Seq != n.current.Seq) {
+		delete(n.relaying, m.Seq)
+		out = append(out, IndirectAckMessage(n.id, origin, m.From, m.Seq, n.takeGossip()))
+	}
+```
+
+#### Step 5: Suspicion, expiry, and refutation
+
+The self-refutation branch is unchanged. For others, `known, ok := n.View[u.Member]` feeds `Overrides`, and `putIfAbsent` is spelled out as a comma-ok check before writing `SuspectedAt`.
+
+```go
+func (n *SwimNode) ApplyUpdate(u Update, now int) {
+	if u.Member == n.id {
+		if u.State != Alive && u.Incarnation >= n.Incarnation {
+			n.Incarnation = u.Incarnation + 1 // refutation (section 4.2): I am alive, and newer
+			n.Refutations++
+			n.tracer(now, fmt.Sprintf("n%d hears it is %s@%d -> refutes with incarnation %d", n.id, u.State, u.Incarnation, n.Incarnation))
+			alive := Update{n.id, Alive, n.Incarnation}
+			n.View[n.id] = alive
+			n.enqueue(alive)
+		}
+		return
+	}
+	known, ok := n.View[u.Member]
+	if !u.Overrides(known, ok) {
+		return
+	}
+	n.View[u.Member] = u
+	if u.State == Suspect {
+		if _, already := n.SuspectedAt[u.Member]; !already {
+			n.SuspectedAt[u.Member] = now
+		}
+	} else {
+		delete(n.SuspectedAt, u.Member)
+	}
+	n.enqueue(u)
+}
+```
+
+#### Step 6: Piggyback with bounded retransmission
+
+The queue is a slice of `gossipEntry` in insertion order, because a Go map would lose the `LinkedHashMap` ordering. `enqueue` filters out any entry for the same member in place and appends the new one. `takeGossip` sorts a copy with `sort.SliceStable`, decides which entries are retired or bumped, and then rebuilds the queue in its original order with those changes applied.
+
+```go
+func (n *SwimNode) enqueue(u Update) {
+	kept := n.gossipQueue[:0]
+	for _, e := range n.gossipQueue { // one entry per member: the newest wins
+		if e.update.Member != u.Member {
+			kept = append(kept, e)
+		}
+	}
+	n.gossipQueue = append(kept, gossipEntry{u, 0})
+}
+
+func (n *SwimNode) takeGossip() []Update {
+	size := max(2, len(n.View))
+	limit := int(math.Ceil(float64(n.config.RetransmitFactor) * (math.Log(float64(size)) / math.Log(2))))
+	entries := append([]gossipEntry(nil), n.gossipQueue...)
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].sent < entries[j].sent })
+	var out []Update
+	retired := map[Update]bool{}
+	bumped := map[Update]int{}
+	for _, e := range entries {
+		if len(out) >= n.config.MaxPiggyback {
+			break
+		}
+		out = append(out, e.update)
+		if e.sent+1 >= limit {
+			retired[e.update] = true
+		} else {
+			bumped[e.update] = e.sent + 1
+		}
+	}
+	kept := n.gossipQueue[:0]
+	for _, e := range n.gossipQueue {
+		if retired[e.update] {
+			continue
+		}
+		if s, ok := bumped[e.update]; ok {
+			e.sent = s
+		}
+		kept = append(kept, e)
+	}
+	n.gossipQueue = kept
+	return out
+}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/05-distributed-foundations/13-gossip-and-failure-detection/code/go
 go run .
 go test ./...
+```
+
+`diff <(go run .) <(python3 ../python/main.py)` is empty; every tick in the Go trace matches Java and Python:
+
+```console
+== 8 nodes, seed 3, delay 1-2, no drops: n5 crashes at t=100 ==
+t=100  n5 crashes
+t=122  n2 got no ack from n5 (direct + 3 indirect) -> SUSPECT
+t=170  n2 suspicion of n5 expired -> DEAD
+first suspicion reached everyone by t=136, DEAD everywhere by t=188 (protocol period 12, suspicion timeout 48)
+
+== Load per node is constant in N (the reason gossip beats all-to-all heartbeats) ==
+N=8   messages per node per period = 2.00   (all-to-all heartbeats would need 7)
+N=64  messages per node per period = 2.00   (all-to-all heartbeats would need 63)
+
+== A slow link is not a dead node: n1 cannot reach n2, but n0, n3, n4 can; indirect probes save n2 ==
+after 600 ticks with the n1<->n2 link cut: n1 believes n2 is ALIVE; false positives = 0; indirect acks received by n1 = 36
+
+== Convergence over 20 seeds: 12 nodes, 10% message loss, delay 1-2, one crash at t=200 ==
+seeds where every live node declared n7 DEAD: 20/20; mean detection+dissemination 79 ticks, worst 104 ticks; false positives across all seeds: 0
 ```
 
 ## Use It

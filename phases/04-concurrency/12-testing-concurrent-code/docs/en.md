@@ -343,19 +343,224 @@ The stress section follows and its first line varies between runs; that variatio
 
 ### In Python
 
-`code/python/main.py` ports Part 1 unchanged in shape: the instructions are frozen dataclasses, `Machine.step` is a `match` over them, and `Explorer.random` uses `JavaRandom`, an exact port of `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so seed 42 samples the same 1,000 schedules and every number in the model-checking half of the demo matches Java's. `IllegalStateException` becomes `IllegalStateError`, and `add_exact` reproduces `Math.addExact`'s overflow error because a Python `int` never overflows. Part 2 is where the languages part ways.
+The Python port (`code/python/main.py`) ports Part 1 unchanged in shape: the instructions are frozen dataclasses, `Machine.step` is a `match` over them, and `Explorer.random` uses `JavaRandom`, an exact port of `java.util.Random`'s 48-bit LCG and `nextInt(bound)`, so seed 42 samples the same 1,000 schedules and every number in the model-checking half of the demo matches Java's. `IllegalStateException` becomes `IllegalStateError`, and `add_exact` reproduces `Math.addExact`'s overflow error because a Python `int` never overflows. Part 2 is where the languages part ways. **The GIL hides the race unless you give it somewhere to switch.** CPython only hands the GIL to another thread at "eval breaker" checks (function calls and loop back-edges). `loaded = self._balance; self._balance = loaded + delta` has no check between the load and the store, so on a stock interpreter the racy counter loses nothing and the stress test passes: a green test over a bug the model checker proves in 20 schedules. The port therefore puts one no-op call, `_preemption_point()`, between the load and the store, standing in for the instruction boundary where a real CPU would interleave. **Collide as hard as the runtime allows.** `CyclicBarrier` becomes `threading.Barrier`, and `StressTest.run` drops `sys.setswitchinterval` from the default 5 ms to 10 microseconds for the duration of the run (and restores it in `finally`). With both, most rounds of the racy counter lose updates; without the preemption point, almost none do. On free-threaded CPython (3.13t) neither trick is needed. **The racy line still varies.** Like Java's, the `racy :` stress line differs between runs; everything else in the demo is identical to the Java output. The tests assert only what the Java tests assert about the race (nothing is ever gained, every round is reported), so they never flake.
 
-- **The GIL hides the race unless you give it somewhere to switch.** CPython only hands the GIL to another thread at "eval breaker" checks (function calls and loop back-edges). `loaded = self._balance; self._balance = loaded + delta` has no check between the load and the store, so on a stock interpreter the racy counter loses nothing and the stress test passes: a green test over a bug the model checker proves in 20 schedules. The port therefore puts one no-op call, `_preemption_point()`, between the load and the store, standing in for the instruction boundary where a real CPU would interleave:
+Run it from `code/python/` with `python3 main.py`; test with `python3 -m unittest -v`.
+
+#### Step 1: The instruction set
+
+Seven frozen dataclasses, each with a `__str__` that prints the trace line, and a `Union` alias standing in for the sealed interface. Python cannot make the `match` in Step 2 exhaustive at compile time, but the frozen dataclasses give the same value semantics as records: `Load("balance", "r") == Load("balance", "r")` and both are hashable.
 
 ```python
-def add(self, delta: int) -> None:
-    loaded = self._balance
-    _preemption_point()
-    self._balance = loaded + delta
+@dataclass(frozen=True)
+class Load:
+    """reg = memory[var]"""
+
+    var: str
+    reg: str
+
+    def __str__(self) -> str:
+        return f"{self.reg} = load {self.var}"
+
+
+@dataclass(frozen=True)
+class AtomicAdd:
+    """memory[var] += k in one indivisible step: AtomicLong.addAndGet, Redis INCRBY, UPDATE ... SET x = x + k."""
+
+    var: str
+    k: int
+
+    def __str__(self) -> str:
+        return f"atomic {self.var} += {self.k}"
+
+
+@dataclass(frozen=True)
+class BranchIfLess:
+    """if (reg < k) jump to instruction index `target` in this thread, else fall through."""
+
+    reg: str
+    k: int
+    target: int
+
+    def __str__(self) -> str:
+        return f"if {self.reg} < {self.k} goto {self.target}"
+
+
+# One atomic step of a modelled thread (Java's sealed interface Instruction).
+Instruction = Union[Load, Store, Add, AtomicAdd, Lock, Unlock, BranchIfLess]
 ```
 
-- **Collide as hard as the runtime allows.** `CyclicBarrier` becomes `threading.Barrier`, and `StressTest.run` drops `sys.setswitchinterval` from the default 5 ms to 10 microseconds for the duration of the run (and restores it in `finally`). With both, most rounds of the racy counter lose updates; without the preemption point, almost none do. On free-threaded CPython (3.13t) neither trick is needed.
-- **The racy line still varies.** Like Java's, the `racy :` stress line differs between runs; everything else in the demo is identical to the Java output. The tests assert only what the Java tests assert about the race (nothing is ever gained, every round is reported), so they never flake.
+#### Step 2: The machine
+
+`enabled` uses `isinstance` for the one instruction that can block; `step` is a `match` with class patterns that bind the fields by keyword. `add_exact` wraps the two additions so an overflow raises instead of growing a Python int, and an `Unlock` by a non-owner raises `IllegalStateError`. One instruction, one thread, on the caller's thread: nothing here runs concurrently.
+
+```python
+    def enabled(self, t: int) -> bool:
+        """A thread is enabled when it has an instruction left and that instruction can run now."""
+        if self.finished(t):
+            return False
+        nxt = self._program.threads[t].code[self._pc[t]]
+        if isinstance(nxt, Lock):
+            owner = self._lock_owner.get(nxt.lock)
+            return owner is None or owner == t
+        return True
+
+    def deadlocked(self) -> bool:
+        """Deadlock: nobody finished everything, yet nobody can move."""
+        return not self.all_finished() and not self.enabled_threads()
+
+    def step(self, t: int) -> None:
+        if not self.enabled(t):
+            raise IllegalStateError(f"thread {t} is not enabled")
+        spec = self._program.threads[t]
+        ins = spec.code[self._pc[t]]
+        regs = self._registers[t]
+        nxt = self._pc[t] + 1
+        match ins:
+            case Load(var=var, reg=reg):
+                regs[reg] = self.memory.get(var, 0)
+            case Store(var=var, reg=reg):
+                self.memory[var] = regs.get(reg, 0)
+            case Add(reg=reg, k=k):
+                regs[reg] = add_exact(regs.get(reg, 0), k)
+            case AtomicAdd(var=var, k=k):
+                self.memory[var] = add_exact(self.memory.get(var, 0), k)
+            case Lock(lock=lock):
+                self._lock_owner[lock] = t
+            case Unlock(lock=lock):
+                if self._lock_owner.get(lock) != t:
+                    raise IllegalStateError(f"{spec.name} unlocks {lock} it does not hold")
+                del self._lock_owner[lock]
+            case BranchIfLess(reg=reg, k=k, target=target):
+                if regs.get(reg, 0) < k:
+                    nxt = target
+        self._pc[t] = nxt
+        self._trace.append(TraceStep(spec.name, ins))
+```
+
+#### Step 3: Exhaustive exploration by replay
+
+Stateless DFS: the prefix is a plain list that is appended before the recursive call and popped after, and `_replay` rebuilds a fresh `Machine` from the initial state every time. `_record` counts deadlocks before violations (a deadlocked machine has not reached a final state worth checking) and keeps the first bad trace and its memory snapshot.
+
+```python
+    def _dfs(self, program: Program, invariant: Invariant, prefix: list[int]) -> None:
+        m = Explorer._replay(program, prefix)
+        if m.all_finished() or m.deadlocked():
+            self._record(m, invariant)
+            return
+        for t in m.enabled_threads():
+            prefix.append(t)
+            self._dfs(program, invariant, prefix)
+            prefix.pop()
+
+    @staticmethod
+    def _replay(program: Program, schedule: list[int]) -> Machine:
+        m = Machine(program)
+        for t in schedule:
+            m.step(t)
+        return m
+
+    def _record(self, m: Machine, invariant: Invariant) -> None:
+        self._explored += 1
+        bad = False
+        if m.deadlocked():
+            self._deadlocks += 1
+            bad = True
+        elif not invariant.holds(m.memory):
+            self._violations += 1
+            bad = True
+        if bad and self._counterexample is None:
+            self._counterexample = m.trace()
+            self._final_memory = m.memory_snapshot()
+```
+
+#### Step 4: Seeded random exploration
+
+`JavaRandom(seed).next_int(bound)` is bit-for-bit `java.util.Random`, which is why the Python run reports the same 735 violations for seed 42. `random.Random` would be reproducible too, but only within Python; the shared generator is what lets a CI failure be replayed in any of the three languages.
+
+```python
+    @staticmethod
+    def random(program: Program, invariant: Invariant, seed: int, schedules: int) -> ExplorationResult:
+        e = Explorer()
+        rng = JavaRandom(seed)
+        for _ in range(schedules):
+            m = Machine(program)
+            while not m.all_finished() and not m.deadlocked():
+                choices = m.enabled_threads()
+                m.step(choices[rng.next_int(len(choices))])
+            e._record(m, invariant)
+        return e._result()
+```
+
+#### Step 5: The programs
+
+The programs are lists of instruction instances; the same `body` list is shared by both `ThreadSpec`s because instructions are immutable. Invariants are small objects with a name and a `holds(memory)` predicate, so the counterexample report can say which rule broke.
+
+```python
+    @staticmethod
+    def check_then_act_debit(initial: int, debit: int) -> Program:
+        """Two debits that each check the balance, then subtract atomically. A bare atomic cannot do a debit."""
+        body = [
+            Load("balance", "r"),             # 0: check...
+            BranchIfLess("r", debit, 3),      # 1: insufficient -> skip to end
+            AtomicAdd("balance", -debit),     # 2: ...then act, atomically but too late
+        ]
+        return Program({"balance": initial}, [ThreadSpec("D1", body), ThreadSpec("D2", body)])
+```
+
+#### Step 6: A stress harness that tells the truth
+
+`RacyCounter.add` carries the one extra line that CPython needs: `_preemption_point()` is an empty function whose *call* is an eval-breaker check where the GIL may change hands. The harness shrinks the switch interval inside a `try/finally`, uses `threading.Barrier` as the start gate, and counts rounds that lost updates exactly as the Java loop does.
+
+```python
+def _preemption_point() -> None:
+    """A no-op call. CPython only switches threads at "eval breaker" checks (calls, loop back-edges), so without
+    a call between the load and the store the GIL makes Lesson 02's window effectively atomic and the stress test
+    would never see the race the model checker proves. This call is where a real JIT or a real CPU would interleave."""
+
+
+class RacyCounter(BalanceCounter):
+    """Lesson 02's bug, plus the one preemption point CPython needs to expose it."""
+
+    def __init__(self) -> None:
+        self._balance = 0
+
+    def add(self, delta: int) -> None:
+        loaded = self._balance
+        _preemption_point()
+        self._balance = loaded + delta
+```
+
+```python
+        previous = sys.getswitchinterval()
+        sys.setswitchinterval(StressTest.SWITCH_INTERVAL_SECONDS)
+        try:
+            for _ in range(rounds):
+                counter = factory()
+                barrier = threading.Barrier(threads)
+
+                def work() -> None:
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        return
+                    for _ in range(ops_per_thread):
+                        counter.add(delta)
+
+                ts = [threading.Thread(target=work) for _ in range(threads)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join()
+                lost = expected - counter.get()
+                if lost != 0:
+                    bad_rounds += 1
+                    total_lost += lost
+        finally:
+            sys.setswitchinterval(previous)
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/04-concurrency/12-testing-concurrent-code/code/python
@@ -363,28 +568,292 @@ python3 main.py
 python3 -m unittest -v
 ```
 
+The model-checking half is identical to Java; only the final `racy :` line is nondeterministic:
+
+```console
+== Exhaustive: balance += 25.00 USD twice, from 100.00 USD (minor units) ==
+-- racy load/add/store --
+interleavings (upper bound) = 20, explored = 20, violations = 18, deadlocks = 0
+first counterexample, final memory {balance=12500}:
+    T1: r = load balance
+    T1: r += 2500
+    T2: r = load balance
+    T1: store balance = r
+    T2: r += 2500
+    T2: store balance = r
+-- same increment under a lock --
+interleavings (upper bound) = 252, explored = 2, violations = 0, deadlocks = 0
+
+== Random schedules (seed 42): same bug, sampled instead of enumerated ==
+1000 random schedules of the racy program: violations = 735
+same seed again: violations = 735 (identical: true)
+
+== Stress with real threads: 4 threads x 20000 adds, 20 rounds, barrier start ==
+racy  : rounds with lost updates = 13 of 20 (nondeterministic: this line may differ between runs)
+locked: rounds with lost updates = 0 of 20 (the lock makes this exact)
+```
+
 ### In Go
 
-`code/go/main.go` ports Part 1 shape for shape: the instructions are small structs behind an `Instruction` interface, `Machine.Step` is a type switch over them, and `Random` drives the same `JavaRandom` (`javarandom.go`), so seed 42 finds 735 violations in 1,000 schedules in all three languages and every line of the model-checking half of the demo matches Java's. Four things differ.
+The Go port (`code/go/main.go`) ports Part 1 shape for shape: the instructions are small structs behind an `Instruction` interface, `Machine.Step` is a type switch over them, and `Random` drives the same `JavaRandom` (`javarandom.go`), so seed 42 finds 735 violations in 1,000 schedules in all three languages and every line of the model-checking half of the demo matches Java's. Four things differ. **Errors are values.** `Machine.Step` returns `ErrNotEnabled` or `ErrUnlockNoHold` where Java throws `IllegalStateException`, and `Exhaustive`/`Random` return `(ExplorationResult, error)` so a malformed program surfaces instead of panicking mid-search. `Math.addExact` becomes `addChecked`; `Program.InterleavingsUpperBound` uses `mulChecked`, because Go's `int64` wraps silently like Java's primitive `long`. **No `Optional`.** `ExplorationResult.Counterexample` and `FinalMemory` are `nil` when the exploration was clean. Go maps have no insertion order, so `Program` keeps `Vars` and `FormatMemory` sorts keys to print `{a=100, b=100}` like the `LinkedHashMap`. **The barrier is a closed channel.** `StressRun` parks every goroutine on `<-start` and `close(start)` releases them all at once: that is the `CyclicBarrier`. A `sync.WaitGroup` is the `join`. **The race detector is the fourth tool.** `go test -race ./...` instruments every memory access and reports the `RacyCounter` race the moment two goroutines touch `balance`, with both stacks. That is also why the racy stress test must step aside under the detector: `race_on.go` and `race_off.go` set `raceDetectorEnabled` with build tags, and `TestStressHarness` skips the racy half when it is true. Under the detector the race is a failure, not a probability; without it, the stress line still varies between runs exactly as in Java. Try `GOMAXPROCS=1 go run .` for the single-core experiment: the racy stress line usually drops to 0 of 20 while the model checker still reports 18 violations.
 
-- **Errors are values.** `Machine.Step` returns `ErrNotEnabled` or `ErrUnlockNoHold` where Java throws `IllegalStateException`, and `Exhaustive`/`Random` return `(ExplorationResult, error)` so a malformed program surfaces instead of panicking mid-search. `Math.addExact` becomes `addChecked`; `Program.InterleavingsUpperBound` uses `mulChecked`, because Go's `int64` wraps silently like Java's primitive `long`.
-- **No `Optional`.** `ExplorationResult.Counterexample` and `FinalMemory` are `nil` when the exploration was clean. Go maps have no insertion order, so `Program` keeps `Vars` and `FormatMemory` sorts keys to print `{a=100, b=100}` like the `LinkedHashMap`.
-- **The barrier is a closed channel.** `StressRun` parks every goroutine on `<-start` and `close(start)` releases them all at once: that is the `CyclicBarrier`. A `sync.WaitGroup` is the `join`.
-- **The race detector is the fourth tool.** `go test -race ./...` instruments every memory access and reports the `RacyCounter` race the moment two goroutines touch `balance`, with both stacks. That is also why the racy stress test must step aside under the detector: `race_on.go` and `race_off.go` set `raceDetectorEnabled` with build tags, and `TestStressHarness` skips the racy half when it is true. Under the detector the race is a failure, not a probability; without it, the stress line still varies between runs exactly as in Java. Try `GOMAXPROCS=1 go run .` for the single-core experiment: the racy stress line usually drops to 0 of 20 while the model checker still reports 18 violations.
+Run it from `code/go/` with `go run .`; test with `go test ./...` (runs the racy stress test too) and `go test -race ./...` (skips it, and would flag `RacyCounter` if it ran).
+
+#### Step 1: The instruction set
+
+An interface with an unexported marker method closes the set to this package, which is the Go reading of `sealed`; embedding `fmt.Stringer` makes every instruction print its own trace line. The structs are tiny value types with exported fields.
 
 ```go
-func (c *RacyCounter) Add(delta int64) { loaded := c.balance; c.balance = loaded + delta }
+type Instruction interface {
+	fmt.Stringer
+	isInstruction()
+}
 
-if raceDetectorEnabled {
-    t.Skip("RacyCounter is a deliberate data race: the race detector would (correctly) fail the run")
+// Load: reg = memory[var]
+type Load struct{ Var, Reg string }
+
+// Store: memory[var] = reg
+type Store struct{ Var, Reg string }
+
+// Add: reg = reg + k
+type Add struct {
+	Reg string
+	K   int64
+}
+
+// AtomicAdd: memory[var] += k in one indivisible step: atomic.AddInt64, Redis INCRBY, UPDATE ... SET x = x + k.
+type AtomicAdd struct {
+	Var string
+	K   int64
+}
+
+// Lock blocks while another thread holds the lock.
+type Lock struct{ Lock string }
+
+type Unlock struct{ Lock string }
+
+// BranchIfLess: if (reg < k) jump to instruction index `target` in this thread, else fall through.
+type BranchIfLess struct {
+	Reg    string
+	K      int64
+	Target int
 }
 ```
+
+#### Step 2: The machine
+
+`Enabled` uses a type assertion for the one blocking instruction. `Step` returns an error rather than panicking: `ErrNotEnabled` for a disabled thread, `ErrUnlockNoHold` for a bad unlock, and the overflow error from `addChecked`. Go map reads return the zero value for a missing key, so the `getOrDefault(..., 0L)` calls disappear.
+
+```go
+func (m *Machine) Enabled(t int) bool {
+	if m.Finished(t) {
+		return false
+	}
+	if l, ok := m.program.Threads[t].Code[m.pc[t]].(Lock); ok {
+		owner, held := m.lockOwner[l.Lock]
+		return !held || owner == t
+	}
+	return true
+}
+
+func (m *Machine) Step(t int) error {
+	if !m.Enabled(t) {
+		return fmt.Errorf("%w: thread %d", ErrNotEnabled, t)
+	}
+	spec := m.program.Threads[t]
+	ins := spec.Code[m.pc[t]]
+	regs := m.registers[t]
+	next := m.pc[t] + 1
+	switch i := ins.(type) {
+	case Load:
+		regs[i.Reg] = m.Memory[i.Var]
+	case Store:
+		m.Memory[i.Var] = regs[i.Reg]
+	case Add:
+		sum, err := addChecked(regs[i.Reg], i.K)
+		if err != nil {
+			return err
+		}
+		regs[i.Reg] = sum
+	case AtomicAdd:
+		sum, err := addChecked(m.Memory[i.Var], i.K)
+		if err != nil {
+			return err
+		}
+		m.Memory[i.Var] = sum
+	case Lock:
+		m.lockOwner[i.Lock] = t
+	case Unlock:
+		if owner, held := m.lockOwner[i.Lock]; !held || owner != t {
+			return fmt.Errorf("%w: %s unlocks %s it does not hold", ErrUnlockNoHold, spec.Name, i.Lock)
+		}
+		delete(m.lockOwner, i.Lock)
+	case BranchIfLess:
+		if regs[i.Reg] < i.K {
+			next = i.Target
+		}
+	}
+	m.pc[t] = next
+	m.trace = append(m.trace, TraceStep{spec.Name, ins})
+	return nil
+}
+```
+
+#### Step 3: Exhaustive exploration by replay
+
+The recursion passes `append(prefix, t)` directly, which is safe here because each level only reads its slice and the replay copies nothing; errors from `replay` propagate up so a bad program stops the search. `record` is the Java logic with `nil` for "no counterexample yet".
+
+```go
+func (e *Explorer) dfs(program Program, invariant Invariant, prefix []int) error {
+	m, err := replay(program, prefix)
+	if err != nil {
+		return err
+	}
+	if m.AllFinished() || m.Deadlocked() {
+		e.record(m, invariant)
+		return nil
+	}
+	for _, t := range m.EnabledThreads() {
+		if err := e.dfs(program, invariant, append(prefix, t)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func replay(program Program, schedule []int) (*Machine, error) {
+	m := NewMachine(program)
+	for _, t := range schedule {
+		if err := m.Step(t); err != nil {
+			return nil, err
+		}
+	}
+	return m, nil
+}
+
+func (e *Explorer) record(m *Machine, invariant Invariant) {
+	e.explored++
+	bad := false
+	if m.Deadlocked() {
+		e.deadlocks++
+		bad = true
+	} else if !invariant.Holds(m.Memory) {
+		e.violations++
+		bad = true
+	}
+	if bad && e.counterexample == nil {
+		e.counterexample = m.Trace()
+		e.finalMemory = m.MemorySnapshot()
+	}
+}
+```
+
+#### Step 4: Seeded random exploration
+
+`NewJavaRandom(seed).NextInt(int32(n))` reproduces `java.util.Random`, so the Go run picks the identical 1,000 schedules. `math/rand` with the same seed would give different numbers, which is why the course ships its own generator.
+
+```go
+func Random(program Program, invariant Invariant, seed int64, schedules int) (ExplorationResult, error) {
+	e := &Explorer{}
+	rng := NewJavaRandom(seed)
+	for i := 0; i < schedules; i++ {
+		m := NewMachine(program)
+		for !m.AllFinished() && !m.Deadlocked() {
+			choices := m.EnabledThreads()
+			if err := m.Step(choices[rng.NextInt(int32(len(choices)))]); err != nil {
+				return ExplorationResult{}, err
+			}
+		}
+		e.record(m, invariant)
+	}
+	return e.result(), nil
+}
+```
+
+#### Step 5: The programs
+
+Composite literals build the instruction slice; the same `body` is shared by both threads. `NewProgram` records the variable names so `FormatMemory` can print them in a stable order.
+
+```go
+func CheckThenActDebit(initial, debit int64) Program {
+	body := []Instruction{
+		Load{"balance", "r"},         // 0: check...
+		BranchIfLess{"r", debit, 3},  // 1: insufficient -> skip to end
+		AtomicAdd{"balance", -debit}, // 2: ...then act, atomically but too late
+	}
+	return NewProgram(map[string]int64{"balance": initial}, []ThreadSpec{{"D1", body}, {"D2", body}})
+}
+```
+
+#### Step 6: A stress harness that tells the truth
+
+`RacyCounter.Add` is one line with no help: Go goroutines are preempted by the runtime and run on real cores, so no preemption point is needed. The harness has two `WaitGroup`s, `ready` so that `close(start)` happens only once every goroutine is parked at the gate (otherwise an early closer would let the first goroutine run alone), and `done` as the join.
+
+```go
+type RacyCounter struct{ balance int64 }
+
+func (c *RacyCounter) Add(delta int64) { loaded := c.balance; c.balance = loaded + delta }
+func (c *RacyCounter) Get() int64      { return c.balance }
+```
+
+```go
+	for r := 0; r < rounds; r++ {
+		counter := factory()
+		start := make(chan struct{})
+		var ready, done sync.WaitGroup
+		ready.Add(threads)
+		done.Add(threads)
+		for i := 0; i < threads; i++ {
+			go func() {
+				defer done.Done()
+				ready.Done()
+				<-start
+				for k := 0; k < opsPerThread; k++ {
+					counter.Add(delta)
+				}
+			}()
+		}
+		ready.Wait()
+		close(start)
+		done.Wait()
+		lost := expected - counter.Get()
+		if lost != 0 {
+			badRounds++
+			totalLost += lost
+		}
+	}
+```
+
+#### Step 7: Run it
 
 ```bash
 cd phases/04-concurrency/12-testing-concurrent-code/code/go
 go run .
 go test ./...          # runs the racy stress test too
 go test -race ./...    # skips it, and would flag RacyCounter if it ran
+```
+
+Identical to Java through the random section. On the two-core machine used for this run the racy stress line reported no loss at all, which is the single-core effect the lesson warns about: the model checker still proved 18 violations in 20 schedules.
+
+```console
+== Exhaustive: balance += 25.00 USD twice, from 100.00 USD (minor units) ==
+-- racy load/add/store --
+interleavings (upper bound) = 20, explored = 20, violations = 18, deadlocks = 0
+first counterexample, final memory {balance=12500}:
+    T1: r = load balance
+    T1: r += 2500
+    T2: r = load balance
+    T1: store balance = r
+    T2: r += 2500
+    T2: store balance = r
+
+== Random schedules (seed 42): same bug, sampled instead of enumerated ==
+1000 random schedules of the racy program: violations = 735
+same seed again: violations = 735 (identical: true)
+
+== Stress with real goroutines: 4 goroutines x 20000 adds, 20 rounds, barrier start ==
+racy  : rounds with lost updates = 0 of 20 (nondeterministic: this line may differ between runs)
+locked: rounds with lost updates = 0 of 20 (the lock makes this exact)
 ```
 
 ## Use It
