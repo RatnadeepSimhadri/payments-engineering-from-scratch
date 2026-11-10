@@ -57,33 +57,34 @@
   }
   var LANG_NAME = { java: 'Java', python: 'Python', go: 'Go' };
   function applyWalkthrough(lang) {
-    var notice = $('[data-lang-notice]');
-    var walk = $('[data-java-walkthrough]');
-    if (!notice || !walk) return;
-    var isJava = lang === 'java';
-    notice.hidden = isJava;
-    var expanded = walk.getAttribute('data-expanded') === 'true';
-    walk.classList.toggle('is-collapsed', !isJava && !expanded);
-    var has = (notice.getAttribute('data-has') || '').split(' ');
-    var text = $('.lang-notice-text', notice);
-    if (text) {
-      text.textContent = has.indexOf(lang) >= 0
-        ? 'The steps below teach the design in Java; "What differs in ' + LANG_NAME[lang] + '" covers the ' + LANG_NAME[lang] + ' idioms, and the ' + LANG_NAME[lang] + ' tab under Code has the complete implementation with tests.'
-        : 'The ' + LANG_NAME[lang] + ' tab under Code has the complete implementation with tests.';
-    }
-    $$('.lang-name', notice).forEach(function (n) { n.textContent = LANG_NAME[lang] || lang; });
-    $$('[data-notice-lang]', notice).forEach(function (a) { a.hidden = a.getAttribute('data-notice-lang') !== lang; });
-    var btn = $('[data-toggle-walkthrough]', notice);
-    if (btn) { btn.textContent = expanded ? 'Hide the Java walkthrough' : 'Show the Java walkthrough'; btn.setAttribute('aria-expanded', expanded ? 'true' : 'false'); }
+    var bar = $('[data-walk-switch]');
+    var blocks = $$('[data-walkthrough]');
+    if (!bar || !blocks.length) return;
+    var langs = (bar.getAttribute('data-langs') || '').split(' ');
+    var shown = langs.indexOf(lang) >= 0 ? lang : 'java';
+    var all = bar.getAttribute('data-show-all') === 'true';
+    blocks.forEach(function (b) { b.hidden = !all && b.getAttribute('data-walkthrough') !== shown; });
+    var cur = $('.walk-current', bar); if (cur) cur.textContent = all ? 'all three languages' : (LANG_NAME[shown] || shown);
+    $$('[data-lang]', bar).forEach(function (b) { b.hidden = all || b.getAttribute('data-lang') === shown; });
+    var links = $('.walk-switch-links', bar); if (links) links.hidden = all;
+    var allBtn = $('[data-walk-all]', bar);
+    if (allBtn) { allBtn.textContent = all ? 'Show only ' + (LANG_NAME[shown] || shown) : 'Show all three'; allBtn.setAttribute('aria-pressed', all ? 'true' : 'false'); }
+    /* keep the table of contents in step with what is visible */
+    $$('.toc a[href^="#"]').forEach(function (a) {
+      var target = document.getElementById(a.getAttribute('href').slice(1));
+      var holder = target && target.closest('[data-walkthrough]');
+      var li = a.closest('li');
+      if (li) li.hidden = !!(holder && holder.hidden);
+    });
   }
   function initWalkthrough() {
     document.addEventListener('click', function (event) {
-      var btn = event.target.closest('[data-toggle-walkthrough]');
-      if (!btn) return;
-      var walk = $('[data-java-walkthrough]');
-      if (!walk) return;
-      walk.setAttribute('data-expanded', walk.getAttribute('data-expanded') === 'true' ? 'false' : 'true');
-      applyWalkthrough(currentLang());
+      var allBtn = event.target.closest('[data-walk-all]');
+      if (allBtn) {
+        var bar = allBtn.closest('[data-walk-switch]');
+        bar.setAttribute('data-show-all', bar.getAttribute('data-show-all') === 'true' ? 'false' : 'true');
+        applyWalkthrough(currentLang());
+      }
     });
   }
   function applyLang(lang, scrollTarget) {
@@ -107,7 +108,7 @@
     applyLang(currentLang());
     document.addEventListener('click', function (event) {
       var btn = event.target.closest('[data-lang]');
-      if (!btn || !(btn.matches('.lang-pick button') || btn.matches('.lang-card') || btn.matches('.tabs [role="tab"]'))) return;
+      if (!btn || !(btn.matches('.lang-pick button') || btn.matches('.lang-card') || btn.matches('.walk-switch [data-lang]') || btn.matches('.tabs [role="tab"]'))) return;
       var lang = btn.getAttribute('data-lang');
       store(KEYS.lang, lang);
       applyLang(lang);

@@ -2,6 +2,14 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-11-09 — Build It walkthroughs in Python and Go (all 143 Build lessons)
+
+- Every Build lesson's `### In Python` and `### In Go` sections are now full step-by-step walkthroughs mirroring the Java steps one for one (`#### Step N: <same title>`), with chunks copied verbatim from the shipped ports and prose written for a reader of that language; the existing difference notes were kept as each block's intro. 7 agents, 142 lessons (10/01 hand-converted as the model); +64,000 lines of docs, no code touched.
+- New `scripts/check_walkthroughs.py` (stdlib) enforces step count/title parity, fence language, and that ≥60% of each chunk's identifiers exist in `code/<lang>/`; wired into CI and the per-PR checklist; AGENTS.md Build It contract updated; the `learn` skill teaches from the learner's language block.
+- Site: the language picker now switches the whole Build It between the three walkthroughs (switch bar with "Also in" links and "Show all three"); table of contents follows what is visible.
+- Side corrections found while quoting real output: 03/15 JSON size 1638646 bytes / 2.89x (docs said 1618646 / 2.85x); 06/04 Paxos `chosen ... at t=3`; 06/07 disjoint-majority line; 07/08 Go intro (commit-from-NONE returns ErrIllegalState, not a panic).
+- Verification: check_walkthroughs 143/143 0 problems; audit 199/199 0 issues; Python 143/143; Go 143/143; site 228 pages 0 problems.
+
 ## 2026-11-09 — Site: progress export/import and LEARNING.md sync
 
 - Progress page: download progress as JSON (v2 payload: completed lessons, quiz scores, language) and import a file on another device; copy/paste text kept; v1 payloads still import. Imports merge and show a preview before applying.

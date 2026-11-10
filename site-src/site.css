@@ -422,9 +422,9 @@ ul.task-list .task-text { min-width: 0; }
 .roadmap .done-cell { white-space: nowrap; }
 .roadmap .done-cell .done-when { margin-left: 4px; }
 [hidden] { display: none !important; }
-.lang-notice { margin: 12px 0 16px; padding: 12px 14px; border-left: 3px solid var(--accent); background: var(--bg-sunken); border-radius: 8px; }
-.lang-notice p { margin: 0 0 8px; }
-.lang-notice p:last-child { margin-bottom: 0; }
-.lang-notice-links { display: flex; flex-wrap: wrap; gap: 8px; }
-.btn.small { padding: 6px 10px; font-size: .85rem; min-height: 36px; }
-.java-walkthrough.is-collapsed { display: none; }
+
+.walk-switch { margin: 10px 0 18px; padding: 10px 14px; border-left: 3px solid var(--accent); background: var(--bg-sunken); border-radius: 8px; font-size: .92rem; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+.walk-switch .linklike { background: none; border: 0; padding: 0; margin: 0; color: var(--accent); font: inherit; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.walk-switch .linklike:hover { color: var(--fg); }
+.walk-switch-links .linklike + .linklike { margin-left: 8px; }
+.walkthrough[hidden] { display: none; }

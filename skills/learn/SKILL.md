@@ -102,10 +102,12 @@ in that order, interactively:
 4. **Build it, in their language**: open `code/<lang-dir>/<entry>`. Walk the
    implementation in chunks of 5–25 lines following the docs' Build It steps.
    For each chunk: what it does, why it exists, the docs' "Predict:" question
-   if there is one. The docs show Java; if the learner's language is Python or
-   Go and that implementation exists, show the equivalent chunk from their
-   file and point out the one idiom that differs. If it does not exist, teach
-   the Java chunk and read them the `### Porting notes`.
+   if there is one. Every Build lesson carries the walkthrough in all three
+   languages: Java as `### Step N`, and the same steps for Python and Go as
+   `#### Step N` under `### In Python` / `### In Go`, with that language's code.
+   Teach from the learner's block, in step order; open its intro paragraph
+   first, because that is where the language-specific differences (numeric
+   model, errors, concurrency, substitutions) are explained.
 5. **Run it**: if the repo is cloned and the toolchain is present, run from the
    repository root
    `python3 scripts/run_lesson.py phases/<phase-dir>/<lesson-dir> --lang <language id>`

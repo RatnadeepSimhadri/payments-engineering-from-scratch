@@ -13,7 +13,8 @@ Thank you for helping build Payments Engineering from Scratch. The lessons are t
 ## Checklist before opening a PR
 
 ```bash
-python3 scripts/audit_lessons.py                          # 0 issues
+python3 scripts/audit_lessons.py
+python3 scripts/check_walkthroughs.py                          # 0 issues
 python3 scripts/run_lesson.py phases/NN-.../MM-... --lang java   # and python/go if you ported
 python3 scripts/build_catalog.py                          # regenerates README Contents, ROADMAP, phase READMEs
 python3 scripts/sync_skills.py --check                    # if you touched skills/

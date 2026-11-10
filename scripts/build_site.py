@@ -1026,42 +1026,43 @@ def lesson_code_files(lesson_dir: Path, lang: dict) -> list[Path]:
 
 
 WALK_H2_RE = re.compile(r'<h2 id="build-it">')
-WALK_END_RE = re.compile(r'<h3 id="in-(python|go)(?:-[^"]*)?">|<h2 id="')
+WALK_LANG_RE = re.compile(r'<h3 id="in-(python|go)(?:-\d+)?">')
+WALK_STOP_RE = re.compile(r'<h2 id="')
+LANG_LABEL = {"java": "Java", "python": "Python", "go": "Go"}
 
 
 def mark_java_walkthrough(docs_html: str, lesson: dict) -> str:
-    """Build It is written in Java (AGENTS.md: primary teaching language), with `### In Python` and
-    `### In Go` subsections for what differs and the full ports in the code tabs. Wrap the Java
-    chunk sequence so the page can lead with the learner's language: when Python or Go is selected,
-    site.js shows a notice with jump links and collapses the Java walkthrough behind a toggle."""
+    """Build It carries three walkthroughs: the Java steps (`### Step N`), then `### In Python` and
+    `### In Go` with the same steps as `#### Step N` (AGENTS.md). Wrap each in a
+    `data-walkthrough="<lang>"` block and prepend a switch bar, so site.js shows the block for the
+    learner's language and hides the other two (every language stays in the HTML for search and
+    for readers without JavaScript)."""
     start = WALK_H2_RE.search(docs_html)
     if not start:
         return docs_html
     body_from = docs_html.index("</h2>", start.start()) + len("</h2>")
-    end = WALK_END_RE.search(docs_html, body_from)
-    body_to = end.start() if end else len(docs_html)
-    has_py = 'id="in-python"' in docs_html
-    has_go = 'id="in-go"' in docs_html
-    langs = " ".join(l for l, ok in (("python", has_py), ("go", has_go)) if ok)
-    notice = (
-        f'<div class="lang-notice" data-lang-notice data-has="{langs}" hidden>'
-        f'<p><strong>This walkthrough is written in Java.</strong> <span class="lang-notice-text"></span></p>'
-        f'<p class="lang-notice-links">'
-        + (f'<a class="btn small" data-notice-lang="python" href="#in-python">What differs in Python</a> ' if has_py else "")
-        + (f'<a class="btn small" data-notice-lang="go" href="#in-go">What differs in Go</a> ' if has_go else "")
-        + f'<a class="btn small" href="#code">Full <span class="lang-name"></span> implementation</a> '
-        f'<button type="button" class="btn small ghost" data-toggle-walkthrough aria-expanded="false">Show the Java walkthrough</button>'
-        f'</p></div>'
+    stop = WALK_STOP_RE.search(docs_html, body_from)
+    body_to = stop.start() if stop else len(docs_html)
+    body = docs_html[body_from:body_to]
+    cuts = [(m.start(), m.group(1)) for m in WALK_LANG_RE.finditer(body)]
+    blocks: list[tuple[str, str]] = []
+    prev_pos, prev_lang = 0, "java"
+    for pos, lang in cuts:
+        blocks.append((prev_lang, body[prev_pos:pos]))
+        prev_pos, prev_lang = pos, lang
+    blocks.append((prev_lang, body[prev_pos:]))
+    langs = [lang for lang, _ in blocks]
+    switch = (
+        '<div class="walk-switch" data-walk-switch data-langs="' + " ".join(langs) + '">'
+        '<span class="walk-switch-label">Walkthrough in <strong class="walk-current"></strong>.</span> '
+        '<span class="walk-switch-links">Also in: '
+        + " ".join(f'<button type="button" class="linklike" data-lang="{lang}">{LANG_LABEL[lang]}</button>' for lang in langs)
+        + '</span> '
+        '<button type="button" class="linklike" data-walk-all aria-pressed="false">Show all three</button>'
+        '</div>'
     )
-    wrapped = (
-        docs_html[:body_from]
-        + notice
-        + '<div class="java-walkthrough" data-java-walkthrough>'
-        + docs_html[body_from:body_to]
-        + "</div>"
-        + docs_html[body_to:]
-    )
-    return wrapped
+    wrapped = "".join(f'<div class="walkthrough" data-walkthrough="{lang}">{html_block}</div>' for lang, html_block in blocks)
+    return docs_html[:body_from] + switch + wrapped + docs_html[body_to:]
 
 
 def build_lesson(site: Site, lesson: dict) -> None:

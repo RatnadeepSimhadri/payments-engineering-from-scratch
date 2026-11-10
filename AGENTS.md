@@ -108,7 +108,7 @@ Depth expectations for a Complete lesson:
 
 - **The Problem** (2-4 paragraphs): a concrete failure. Name the system, the input, and what breaks. Prefer a payments scenario when it is natural.
 - **The Concept** (the longest prose section): the mental model, the invariant, the complexity, and the trade-offs. Walk one worked example by hand with real numbers. Include a mermaid diagram or a comparison table. State what the structure *promises* and what it does not.
-- **Build It**: step-by-step. Show the code in the **primary teaching language for that lesson** (usually Java, the course's first language) in chunks of 5–25 lines, each explained. Then a `### In Python` and `### In Go` subsection that shows only what differs (idioms, memory model, numeric types) and points to the full files. Every chunk must correspond to code that exists in `code/`.
+- **Build It**: step-by-step, in every CI language. The Java walkthrough is `### Step N: <title>` headings, each with a 5–25-line chunk and its explanation. Then `### In Python` and `### In Go`: one or two paragraphs on what differs (idioms, memory model, numeric types, substitutions), the run/test commands, and **the same steps again as `#### Step N: <identical title>`**, each with a chunk copied verbatim from that port and prose written for a reader of that language. `scripts/check_walkthroughs.py` fails a lesson whose Python or Go steps do not match the Java steps one for one, or whose chunks are not real code from `code/<lang>/`. Every chunk in every language must correspond to code that exists in `code/`.
 - **Use It**: the standard-library or production equivalent (`java.util.HashMap`, `sorted`, `sync.Map`, PostgreSQL, Kafka, Stripe's API shape), and specifically what it does that the from-scratch version made explicit.
 - **Ship It**: the artifact in `outputs/` — a checklist, a design-review template, an interview card, a runbook — written so the learner can use it at work on Monday.
 - **Exercises**: three, graded easy / medium / hard, with the hard one combining a previous lesson.
@@ -176,6 +176,7 @@ See `projects/AUTHORING.md`. In short: a `project.json` with ordered stages; sta
 
 ```bash
 python3 scripts/audit_lessons.py                     # lesson invariants, blocking
+python3 scripts/check_walkthroughs.py                # Build It mirrored in Python and Go, blocking
 python3 scripts/build_catalog.py --check             # README/ROADMAP in sync
 python3 scripts/sync_skills.py --check               # skills mirrored
 python3 scripts/run_lesson.py phases/NN-.../MM-...   # run + test the lesson you touched in all 3 languages
