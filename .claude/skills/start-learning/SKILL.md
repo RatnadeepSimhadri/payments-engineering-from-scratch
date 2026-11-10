@@ -43,7 +43,7 @@ use the natural-language form.
 Prefer local files when the repository is cloned (a `curriculum/curriculum.json`
 exists in or above the current directory). Otherwise fetch from
 `https://raw.githubusercontent.com/RatnadeepSimhadri/payments-engineering-from-scratch/main/<path>`.
-The repository is private: the raw fallback works only for collaborators with a token, so prefer a local clone.
+The repository is public, so the raw fallback works without a token; still prefer a local clone so the learner can run the code and keep LEARNING.md under version control.
 
 - Phase and lesson list, hooks, minutes: `curriculum/curriculum.json`
 - Which lessons are complete and in which languages: `ROADMAP.md` (✅ rows) or `catalog.json` if present

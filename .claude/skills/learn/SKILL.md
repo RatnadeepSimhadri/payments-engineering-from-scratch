@@ -32,7 +32,7 @@ Never present a slash command as universal syntax.
 Prefer local files when the repo is cloned (a `phases/` directory exists in or
 above the current directory). Otherwise fetch from
 `https://raw.githubusercontent.com/RatnadeepSimhadri/payments-engineering-from-scratch/main/<path>`.
-The repository is private: the raw fallback works only for collaborators with a token, so prefer a local clone.
+The repository is public, so the raw fallback works without a token; still prefer a local clone so the learner can run the code and keep LEARNING.md under version control.
 
 - Lesson text: `phases/<phase-dir>/<lesson-dir>/docs/en.md`
 - Lesson quiz: `phases/<phase-dir>/<lesson-dir>/quiz.json`
