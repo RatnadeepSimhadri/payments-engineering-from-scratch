@@ -754,7 +754,11 @@ def toc_html(headings: list[tuple[int, str, str]], extra: list[tuple[str, str]] 
 
 
 def status_badge(status: str) -> str:
-    return f'<span class="badge status-{STATUS_CLASS[status]}" title="{attr(status)}">{STATUS_GLYPH[status]} {escape(status)}</span>'
+    """Authoring state. Every published lesson is Complete, so the badge is shown only for the
+    exceptional states a fork might have (In Progress / Planned); learner progress is the tick mark."""
+    if status == "Complete":
+        return ""
+    return f'<span class="badge status-{STATUS_CLASS[status]}" title="{attr("Authoring status: " + status)}">{STATUS_GLYPH[status]} {escape(status)}</span>'
 
 
 def type_badge(kind: str) -> str:
@@ -848,7 +852,7 @@ def build_index(site: Site) -> None:
         track_id = track["id"]
         tracks.append(
             f'<section class="track track-{attr(track_id)}"><h3>{escape(track["title"])}</h3>'
-            f'<p class="track-stats">{lesson_total} lessons · {done} complete · ~{minutes // 60} h</p>'
+            f'<p class="track-stats">{lesson_total} lessons · {(str(done) + " complete · ") if done != lesson_total else ""}~{minutes // 60} h</p>'
             f'<ul class="phase-links">{phase_links}</ul></section>'
         )
     hours = catalog["totalMinutes"] // 60
@@ -857,7 +861,7 @@ def build_index(site: Site) -> None:
         f'<li><strong>{catalog["lessonCount"]}</strong><span>lessons</span></li>'
         f'<li><strong>{catalog["phaseCount"]}</strong><span>phases</span></li>'
         f'<li><strong>{len(catalog["tracks"])}</strong><span>tracks</span></li>'
-        f'<li><strong>{catalog["completeCount"]}</strong><span>complete</span></li>'
+        f'<li><strong>{len(site.projects)}</strong><span>projects</span></li>'
         f'<li><strong>{hours}</strong><span>hours</span></li>'
         f'<li><strong>{len(catalog["languages"])}</strong><span>languages</span></li>'
         f'</ul>'
@@ -945,23 +949,23 @@ def build_roadmap(site: Site) -> None:
                     f'<td><span class="done-mark" aria-hidden="true"></span><a href="{site.relative(lesson["url"], url)}">{escape(lesson["title"])}</a>'
                     f'<div class="hook small">{escape(lesson["hook"])}</div></td>'
                     f'<td>{type_badge(lesson["type"])}</td><td class="num">{lesson["minutes"]}</td>'
-                    f'<td class="langs">{escape(langs)}</td><td>{status_badge(lesson["status"])}</td></tr>'
+                    f'<td class="langs">{escape(langs)}</td><td class="done-cell"><span class="done-mark" aria-hidden="true"></span><span class="done-when small muted"></span>{status_badge(lesson["status"])}</td></tr>'
                 )
             scope = f"phase-{phase['number']}"
             sections.append(
                 f'<section class="phase-block" id="phase-{phase["number"]}" data-progress-scope="{scope}">'
                 f'<h3><a href="{site.relative("phases/" + phase["slug"] + "/index.html", url)}"><span class="num">Phase {phase["number"]}</span> {escape(phase["title"])}</a></h3>'
                 f'<p class="motto">{escape(phase["motto"])}</p>'
-                f'<p class="phase-stats">{len(phase["lessons"])} lessons · {done} complete · ~{phase["minutes"] // 60} h · '
+                f'<p class="phase-stats">{len(phase["lessons"])} lessons · {(str(done) + " complete · ") if done != len(phase["lessons"]) else ""}~{phase["minutes"] // 60} h · '
                 f'<span data-progress-text="{scope}">0 of {len(phase["lessons"])}</span> done by you</p>'
                 f'<div class="progress" data-progress="{scope}"><div class="progress-bar"></div></div>'
-                f'<div class="table-wrap"><table class="roadmap"><thead><tr><th>#</th><th>Lesson</th><th>Type</th><th>Min</th><th>Languages</th><th>Status</th></tr></thead>'
+                f'<div class="table-wrap"><table class="roadmap"><thead><tr><th>#</th><th>Lesson</th><th>Type</th><th>Min</th><th>Languages</th><th>Done</th></tr></thead>'
                 f'<tbody>{"".join(rows)}</tbody></table></div></section>'
             )
     body = f"""
 {breadcrumbs(site, url, [("index.html", "Home"), ("", "Roadmap")])}
 <h1>Roadmap</h1>
-<p class="lede">{catalog["phaseCount"]} phases, {catalog["lessonCount"]} lessons, {catalog["completeCount"]} complete, about {catalog["totalMinutes"] // 60} hours. Status reflects what exists in the repository: <strong>Complete</strong> means docs, quiz, and code in every CI language ({escape(", ".join(catalog["languages"]))}). Tick marks are your own progress, stored in this browser.</p>
+<p class="lede">{catalog["phaseCount"]} phases, {catalog["lessonCount"]} lessons, about {catalog["totalMinutes"] // 60} hours; every lesson ships docs, a quiz, and code in {escape(", ".join(catalog["languages"]))}. The <strong>Done</strong> column is your own progress, stored in this browser: mark lessons complete on their pages, or sync from <code>LEARNING.md</code> on the <a href="progress.html">Progress</a> page.</p>
 <div class="progress-block"><div class="progress" data-progress="all" data-total="{catalog["lessonCount"]}"><div class="progress-bar"></div></div>
 <p class="progress-label"><span data-progress-text="all">0 of {catalog["lessonCount"]}</span> lessons complete</p></div>
 {"".join(sections)}

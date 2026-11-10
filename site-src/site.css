@@ -415,3 +415,5 @@ ul.task-list .task-text { min-width: 0; }
 .sync-preview ul { margin: 6px 0 0 18px; }
 .sync-ok { color: var(--accent); font-weight: 600; margin: 0; }
 .quiz-last { margin: 0 0 8px; }
+.roadmap .done-cell { white-space: nowrap; }
+.roadmap .done-cell .done-when { margin-left: 4px; }
