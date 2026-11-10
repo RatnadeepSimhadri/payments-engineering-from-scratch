@@ -96,7 +96,7 @@ Count the work: six operations, five pointer hops in total, no walk longer than 
 
 The code uses the two-pass iterative form: first loop finds the root, second loop rewrites parents. The recursive one-liner `parent[x] = find(parent[x])` is prettier and overflows the stack on exactly the deep chain it is meant to repair.
 
-Path compression alone is also strong: on the chain workload the first `find(0)` costs 19,999 hops and every later find costs 1; averaged over 20,000 finds the demo reports about 1 hop each. Its worst case is worse than rank's, though: Tarjan and van Leeuwen showed that compression with naive linking costs Theta(m log_(1+m/n) n) for m finds over n elements, which for m close to n is Theta(log n) amortised, and an adversary can keep rebuilding deep chains between the finds that flatten them.
+Path compression alone is also strong: on the chain workload the first `find(0)` costs 19,999 hops and every later find costs 1; averaged over 20,000 finds the demo reports about 1 hop each. Its worst case is worse than rank's, though: Tarjan and van Leeuwen showed that compression with naive linking costs Θ(m log_(1+m/n) n) for m finds over n elements, which for m close to n is Θ(log n) amortised, and an adversary can keep rebuilding deep chains between the finds that flatten them.
 
 ### Both together: inverse Ackermann
 

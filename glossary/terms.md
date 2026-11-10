@@ -138,7 +138,7 @@ The canonical definitions for Payments Engineering from Scratch. Every term here
 - **Category:** Data structures & algorithms
 - **What it actually means:** An asymptotic upper bound up to a constant: `f = O(g)` means `f <= c * g` for all sufficiently large `n`.
 - **Why it matters:** It predicts which structure survives a quarter-end batch, but constants, cache lines, and branch misprediction decide which one is faster at the sizes a payment system actually sees.
-- **Common confusion:** "The complexity" is usually meant as a tight bound (Big-Theta); strictly, `O(n^2)` is a true statement about binary search.
+- **Common confusion:** "The complexity" is usually meant as a tight bound (Big-Θ); strictly, `O(n^2)` is a true statement about binary search.
 - **Taught in:** `phases/01-complexity-and-core-structures/01-complexity-and-big-o`
 - **Related terms:** Tail latency, Load factor, Heap
 

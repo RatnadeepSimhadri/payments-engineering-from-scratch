@@ -9,10 +9,10 @@
 
 ## Learning Objectives
 
-- State the formal definitions of O, Omega, and Theta and use them to say precisely what "binary search is O(n)" does and does not claim
-- Distinguish a *bound* (O, Theta, Omega) from a *case* (best, average, worst) and from an *amortised* cost, and give one example where each distinction changes a decision
+- State the formal definitions of O, Ω, and Θ and use them to say precisely what "binary search is O(n)" does and does not claim
+- Distinguish a *bound* (O, Θ, Ω) from a *case* (best, average, worst) and from an *amortised* cost, and give one example where each distinction changes a decision
 - Convert a complexity class into a concrete running time for n = 10, 10^3, 10^6, and 10^9, and recognise which classes are usable at each scale
-- Apply a six-step decision procedure to a loop nest or a recursive function and produce its Theta class, including loops with hidden costs
+- Apply a six-step decision procedure to a loop nest or a recursive function and produce its Θ class, including loops with hidden costs
 - Explain cache lines, memory latency, and branch prediction well enough to predict when an O(n) scan beats an O(log n) search, and verify it with a measurement
 - Decide, for a given payments workload, whether the asymptotic class or the constant factor is the thing to optimise
 
@@ -33,32 +33,32 @@ Let `f(n)` be the exact cost of an algorithm on an input of size `n`, counted in
 | Notation | Definition | Plain reading | Example |
 |---|---|---|---|
 | `f(n) = O(g(n))` | there exist constants `c > 0` and `n0` such that for all `n >= n0`, `0 <= f(n) <= c * g(n)` | `g` is an upper bound, up to a constant, eventually | `3n^2 + 50n + 7 = O(n^2)`; also `= O(n^3)`, which is true and useless |
-| `f(n) = Omega(g(n))` | there exist `c > 0` and `n0` such that for all `n >= n0`, `f(n) >= c * g(n)` | `g` is a lower bound, up to a constant, eventually | any comparison sort is `Omega(n log n)` in the worst case |
-| `f(n) = Theta(g(n))` | `f(n) = O(g(n))` and `f(n) = Omega(g(n))` | `g` is the exact growth rate, up to a constant | insertion sort's worst case is `Theta(n^2)`: not just at most quadratic, quadratic |
+| `f(n) = Ω(g(n))` | there exist `c > 0` and `n0` such that for all `n >= n0`, `f(n) >= c * g(n)` | `g` is a lower bound, up to a constant, eventually | any comparison sort is `Ω(n log n)` in the worst case |
+| `f(n) = Θ(g(n))` | `f(n) = O(g(n))` and `f(n) = Ω(g(n))` | `g` is the exact growth rate, up to a constant | insertion sort's worst case is `Θ(n^2)`: not just at most quadratic, quadratic |
 
 Three consequences follow from the definitions and are the source of most arguments in code review:
 
-1. **O is an upper bound, not a description.** "Binary search is O(n)" is a true statement, because `log n <= n`. It is also unhelpful. When someone says "this is O(n^2)" about an algorithm that is actually linear, they are not wrong, they are imprecise. If you mean the exact growth rate, say Theta.
-2. **Constants and lower-order terms vanish.** `3n^2 + 50n` and `n^2 / 1000` are both `Theta(n^2)`. The notation says that for large enough `n` the quadratic term dominates; it says nothing about where "large enough" starts. For `n^2 / 1000` versus `50n`, the crossover is at `n = 50,000`. Below that the "slower" algorithm is faster.
+1. **O is an upper bound, not a description.** "Binary search is O(n)" is a true statement, because `log n <= n`. It is also unhelpful. When someone says "this is O(n^2)" about an algorithm that is actually linear, they are not wrong, they are imprecise. If you mean the exact growth rate, say Θ.
+2. **Constants and lower-order terms vanish.** `3n^2 + 50n` and `n^2 / 1000` are both `Θ(n^2)`. The notation says that for large enough `n` the quadratic term dominates; it says nothing about where "large enough" starts. For `n^2 / 1000` versus `50n`, the crossover is at `n = 50,000`. Below that the "slower" algorithm is faster.
 3. **The input size has to be named.** For a hash map with `n` keys of average length `L`, a lookup is `O(L)`, not `O(1)`; the `O(1)` claim silently assumes `L` is bounded. For a graph, `n` is vertices and `m` is edges, and `O(n + m)` is not `O(n)`. Half of all "this is O(1)" claims in design documents are missing a variable.
 
 ### Cases are not bounds
 
-Best, average, and worst case describe *which input* you are measuring. O, Theta, and Omega describe *how the cost grows* on that input. The two axes are independent, and conflating them produces statements like "quicksort is O(n log n)", which is false for the worst case (`Theta(n^2)` on sorted input with a naive pivot) and true for the average.
+Best, average, and worst case describe *which input* you are measuring. O, Θ, and Ω describe *how the cost grows* on that input. The two axes are independent, and conflating them produces statements like "quicksort is O(n log n)", which is false for the worst case (`Θ(n^2)` on sorted input with a naive pivot) and true for the average.
 
 | | Best case | Average case | Worst case |
 |---|---|---|---|
-| Linear search in an array of `n` | `Theta(1)` (first element) | `Theta(n)` | `Theta(n)` |
-| Binary search in a sorted array | `Theta(1)` (middle element) | `Theta(log n)` | `Theta(log n)` |
-| Quicksort, first-element pivot | `Theta(n log n)` | `Theta(n log n)` | `Theta(n^2)` (already sorted input) |
-| Hash map lookup, chaining | `Theta(1)` | `Theta(1)` expected, under a uniform hash | `Theta(n)` (all keys in one bucket) |
-| Insertion into a dynamic array | `Theta(1)` | `Theta(1)` amortised | `Theta(n)` (the resize) |
+| Linear search in an array of `n` | `Θ(1)` (first element) | `Θ(n)` | `Θ(n)` |
+| Binary search in a sorted array | `Θ(1)` (middle element) | `Θ(log n)` | `Θ(log n)` |
+| Quicksort, first-element pivot | `Θ(n log n)` | `Θ(n log n)` | `Θ(n^2)` (already sorted input) |
+| Hash map lookup, chaining | `Θ(1)` | `Θ(1)` expected, under a uniform hash | `Θ(n)` (all keys in one bucket) |
+| Insertion into a dynamic array | `Θ(1)` | `Θ(1)` amortised | `Θ(n)` (the resize) |
 
-A payment system usually cares about the worst case, because the worst case is what an attacker sends and what the quarter-end batch looks like. The hash map row is the one to remember: its `Theta(1)` depends on an assumption about the hash function, and Lesson 06 shows exactly what breaks when the assumption does.
+A payment system usually cares about the worst case, because the worst case is what an attacker sends and what the quarter-end batch looks like. The hash map row is the one to remember: its `Θ(1)` depends on an assumption about the hash function, and Lesson 06 shows exactly what breaks when the assumption does.
 
 ### Amortised cost: a preview
 
-The dynamic array row introduces a third kind of statement. A single append is `Theta(n)` when the backing array is full and must be copied. But doubling the capacity means a copy of size `n` happens only after `n/2` cheap appends, so any sequence of `m` appends costs `O(m)` in total: `O(1)` *amortised* per operation. Amortised cost is a bound on the average over a *sequence* of operations, with no probability involved; it is a worst-case statement about the sequence. It is the right measure for a structure's throughput and the wrong measure for its latency, because the `Theta(n)` append still happens, and if it happens on a request thread the p99 shows it. Lesson 02 makes this rigorous with the accounting and potential methods; Lesson 03 builds the array and measures the spikes.
+The dynamic array row introduces a third kind of statement. A single append is `Θ(n)` when the backing array is full and must be copied. But doubling the capacity means a copy of size `n` happens only after `n/2` cheap appends, so any sequence of `m` appends costs `O(m)` in total: `O(1)` *amortised* per operation. Amortised cost is a bound on the average over a *sequence* of operations, with no probability involved; it is a worst-case statement about the sequence. It is the right measure for a structure's throughput and the wrong measure for its latency, because the `Θ(n)` append still happens, and if it happens on a request thread the p99 shows it. Lesson 02 makes this rigorous with the accounting and potential methods; Lesson 03 builds the array and measures the spikes.
 
 ### From class to clock
 
@@ -66,20 +66,20 @@ The notation is only useful if you can turn it into seconds. Assume `10^9` simpl
 
 | Class | n = 10 | n = 1,000 | n = 10^6 | n = 10^9 | Largest n in one second | Where it shows up |
 |---|---|---|---|---|---|---|
-| `Theta(1)` | 1 | 1 | 1 | 1 | unbounded | hash lookup, array index |
-| `Theta(log n)` | 3 | 10 | 20 | 30 | unbounded in practice | binary search, balanced tree, heap push |
-| `Theta(n)` | 10 | 10^3 | 10^6 (1 ms) | 10^9 (1 s) | about 10^9 | one pass over the settlement file |
-| `Theta(n log n)` | 33 | 10^4 | 2 x 10^7 (20 ms) | 3 x 10^10 (30 s) | about 4 x 10^7 | sorting, merging, heapsort |
-| `Theta(n^2)` | 100 | 10^6 (1 ms) | 10^12 (17 min) | 10^18 (32 years) | about 3 x 10^4 | the nested reconciliation loop |
-| `Theta(n^3)` | 1,000 | 10^9 (1 s) | 10^18 (32 years) | - | about 1,000 | naive matrix multiply, some DP |
-| `Theta(2^n)` | 1,024 | 10^301 | - | - | about 30 | brute-force subset search |
-| `Theta(n!)` | 3.6 x 10^6 | - | - | - | about 12 | brute-force permutations |
+| `Θ(1)` | 1 | 1 | 1 | 1 | unbounded | hash lookup, array index |
+| `Θ(log n)` | 3 | 10 | 20 | 30 | unbounded in practice | binary search, balanced tree, heap push |
+| `Θ(n)` | 10 | 10^3 | 10^6 (1 ms) | 10^9 (1 s) | about 10^9 | one pass over the settlement file |
+| `Θ(n log n)` | 33 | 10^4 | 2 x 10^7 (20 ms) | 3 x 10^10 (30 s) | about 4 x 10^7 | sorting, merging, heapsort |
+| `Θ(n^2)` | 100 | 10^6 (1 ms) | 10^12 (17 min) | 10^18 (32 years) | about 3 x 10^4 | the nested reconciliation loop |
+| `Θ(n^3)` | 1,000 | 10^9 (1 s) | 10^18 (32 years) | - | about 1,000 | naive matrix multiply, some DP |
+| `Θ(2^n)` | 1,024 | 10^301 | - | - | about 30 | brute-force subset search |
+| `Θ(n!)` | 3.6 x 10^6 | - | - | - | about 12 | brute-force permutations |
 
 Read the quadratic row against The Problem: `n = 10,000` costs `10^8`, a tenth of a second, which is why the staging test passed; `n = 2.1 x 10^6` costs `4.4 x 10^12`, over an hour at the idealised rate. The `n log n` row explains why sorting two million records and merging them is a non-event. The table also shows that for `n <= 1,000` almost anything polynomial is fine, and that for `n = 10^9` only linear and below survive, which is the regime streaming systems (Phase 8) live in.
 
 ### A decision procedure for loop nests
 
-Reading a function and producing its Theta class is mechanical once the steps are written down.
+Reading a function and producing its Θ class is mechanical once the steps are written down.
 
 ```mermaid
 flowchart TD
@@ -89,23 +89,23 @@ flowchart TD
   D --> E["5. Does the inner bound depend on the outer index? Sum it (triangular: n^2/2)"]
   E --> F["6. Price every call in the body: contains, indexOf, string concat, hashing a long key"]
   F --> G["7. Recursion: write T(n) = a T(n/b) + f(n) and solve"]
-  G --> H["Keep the dominant term, drop constants: Theta(...)"]
+  G --> H["Keep the dominant term, drop constants: Θ(...)"]
 ```
 
 Applied to six common shapes:
 
 ```text
-A.  for i in 0..n:  for j in 0..n:  body            n * n                         Theta(n^2)
-B.  for i in 0..n:  for j in i+1..n:  body          sum_{i} (n - i - 1) = n(n-1)/2  Theta(n^2)
-C.  for (i = n; i > 0; i /= 2):  body               halves each time              Theta(log n)
-D.  for (i = 1; i < n; i *= 2):  for j in 0..n       (log n) outer * n inner       Theta(n log n)
-E.  for i in 0..n:  for j in 0..i*i:  body          sum_{i} i^2 ~ n^3 / 3           Theta(n^3)
-F.  for x in list:  if other.contains(x): ...       n iterations * O(n) contains   Theta(n * m), quadratic if m ~ n
+A.  for i in 0..n:  for j in 0..n:  body            n * n                         Θ(n^2)
+B.  for i in 0..n:  for j in i+1..n:  body          sum_{i} (n - i - 1) = n(n-1)/2  Θ(n^2)
+C.  for (i = n; i > 0; i /= 2):  body               halves each time              Θ(log n)
+D.  for (i = 1; i < n; i *= 2):  for j in 0..n       (log n) outer * n inner       Θ(n log n)
+E.  for i in 0..n:  for j in 0..i*i:  body          sum_{i} i^2 ~ n^3 / 3           Θ(n^3)
+F.  for x in list:  if other.contains(x): ...       n iterations * O(n) contains   Θ(n * m), quadratic if m ~ n
 ```
 
-Shape F is the reconciliation bug: the body looks like one line, and the cost is in the call. The same trap hides in `String s = s + piece` inside a loop (each concatenation copies the whole string so far: `Theta(n^2)` characters copied), in `list.remove(0)` on an array-backed list (shifts everything: `Theta(n)` per call), and in `indexOf` inside a loop over the same list. Step 6 exists because the body of a loop is where the complexity hides from a reviewer who only counts the `for` keywords.
+Shape F is the reconciliation bug: the body looks like one line, and the cost is in the call. The same trap hides in `String s = s + piece` inside a loop (each concatenation copies the whole string so far: `Θ(n^2)` characters copied), in `list.remove(0)` on an array-backed list (shifts everything: `Θ(n)` per call), and in `indexOf` inside a loop over the same list. Step 6 exists because the body of a loop is where the complexity hides from a reviewer who only counts the `for` keywords.
 
-For recursion, step 7 writes the recurrence. `T(n) = 2T(n/2) + Theta(n)` (merge sort: two halves plus a linear merge) solves to `Theta(n log n)`. `T(n) = T(n/2) + Theta(1)` (binary search) is `Theta(log n)`. `T(n) = T(n-1) + Theta(n)` (selection sort, or a recursive function that scans then recurses on one less) is `Theta(n^2)`. The master theorem covers the `a T(n/b) + f(n)` family in general; for the recurrences that appear in this course, the three above and `T(n) = 2T(n-1) + 1 = Theta(2^n)` are nearly all of them.
+For recursion, step 7 writes the recurrence. `T(n) = 2T(n/2) + Θ(n)` (merge sort: two halves plus a linear merge) solves to `Θ(n log n)`. `T(n) = T(n/2) + Θ(1)` (binary search) is `Θ(log n)`. `T(n) = T(n-1) + Θ(n)` (selection sort, or a recursive function that scans then recurses on one less) is `Θ(n^2)`. The master theorem covers the `a T(n/b) + f(n)` family in general; for the recurrences that appear in this course, the three above and `T(n) = 2T(n-1) + 1 = Θ(2^n)` are nearly all of them.
 
 ### Solving a recurrence by drawing the tree
 
@@ -118,12 +118,12 @@ level 2:  four problems of size n/4      work 4 * (n/4) = n
 ...
 level k:  2^k problems of size n/2^k     work n
 depth:    log2(n) levels until size 1
-total:    n * log2(n)                    Theta(n log n)
+total:    n * log2(n)                    Θ(n log n)
 ```
 
-Every level does the same `n` units of work, and there are `log n` levels. For `T(n) = T(n/2) + 1` the tree is a single path of `log n` nodes each doing constant work: `Theta(log n)`. For `T(n) = 2T(n-1) + 1` the tree doubles at each of `n` levels: `Theta(2^n)`. The shape of the tree is the answer; the master theorem is a shortcut for the cases where the levels are geometric.
+Every level does the same `n` units of work, and there are `log n` levels. For `T(n) = T(n/2) + 1` the tree is a single path of `log n` nodes each doing constant work: `Θ(log n)`. For `T(n) = 2T(n-1) + 1` the tree doubles at each of `n` levels: `Θ(2^n)`. The shape of the tree is the answer; the master theorem is a shortcut for the cases where the levels are geometric.
 
-Two facts about logarithms that come up constantly: the base does not matter inside Theta, because `log_2 n = log_10 n / log_10 2` differs by a constant, so `O(log n)` never needs a base; and `log n` is small, with `log2(10^9) = 30` and `log2(10^18) = 60`, which is why `Theta(log n)` is treated as "effectively constant" for any `n` that fits in a `long`, and why a balanced tree over the whole world's transaction history is still only about 40 levels deep.
+Two facts about logarithms that come up constantly: the base does not matter inside Θ, because `log_2 n = log_10 n / log_10 2` differs by a constant, so `O(log n)` never needs a base; and `log n` is small, with `log2(10^9) = 30` and `log2(10^18) = 60`, which is why `Θ(log n)` is treated as "effectively constant" for any `n` that fits in a `long`, and why a balanced tree over the whole world's transaction history is still only about 40 levels deep.
 
 ### What the standard structures actually cost
 
@@ -131,14 +131,14 @@ The classes you will meet in this phase, as the standard libraries implement the
 
 | Structure | Lookup by key | Lookup by index | Insert | Delete | Min / max | Lesson |
 |---|---|---|---|---|---|---|
-| Dynamic array (`ArrayList`, `list`, slice) | `Theta(n)` | `Theta(1)` | `Theta(1)` amortised at end, `Theta(n)` at front | `Theta(n)` | `Theta(n)` | 03 |
-| Linked list | `Theta(n)` | `Theta(n)` | `Theta(1)` with a node reference | `Theta(1)` with a node reference | `Theta(n)` | 04 |
-| Hash map | `Theta(1)` expected, `Theta(n)` worst | - | `Theta(1)` expected | `Theta(1)` expected | `Theta(n)` | 06 |
-| Balanced BST (`TreeMap`) | `Theta(log n)` | - | `Theta(log n)` | `Theta(log n)` | `Theta(log n)` | 08 |
-| Binary heap (`PriorityQueue`) | `Theta(n)` | - | `Theta(log n)` | `Theta(log n)` for the min | `Theta(1)` | 09 |
-| Trie (keys of length `L`) | `Theta(L)` | - | `Theta(L)` | `Theta(L)` | - | 13 |
+| Dynamic array (`ArrayList`, `list`, slice) | `Θ(n)` | `Θ(1)` | `Θ(1)` amortised at end, `Θ(n)` at front | `Θ(n)` | `Θ(n)` | 03 |
+| Linked list | `Θ(n)` | `Θ(n)` | `Θ(1)` with a node reference | `Θ(1)` with a node reference | `Θ(n)` | 04 |
+| Hash map | `Θ(1)` expected, `Θ(n)` worst | - | `Θ(1)` expected | `Θ(1)` expected | `Θ(n)` | 06 |
+| Balanced BST (`TreeMap`) | `Θ(log n)` | - | `Θ(log n)` | `Θ(log n)` | `Θ(log n)` | 08 |
+| Binary heap (`PriorityQueue`) | `Θ(n)` | - | `Θ(log n)` | `Θ(log n)` for the min | `Θ(1)` | 09 |
+| Trie (keys of length `L`) | `Θ(L)` | - | `Θ(L)` | `Θ(L)` | - | 13 |
 
-The table is the first thing to consult when a design says "store the pending authorisations in a list and find the oldest": that is `Theta(n)` per find, and the heap row is one line down.
+The table is the first thing to consult when a design says "store the pending authorisations in a list and find the oldest": that is `Θ(n)` per find, and the heap row is one line down.
 
 ### Reading the library's promise
 
@@ -147,9 +147,9 @@ Standard-library documentation states complexity in careful language, and the qu
 | Documentation says | The word to stop on | What it means for you |
 |---|---|---|
 | `java.util.HashMap`: "constant-time performance for the basic operations, assuming the hash function disperses the elements properly among the buckets" | *assuming* | The `O(1)` is conditional on your `hashCode()`. A key type with a bad hash gets `O(log n)` after treeification, or `O(n)` in older JDKs |
-| `java.util.ArrayList`: "the `add` operation runs in amortized constant time" | *amortized* | Individual appends are `Theta(n)` when the array grows; fine for throughput, visible in a latency histogram |
-| `java.util.PriorityQueue`: "`O(log(n))` time for the enqueuing and dequeuing methods; linear time for the `remove(Object)` and `contains(Object)` methods" | *linear* | Cancelling an arbitrary scheduled retry is `Theta(n)`; Lesson 09 adds an index map to fix exactly this |
-| `java.util.LinkedList`: "operations that index into the list will traverse the list from the beginning or the end, whichever is closer" | *traverse* | `get(i)` is `Theta(n)`; a `for (int i...) list.get(i)` loop over a `LinkedList` is `Theta(n^2)` |
+| `java.util.ArrayList`: "the `add` operation runs in amortized constant time" | *amortized* | Individual appends are `Θ(n)` when the array grows; fine for throughput, visible in a latency histogram |
+| `java.util.PriorityQueue`: "`O(log(n))` time for the enqueuing and dequeuing methods; linear time for the `remove(Object)` and `contains(Object)` methods" | *linear* | Cancelling an arbitrary scheduled retry is `Θ(n)`; Lesson 09 adds an index map to fix exactly this |
+| `java.util.LinkedList`: "operations that index into the list will traverse the list from the beginning or the end, whichever is closer" | *traverse* | `get(i)` is `Θ(n)`; a `for (int i...) list.get(i)` loop over a `LinkedList` is `Θ(n^2)` |
 | Python `list.insert(0, x)` and `list.pop(0)`: documented in the wiki as `O(n)` | *O(n)* | The idiom "use a list as a queue" is quadratic; `collections.deque` exists for this reason |
 | Go `map`: the specification promises nothing about complexity; the runtime's map is "average `O(1)`" by implementation | *nothing* | Go's language spec deliberately leaves map complexity unspecified; you are relying on the runtime, not the language |
 
@@ -157,7 +157,7 @@ Every row is the same pattern: the headline class is true under a condition, and
 
 ### Space is a resource too
 
-The same notation applies to memory. The nested reconciliation loop uses `Theta(1)` extra space; the hash-map join uses `Theta(m)` extra to hold the ledger side; sort-then-merge uses `Theta(1)` extra if both inputs can be sorted in place and `Theta(n + m)` if they cannot. Trading space for time is the most common move in this course: the hash map in Lesson 06 trades a table proportional to the key count for `Theta(1)` lookups; the index map in Lesson 09 trades a second structure for `O(log n)` decrease-key. The trade is only free when the extra space fits: a join that needs 2.1 million ledger records in memory needs a machine with the memory, and a streaming job (Phase 8) that sees records once cannot hold either side. State the space class next to the time class in every design document; a reviewer who sees `Theta(n)` time and `Theta(n)` space will ask what `n` is in bytes, which is the right question.
+The same notation applies to memory. The nested reconciliation loop uses `Θ(1)` extra space; the hash-map join uses `Θ(m)` extra to hold the ledger side; sort-then-merge uses `Θ(1)` extra if both inputs can be sorted in place and `Θ(n + m)` if they cannot. Trading space for time is the most common move in this course: the hash map in Lesson 06 trades a table proportional to the key count for `Θ(1)` lookups; the index map in Lesson 09 trades a second structure for `O(log n)` decrease-key. The trade is only free when the extra space fits: a join that needs 2.1 million ledger records in memory needs a machine with the memory, and a streaming job (Phase 8) that sees records once cannot hold either side. State the space class next to the time class in every design document; a reviewer who sees `Θ(n)` time and `Θ(n)` space will ask what `n` is in bytes, which is the right question.
 
 ### Measuring the class: the doubling test
 
@@ -165,12 +165,12 @@ You can recover an algorithm's class from a benchmark without reading the code. 
 
 | Class | Time ratio when `n` doubles | What you see across four doublings |
 |---|---|---|
-| `Theta(1)` | 1.0 | flat |
-| `Theta(log n)` | approaches 1.0 from above | 1.1, 1.08, 1.07, ... |
-| `Theta(n)` | 2.0 | 2, 2, 2, 2 |
-| `Theta(n log n)` | about 2.1-2.3 for practical `n` | 2.3, 2.2, 2.15, 2.1 (slowly tending to 2) |
-| `Theta(n^2)` | 4.0 | 4, 4, 4, 4 |
-| `Theta(n^3)` | 8.0 | 8, 8, 8, 8 |
+| `Θ(1)` | 1.0 | flat |
+| `Θ(log n)` | approaches 1.0 from above | 1.1, 1.08, 1.07, ... |
+| `Θ(n)` | 2.0 | 2, 2, 2, 2 |
+| `Θ(n log n)` | about 2.1-2.3 for practical `n` | 2.3, 2.2, 2.15, 2.1 (slowly tending to 2) |
+| `Θ(n^2)` | 4.0 | 4, 4, 4, 4 |
+| `Θ(n^3)` | 8.0 | 8, 8, 8, 8 |
 
 ```java
 for (int n = 1_000; n <= 128_000; n *= 2) {
@@ -180,11 +180,11 @@ for (int n = 1_000; n <= 128_000; n *= 2) {
 }
 ```
 
-Run on the nested loop, the ratios are 4, 4, 4; on the hash join they are 2, 2, 2 with a bump where the table outgrows a cache level. Two cautions, both from Phase 0, Lesson 05: warm up before timing (the JIT changes the constant mid-run), and keep going until the ratios stabilise, because at small `n` the fixed costs dominate and every algorithm looks `Theta(1)`. A ratio that is 2 at small `n` and drifts to 3 as `n` grows is the signature of the memory hierarchy: the algorithm is still linear in operations but each operation is getting more expensive as the working set falls out of cache.
+Run on the nested loop, the ratios are 4, 4, 4; on the hash join they are 2, 2, 2 with a bump where the table outgrows a cache level. Two cautions, both from Phase 0, Lesson 05: warm up before timing (the JIT changes the constant mid-run), and keep going until the ratios stabilise, because at small `n` the fixed costs dominate and every algorithm looks `Θ(1)`. A ratio that is 2 at small `n` and drifts to 3 as `n` grows is the signature of the memory hierarchy: the algorithm is still linear in operations but each operation is getting more expensive as the working set falls out of cache.
 
 ### A real incident: the quadratic loader
 
-In 2021 an independent engineer profiled the six-minute loading screen of a popular online game and found two quadratic loops in the startup path. The game parsed a 10 MB JSON file of about 63,000 in-app store items with a hand-rolled tokenizer that called `sscanf` on the remaining buffer for every token; `sscanf` calls `strlen` on its input, so every token paid for a scan of the whole unparsed remainder: shape F, hidden cost in the body, `Theta(n^2)` over 10 MB. After parsing, each item was inserted into an array with a linear duplicate check: `Theta(n^2)` again over 63,000 items, with no duplicates ever present. Replacing the `strlen` with a cached length and the array with a hash set cut the load time by about 70%. The publisher shipped the fix. Nothing in that code was wrong at the `n` it was written for; the catalogue had grown by two orders of magnitude since, which is exactly what happens to a payments platform's merchant list, BIN table, or daily transaction count. The procedure in this lesson, applied once during review, would have flagged both loops in under a minute.
+In 2021 an independent engineer profiled the six-minute loading screen of a popular online game and found two quadratic loops in the startup path. The game parsed a 10 MB JSON file of about 63,000 in-app store items with a hand-rolled tokenizer that called `sscanf` on the remaining buffer for every token; `sscanf` calls `strlen` on its input, so every token paid for a scan of the whole unparsed remainder: shape F, hidden cost in the body, `Θ(n^2)` over 10 MB. After parsing, each item was inserted into an array with a linear duplicate check: `Θ(n^2)` again over 63,000 items, with no duplicates ever present. Replacing the `strlen` with a cached length and the array with a hash set cut the load time by about 70%. The publisher shipped the fix. Nothing in that code was wrong at the `n` it was written for; the catalogue had grown by two orders of magnitude since, which is exactly what happens to a payments platform's merchant list, BIN table, or daily transaction count. The procedure in this lesson, applied once during review, would have flagged both loops in under a minute.
 
 ### Phrases to challenge in a design review
 
@@ -218,7 +218,7 @@ for (Record p : processorRecords) {                 // n iterations
 6. Body: `equals` on two 32-character strings is `O(L)`, and `match` is constant.
 7. No recursion.
 
-Result: `Theta(n * m * L)`, and with `n ~ m` and `L` fixed, `Theta(n^2)`. The fix, building a `HashMap<String, Record>` from `ledgerRecords` once (`Theta(m * L)` to hash every key) and probing it once per processor record (`Theta(L)` expected per probe), is `Theta((n + m) * L)`, which with fixed `L` is linear. The `break` and the average-case halving were red herrings: they change the constant, not the class.
+Result: `Θ(n * m * L)`, and with `n ~ m` and `L` fixed, `Θ(n^2)`. The fix, building a `HashMap<String, Record>` from `ledgerRecords` once (`Θ(m * L)` to hash every key) and probing it once per processor record (`Θ(L)` expected per probe), is `Θ((n + m) * L)`, which with fixed `L` is linear. The `break` and the average-case halving were red herrings: they change the constant, not the class.
 
 ### Linear scan versus binary search at small n
 
@@ -273,28 +273,28 @@ They cross between 32 and 64 elements. The asymptotic analysis was right about t
 
 ### The hook, with numbers
 
-Summing a linked list of one million nodes is `Theta(n)`. Sorting an array of one million `int`s is `Theta(n log n)`. The list's nodes were allocated over time and sit scattered across the heap, so each `node.next` is a dependent load that misses cache: about 10^6 x 80 ns = **80 ms**. The sort reads the array sequentially many times, each pass prefetched: about 10^6 x 20 x 1-3 ns = **20-60 ms**. The `n log n` algorithm finishes first, by a factor the notation cannot see, because the notation counts operations and the machine charges for memory access patterns. The lesson for a payments engineer: a `LinkedList<Transaction>` is `O(1)` to append and `O(n)` to iterate, exactly like an `ArrayList`, and will be several times slower at both; Lesson 04 builds it anyway so you know what you are not using.
+Summing a linked list of one million nodes is `Θ(n)`. Sorting an array of one million `int`s is `Θ(n log n)`. The list's nodes were allocated over time and sit scattered across the heap, so each `node.next` is a dependent load that misses cache: about 10^6 x 80 ns = **80 ms**. The sort reads the array sequentially many times, each pass prefetched: about 10^6 x 20 x 1-3 ns = **20-60 ms**. The `n log n` algorithm finishes first, by a factor the notation cannot see, because the notation counts operations and the machine charges for memory access patterns. The lesson for a payments engineer: a `LinkedList<Transaction>` is `O(1)` to append and `O(n)` to iterate, exactly like an `ArrayList`, and will be several times slower at both; Lesson 04 builds it anyway so you know what you are not using.
 
 ### What asymptotic analysis does not tell you
 
 - **Where the crossover is.** Two algorithms with different classes have a crossover point; the notation proves it exists and says nothing about whether it is at n = 8 or n = 8 million.
-- **Anything about latency distribution.** `O(1)` amortised hides `Theta(n)` spikes; `Theta(1)` expected hides a `Theta(n)` worst case. Both matter for a p99.
-- **Memory traffic.** Two `Theta(n)` algorithms can differ by 50x if one streams through an array and the other chases pointers.
+- **Anything about latency distribution.** `O(1)` amortised hides `Θ(n)` spikes; `Θ(1)` expected hides a `Θ(n)` worst case. Both matter for a p99.
+- **Memory traffic.** Two `Θ(n)` algorithms can differ by 50x if one streams through an array and the other chases pointers.
 - **Which n.** A claim without a named input size is not a claim. "The fraud check is O(1)" means nothing until someone says "in the number of rules" or "in the number of past transactions for this card".
 
 ## Exercises
 
-1. **Reinforce.** Give the Theta class of each of the six loop shapes A-F from the decision procedure, then write a seventh: `for (i = 0; i < n; i++) for (j = 1; j < n; j *= 3)`. Prove your answer for shape B by writing out the sum for `n = 5` and checking it against `n(n-1)/2`.
+1. **Reinforce.** Give the Θ class of each of the six loop shapes A-F from the decision procedure, then write a seventh: `for (i = 0; i < n; i++) for (j = 1; j < n; j *= 3)`. Prove your answer for shape B by writing out the sum for `n = 5` and checking it against `n(n-1)/2`.
 2. **Apply.** Using the benchmark harness from Phase 0, Lesson 05, implement `scan` and `search` above in your chosen language and measure them for `n` in `{4, 8, 16, 32, 64, 128, 256, 1024}` with random queries. Report the crossover and compare it with the 32-128 prediction. Then repeat with the array replaced by a `TreeMap` / `bisect` on a list / `sort.SearchInts`, and explain each difference in one sentence about memory layout.
-3. **Extend.** Take the settlement reconciliation loop and rewrite it three ways: hash-map join, sort both sides then merge, and the original nested loop. Give the Theta class of each in `n`, `m`, and `L`. Then estimate, using the cost table above, the clock time of each at `n = m = 2.1 x 10^6`, `L = 32`, assuming every ID comparison misses L1 for the nested loop but not for the sort-merge. State which one you would ship and why the answer could change if the records arrived as a stream (Phase 8).
+3. **Extend.** Take the settlement reconciliation loop and rewrite it three ways: hash-map join, sort both sides then merge, and the original nested loop. Give the Θ class of each in `n`, `m`, and `L`. Then estimate, using the cost table above, the clock time of each at `n = m = 2.1 x 10^6`, `L = 32`, assuming every ID comparison misses L1 for the nested loop but not for the sort-merge. State which one you would ship and why the answer could change if the records arrived as a stream (Phase 8).
 
 ## Key Terms
 
 | Term | What people say | What it actually means |
 |------|-----------------|------------------------|
 | Big-O | "the complexity" | An asymptotic *upper* bound up to a constant: `f = O(g)` means `f <= c * g` for large `n`; `O(n^2)` is a true statement about binary search |
-| Big-Theta | "exactly O(...)" | A tight bound: upper and lower at once; the class you usually mean when you say "this algorithm is quadratic" |
-| Big-Omega | "at least" | An asymptotic lower bound; used for impossibility results such as `Omega(n log n)` for comparison sorting |
+| Big-Θ | "exactly O(...)" | A tight bound: upper and lower at once; the class you usually mean when you say "this algorithm is quadratic" |
+| Big-Ω | "at least" | An asymptotic lower bound; used for impossibility results such as `Ω(n log n)` for comparison sorting |
 | Worst case | "the slow path" | The input that maximises cost for a given `n`; a property of the input, not of the bound, and the case an attacker or a quarter-end batch will find |
 | Amortised | "O(1) on average" | The total cost of any sequence of `m` operations divided by `m`, with no randomness; a throughput guarantee that says nothing about individual latency |
 | Cache line | "a chunk of memory" | The 64-byte unit in which data moves between RAM and the core; touching one byte fetches all 64, so sequential access is nearly free after the first miss |
@@ -304,7 +304,7 @@ Summing a linked list of one million nodes is `Theta(n)`. Sorting an array of on
 ## Further Reading
 
 - [Knuth, *The Art of Computer Programming*, Vol. 1, Section 1.2.11.1 "The O-notation"](https://www-cs-faculty.stanford.edu/~knuth/taocp.html) — the definitions as the field uses them, and Knuth's own warning about the abuse of `=` in `f = O(g)`.
-- [Cormen, Leiserson, Rivest, Stein, *Introduction to Algorithms*, Chapter 3 "Characterizing Running Times"](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/) — the formal definitions of O, Omega, Theta, little-o, and the master theorem for recurrences (Chapter 4).
+- [Cormen, Leiserson, Rivest, Stein, *Introduction to Algorithms*, Chapter 3 "Characterizing Running Times"](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/) — the formal definitions of O, Ω, Θ, little-o, and the master theorem for recurrences (Chapter 4).
 - [Drepper, "What Every Programmer Should Know About Memory" (2007)](https://people.freebsd.org/~lstewart/articles/cpumemory.pdf) — cache lines, the memory hierarchy, prefetching, and measured costs; the source for the hardware table.
 - [Intel 64 and IA-32 Architectures Optimization Reference Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html) — branch prediction, misprediction penalties, and conditional-move guidance straight from the vendor.
 - [Fog, "Instruction tables" and "Optimizing software in C++"](https://www.agner.org/optimize/) — per-instruction latencies and the practical consequences of mispredicts and dependent loads, maintained for every current microarchitecture.
