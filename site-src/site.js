@@ -55,7 +55,39 @@
     var lang = load(KEYS.lang);
     return LANGS.indexOf(lang) >= 0 ? lang : 'java';
   }
+  var LANG_NAME = { java: 'Java', python: 'Python', go: 'Go' };
+  function applyWalkthrough(lang) {
+    var notice = $('[data-lang-notice]');
+    var walk = $('[data-java-walkthrough]');
+    if (!notice || !walk) return;
+    var isJava = lang === 'java';
+    notice.hidden = isJava;
+    var expanded = walk.getAttribute('data-expanded') === 'true';
+    walk.classList.toggle('is-collapsed', !isJava && !expanded);
+    var has = (notice.getAttribute('data-has') || '').split(' ');
+    var text = $('.lang-notice-text', notice);
+    if (text) {
+      text.textContent = has.indexOf(lang) >= 0
+        ? 'The steps below teach the design in Java; "What differs in ' + LANG_NAME[lang] + '" covers the ' + LANG_NAME[lang] + ' idioms, and the ' + LANG_NAME[lang] + ' tab under Code has the complete implementation with tests.'
+        : 'The ' + LANG_NAME[lang] + ' tab under Code has the complete implementation with tests.';
+    }
+    $$('.lang-name', notice).forEach(function (n) { n.textContent = LANG_NAME[lang] || lang; });
+    $$('[data-notice-lang]', notice).forEach(function (a) { a.hidden = a.getAttribute('data-notice-lang') !== lang; });
+    var btn = $('[data-toggle-walkthrough]', notice);
+    if (btn) { btn.textContent = expanded ? 'Hide the Java walkthrough' : 'Show the Java walkthrough'; btn.setAttribute('aria-expanded', expanded ? 'true' : 'false'); }
+  }
+  function initWalkthrough() {
+    document.addEventListener('click', function (event) {
+      var btn = event.target.closest('[data-toggle-walkthrough]');
+      if (!btn) return;
+      var walk = $('[data-java-walkthrough]');
+      if (!walk) return;
+      walk.setAttribute('data-expanded', walk.getAttribute('data-expanded') === 'true' ? 'false' : 'true');
+      applyWalkthrough(currentLang());
+    });
+  }
   function applyLang(lang, scrollTarget) {
+    applyWalkthrough(lang);
     $$('.lang-pick button, .lang-card').forEach(function (b) {
       b.setAttribute('aria-pressed', b.getAttribute('data-lang') === lang ? 'true' : 'false');
     });
@@ -604,6 +636,7 @@
   function init() {
     initTheme();
     initNav();
+    initWalkthrough();
     initLang();
     initCopyButtons();
     initProgress();

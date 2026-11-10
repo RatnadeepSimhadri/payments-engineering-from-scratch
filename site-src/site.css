@@ -421,3 +421,10 @@ ul.task-list .task-text { min-width: 0; }
 .quiz-last { margin: 0 0 8px; }
 .roadmap .done-cell { white-space: nowrap; }
 .roadmap .done-cell .done-when { margin-left: 4px; }
+[hidden] { display: none !important; }
+.lang-notice { margin: 12px 0 16px; padding: 12px 14px; border-left: 3px solid var(--accent); background: var(--bg-sunken); border-radius: 8px; }
+.lang-notice p { margin: 0 0 8px; }
+.lang-notice p:last-child { margin-bottom: 0; }
+.lang-notice-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn.small { padding: 6px 10px; font-size: .85rem; min-height: 36px; }
+.java-walkthrough.is-collapsed { display: none; }

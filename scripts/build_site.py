@@ -1025,6 +1025,45 @@ def lesson_code_files(lesson_dir: Path, lang: dict) -> list[Path]:
     return sorted(files, key=order)
 
 
+WALK_H2_RE = re.compile(r'<h2 id="build-it">')
+WALK_END_RE = re.compile(r'<h3 id="in-(python|go)(?:-[^"]*)?">|<h2 id="')
+
+
+def mark_java_walkthrough(docs_html: str, lesson: dict) -> str:
+    """Build It is written in Java (AGENTS.md: primary teaching language), with `### In Python` and
+    `### In Go` subsections for what differs and the full ports in the code tabs. Wrap the Java
+    chunk sequence so the page can lead with the learner's language: when Python or Go is selected,
+    site.js shows a notice with jump links and collapses the Java walkthrough behind a toggle."""
+    start = WALK_H2_RE.search(docs_html)
+    if not start:
+        return docs_html
+    body_from = docs_html.index("</h2>", start.start()) + len("</h2>")
+    end = WALK_END_RE.search(docs_html, body_from)
+    body_to = end.start() if end else len(docs_html)
+    has_py = 'id="in-python"' in docs_html
+    has_go = 'id="in-go"' in docs_html
+    langs = " ".join(l for l, ok in (("python", has_py), ("go", has_go)) if ok)
+    notice = (
+        f'<div class="lang-notice" data-lang-notice data-has="{langs}" hidden>'
+        f'<p><strong>This walkthrough is written in Java.</strong> <span class="lang-notice-text"></span></p>'
+        f'<p class="lang-notice-links">'
+        + (f'<a class="btn small" data-notice-lang="python" href="#in-python">What differs in Python</a> ' if has_py else "")
+        + (f'<a class="btn small" data-notice-lang="go" href="#in-go">What differs in Go</a> ' if has_go else "")
+        + f'<a class="btn small" href="#code">Full <span class="lang-name"></span> implementation</a> '
+        f'<button type="button" class="btn small ghost" data-toggle-walkthrough aria-expanded="false">Show the Java walkthrough</button>'
+        f'</p></div>'
+    )
+    wrapped = (
+        docs_html[:body_from]
+        + notice
+        + '<div class="java-walkthrough" data-java-walkthrough>'
+        + docs_html[body_from:body_to]
+        + "</div>"
+        + docs_html[body_to:]
+    )
+    return wrapped
+
+
 def build_lesson(site: Site, lesson: dict) -> None:
     phase = lesson["phase"]
     url = lesson["url"]
@@ -1044,6 +1083,8 @@ def build_lesson(site: Site, lesson: dict) -> None:
         docs_html = f"<h1>{escape(lesson['title'])}</h1><blockquote><p>{escape(lesson['hook'])}</p></blockquote><p>This lesson is planned and has not been written yet.</p>"
     if "```" in TAG_RE.sub("", re.sub(r"<pre.*?</pre>", "", docs_html, flags=re.DOTALL)):
         unhandled(source, "a code fence survived into the rendered text")
+    if lesson["type"] == "Build":
+        docs_html = mark_java_walkthrough(docs_html, lesson)
 
     # key terms + headings for the search index
     key_terms = []
