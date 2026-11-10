@@ -108,7 +108,7 @@ python3 scripts/build_site.py             # writes site/ (gitignored); --check a
 python3 -m http.server -d site            # open http://localhost:8000/
 ```
 
-`.github/workflows/site.yml` rebuilds and deploys the site on every push to `main`. Pages must be enabled once in the repository settings with the source set to **GitHub Actions**.
+`.github/workflows/site.yml` rebuilds and deploys the site on every push to `main`. The first run enables Pages automatically (source: GitHub Actions).
 
 ## Projects
 

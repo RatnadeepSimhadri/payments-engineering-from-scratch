@@ -1,7 +1,7 @@
 name: site
 
 # Builds the learner-facing static site with scripts/build_site.py and deploys it to GitHub Pages.
-# Pages must be enabled once in the repository settings with source "GitHub Actions".
+# The build job enables Pages (source "GitHub Actions") on first run; no manual setup needed.
 
 on:
   push:
@@ -25,8 +25,16 @@ jobs:
   build:
     name: Build and check the site
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+        with:
+          enablement: true
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: python3 scripts/build_catalog.py && python3 scripts/build_site.py --check
