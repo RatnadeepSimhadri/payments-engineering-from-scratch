@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  var KEYS = { lang: 'pefs:lang', done: 'pefs:done', theme: 'pefs:theme' };
+  var KEYS = { lang: 'pefs:lang', done: 'pefs:done', theme: 'pefs:theme', quiz: 'pefs:quiz' };
   var LANGS = ['java', 'python', 'go'];
 
   function store(key, value) {
@@ -17,6 +17,11 @@
     try { return JSON.parse(load(KEYS.done) || '{}') || {}; } catch (e) { return {}; }
   }
   function saveDone(done) { store(KEYS.done, JSON.stringify(done)); }
+  function loadQuiz() {
+    try { return JSON.parse(load(KEYS.quiz) || '{}') || {}; } catch (e) { return {}; }
+  }
+  function saveQuiz(q) { store(KEYS.quiz, JSON.stringify(q)); }
+  var LESSON_ID_RE = /^[\w-]+\/[\w-]+$/;
   function $(sel, root) { return (root || document).querySelector(sel); }
   function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
 
@@ -129,6 +134,7 @@
   /* ---------------- progress ---------------- */
   function refreshProgress() {
     var done = loadDone();
+    var quiz = loadQuiz();
     $$('[data-lesson]').forEach(function (el) {
       var id = el.getAttribute('data-lesson');
       var isDone = !!done[id];
@@ -138,7 +144,10 @@
         el.textContent = isDone ? 'Completed' : 'Mark complete';
       }
       var when = $('.done-when', el);
-      if (when) when.textContent = isDone && done[id] > 1 ? new Date(done[id]).toLocaleDateString() : '';
+      if (when) {
+        var q = quiz[id];
+        when.textContent = (isDone && done[id] > 1 ? new Date(done[id]).toLocaleDateString() : '') + (q ? (isDone ? ' · ' : '') + 'quiz ' + q.score + '/' + q.total : '');
+      }
     });
     var total = Object.keys(done).length;
     $$('[data-progress]').forEach(function (bar) {
@@ -175,27 +184,187 @@
       saveDone(done);
       refreshProgress();
     });
-    var exportBtn = $('#export-progress'), importBtn = $('#import-progress'), resetBtn = $('#reset-progress');
-    if (exportBtn) exportBtn.addEventListener('click', function () {
-      var text = JSON.stringify(loadDone());
-      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text); else fallbackCopy(text);
-      exportBtn.textContent = 'Copied'; setTimeout(function () { exportBtn.textContent = 'Copy progress as JSON'; }, 1500);
+    initSync();
+    window.addEventListener('storage', function (event) { if (event.key === KEYS.done || event.key === KEYS.quiz) refreshProgress(); });
+  }
+
+  /* ---------------- progress sync: file export/import + LEARNING.md ---------------- */
+  function exportPayload() {
+    return { app: 'payments-engineering-from-scratch', version: 2, exported: new Date().toISOString(),
+             lang: load(KEYS.lang) || null, done: loadDone(), quiz: loadQuiz() };
+  }
+  function normaliseImport(parsed) {
+    /* Accepts v2 payloads and the v1 flat {id: timestamp} map. Returns {done, quiz, lang} or null. */
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    var out = { done: {}, quiz: {}, lang: null };
+    var src = (parsed.version === 2 && parsed.done && typeof parsed.done === 'object') ? parsed : { done: parsed };
+    Object.keys(src.done || {}).forEach(function (k) { if (LESSON_ID_RE.test(k)) out.done[k] = Number(src.done[k]) || Date.now(); });
+    Object.keys(src.quiz || {}).forEach(function (k) {
+      var v = src.quiz[k];
+      if (LESSON_ID_RE.test(k) && v && typeof v === 'object' && isFinite(v.score) && isFinite(v.total)) out.quiz[k] = { score: +v.score, total: +v.total, at: Number(v.at) || Date.now() };
     });
-    if (importBtn) importBtn.addEventListener('click', function () {
-      var text = window.prompt('Paste the progress JSON you copied from another browser:');
+    if (['java', 'python', 'go'].indexOf(src.lang) >= 0) out.lang = src.lang;
+    if (!Object.keys(out.done).length && !Object.keys(out.quiz).length) return null;
+    return out;
+  }
+  function mergeImport(data) {
+    var done = loadDone(), quiz = loadQuiz(), added = 0;
+    Object.keys(data.done).forEach(function (k) { if (!done[k]) added++; done[k] = done[k] || data.done[k]; });
+    Object.keys(data.quiz).forEach(function (k) { if (!quiz[k] || data.quiz[k].at > quiz[k].at) quiz[k] = data.quiz[k]; });
+    saveDone(done); saveQuiz(quiz);
+    if (data.lang && !load(KEYS.lang)) store(KEYS.lang, data.lang);
+    refreshProgress();
+    return added;
+  }
+  function downloadText(name, text, type) {
+    var blob = new Blob([text], { type: type || 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+  function readFile(input, cb) {
+    var file = input.files && input.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () { cb(String(reader.result || '')); input.value = ''; };
+    reader.readAsText(file);
+  }
+  function lessonIndex() {
+    var el = $('#lesson-index');
+    if (!el) return [];
+    try { return JSON.parse(el.textContent) || []; } catch (e) { return []; }
+  }
+  function parseLearningMd(text) {
+    /* Finds lessons in a LEARNING.md (or LEDGER-/CONSENSUS-LEARNING.md): every row of the
+       "Progress log" table and every phase marked Done in the "Path" table. Returns
+       {done: {id: ts}, quiz: {id: {score,total,at}}, unknown: [strings]}. */
+    var index = lessonIndex();
+    var byId = {}, byNum = {}, bySlug = {}, byPhase = {};
+    index.forEach(function (l) {
+      byId[l.id] = l; byNum[l.p + '/' + l.n] = l;
+      var parts = l.id.split('/'); bySlug[parts[1]] = l; bySlug[parts[0] + '/' + parts[1]] = l;
+      (byPhase[l.p] = byPhase[l.p] || []).push(l);
+    });
+    function resolve(ref) {
+      ref = ref.replace(/`/g, '').trim();
+      if (!ref) return null;
+      if (byId[ref]) return byId[ref];
+      var m = ref.match(/^(?:phase\s*)?(\d{1,2})\s*[\/,-]?\s*(?:lesson\s*)?(\d{1,2})\b/i);
+      if (m) { var hit = byNum[parseInt(m[1], 10) + '/' + parseInt(m[2], 10)]; if (hit) return hit; }
+      m = ref.match(/([\w-]+)\/([\w-]+)/);
+      if (m) {
+        if (bySlug[m[1] + '/' + m[2]]) return bySlug[m[1] + '/' + m[2]];
+        var pn = m[1].match(/^(\d{1,2})/), ln = m[2].match(/^(\d{1,2})/);
+        if (pn && ln && byNum[parseInt(pn[1], 10) + '/' + parseInt(ln[1], 10)]) return byNum[parseInt(pn[1], 10) + '/' + parseInt(ln[1], 10)];
+      }
+      m = ref.match(/^\d{1,2}-[\w-]+$/);
+      if (m && bySlug[ref]) return bySlug[ref];
+      var low = ref.toLowerCase();
+      var titleHit = index.filter(function (l) { return low === l.t.toLowerCase() || low === l.t.split(':')[0].toLowerCase(); });
+      return titleHit.length === 1 ? titleHit[0] : null;
+    }
+    var out = { done: {}, quiz: {}, unknown: [] };
+    var section = '';
+    text.split(/\r?\n/).forEach(function (line) {
+      var h = line.match(/^##\s+(.*)/);
+      if (h) { section = h[1].trim().toLowerCase(); return; }
+      if (!/^\|/.test(line) || /^\|\s*-/.test(line)) return;
+      var cells = line.split('|').slice(1, -1).map(function (c) { return c.trim(); });
+      if (section.indexOf('progress log') === 0) {
+        if (cells.length < 2 || /^date$/i.test(cells[0])) return;
+        var lesson = resolve(cells[1]);
+        if (!lesson) { out.unknown.push(cells[1]); return; }
+        var ts = Date.parse(cells[0]); if (!isFinite(ts)) ts = Date.now();
+        out.done[lesson.id] = out.done[lesson.id] || ts;
+        var q = (cells[3] || '').match(/(\d+)\s*\/\s*(\d+)/);
+        if (q) out.quiz[lesson.id] = { score: +q[1], total: +q[2], at: ts };
+      } else if (section.indexOf('path') === 0) {
+        if (cells.length < 3 || /^phase$/i.test(cells[0])) return;
+        if (!/^done$/i.test(cells[2])) return;
+        var pn2 = (cells[0].match(/(\d{1,2})/) || [])[1];
+        (byPhase[parseInt(pn2, 10)] || []).forEach(function (l) { out.done[l.id] = out.done[l.id] || Date.now(); });
+      }
+    });
+    return out;
+  }
+  function showPreview(title, parsed, onApply) {
+    var box = $('#sync-preview');
+    if (!box) return;
+    var done = loadDone();
+    var ids = Object.keys(parsed.done);
+    var fresh = ids.filter(function (k) { return !done[k]; });
+    var quizN = Object.keys(parsed.quiz).length;
+    box.innerHTML = '';
+    var h = document.createElement('h3'); h.textContent = title; box.appendChild(h);
+    var p = document.createElement('p');
+    p.textContent = ids.length + ' lesson' + (ids.length === 1 ? '' : 's') + ' recognised, ' + fresh.length + ' not yet marked here' + (quizN ? ', ' + quizN + ' quiz score' + (quizN === 1 ? '' : 's') : '') + '.';
+    box.appendChild(p);
+    if (parsed.unknown && parsed.unknown.length) {
+      var u = document.createElement('p'); u.className = 'small muted';
+      u.textContent = 'Not recognised (left alone): ' + parsed.unknown.slice(0, 8).join(', ') + (parsed.unknown.length > 8 ? ' …' : '');
+      box.appendChild(u);
+    }
+    if (fresh.length) {
+      var ul = document.createElement('ul'); ul.className = 'small';
+      var idx = {}; lessonIndex().forEach(function (l) { idx[l.id] = l; });
+      fresh.slice(0, 12).forEach(function (k) { var li = document.createElement('li'); li.textContent = idx[k] ? ('Phase ' + idx[k].p + ' · ' + idx[k].t) : k; ul.appendChild(li); });
+      if (fresh.length > 12) { var more = document.createElement('li'); more.textContent = '… and ' + (fresh.length - 12) + ' more'; ul.appendChild(more); }
+      box.appendChild(ul);
+    }
+    var actions = document.createElement('p'); actions.className = 'progress-actions';
+    var apply = document.createElement('button'); apply.type = 'button'; apply.className = 'btn primary';
+    apply.textContent = ids.length ? 'Apply (merge into this browser)' : 'Nothing to apply';
+    apply.disabled = !ids.length;
+    var cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'btn ghost'; cancel.textContent = 'Cancel';
+    apply.addEventListener('click', function () { var added = onApply(); box.innerHTML = ''; var ok = document.createElement('p'); ok.className = 'sync-ok'; ok.textContent = 'Done: ' + added + ' lesson' + (added === 1 ? '' : 's') + ' newly marked complete.'; box.appendChild(ok); });
+    cancel.addEventListener('click', function () { box.hidden = true; box.innerHTML = ''; });
+    actions.appendChild(apply); actions.appendChild(cancel); box.appendChild(actions);
+    box.hidden = false;
+    box.scrollIntoView({ block: 'nearest' });
+  }
+  function initSync() {
+    var dl = $('#download-progress'), fileBtn = $('#import-file-btn'), fileIn = $('#import-file');
+    var copyBtn = $('#export-progress'), pasteBtn = $('#import-progress'), resetBtn = $('#reset-progress');
+    var lmBtn = $('#learning-file-btn'), lmIn = $('#learning-file'), lmPaste = $('#learning-paste-btn');
+    function importJsonText(text, title) {
+      var parsed; try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
+      var data = parsed && normaliseImport(parsed);
+      if (!data) { window.alert('That did not look like a progress file from this site.'); return; }
+      showPreview(title, { done: data.done, quiz: data.quiz, unknown: [] }, function () { return mergeImport(data); });
+    }
+    if (dl) dl.addEventListener('click', function () {
+      downloadText('payments-course-progress-' + new Date().toISOString().slice(0, 10) + '.json', JSON.stringify(exportPayload(), null, 2));
+    });
+    if (fileBtn && fileIn) {
+      fileBtn.addEventListener('click', function () { fileIn.click(); });
+      fileIn.addEventListener('change', function () { readFile(fileIn, function (text) { importJsonText(text, 'Import progress file'); }); });
+    }
+    if (copyBtn) copyBtn.addEventListener('click', function () {
+      var text = JSON.stringify(exportPayload());
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text); else fallbackCopy(text);
+      copyBtn.textContent = 'Copied'; setTimeout(function () { copyBtn.textContent = 'Copy as text'; }, 1500);
+    });
+    if (pasteBtn) pasteBtn.addEventListener('click', function () {
+      var text = window.prompt('Paste the progress text you copied from another browser:');
+      if (text) importJsonText(text, 'Import pasted progress');
+    });
+    if (lmBtn && lmIn) {
+      lmBtn.addEventListener('click', function () { lmIn.click(); });
+      lmIn.addEventListener('change', function () { readFile(lmIn, function (text) {
+        var parsed = parseLearningMd(text);
+        showPreview('Sync from LEARNING.md', parsed, function () { return mergeImport({ done: parsed.done, quiz: parsed.quiz, lang: null }); });
+      }); });
+    }
+    if (lmPaste) lmPaste.addEventListener('click', function () {
+      var text = window.prompt('Paste the full contents of LEARNING.md:');
       if (!text) return;
-      try {
-        var parsed = JSON.parse(text);
-        if (typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
-        var merged = loadDone();
-        Object.keys(parsed).forEach(function (k) { if (/^[\w-]+\/[\w-]+$/.test(k)) merged[k] = parsed[k] || Date.now(); });
-        saveDone(merged); refreshProgress();
-      } catch (e) { window.alert('That did not look like progress JSON.'); }
+      var parsed = parseLearningMd(text);
+      showPreview('Sync from LEARNING.md', parsed, function () { return mergeImport({ done: parsed.done, quiz: parsed.quiz, lang: null }); });
     });
     if (resetBtn) resetBtn.addEventListener('click', function () {
-      if (window.confirm('Remove every completed-lesson mark from this browser?')) { saveDone({}); refreshProgress(); }
+      if (window.confirm('Remove every completed-lesson mark and quiz score from this browser?')) { saveDone({}); saveQuiz({}); refreshProgress(); }
     });
-    window.addEventListener('storage', function (event) { if (event.key === KEYS.done) refreshProgress(); });
   }
 
   /* ---------------- quiz ---------------- */
@@ -206,6 +375,15 @@
     if (!holder || !data) return;
     var questions;
     try { questions = JSON.parse(data.textContent); } catch (e) { return; }
+    var article = holder.closest('[data-lesson-id]');
+    var lessonId = article ? article.getAttribute('data-lesson-id') : null;
+    var last = document.createElement('p'); last.className = 'quiz-last small muted';
+    function showLastScore() {
+      var rec = lessonId ? loadQuiz()[lessonId] : null;
+      last.textContent = rec ? 'Last score in this browser: ' + rec.score + ' / ' + rec.total + ' (' + new Date(rec.at).toLocaleDateString() + ')' : '';
+    }
+    showLastScore();
+    holder.parentNode.insertBefore(last, holder);
     var form = document.createElement('form');
     form.addEventListener('submit', function (e) { e.preventDefault(); });
     questions.forEach(function (q, qi) {
@@ -271,6 +449,9 @@
         explain.hidden = false;
       });
       score.textContent = answered ? 'Score: ' + right + ' / ' + questions.length + (answered < questions.length ? ' (' + (questions.length - answered) + ' unanswered)' : '') : 'Pick an answer first.';
+      if (answered === questions.length && lessonId) {
+        var q = loadQuiz(); q[lessonId] = { score: right, total: questions.length, at: Date.now() }; saveQuiz(q); showLastScore();
+      }
     });
     reset.addEventListener('click', function () {
       form.reset();

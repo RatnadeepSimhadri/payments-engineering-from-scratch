@@ -1480,17 +1480,31 @@ def build_progress(site: Site) -> None:
             f'<div class="progress" data-progress="{scope}"><div class="progress-bar"></div></div>'
             f'<details><summary>Lessons</summary><ul class="progress-list">{rows}</ul></details></section>'
         )
+    lesson_index = json.dumps(
+        [{"id": l["id"], "p": phase["number"], "n": l["n"], "t": l["title"]} for phase in catalog["phases"] for l in phase["lessons"]],
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
     body = f"""
 {breadcrumbs(site, url, [("index.html", "Home"), ("", "Progress")])}
 <h1>Your progress</h1>
 <p class="lede">Lessons you marked complete, by phase. Everything here lives in this browser's local storage; nothing is uploaded. The tutor skills keep the authoritative record in <code>LEARNING.md</code> in your clone.</p>
 <div class="progress-block"><div class="progress big" data-progress="all" data-total="{catalog["lessonCount"]}"><div class="progress-bar"></div></div>
 <p class="progress-label"><strong><span data-progress-text="all">0 of {catalog["lessonCount"]}</span></strong> lessons · <span data-progress-percent="all">0%</span></p></div>
-<p class="progress-actions"><button type="button" class="btn ghost" id="export-progress">Copy progress as JSON</button> <button type="button" class="btn ghost" id="import-progress">Paste progress JSON</button> <button type="button" class="btn danger" id="reset-progress">Reset progress</button></p>
+<section class="progress-sync" id="sync">
+<h2 id="move-progress">Move your progress between devices</h2>
+<p>Progress is stored only in this browser. To carry it to another device, download it here and import it there; the import merges, so nothing already marked is lost.</p>
+<p class="progress-actions"><button type="button" class="btn primary" id="download-progress">Download progress (JSON)</button> <button type="button" class="btn" id="import-file-btn">Import a progress file</button> <input type="file" id="import-file" accept=".json,application/json" hidden> <button type="button" class="btn ghost" id="export-progress">Copy as text</button> <button type="button" class="btn ghost" id="import-progress">Paste text</button></p>
+<h3 id="sync-learning-md">Sync with <code>LEARNING.md</code></h3>
+<p>If you study with the tutor skills (<code>/learn</code>), your clone's <code>LEARNING.md</code> is the authoritative record. Load it here and every lesson in its progress log, plus every phase marked <code>Done</code> in its path table, is marked complete on this site. <code>LEDGER-LEARNING.md</code> and <code>CONSENSUS-LEARNING.md</code> work too.</p>
+<p class="progress-actions"><button type="button" class="btn" id="learning-file-btn">Load LEARNING.md</button> <input type="file" id="learning-file" accept=".md,text/markdown,text/plain" hidden> <button type="button" class="btn ghost" id="learning-paste-btn">Paste its contents</button></p>
+<div id="sync-preview" class="sync-preview" hidden></div>
+<p class="progress-actions"><button type="button" class="btn danger" id="reset-progress">Reset progress</button></p>
+</section>
 {"".join(sections)}
+<script type="application/json" id="lesson-index">{lesson_index}</script>
 """
     site.write(url, page_shell(site, url, title="Progress", body=body, active="progress.html",
-                               toc=toc_html([(2, f"Phase {p['number']}: {p['title']}", f"phase-{p['number']}") for p in catalog["phases"]])))
+                               toc=toc_html([(2, "Move your progress", "move-progress")] + [(2, f"Phase {p['number']}: {p['title']}", f"phase-{p['number']}") for p in catalog["phases"]])))
 
 
 # --------------------------------------------------------------------------------------

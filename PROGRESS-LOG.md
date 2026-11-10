@@ -2,6 +2,12 @@
 
 Hand-maintained record of build batches, newest first. The live numbers are in `PROGRESS.md` (generated).
 
+## 2026-11-09 — Site: progress export/import and LEARNING.md sync
+
+- Progress page: download progress as JSON (v2 payload: completed lessons, quiz scores, language) and import a file on another device; copy/paste text kept; v1 payloads still import. Imports merge and show a preview before applying.
+- `LEARNING.md` sync: loads or pastes `LEARNING.md` (also `LEDGER-`/`CONSENSUS-LEARNING.md`), resolves Progress-log rows by `NN/MM`, slug path, "Phase N Lesson MM" or title, and phases marked `Done` in the Path table; unknown rows are listed, not guessed.
+- Quizzes now store the last full score per lesson in the browser and show it above the quiz and in progress lists.
+
 ## 2026-11-09 — Full validation pass (curriculum fidelity, content quality, site QA)
 
 - Three independent reviewers (fresh agents) plus the full mechanical matrix: audit 199/199 0 issues; 143/143 Build lessons pass in Java, Python and Go (429 runs); 9/9 project grader runs; curriculum ↔ disk 199/199 with no missing or extra lessons; 995/995 Build It code chunks correspond to shipped code; learning paths, skills, capstone references all resolve.

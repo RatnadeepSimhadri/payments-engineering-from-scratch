@@ -407,3 +407,11 @@ ul.task-list .task-text { min-width: 0; }
   .layout { display: block; }
   .content { max-width: none; padding: 0; }
 }
+
+.progress-sync { margin: 24px 0 32px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-elev); }
+.progress-sync h2 { margin-top: 0; }
+.sync-preview { margin: 12px 0; padding: 12px 14px; border-left: 3px solid var(--accent); background: var(--bg-sunken); border-radius: 8px; }
+.sync-preview h3 { margin: 0 0 6px; font-size: 1rem; }
+.sync-preview ul { margin: 6px 0 0 18px; }
+.sync-ok { color: var(--accent); font-weight: 600; margin: 0; }
+.quiz-last { margin: 0 0 8px; }

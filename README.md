@@ -98,7 +98,7 @@ You need Java 21+, Python 3.11+, or Go 1.22+, depending on the language you choo
 
 ### Website
 
-The repository is also published as a static site at `https://<user>.github.io/payments-engineering-from-scratch/` (for this repository, [ratnadeepsimhadri.github.io/payments-engineering-from-scratch](https://ratnadeepsimhadri.github.io/payments-engineering-from-scratch/)): every lesson with code tabs in Java, Python, and Go, an interactive quiz, the artifacts, a roadmap with your progress, the projects and learning paths, a glossary, and search. Nothing leaves your browser: the language choice and completed lessons live in `localStorage`.
+The repository is also published as a static site at `https://<user>.github.io/payments-engineering-from-scratch/` (for this repository, [ratnadeepsimhadri.github.io/payments-engineering-from-scratch](https://ratnadeepsimhadri.github.io/payments-engineering-from-scratch/)): every lesson with code tabs in Java, Python, and Go, an interactive quiz, the artifacts, a roadmap with your progress, the projects and learning paths, a glossary, and search. Nothing leaves your browser: the language choice, completed lessons, and quiz scores live in `localStorage`. The **Progress** page lets you download that record as JSON and import it on another device, and it can read your clone's `LEARNING.md` (the tutor's record) so the site and the tutor agree.
 
 Preview it locally with the standard library only:
 
