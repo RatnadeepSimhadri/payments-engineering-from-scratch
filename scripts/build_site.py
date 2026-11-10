@@ -332,6 +332,8 @@ def render_list(lines: list[str], ctx: RenderContext) -> str:
         if inner.count("<p>") == 1 and inner.startswith("<p>") and inner.endswith("</p>"):
             inner = inner[3:-4]
         li_class = ' class="task"' if task else ""
+        if task:
+            inner = f'<span class="task-text">{inner}</span>'
         out.append(f"<li{li_class}>{checkbox}{inner}</li>")
     out.append(f"</{tag}>")
     result = "".join(out)
@@ -1403,6 +1405,8 @@ def build_glossary(site: Site) -> None:
             letters[-1][1].append(current_term)
             continue
         if current_letter is None:
+            if not in_fence and line.startswith("# "):
+                continue  # the page template already renders the H1
             intro.append(line)
         elif current_term is not None:
             current_term[1].append(line)

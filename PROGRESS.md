@@ -1,6 +1,6 @@
 # Progress Tracker
 
-Generated 2026-10-27T10:28:05+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
+Generated 2026-11-10T00:56:27+00:00 by `python3 scripts/progress.py` from the repository state. Do not edit by hand; rerun the script after any batch of work.
 
 ## Overall
 
@@ -13,7 +13,7 @@ Generated 2026-10-27T10:28:05+00:00 by `python3 scripts/progress.py` from the re
 | Go implementations | 143 / 143 Build lessons (primary, gates completion) |
 | Projects | 3 ready: `idempotent-payment-gateway` (4 stages, Java/Python/Go), `ledger-engine` (4 stages, Java/Python/Go), `raft-kv` (4 stages, Java/Python/Go) |
 | Skills | 9 / 9 present and mirrored to `.claude/skills/` |
-| Git | HEAD `b69a01e feat(go): Wave 1 - 56 lessons (Phases 0-7, 13); Go at 96/143`; 168 uncommitted files |
+| Git | HEAD `08af7d5 feat(site): static website generator and GitHub Pages workflow`; 314 uncommitted files |
 
 ## By track and phase
 
